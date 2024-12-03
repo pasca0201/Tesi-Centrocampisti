@@ -13,7 +13,7 @@ def fit_model(df, target, features):
     X = df[features]
     y = df[target]
     X = sm.add_constant(X)
-    # Aggiunta della costante per calcolare intercetta del modello, vvero il valore di base di Y quando tutti i KPI
+    # Aggiunta della costante per calcolare intercetta del modello, ovvero il valore di base di Y quando tutti i KPI
     # sono a 0
     return sm.OLS(y, X).fit()
 

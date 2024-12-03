@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def print_and_plot_model_summary(model, title, plot=True):
+def print_and_plot_model_summary(model, title, plot):
     """Stampa il riepilogo del modello (R², p-value, coefficienti, Z-score).
     Opzionalmente, visualizza i grafici per p-value e Z-score"""
 
@@ -20,7 +20,7 @@ def print_and_plot_model_summary(model, title, plot=True):
     })
     print(summary_df.to_string(index=True))
 
-    # Opzionale: generazione grafici
+    # Opzionale: generazione grafici - Usare Flag
     if plot:
         fig, axes = plt.subplots(1, 2, figsize=(15, 6))
         summary_df[summary_df['KPI'] != 'const'].plot.barh(x='KPI', y='p-value', ax=axes[0], color="skyblue")
