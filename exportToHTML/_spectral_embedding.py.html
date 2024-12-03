@@ -1,0 +1,801 @@
+<html>
+<head>
+<title>_spectral_embedding.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_spectral_embedding.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Spectral Embedding.&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Gael Varoquaux &lt;gael.varoquaux@normalesup.org&gt;</span>
+<span class="s2">#         Wei LI &lt;kuantkid@gmail.com&gt;</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">sparse</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg </span><span class="s3">import </span><span class="s1">eigh</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">csgraph </span><span class="s3">import </span><span class="s1">connected_components</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">linalg </span><span class="s3">import </span><span class="s1">eigsh</span><span class="s4">, </span><span class="s1">lobpcg</span>
+
+<span class="s3">from </span><span class="s4">..</span><span class="s1">base </span><span class="s3">import </span><span class="s1">BaseEstimator</span><span class="s4">, </span><span class="s1">_fit_context</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">metrics</span><span class="s4">.</span><span class="s1">pairwise </span><span class="s3">import </span><span class="s1">rbf_kernel</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">neighbors </span><span class="s3">import </span><span class="s1">NearestNeighbors</span><span class="s4">, </span><span class="s1">kneighbors_graph</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">check_array</span><span class="s4">,</span>
+    <span class="s1">check_random_state</span><span class="s4">,</span>
+    <span class="s1">check_symmetric</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_arpack </span><span class="s3">import </span><span class="s1">_init_arpack_v0</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s1">Interval</span><span class="s4">, </span><span class="s1">StrOptions</span><span class="s4">, </span><span class="s1">validate_params</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">extmath </span><span class="s3">import </span><span class="s1">_deterministic_vector_sign_flip</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">fixes </span><span class="s3">import </span><span class="s1">laplacian </span><span class="s3">as </span><span class="s1">csgraph_laplacian</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">fixes </span><span class="s3">import </span><span class="s1">parse_version</span><span class="s4">, </span><span class="s1">sp_version</span>
+
+
+<span class="s3">def </span><span class="s1">_graph_connected_component</span><span class="s4">(</span><span class="s1">graph</span><span class="s4">, </span><span class="s1">node_id</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Find the largest graph connected components that contains one 
+    given node. 
+ 
+    Parameters 
+    ---------- 
+    graph : array-like of shape (n_samples, n_samples) 
+        Adjacency matrix of the graph, non-zero weight means an edge 
+        between the nodes. 
+ 
+    node_id : int 
+        The index of the query node of the graph. 
+ 
+    Returns 
+    ------- 
+    connected_components_matrix : array-like of shape (n_samples,) 
+        An array of bool value indicating the indexes of the nodes 
+        belonging to the largest connected components of the given query 
+        node. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">n_node </span><span class="s4">= </span><span class="s1">graph</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+    <span class="s3">if </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">graph</span><span class="s4">):</span>
+        <span class="s2"># speed up row-wise access to boolean connection mask</span>
+        <span class="s1">graph </span><span class="s4">= </span><span class="s1">graph</span><span class="s4">.</span><span class="s1">tocsr</span><span class="s4">()</span>
+    <span class="s1">connected_nodes </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_node</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">bool</span><span class="s4">)</span>
+    <span class="s1">nodes_to_explore </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_node</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">bool</span><span class="s4">)</span>
+    <span class="s1">nodes_to_explore</span><span class="s4">[</span><span class="s1">node_id</span><span class="s4">] = </span><span class="s3">True</span>
+    <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_node</span><span class="s4">):</span>
+        <span class="s1">last_num_component </span><span class="s4">= </span><span class="s1">connected_nodes</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">()</span>
+        <span class="s1">np</span><span class="s4">.</span><span class="s1">logical_or</span><span class="s4">(</span><span class="s1">connected_nodes</span><span class="s4">, </span><span class="s1">nodes_to_explore</span><span class="s4">, </span><span class="s1">out</span><span class="s4">=</span><span class="s1">connected_nodes</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">last_num_component </span><span class="s4">&gt;= </span><span class="s1">connected_nodes</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">():</span>
+            <span class="s3">break</span>
+        <span class="s1">indices </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">where</span><span class="s4">(</span><span class="s1">nodes_to_explore</span><span class="s4">)[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s1">nodes_to_explore</span><span class="s4">.</span><span class="s1">fill</span><span class="s4">(</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">indices</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">graph</span><span class="s4">):</span>
+                <span class="s2"># scipy not yet implemented 1D sparse slices; can be changed back to</span>
+                <span class="s2"># `neighbors = graph[i].toarray().ravel()` once implemented</span>
+                <span class="s1">neighbors </span><span class="s4">= </span><span class="s1">graph</span><span class="s4">[[</span><span class="s1">i</span><span class="s4">], :].</span><span class="s1">toarray</span><span class="s4">().</span><span class="s1">ravel</span><span class="s4">()</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">neighbors </span><span class="s4">= </span><span class="s1">graph</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">logical_or</span><span class="s4">(</span><span class="s1">nodes_to_explore</span><span class="s4">, </span><span class="s1">neighbors</span><span class="s4">, </span><span class="s1">out</span><span class="s4">=</span><span class="s1">nodes_to_explore</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">connected_nodes</span>
+
+
+<span class="s3">def </span><span class="s1">_graph_is_connected</span><span class="s4">(</span><span class="s1">graph</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Return whether the graph is connected (True) or Not (False). 
+ 
+    Parameters 
+    ---------- 
+    graph : {array-like, sparse matrix} of shape (n_samples, n_samples) 
+        Adjacency matrix of the graph, non-zero weight means an edge 
+        between the nodes. 
+ 
+    Returns 
+    ------- 
+    is_connected : bool 
+        True means the graph is fully connected and False means not. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">graph</span><span class="s4">):</span>
+        <span class="s2"># Before Scipy 1.11.3, `connected_components` only supports 32-bit indices.</span>
+        <span class="s2"># PR: https://github.com/scipy/scipy/pull/18913</span>
+        <span class="s2"># First integration in 1.11.3: https://github.com/scipy/scipy/pull/19279</span>
+        <span class="s2"># TODO(jjerphan): Once SciPy 1.11.3 is the minimum supported version, use</span>
+        <span class="s2"># `accept_large_sparse=True`.</span>
+        <span class="s1">accept_large_sparse </span><span class="s4">= </span><span class="s1">sp_version </span><span class="s4">&gt;= </span><span class="s1">parse_version</span><span class="s4">(</span><span class="s6">&quot;1.11.3&quot;</span><span class="s4">)</span>
+        <span class="s1">graph </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span>
+            <span class="s1">graph</span><span class="s4">, </span><span class="s1">accept_sparse</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">accept_large_sparse</span><span class="s4">=</span><span class="s1">accept_large_sparse</span>
+        <span class="s4">)</span>
+        <span class="s2"># sparse graph, find all the connected components</span>
+        <span class="s1">n_connected_components</span><span class="s4">, </span><span class="s1">_ </span><span class="s4">= </span><span class="s1">connected_components</span><span class="s4">(</span><span class="s1">graph</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">n_connected_components </span><span class="s4">== </span><span class="s5">1</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s2"># dense graph, find all connected components start from node 0</span>
+        <span class="s3">return </span><span class="s1">_graph_connected_component</span><span class="s4">(</span><span class="s1">graph</span><span class="s4">, </span><span class="s5">0</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">() == </span><span class="s1">graph</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+
+
+<span class="s3">def </span><span class="s1">_set_diag</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s1">value</span><span class="s4">, </span><span class="s1">norm_laplacian</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Set the diagonal of the laplacian matrix and convert it to a 
+    sparse format well suited for eigenvalue decomposition. 
+ 
+    Parameters 
+    ---------- 
+    laplacian : {ndarray, sparse matrix} 
+        The graph laplacian. 
+ 
+    value : float 
+        The value of the diagonal. 
+ 
+    norm_laplacian : bool 
+        Whether the value of the diagonal should be changed or not. 
+ 
+    Returns 
+    ------- 
+    laplacian : {array, sparse matrix} 
+        An array of matrix in a form that is well suited to fast 
+        eigenvalue decomposition, depending on the band width of the 
+        matrix. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">n_nodes </span><span class="s4">= </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+    <span class="s2"># We need all entries in the diagonal to values</span>
+    <span class="s3">if not </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">norm_laplacian</span><span class="s4">:</span>
+            <span class="s1">laplacian</span><span class="s4">.</span><span class="s1">flat</span><span class="s4">[:: </span><span class="s1">n_nodes </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">] = </span><span class="s1">value</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">tocoo</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">norm_laplacian</span><span class="s4">:</span>
+            <span class="s1">diag_idx </span><span class="s4">= </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">row </span><span class="s4">== </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">col</span>
+            <span class="s1">laplacian</span><span class="s4">.</span><span class="s1">data</span><span class="s4">[</span><span class="s1">diag_idx</span><span class="s4">] = </span><span class="s1">value</span>
+        <span class="s2"># If the matrix has a small number of diagonals (as in the</span>
+        <span class="s2"># case of structured matrices coming from images), the</span>
+        <span class="s2"># dia format might be best suited for matvec products:</span>
+        <span class="s1">n_diags </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">unique</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">row </span><span class="s4">- </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">col</span><span class="s4">).</span><span class="s1">size</span>
+        <span class="s3">if </span><span class="s1">n_diags </span><span class="s4">&lt;= </span><span class="s5">7</span><span class="s4">:</span>
+            <span class="s2"># 3 or less outer diagonals on each side</span>
+            <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">todia</span><span class="s4">()</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s2"># csr has the fastest matvec and is thus best suited to</span>
+            <span class="s2"># arpack</span>
+            <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">tocsr</span><span class="s4">()</span>
+    <span class="s3">return </span><span class="s1">laplacian</span>
+
+
+<span class="s4">@</span><span class="s1">validate_params</span><span class="s4">(</span>
+    <span class="s4">{</span>
+        <span class="s6">&quot;adjacency&quot;</span><span class="s4">: [</span><span class="s6">&quot;array-like&quot;</span><span class="s4">, </span><span class="s6">&quot;sparse matrix&quot;</span><span class="s4">],</span>
+        <span class="s6">&quot;n_components&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s6">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s6">&quot;eigen_solver&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s6">&quot;arpack&quot;</span><span class="s4">, </span><span class="s6">&quot;lobpcg&quot;</span><span class="s4">, </span><span class="s6">&quot;amg&quot;</span><span class="s4">}), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s6">&quot;random_state&quot;</span><span class="s4">: [</span><span class="s6">&quot;random_state&quot;</span><span class="s4">],</span>
+        <span class="s6">&quot;eigen_tol&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s6">&quot;left&quot;</span><span class="s4">), </span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s6">&quot;auto&quot;</span><span class="s4">})],</span>
+        <span class="s6">&quot;norm_laplacian&quot;</span><span class="s4">: [</span><span class="s6">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s6">&quot;drop_first&quot;</span><span class="s4">: [</span><span class="s6">&quot;boolean&quot;</span><span class="s4">],</span>
+    <span class="s4">},</span>
+    <span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">def </span><span class="s1">spectral_embedding</span><span class="s4">(</span>
+    <span class="s1">adjacency</span><span class="s4">,</span>
+    <span class="s4">*,</span>
+    <span class="s1">n_components</span><span class="s4">=</span><span class="s5">8</span><span class="s4">,</span>
+    <span class="s1">eigen_solver</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">eigen_tol</span><span class="s4">=</span><span class="s6">&quot;auto&quot;</span><span class="s4">,</span>
+    <span class="s1">norm_laplacian</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s1">drop_first</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Project the sample on the first eigenvectors of the graph Laplacian. 
+ 
+    The adjacency matrix is used to compute a normalized graph Laplacian 
+    whose spectrum (especially the eigenvectors associated to the 
+    smallest eigenvalues) has an interpretation in terms of minimal 
+    number of cuts necessary to split the graph into comparably sized 
+    components. 
+ 
+    This embedding can also 'work' even if the ``adjacency`` variable is 
+    not strictly the adjacency matrix of a graph but more generally 
+    an affinity or similarity matrix between samples (for instance the 
+    heat kernel of a euclidean distance matrix or a k-NN matrix). 
+ 
+    However care must taken to always make the affinity matrix symmetric 
+    so that the eigenvector decomposition works as expected. 
+ 
+    Note : Laplacian Eigenmaps is the actual algorithm implemented here. 
+ 
+    Read more in the :ref:`User Guide &lt;spectral_embedding&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    adjacency : {array-like, sparse graph} of shape (n_samples, n_samples) 
+        The adjacency matrix of the graph to embed. 
+ 
+    n_components : int, default=8 
+        The dimension of the projection subspace. 
+ 
+    eigen_solver : {'arpack', 'lobpcg', 'amg'}, default=None 
+        The eigenvalue decomposition strategy to use. AMG requires pyamg 
+        to be installed. It can be faster on very large, sparse problems, 
+        but may also lead to instabilities. If None, then ``'arpack'`` is 
+        used. 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        A pseudo random number generator used for the initialization 
+        of the lobpcg eigen vectors decomposition when `eigen_solver == 
+        'amg'`, and for the K-Means initialization. Use an int to make 
+        the results deterministic across calls (See 
+        :term:`Glossary &lt;random_state&gt;`). 
+ 
+        .. note:: 
+            When using `eigen_solver == 'amg'`, 
+            it is necessary to also fix the global numpy seed with 
+            `np.random.seed(int)` to get deterministic results. See 
+            https://github.com/pyamg/pyamg/issues/139 for further 
+            information. 
+ 
+    eigen_tol : float, default=&quot;auto&quot; 
+        Stopping criterion for eigendecomposition of the Laplacian matrix. 
+        If `eigen_tol=&quot;auto&quot;` then the passed tolerance will depend on the 
+        `eigen_solver`: 
+ 
+        - If `eigen_solver=&quot;arpack&quot;`, then `eigen_tol=0.0`; 
+        - If `eigen_solver=&quot;lobpcg&quot;` or `eigen_solver=&quot;amg&quot;`, then 
+          `eigen_tol=None` which configures the underlying `lobpcg` solver to 
+          automatically resolve the value according to their heuristics. See, 
+          :func:`scipy.sparse.linalg.lobpcg` for details. 
+ 
+        Note that when using `eigen_solver=&quot;amg&quot;` values of `tol&lt;1e-5` may lead 
+        to convergence issues and should be avoided. 
+ 
+        .. versionadded:: 1.2 
+           Added 'auto' option. 
+ 
+    norm_laplacian : bool, default=True 
+        If True, then compute symmetric normalized Laplacian. 
+ 
+    drop_first : bool, default=True 
+        Whether to drop the first eigenvector. For spectral embedding, this 
+        should be True as the first eigenvector should be constant vector for 
+        connected graph, but for spectral clustering, this should be kept as 
+        False to retain the first eigenvector. 
+ 
+    Returns 
+    ------- 
+    embedding : ndarray of shape (n_samples, n_components) 
+        The reduced samples. 
+ 
+    Notes 
+    ----- 
+    Spectral Embedding (Laplacian Eigenmaps) is most useful when the graph 
+    has one connected component. If there graph has many components, the first 
+    few eigenvectors will simply uncover the connected components of the graph. 
+ 
+    References 
+    ---------- 
+    * https://en.wikipedia.org/wiki/LOBPCG 
+ 
+    * :doi:`&quot;Toward the Optimal Preconditioned Eigensolver: Locally Optimal 
+      Block Preconditioned Conjugate Gradient Method&quot;, 
+      Andrew V. Knyazev 
+      &lt;10.1137/S1064827500366124&gt;` 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_digits 
+    &gt;&gt;&gt; from sklearn.neighbors import kneighbors_graph 
+    &gt;&gt;&gt; from sklearn.manifold import spectral_embedding 
+    &gt;&gt;&gt; X, _ = load_digits(return_X_y=True) 
+    &gt;&gt;&gt; X = X[:100] 
+    &gt;&gt;&gt; affinity_matrix = kneighbors_graph( 
+    ...     X, n_neighbors=int(X.shape[0] / 10), include_self=True 
+    ... ) 
+    &gt;&gt;&gt; # make the matrix symmetric 
+    &gt;&gt;&gt; affinity_matrix = 0.5 * (affinity_matrix + affinity_matrix.T) 
+    &gt;&gt;&gt; embedding = spectral_embedding(affinity_matrix, n_components=2, random_state=42) 
+    &gt;&gt;&gt; embedding.shape 
+    (100, 2) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">random_state </span><span class="s4">= </span><span class="s1">check_random_state</span><span class="s4">(</span><span class="s1">random_state</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">_spectral_embedding</span><span class="s4">(</span>
+        <span class="s1">adjacency</span><span class="s4">,</span>
+        <span class="s1">n_components</span><span class="s4">=</span><span class="s1">n_components</span><span class="s4">,</span>
+        <span class="s1">eigen_solver</span><span class="s4">=</span><span class="s1">eigen_solver</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">,</span>
+        <span class="s1">eigen_tol</span><span class="s4">=</span><span class="s1">eigen_tol</span><span class="s4">,</span>
+        <span class="s1">norm_laplacian</span><span class="s4">=</span><span class="s1">norm_laplacian</span><span class="s4">,</span>
+        <span class="s1">drop_first</span><span class="s4">=</span><span class="s1">drop_first</span><span class="s4">,</span>
+    <span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_spectral_embedding</span><span class="s4">(</span>
+    <span class="s1">adjacency</span><span class="s4">,</span>
+    <span class="s4">*,</span>
+    <span class="s1">n_components</span><span class="s4">=</span><span class="s5">8</span><span class="s4">,</span>
+    <span class="s1">eigen_solver</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">eigen_tol</span><span class="s4">=</span><span class="s6">&quot;auto&quot;</span><span class="s4">,</span>
+    <span class="s1">norm_laplacian</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s1">drop_first</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s1">adjacency </span><span class="s4">= </span><span class="s1">check_symmetric</span><span class="s4">(</span><span class="s1">adjacency</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">eigen_solver </span><span class="s4">== </span><span class="s6">&quot;amg&quot;</span><span class="s4">:</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">from </span><span class="s1">pyamg </span><span class="s3">import </span><span class="s1">smoothed_aggregation_solver</span>
+        <span class="s3">except </span><span class="s1">ImportError </span><span class="s3">as </span><span class="s1">e</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s6">&quot;The eigen_solver was set to 'amg', but pyamg is not available.&quot;</span>
+            <span class="s4">) </span><span class="s3">from </span><span class="s1">e</span>
+
+    <span class="s3">if </span><span class="s1">eigen_solver </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">eigen_solver </span><span class="s4">= </span><span class="s6">&quot;arpack&quot;</span>
+
+    <span class="s1">n_nodes </span><span class="s4">= </span><span class="s1">adjacency</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+    <span class="s2"># Whether to drop the first eigenvector</span>
+    <span class="s3">if </span><span class="s1">drop_first</span><span class="s4">:</span>
+        <span class="s1">n_components </span><span class="s4">= </span><span class="s1">n_components </span><span class="s4">+ </span><span class="s5">1</span>
+
+    <span class="s3">if not </span><span class="s1">_graph_is_connected</span><span class="s4">(</span><span class="s1">adjacency</span><span class="s4">):</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+            <span class="s6">&quot;Graph is not fully connected, spectral embedding may not work as expected.&quot;</span>
+        <span class="s4">)</span>
+
+    <span class="s1">laplacian</span><span class="s4">, </span><span class="s1">dd </span><span class="s4">= </span><span class="s1">csgraph_laplacian</span><span class="s4">(</span>
+        <span class="s1">adjacency</span><span class="s4">, </span><span class="s1">normed</span><span class="s4">=</span><span class="s1">norm_laplacian</span><span class="s4">, </span><span class="s1">return_diag</span><span class="s4">=</span><span class="s3">True</span>
+    <span class="s4">)</span>
+    <span class="s3">if </span><span class="s4">(</span>
+        <span class="s1">eigen_solver </span><span class="s4">== </span><span class="s6">&quot;arpack&quot;</span>
+        <span class="s3">or </span><span class="s1">eigen_solver </span><span class="s4">!= </span><span class="s6">&quot;lobpcg&quot;</span>
+        <span class="s3">and </span><span class="s4">(</span><span class="s3">not </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">) </span><span class="s3">or </span><span class="s1">n_nodes </span><span class="s4">&lt; </span><span class="s5">5 </span><span class="s4">* </span><span class="s1">n_components</span><span class="s4">)</span>
+    <span class="s4">):</span>
+        <span class="s2"># lobpcg used with eigen_solver='amg' has bugs for low number of nodes</span>
+        <span class="s2"># for details see the source code in scipy:</span>
+        <span class="s2"># https://github.com/scipy/scipy/blob/v0.11.0/scipy/sparse/linalg/eigen</span>
+        <span class="s2"># /lobpcg/lobpcg.py#L237</span>
+        <span class="s2"># or matlab:</span>
+        <span class="s2"># https://www.mathworks.com/matlabcentral/fileexchange/48-lobpcg-m</span>
+        <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">_set_diag</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">norm_laplacian</span><span class="s4">)</span>
+
+        <span class="s2"># Here we'll use shift-invert mode for fast eigenvalues</span>
+        <span class="s2"># (see https://docs.scipy.org/doc/scipy/reference/tutorial/arpack.html</span>
+        <span class="s2">#  for a short explanation of what this means)</span>
+        <span class="s2"># Because the normalized Laplacian has eigenvalues between 0 and 2,</span>
+        <span class="s2"># I - L has eigenvalues between -1 and 1.  ARPACK is most efficient</span>
+        <span class="s2"># when finding eigenvalues of largest magnitude (keyword which='LM')</span>
+        <span class="s2"># and when these eigenvalues are very large compared to the rest.</span>
+        <span class="s2"># For very large, very sparse graphs, I - L can have many, many</span>
+        <span class="s2"># eigenvalues very near 1.0.  This leads to slow convergence.  So</span>
+        <span class="s2"># instead, we'll use ARPACK's shift-invert mode, asking for the</span>
+        <span class="s2"># eigenvalues near 1.0.  This effectively spreads-out the spectrum</span>
+        <span class="s2"># near 1.0 and leads to much faster convergence: potentially an</span>
+        <span class="s2"># orders-of-magnitude speedup over simply using keyword which='LA'</span>
+        <span class="s2"># in standard mode.</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s2"># We are computing the opposite of the laplacian inplace so as</span>
+            <span class="s2"># to spare a memory allocation of a possibly very large array</span>
+            <span class="s1">tol </span><span class="s4">= </span><span class="s5">0 </span><span class="s3">if </span><span class="s1">eigen_tol </span><span class="s4">== </span><span class="s6">&quot;auto&quot; </span><span class="s3">else </span><span class="s1">eigen_tol</span>
+            <span class="s1">laplacian </span><span class="s4">*= -</span><span class="s5">1</span>
+            <span class="s1">v0 </span><span class="s4">= </span><span class="s1">_init_arpack_v0</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">random_state</span><span class="s4">)</span>
+            <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span>
+                <span class="s1">laplacian</span><span class="s4">, </span><span class="s1">accept_sparse</span><span class="s4">=</span><span class="s6">&quot;csr&quot;</span><span class="s4">, </span><span class="s1">accept_large_sparse</span><span class="s4">=</span><span class="s3">False</span>
+            <span class="s4">)</span>
+            <span class="s1">_</span><span class="s4">, </span><span class="s1">diffusion_map </span><span class="s4">= </span><span class="s1">eigsh</span><span class="s4">(</span>
+                <span class="s1">laplacian</span><span class="s4">, </span><span class="s1">k</span><span class="s4">=</span><span class="s1">n_components</span><span class="s4">, </span><span class="s1">sigma</span><span class="s4">=</span><span class="s5">1.0</span><span class="s4">, </span><span class="s1">which</span><span class="s4">=</span><span class="s6">&quot;LM&quot;</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">, </span><span class="s1">v0</span><span class="s4">=</span><span class="s1">v0</span>
+            <span class="s4">)</span>
+            <span class="s1">embedding </span><span class="s4">= </span><span class="s1">diffusion_map</span><span class="s4">.</span><span class="s1">T</span><span class="s4">[</span><span class="s1">n_components</span><span class="s4">::-</span><span class="s5">1</span><span class="s4">]</span>
+            <span class="s3">if </span><span class="s1">norm_laplacian</span><span class="s4">:</span>
+                <span class="s2"># recover u = D^-1/2 x from the eigenvector output x</span>
+                <span class="s1">embedding </span><span class="s4">= </span><span class="s1">embedding </span><span class="s4">/ </span><span class="s1">dd</span>
+        <span class="s3">except </span><span class="s1">RuntimeError</span><span class="s4">:</span>
+            <span class="s2"># When submatrices are exactly singular, an LU decomposition</span>
+            <span class="s2"># in arpack fails. We fallback to lobpcg</span>
+            <span class="s1">eigen_solver </span><span class="s4">= </span><span class="s6">&quot;lobpcg&quot;</span>
+            <span class="s2"># Revert the laplacian to its opposite to have lobpcg work</span>
+            <span class="s1">laplacian </span><span class="s4">*= -</span><span class="s5">1</span>
+
+    <span class="s3">elif </span><span class="s1">eigen_solver </span><span class="s4">== </span><span class="s6">&quot;amg&quot;</span><span class="s4">:</span>
+        <span class="s2"># Use AMG to get a preconditioner and speed up the eigenvalue</span>
+        <span class="s2"># problem.</span>
+        <span class="s3">if not </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">):</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s6">&quot;AMG works better for sparse matrices&quot;</span><span class="s4">)</span>
+        <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span>
+            <span class="s1">laplacian</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">], </span><span class="s1">accept_sparse</span><span class="s4">=</span><span class="s3">True</span>
+        <span class="s4">)</span>
+        <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">_set_diag</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">norm_laplacian</span><span class="s4">)</span>
+
+        <span class="s2"># The Laplacian matrix is always singular, having at least one zero</span>
+        <span class="s2"># eigenvalue, corresponding to the trivial eigenvector, which is a</span>
+        <span class="s2"># constant. Using a singular matrix for preconditioning may result in</span>
+        <span class="s2"># random failures in LOBPCG and is not supported by the existing</span>
+        <span class="s2"># theory:</span>
+        <span class="s2">#     see https://doi.org/10.1007/s10208-015-9297-1</span>
+        <span class="s2"># Shift the Laplacian so its diagononal is not all ones. The shift</span>
+        <span class="s2"># does change the eigenpairs however, so we'll feed the shifted</span>
+        <span class="s2"># matrix to the solver and afterward set it back to the original.</span>
+        <span class="s1">diag_shift </span><span class="s4">= </span><span class="s5">1e-5 </span><span class="s4">* </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">eye</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">])</span>
+        <span class="s1">laplacian </span><span class="s4">+= </span><span class="s1">diag_shift</span>
+        <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">sparse</span><span class="s4">, </span><span class="s6">&quot;csr_array&quot;</span><span class="s4">) </span><span class="s3">and </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">csr_array</span><span class="s4">):</span>
+            <span class="s2"># `pyamg` does not work with `csr_array` and we need to convert it to a</span>
+            <span class="s2"># `csr_matrix` object.</span>
+            <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">csr_matrix</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">)</span>
+        <span class="s1">ml </span><span class="s4">= </span><span class="s1">smoothed_aggregation_solver</span><span class="s4">(</span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s1">accept_sparse</span><span class="s4">=</span><span class="s6">&quot;csr&quot;</span><span class="s4">))</span>
+        <span class="s1">laplacian </span><span class="s4">-= </span><span class="s1">diag_shift</span>
+
+        <span class="s1">M </span><span class="s4">= </span><span class="s1">ml</span><span class="s4">.</span><span class="s1">aspreconditioner</span><span class="s4">()</span>
+        <span class="s2"># Create initial approximation X to eigenvectors</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">random_state</span><span class="s4">.</span><span class="s1">standard_normal</span><span class="s4">(</span><span class="s1">size</span><span class="s4">=(</span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">n_components </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">))</span>
+        <span class="s1">X</span><span class="s4">[:, </span><span class="s5">0</span><span class="s4">] = </span><span class="s1">dd</span><span class="s4">.</span><span class="s1">ravel</span><span class="s4">()</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+
+        <span class="s1">tol </span><span class="s4">= </span><span class="s3">None if </span><span class="s1">eigen_tol </span><span class="s4">== </span><span class="s6">&quot;auto&quot; </span><span class="s3">else </span><span class="s1">eigen_tol</span>
+        <span class="s1">_</span><span class="s4">, </span><span class="s1">diffusion_map </span><span class="s4">= </span><span class="s1">lobpcg</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">M</span><span class="s4">=</span><span class="s1">M</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">, </span><span class="s1">largest</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s1">embedding </span><span class="s4">= </span><span class="s1">diffusion_map</span><span class="s4">.</span><span class="s1">T</span>
+        <span class="s3">if </span><span class="s1">norm_laplacian</span><span class="s4">:</span>
+            <span class="s2"># recover u = D^-1/2 x from the eigenvector output x</span>
+            <span class="s1">embedding </span><span class="s4">= </span><span class="s1">embedding </span><span class="s4">/ </span><span class="s1">dd</span>
+        <span class="s3">if </span><span class="s1">embedding</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] == </span><span class="s5">1</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span>
+
+    <span class="s3">if </span><span class="s1">eigen_solver </span><span class="s4">== </span><span class="s6">&quot;lobpcg&quot;</span><span class="s4">:</span>
+        <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span>
+            <span class="s1">laplacian</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">], </span><span class="s1">accept_sparse</span><span class="s4">=</span><span class="s3">True</span>
+        <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">n_nodes </span><span class="s4">&lt; </span><span class="s5">5 </span><span class="s4">* </span><span class="s1">n_components </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">:</span>
+            <span class="s2"># see note above under arpack why lobpcg has problems with small</span>
+            <span class="s2"># number of nodes</span>
+            <span class="s2"># lobpcg will fallback to eigh, so we short circuit it</span>
+            <span class="s3">if </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">):</span>
+                <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">toarray</span><span class="s4">()</span>
+            <span class="s1">_</span><span class="s4">, </span><span class="s1">diffusion_map </span><span class="s4">= </span><span class="s1">eigh</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s1">check_finite</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+            <span class="s1">embedding </span><span class="s4">= </span><span class="s1">diffusion_map</span><span class="s4">.</span><span class="s1">T</span><span class="s4">[:</span><span class="s1">n_components</span><span class="s4">]</span>
+            <span class="s3">if </span><span class="s1">norm_laplacian</span><span class="s4">:</span>
+                <span class="s2"># recover u = D^-1/2 x from the eigenvector output x</span>
+                <span class="s1">embedding </span><span class="s4">= </span><span class="s1">embedding </span><span class="s4">/ </span><span class="s1">dd</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">laplacian </span><span class="s4">= </span><span class="s1">_set_diag</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s1">norm_laplacian</span><span class="s4">)</span>
+            <span class="s2"># We increase the number of eigenvectors requested, as lobpcg</span>
+            <span class="s2"># doesn't behave well in low dimension and create initial</span>
+            <span class="s2"># approximation X to eigenvectors</span>
+            <span class="s1">X </span><span class="s4">= </span><span class="s1">random_state</span><span class="s4">.</span><span class="s1">standard_normal</span><span class="s4">(</span>
+                <span class="s1">size</span><span class="s4">=(</span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">n_components </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">)</span>
+            <span class="s4">)</span>
+            <span class="s1">X</span><span class="s4">[:, </span><span class="s5">0</span><span class="s4">] = </span><span class="s1">dd</span><span class="s4">.</span><span class="s1">ravel</span><span class="s4">()</span>
+            <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">laplacian</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+            <span class="s1">tol </span><span class="s4">= </span><span class="s3">None if </span><span class="s1">eigen_tol </span><span class="s4">== </span><span class="s6">&quot;auto&quot; </span><span class="s3">else </span><span class="s1">eigen_tol</span>
+            <span class="s1">_</span><span class="s4">, </span><span class="s1">diffusion_map </span><span class="s4">= </span><span class="s1">lobpcg</span><span class="s4">(</span>
+                <span class="s1">laplacian</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">, </span><span class="s1">largest</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">maxiter</span><span class="s4">=</span><span class="s5">2000</span>
+            <span class="s4">)</span>
+            <span class="s1">embedding </span><span class="s4">= </span><span class="s1">diffusion_map</span><span class="s4">.</span><span class="s1">T</span><span class="s4">[:</span><span class="s1">n_components</span><span class="s4">]</span>
+            <span class="s3">if </span><span class="s1">norm_laplacian</span><span class="s4">:</span>
+                <span class="s2"># recover u = D^-1/2 x from the eigenvector output x</span>
+                <span class="s1">embedding </span><span class="s4">= </span><span class="s1">embedding </span><span class="s4">/ </span><span class="s1">dd</span>
+            <span class="s3">if </span><span class="s1">embedding</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] == </span><span class="s5">1</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span>
+
+    <span class="s1">embedding </span><span class="s4">= </span><span class="s1">_deterministic_vector_sign_flip</span><span class="s4">(</span><span class="s1">embedding</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">drop_first</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">embedding</span><span class="s4">[</span><span class="s5">1</span><span class="s4">:</span><span class="s1">n_components</span><span class="s4">].</span><span class="s1">T</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">embedding</span><span class="s4">[:</span><span class="s1">n_components</span><span class="s4">].</span><span class="s1">T</span>
+
+
+<span class="s3">class </span><span class="s1">SpectralEmbedding</span><span class="s4">(</span><span class="s1">BaseEstimator</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Spectral embedding for non-linear dimensionality reduction. 
+ 
+    Forms an affinity matrix given by the specified function and 
+    applies spectral decomposition to the corresponding graph laplacian. 
+    The resulting transformation is given by the value of the 
+    eigenvectors for each data point. 
+ 
+    Note : Laplacian Eigenmaps is the actual algorithm implemented here. 
+ 
+    Read more in the :ref:`User Guide &lt;spectral_embedding&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        The dimension of the projected subspace. 
+ 
+    affinity : {'nearest_neighbors', 'rbf', 'precomputed', \ 
+                'precomputed_nearest_neighbors'} or callable, \ 
+                default='nearest_neighbors' 
+        How to construct the affinity matrix. 
+         - 'nearest_neighbors' : construct the affinity matrix by computing a 
+           graph of nearest neighbors. 
+         - 'rbf' : construct the affinity matrix by computing a radial basis 
+           function (RBF) kernel. 
+         - 'precomputed' : interpret ``X`` as a precomputed affinity matrix. 
+         - 'precomputed_nearest_neighbors' : interpret ``X`` as a sparse graph 
+           of precomputed nearest neighbors, and constructs the affinity matrix 
+           by selecting the ``n_neighbors`` nearest neighbors. 
+         - callable : use passed in function as affinity 
+           the function takes in data matrix (n_samples, n_features) 
+           and return affinity matrix (n_samples, n_samples). 
+ 
+    gamma : float, default=None 
+        Kernel coefficient for rbf kernel. If None, gamma will be set to 
+        1/n_features. 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        A pseudo random number generator used for the initialization 
+        of the lobpcg eigen vectors decomposition when `eigen_solver == 
+        'amg'`, and for the K-Means initialization. Use an int to make 
+        the results deterministic across calls (See 
+        :term:`Glossary &lt;random_state&gt;`). 
+ 
+        .. note:: 
+            When using `eigen_solver == 'amg'`, 
+            it is necessary to also fix the global numpy seed with 
+            `np.random.seed(int)` to get deterministic results. See 
+            https://github.com/pyamg/pyamg/issues/139 for further 
+            information. 
+ 
+    eigen_solver : {'arpack', 'lobpcg', 'amg'}, default=None 
+        The eigenvalue decomposition strategy to use. AMG requires pyamg 
+        to be installed. It can be faster on very large, sparse problems. 
+        If None, then ``'arpack'`` is used. 
+ 
+    eigen_tol : float, default=&quot;auto&quot; 
+        Stopping criterion for eigendecomposition of the Laplacian matrix. 
+        If `eigen_tol=&quot;auto&quot;` then the passed tolerance will depend on the 
+        `eigen_solver`: 
+ 
+        - If `eigen_solver=&quot;arpack&quot;`, then `eigen_tol=0.0`; 
+        - If `eigen_solver=&quot;lobpcg&quot;` or `eigen_solver=&quot;amg&quot;`, then 
+          `eigen_tol=None` which configures the underlying `lobpcg` solver to 
+          automatically resolve the value according to their heuristics. See, 
+          :func:`scipy.sparse.linalg.lobpcg` for details. 
+ 
+        Note that when using `eigen_solver=&quot;lobpcg&quot;` or `eigen_solver=&quot;amg&quot;` 
+        values of `tol&lt;1e-5` may lead to convergence issues and should be 
+        avoided. 
+ 
+        .. versionadded:: 1.2 
+ 
+    n_neighbors : int, default=None 
+        Number of nearest neighbors for nearest_neighbors graph building. 
+        If None, n_neighbors will be set to max(n_samples/10, 1). 
+ 
+    n_jobs : int, default=None 
+        The number of parallel jobs to run. 
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context. 
+        ``-1`` means using all processors. See :term:`Glossary &lt;n_jobs&gt;` 
+        for more details. 
+ 
+    Attributes 
+    ---------- 
+    embedding_ : ndarray of shape (n_samples, n_components) 
+        Spectral embedding of the training matrix. 
+ 
+    affinity_matrix_ : ndarray of shape (n_samples, n_samples) 
+        Affinity_matrix constructed from samples or precomputed. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    n_neighbors_ : int 
+        Number of nearest neighbors effectively used. 
+ 
+    See Also 
+    -------- 
+    Isomap : Non-linear dimensionality reduction through Isometric Mapping. 
+ 
+    References 
+    ---------- 
+ 
+    - :doi:`A Tutorial on Spectral Clustering, 2007 
+      Ulrike von Luxburg 
+      &lt;10.1007/s11222-007-9033-z&gt;` 
+ 
+    - `On Spectral Clustering: Analysis and an algorithm, 2001 
+      Andrew Y. Ng, Michael I. Jordan, Yair Weiss 
+      &lt;https://citeseerx.ist.psu.edu/doc_view/pid/796c5d6336fc52aa84db575fb821c78918b65f58&gt;`_ 
+ 
+    - :doi:`Normalized cuts and image segmentation, 2000 
+      Jianbo Shi, Jitendra Malik 
+      &lt;10.1109/34.868688&gt;` 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_digits 
+    &gt;&gt;&gt; from sklearn.manifold import SpectralEmbedding 
+    &gt;&gt;&gt; X, _ = load_digits(return_X_y=True) 
+    &gt;&gt;&gt; X.shape 
+    (1797, 64) 
+    &gt;&gt;&gt; embedding = SpectralEmbedding(n_components=2) 
+    &gt;&gt;&gt; X_transformed = embedding.fit_transform(X[:100]) 
+    &gt;&gt;&gt; X_transformed.shape 
+    (100, 2) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s6">&quot;n_components&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s6">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s6">&quot;affinity&quot;</span><span class="s4">: [</span>
+            <span class="s1">StrOptions</span><span class="s4">(</span>
+                <span class="s4">{</span>
+                    <span class="s6">&quot;nearest_neighbors&quot;</span><span class="s4">,</span>
+                    <span class="s6">&quot;rbf&quot;</span><span class="s4">,</span>
+                    <span class="s6">&quot;precomputed&quot;</span><span class="s4">,</span>
+                    <span class="s6">&quot;precomputed_nearest_neighbors&quot;</span><span class="s4">,</span>
+                <span class="s4">},</span>
+            <span class="s4">),</span>
+            <span class="s1">callable</span><span class="s4">,</span>
+        <span class="s4">],</span>
+        <span class="s6">&quot;gamma&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s6">&quot;left&quot;</span><span class="s4">), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s6">&quot;random_state&quot;</span><span class="s4">: [</span><span class="s6">&quot;random_state&quot;</span><span class="s4">],</span>
+        <span class="s6">&quot;eigen_solver&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s6">&quot;arpack&quot;</span><span class="s4">, </span><span class="s6">&quot;lobpcg&quot;</span><span class="s4">, </span><span class="s6">&quot;amg&quot;</span><span class="s4">}), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s6">&quot;eigen_tol&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s5">0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s6">&quot;left&quot;</span><span class="s4">), </span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s6">&quot;auto&quot;</span><span class="s4">})],</span>
+        <span class="s6">&quot;n_neighbors&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s6">&quot;left&quot;</span><span class="s4">), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s6">&quot;n_jobs&quot;</span><span class="s4">: [</span><span class="s3">None</span><span class="s4">, </span><span class="s1">Integral</span><span class="s4">],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">n_components</span><span class="s4">=</span><span class="s5">2</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">affinity</span><span class="s4">=</span><span class="s6">&quot;nearest_neighbors&quot;</span><span class="s4">,</span>
+        <span class="s1">gamma</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">eigen_solver</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">eigen_tol</span><span class="s4">=</span><span class="s6">&quot;auto&quot;</span><span class="s4">,</span>
+        <span class="s1">n_neighbors</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">n_jobs</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_components </span><span class="s4">= </span><span class="s1">n_components</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity </span><span class="s4">= </span><span class="s1">affinity</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">gamma </span><span class="s4">= </span><span class="s1">gamma</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">random_state </span><span class="s4">= </span><span class="s1">random_state</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">eigen_solver </span><span class="s4">= </span><span class="s1">eigen_solver</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">eigen_tol </span><span class="s4">= </span><span class="s1">eigen_tol</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_neighbors </span><span class="s4">= </span><span class="s1">n_neighbors</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs </span><span class="s4">= </span><span class="s1">n_jobs</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s4">{</span>
+            <span class="s6">&quot;pairwise&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity</span>
+            <span class="s3">in </span><span class="s4">[</span>
+                <span class="s6">&quot;precomputed&quot;</span><span class="s4">,</span>
+                <span class="s6">&quot;precomputed_nearest_neighbors&quot;</span><span class="s4">,</span>
+            <span class="s4">]</span>
+        <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">_get_affinity_matrix</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Calculate the affinity matrix from data 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training vector, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+            If affinity is &quot;precomputed&quot; 
+            X : array-like of shape (n_samples, n_samples), 
+            Interpret X as precomputed adjacency graph computed from 
+            samples. 
+ 
+        Y: Ignored 
+ 
+        Returns 
+        ------- 
+        affinity_matrix of shape (n_samples, n_samples) 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity </span><span class="s4">== </span><span class="s6">&quot;precomputed&quot;</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_ </span><span class="s4">= </span><span class="s1">X</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity </span><span class="s4">== </span><span class="s6">&quot;precomputed_nearest_neighbors&quot;</span><span class="s4">:</span>
+            <span class="s1">estimator </span><span class="s4">= </span><span class="s1">NearestNeighbors</span><span class="s4">(</span>
+                <span class="s1">n_neighbors</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_neighbors</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs</span><span class="s4">, </span><span class="s1">metric</span><span class="s4">=</span><span class="s6">&quot;precomputed&quot;</span>
+            <span class="s4">).</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+            <span class="s1">connectivity </span><span class="s4">= </span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">kneighbors_graph</span><span class="s4">(</span><span class="s1">X</span><span class="s4">=</span><span class="s1">X</span><span class="s4">, </span><span class="s1">mode</span><span class="s4">=</span><span class="s6">&quot;connectivity&quot;</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_ </span><span class="s4">= </span><span class="s5">0.5 </span><span class="s4">* (</span><span class="s1">connectivity </span><span class="s4">+ </span><span class="s1">connectivity</span><span class="s4">.</span><span class="s1">T</span><span class="s4">)</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity </span><span class="s4">== </span><span class="s6">&quot;nearest_neighbors&quot;</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+                <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                    <span class="s6">&quot;Nearest neighbors affinity currently does &quot;</span>
+                    <span class="s6">&quot;not support sparse input, falling back to &quot;</span>
+                    <span class="s6">&quot;rbf affinity&quot;</span>
+                <span class="s4">)</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity </span><span class="s4">= </span><span class="s6">&quot;rbf&quot;</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">n_neighbors_ </span><span class="s4">= (</span>
+                    <span class="s1">self</span><span class="s4">.</span><span class="s1">n_neighbors</span>
+                    <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_neighbors </span><span class="s3">is not None</span>
+                    <span class="s3">else </span><span class="s1">max</span><span class="s4">(</span><span class="s1">int</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] / </span><span class="s5">10</span><span class="s4">), </span><span class="s5">1</span><span class="s4">)</span>
+                <span class="s4">)</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_ </span><span class="s4">= </span><span class="s1">kneighbors_graph</span><span class="s4">(</span>
+                    <span class="s1">X</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_neighbors_</span><span class="s4">, </span><span class="s1">include_self</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs</span>
+                <span class="s4">)</span>
+                <span class="s2"># currently only symmetric affinity_matrix supported</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_ </span><span class="s4">= </span><span class="s5">0.5 </span><span class="s4">* (</span>
+                    <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_ </span><span class="s4">+ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_</span><span class="s4">.</span><span class="s1">T</span>
+                <span class="s4">)</span>
+                <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity </span><span class="s4">== </span><span class="s6">&quot;rbf&quot;</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">gamma_ </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">gamma </span><span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">gamma </span><span class="s3">is not None else </span><span class="s5">1.0 </span><span class="s4">/ </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">1</span><span class="s4">]</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_ </span><span class="s4">= </span><span class="s1">rbf_kernel</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">gamma</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">gamma_</span><span class="s4">)</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_ </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">affinity_matrix_</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model from data in X. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training vector, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+            If affinity is &quot;precomputed&quot; 
+            X : {array-like, sparse matrix}, shape (n_samples, n_samples), 
+            Interpret X as precomputed adjacency graph computed from 
+            samples. 
+ 
+        y : Ignored 
+            Not used, present for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns the instance itself. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">accept_sparse</span><span class="s4">=</span><span class="s6">&quot;csr&quot;</span><span class="s4">, </span><span class="s1">ensure_min_samples</span><span class="s4">=</span><span class="s5">2</span><span class="s4">)</span>
+
+        <span class="s1">random_state </span><span class="s4">= </span><span class="s1">check_random_state</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">random_state</span><span class="s4">)</span>
+
+        <span class="s1">affinity_matrix </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_affinity_matrix</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">embedding_ </span><span class="s4">= </span><span class="s1">_spectral_embedding</span><span class="s4">(</span>
+            <span class="s1">affinity_matrix</span><span class="s4">,</span>
+            <span class="s1">n_components</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_components</span><span class="s4">,</span>
+            <span class="s1">eigen_solver</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">eigen_solver</span><span class="s4">,</span>
+            <span class="s1">eigen_tol</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">eigen_tol</span><span class="s4">,</span>
+            <span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">fit_transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model from data in X and transform X. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training vector, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+            If affinity is &quot;precomputed&quot; 
+            X : {array-like, sparse matrix} of shape (n_samples, n_samples), 
+            Interpret X as precomputed adjacency graph computed from 
+            samples. 
+ 
+        y : Ignored 
+            Not used, present for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        X_new : array-like of shape (n_samples, n_components) 
+            Spectral embedding of the training matrix. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">embedding_</span>
+</pre>
+</body>
+</html>

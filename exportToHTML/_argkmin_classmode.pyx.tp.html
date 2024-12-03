@@ -1,0 +1,199 @@
+<html>
+<head>
+<title>_argkmin_classmode.pyx.tp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_argkmin_classmode.pyx.tp</font>
+</center></td></tr></table>
+<pre><span class="s0">from cython cimport floating, integral</span>
+<span class="s0">from cython.parallel cimport parallel, prange</span>
+<span class="s0">from libcpp.map cimport map as cpp_map, pair as cpp_pair</span>
+<span class="s0">from libc.stdlib cimport free</span>
+
+<span class="s0">from ...utils._typedefs cimport intp_t, float64_t</span>
+<span class="s0">from ...utils.parallel import _get_threadpool_controller</span>
+
+<span class="s0">import numpy as np</span>
+<span class="s0">from scipy.sparse import issparse</span>
+<span class="s0">from ._classmode cimport WeightingStrategy</span>
+
+<span class="s0">{{for name_suffix in [&quot;32&quot;, &quot;64&quot;]}}</span>
+<span class="s0">from ._argkmin cimport ArgKmin{{name_suffix}}</span>
+<span class="s0">from ._datasets_pair cimport DatasetsPair{{name_suffix}}</span>
+
+<span class="s0">cdef class ArgKminClassMode{{name_suffix}}(ArgKmin{{name_suffix}}):</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">{{name_suffix}}bit implementation of ArgKminClassMode.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef:</span>
+        <span class="s0">const intp_t[:] Y_labels,</span>
+        <span class="s0">const intp_t[:] unique_Y_labels</span>
+        <span class="s0">float64_t[:, :] class_scores</span>
+        <span class="s0">cpp_map[intp_t, intp_t] labels_to_index</span>
+        <span class="s0">WeightingStrategy weight_type</span>
+
+    <span class="s0">@classmethod</span>
+    <span class="s0">def compute(</span>
+        <span class="s0">cls,</span>
+        <span class="s0">X,</span>
+        <span class="s0">Y,</span>
+        <span class="s0">intp_t k,</span>
+        <span class="s0">weights,</span>
+        <span class="s0">Y_labels,</span>
+        <span class="s0">unique_Y_labels,</span>
+        <span class="s0">str metric=&quot;euclidean&quot;,</span>
+        <span class="s0">chunk_size=None,</span>
+        <span class="s0">dict metric_kwargs=None,</span>
+        <span class="s0">str strategy=None,</span>
+    <span class="s0">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the argkmin reduction with Y_labels.</span>
+
+        <span class="s0">This classmethod is responsible for introspecting the arguments</span>
+        <span class="s0">values to dispatch to the most appropriate implementation of</span>
+        <span class="s0">:class:`ArgKminClassMode{{name_suffix}}`.</span>
+
+        <span class="s0">This allows decoupling the API entirely from the implementation details</span>
+        <span class="s0">whilst maintaining RAII: all temporarily allocated datastructures necessary</span>
+        <span class="s0">for the concrete implementation are therefore freed when this classmethod</span>
+        <span class="s0">returns.</span>
+
+        <span class="s0">No instance _must_ directly be created outside of this class method.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0"># Use a generic implementation that handles most scipy</span>
+        <span class="s0"># metrics by computing the distances between 2 vectors at a time.</span>
+        <span class="s0">pda = ArgKminClassMode{{name_suffix}}(</span>
+            <span class="s0">datasets_pair=DatasetsPair{{name_suffix}}.get_for(X, Y, metric, metric_kwargs),</span>
+            <span class="s0">k=k,</span>
+            <span class="s0">chunk_size=chunk_size,</span>
+            <span class="s0">strategy=strategy,</span>
+            <span class="s0">weights=weights,</span>
+            <span class="s0">Y_labels=Y_labels,</span>
+            <span class="s0">unique_Y_labels=unique_Y_labels,</span>
+        <span class="s0">)</span>
+
+        <span class="s0"># Limit the number of threads in second level of nested parallelism for BLAS</span>
+        <span class="s0"># to avoid threads over-subscription (in GEMM for instance).</span>
+        <span class="s0">with _get_threadpool_controller().limit(limits=1, user_api=&quot;blas&quot;):</span>
+            <span class="s0">if pda.execute_in_parallel_on_Y:</span>
+                <span class="s0">pda._parallel_on_Y()</span>
+            <span class="s0">else:</span>
+                <span class="s0">pda._parallel_on_X()</span>
+
+        <span class="s0">return pda._finalize_results()</span>
+
+    <span class="s0">def __init__(</span>
+        <span class="s0">self,</span>
+        <span class="s0">DatasetsPair{{name_suffix}} datasets_pair,</span>
+        <span class="s0">const intp_t[:] Y_labels,</span>
+        <span class="s0">const intp_t[:] unique_Y_labels,</span>
+        <span class="s0">chunk_size=None,</span>
+        <span class="s0">strategy=None,</span>
+        <span class="s0">intp_t k=1,</span>
+        <span class="s0">weights=None,</span>
+    <span class="s0">):</span>
+        <span class="s0">super().__init__(</span>
+            <span class="s0">datasets_pair=datasets_pair,</span>
+            <span class="s0">chunk_size=chunk_size,</span>
+            <span class="s0">strategy=strategy,</span>
+            <span class="s0">k=k,</span>
+        <span class="s0">)</span>
+
+        <span class="s0">if weights == &quot;uniform&quot;:</span>
+            <span class="s0">self.weight_type = WeightingStrategy.uniform</span>
+        <span class="s0">elif weights == &quot;distance&quot;:</span>
+            <span class="s0">self.weight_type = WeightingStrategy.distance</span>
+        <span class="s0">else:</span>
+            <span class="s0">self.weight_type = WeightingStrategy.callable</span>
+        <span class="s0">self.Y_labels = Y_labels</span>
+
+        <span class="s0">self.unique_Y_labels = unique_Y_labels</span>
+
+        <span class="s0">cdef intp_t idx, neighbor_class_idx</span>
+        <span class="s0"># Map from set of unique labels to their indices in `class_scores`</span>
+        <span class="s0"># Buffer used in building a histogram for one-pass weighted mode</span>
+        <span class="s0">self.class_scores = np.zeros(</span>
+            <span class="s0">(self.n_samples_X, unique_Y_labels.shape[0]), dtype=np.float64,</span>
+        <span class="s0">)</span>
+
+    <span class="s0">def _finalize_results(self):</span>
+        <span class="s0">probabilities = np.asarray(self.class_scores)</span>
+        <span class="s0">probabilities /= probabilities.sum(axis=1, keepdims=True)</span>
+        <span class="s0">return probabilities</span>
+
+    <span class="s0">cdef inline void weighted_histogram_mode(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t sample_index,</span>
+        <span class="s0">intp_t* indices,</span>
+        <span class="s0">float64_t* distances,</span>
+   <span class="s0">) noexcept nogil:</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">intp_t neighbor_idx, neighbor_class_idx, label_index, multi_output_index</span>
+            <span class="s0">float64_t score_incr = 1</span>
+            <span class="s0"># TODO: Implement other WeightingStrategy values</span>
+            <span class="s0">bint use_distance_weighting = (</span>
+                <span class="s0">self.weight_type == WeightingStrategy.distance</span>
+            <span class="s0">)</span>
+
+        <span class="s0"># Iterate through the sample k-nearest neighbours</span>
+        <span class="s0">for neighbor_rank in range(self.k):</span>
+            <span class="s0"># Absolute indice of the neighbor_rank-th Nearest Neighbors</span>
+            <span class="s0"># in range [0, n_samples_Y)</span>
+            <span class="s0"># TODO: inspect if it worth permuting this condition</span>
+            <span class="s0"># and the for-loop above for improved branching.</span>
+            <span class="s0">if use_distance_weighting:</span>
+                <span class="s0">score_incr = 1 / distances[neighbor_rank]</span>
+            <span class="s0">neighbor_idx = indices[neighbor_rank]</span>
+            <span class="s0">neighbor_class_idx = self.Y_labels[neighbor_idx]</span>
+            <span class="s0">self.class_scores[sample_index][neighbor_class_idx] += score_incr</span>
+        <span class="s0">return</span>
+
+    <span class="s0">cdef void _parallel_on_X_prange_iter_finalize(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t thread_num,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">intp_t idx, sample_index</span>
+        <span class="s0">for idx in range(X_end - X_start):</span>
+            <span class="s0"># One-pass top-one weighted mode</span>
+            <span class="s0"># Compute the absolute index in [0, n_samples_X)</span>
+            <span class="s0">sample_index = X_start + idx</span>
+            <span class="s0">self.weighted_histogram_mode(</span>
+                <span class="s0">sample_index,</span>
+                <span class="s0">&amp;self.heaps_indices_chunks[thread_num][idx * self.k],</span>
+                <span class="s0">&amp;self.heaps_r_distances_chunks[thread_num][idx * self.k],</span>
+            <span class="s0">)</span>
+        <span class="s0">return</span>
+
+    <span class="s0">cdef void _parallel_on_Y_finalize(</span>
+        <span class="s0">self,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">intp_t sample_index, thread_num</span>
+
+        <span class="s0">with nogil, parallel(num_threads=self.chunks_n_threads):</span>
+            <span class="s0"># Deallocating temporary datastructures</span>
+            <span class="s0">for thread_num in prange(self.chunks_n_threads, schedule='static'):</span>
+                <span class="s0">free(self.heaps_r_distances_chunks[thread_num])</span>
+                <span class="s0">free(self.heaps_indices_chunks[thread_num])</span>
+
+            <span class="s0">for sample_index in prange(self.n_samples_X, schedule='static'):</span>
+                <span class="s0">self.weighted_histogram_mode(</span>
+                    <span class="s0">sample_index,</span>
+                    <span class="s0">&amp;self.argkmin_indices[sample_index][0],</span>
+                    <span class="s0">&amp;self.argkmin_distances[sample_index][0],</span>
+                <span class="s0">)</span>
+        <span class="s0">return</span>
+
+<span class="s0">{{endfor}}</span>
+</pre>
+</body>
+</html>

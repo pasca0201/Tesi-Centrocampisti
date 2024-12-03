@@ -1,0 +1,668 @@
+<html>
+<head>
+<title>sparsefuncs_fast.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+sparsefuncs_fast.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Utilities to work with sparse matrices and arrays written in Cython.&quot;&quot;&quot;</span>
+
+<span class="s2"># Authors: Mathieu Blondel</span>
+<span class="s2">#          Olivier Grisel</span>
+<span class="s2">#          Peter Prettenhofer</span>
+<span class="s2">#          Lars Buitinck</span>
+<span class="s2">#          Giorgio Patrini</span>
+<span class="s2">#</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">from </span><span class="s1">libc</span><span class="s4">.</span><span class="s1">math </span><span class="s3">cimport </span><span class="s1">fabs</span><span class="s4">, </span><span class="s1">sqrt</span><span class="s4">, </span><span class="s1">isnan</span>
+<span class="s3">from </span><span class="s1">libc</span><span class="s4">.</span><span class="s1">stdint </span><span class="s3">cimport </span><span class="s1">intptr_t</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">cython </span><span class="s3">cimport </span><span class="s1">floating</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_typedefs </span><span class="s3">cimport </span><span class="s1">float64_t</span><span class="s4">, </span><span class="s1">int32_t</span><span class="s4">, </span><span class="s1">int64_t</span><span class="s4">, </span><span class="s1">intp_t</span><span class="s4">, </span><span class="s1">uint64_t</span>
+
+
+<span class="s3">ctypedef </span><span class="s1">fused integral</span><span class="s4">:</span>
+    <span class="s1">int32_t</span>
+    <span class="s1">int64_t</span>
+
+
+<span class="s3">def </span><span class="s1">csr_row_norms</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Squared L2 norm of each row in CSR matrix X.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype </span><span class="s3">not in </span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">]:</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">_sqeuclidean_row_norms_sparse</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">data</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indptr</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_sqeuclidean_row_norms_sparse</span><span class="s4">(</span>
+    <span class="s1">const floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">X_data</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">X_indptr</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">integral n_samples </span><span class="s4">= </span><span class="s1">X_indptr</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] - </span><span class="s5">1</span>
+        <span class="s1">integral i</span><span class="s4">, </span><span class="s1">j</span>
+
+    <span class="s1">dtype </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32 </span><span class="s3">if </span><span class="s1">floating </span><span class="s3">is </span><span class="s1">float </span><span class="s3">else </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span>
+
+    <span class="s3">cdef </span><span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">squared_row_norms </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">)</span>
+
+    <span class="s3">with </span><span class="s1">nogil</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">):</span>
+            <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+                <span class="s1">squared_row_norms</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] += </span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">j</span><span class="s4">] * </span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">j</span><span class="s4">]</span>
+
+    <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">squared_row_norms</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">csr_mean_variance_axis0</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">return_sum_weights</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Compute mean and variance along axis 0 on a CSR matrix 
+ 
+    Uses a np.float64 accumulator. 
+ 
+    Parameters 
+    ---------- 
+    X : CSR sparse matrix, shape (n_samples, n_features) 
+        Input data. 
+ 
+    weights : ndarray of shape (n_samples,), dtype=floating, default=None 
+        If it is set to None samples will be equally weighted. 
+ 
+        .. versionadded:: 0.24 
+ 
+    return_sum_weights : bool, default=False 
+        If True, returns the sum of weights seen for each feature. 
+ 
+        .. versionadded:: 0.24 
+ 
+    Returns 
+    ------- 
+    means : float array with shape (n_features,) 
+        Feature-wise means 
+ 
+    variances : float array with shape (n_features,) 
+        Feature-wise variances 
+ 
+    sum_weights : ndarray of shape (n_features,), dtype=floating 
+        Returned if return_sum_weights is True. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype </span><span class="s3">not in </span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">]:</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">weights </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+
+    <span class="s1">means</span><span class="s4">, </span><span class="s1">variances</span><span class="s4">, </span><span class="s1">sum_weights </span><span class="s4">= </span><span class="s1">_csr_mean_variance_axis0</span><span class="s4">(</span>
+        <span class="s1">X</span><span class="s4">.</span><span class="s1">data</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">1</span><span class="s4">], </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indptr</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">return_sum_weights</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">means</span><span class="s4">, </span><span class="s1">variances</span><span class="s4">, </span><span class="s1">sum_weights</span>
+    <span class="s3">return </span><span class="s1">means</span><span class="s4">, </span><span class="s1">variances</span>
+
+
+<span class="s3">def </span><span class="s1">_csr_mean_variance_axis0</span><span class="s4">(</span>
+    <span class="s1">const floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">X_data</span><span class="s4">,</span>
+    <span class="s1">uint64_t n_samples</span><span class="s4">,</span>
+    <span class="s1">uint64_t n_features</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indices</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indptr</span><span class="s4">,</span>
+    <span class="s1">const floating</span><span class="s4">[:] </span><span class="s1">weights</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s2"># Implement the function here since variables using fused types</span>
+    <span class="s2"># cannot be declared directly and can only be passed as function arguments</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">intp_t row_ind</span>
+        <span class="s1">uint64_t feature_idx</span>
+        <span class="s1">integral i</span><span class="s4">, </span><span class="s1">col_ind</span>
+        <span class="s1">float64_t diff</span>
+        <span class="s2"># means[j] contains the mean of feature j</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">means </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">)</span>
+        <span class="s2"># variances[j] contains the variance of feature j</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">variances </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">)</span>
+
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sum_weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span>
+            <span class="s1">fill_value</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">weights</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">), </span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span>
+        <span class="s4">)</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sum_weights_nz </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">)</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">correction </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">)</span>
+
+        <span class="s1">uint64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">counts </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span>
+            <span class="s1">fill_value</span><span class="s4">=</span><span class="s1">weights</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint64</span>
+        <span class="s4">)</span>
+        <span class="s1">uint64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">counts_nz </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint64</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">row_ind </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">len</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">) - </span><span class="s5">1</span><span class="s4">):</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">row_ind </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">col_ind </span><span class="s4">= </span><span class="s1">X_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s3">if not </span><span class="s1">isnan</span><span class="s4">(</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]):</span>
+                <span class="s1">means</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += &lt;</span><span class="s1">float64_t</span><span class="s4">&gt;(</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]) * </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s2"># sum of weights where X[:, col_ind] is non-zero</span>
+                <span class="s1">sum_weights_nz</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s2"># number of non-zero elements of X[:, col_ind]</span>
+                <span class="s1">counts_nz</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s5">1</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s2"># sum of weights where X[:, col_ind] is not nan</span>
+                <span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] -= </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s2"># number of non nan elements of X[:, col_ind]</span>
+                <span class="s1">counts</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] -= </span><span class="s5">1</span>
+
+    <span class="s3">for </span><span class="s1">feature_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s1">means</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] /= </span><span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+
+    <span class="s3">for </span><span class="s1">row_ind </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">len</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">) - </span><span class="s5">1</span><span class="s4">):</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">row_ind </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">col_ind </span><span class="s4">= </span><span class="s1">X_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s3">if not </span><span class="s1">isnan</span><span class="s4">(</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]):</span>
+                <span class="s1">diff </span><span class="s4">= </span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] - </span><span class="s1">means</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">]</span>
+                <span class="s2"># correction term of the corrected 2 pass algorithm.</span>
+                <span class="s2"># See &quot;Algorithms for computing the sample variance: analysis</span>
+                <span class="s2"># and recommendations&quot;, by Chan, Golub, and LeVeque.</span>
+                <span class="s1">correction</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s1">diff </span><span class="s4">* </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s1">variances</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s1">diff </span><span class="s4">* </span><span class="s1">diff </span><span class="s4">* </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+
+    <span class="s3">for </span><span class="s1">feature_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">counts</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] != </span><span class="s1">counts_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]:</span>
+            <span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] -= (</span>
+                <span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s1">sum_weights_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+            <span class="s4">) * </span><span class="s1">means</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+        <span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] = </span><span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]**</span><span class="s5">2 </span><span class="s4">/ </span><span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+        <span class="s3">if </span><span class="s1">counts</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] != </span><span class="s1">counts_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]:</span>
+            <span class="s2"># only compute it when it's guaranteed to be non-zero to avoid</span>
+            <span class="s2"># catastrophic cancellation.</span>
+            <span class="s1">variances</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] += (</span>
+                <span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s1">sum_weights_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+            <span class="s4">) * </span><span class="s1">means</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]**</span><span class="s5">2</span>
+        <span class="s1">variances</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] = (</span>
+            <span class="s4">(</span><span class="s1">variances</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]) /</span>
+            <span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+        <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">floating </span><span class="s3">is </span><span class="s1">float</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s4">(</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">means</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">),</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">variances</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">),</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">sum_weights</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">),</span>
+        <span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s4">(</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">means</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">variances</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">sum_weights</span><span class="s4">)</span>
+        <span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">csc_mean_variance_axis0</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">return_sum_weights</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Compute mean and variance along axis 0 on a CSC matrix 
+ 
+    Uses a np.float64 accumulator. 
+ 
+    Parameters 
+    ---------- 
+    X : CSC sparse matrix, shape (n_samples, n_features) 
+        Input data. 
+ 
+    weights : ndarray of shape (n_samples,), dtype=floating, default=None 
+        If it is set to None samples will be equally weighted. 
+ 
+        .. versionadded:: 0.24 
+ 
+    return_sum_weights : bool, default=False 
+        If True, returns the sum of weights seen for each feature. 
+ 
+        .. versionadded:: 0.24 
+ 
+    Returns 
+    ------- 
+    means : float array with shape (n_features,) 
+        Feature-wise means 
+ 
+    variances : float array with shape (n_features,) 
+        Feature-wise variances 
+ 
+    sum_weights : ndarray of shape (n_features,), dtype=floating 
+        Returned if return_sum_weights is True. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype </span><span class="s3">not in </span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">]:</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">weights </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+
+    <span class="s1">means</span><span class="s4">, </span><span class="s1">variances</span><span class="s4">, </span><span class="s1">sum_weights </span><span class="s4">= </span><span class="s1">_csc_mean_variance_axis0</span><span class="s4">(</span>
+        <span class="s1">X</span><span class="s4">.</span><span class="s1">data</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">1</span><span class="s4">], </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indptr</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">return_sum_weights</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">means</span><span class="s4">, </span><span class="s1">variances</span><span class="s4">, </span><span class="s1">sum_weights</span>
+    <span class="s3">return </span><span class="s1">means</span><span class="s4">, </span><span class="s1">variances</span>
+
+
+<span class="s3">def </span><span class="s1">_csc_mean_variance_axis0</span><span class="s4">(</span>
+    <span class="s1">const floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">X_data</span><span class="s4">,</span>
+    <span class="s1">uint64_t n_samples</span><span class="s4">,</span>
+    <span class="s1">uint64_t n_features</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indices</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indptr</span><span class="s4">,</span>
+    <span class="s1">const floating</span><span class="s4">[:] </span><span class="s1">weights</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s2"># Implement the function here since variables using fused types</span>
+    <span class="s2"># cannot be declared directly and can only be passed as function arguments</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">integral i</span><span class="s4">, </span><span class="s1">row_ind</span>
+        <span class="s1">uint64_t feature_idx</span><span class="s4">, </span><span class="s1">col_ind</span>
+        <span class="s1">float64_t diff</span>
+        <span class="s2"># means[j] contains the mean of feature j</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">means </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">)</span>
+        <span class="s2"># variances[j] contains the variance of feature j</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">variances </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">)</span>
+
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sum_weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span>
+            <span class="s1">fill_value</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">weights</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">), </span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span>
+        <span class="s4">)</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sum_weights_nz </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">)</span>
+        <span class="s1">float64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">correction </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">)</span>
+
+        <span class="s1">uint64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">counts </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span>
+            <span class="s1">fill_value</span><span class="s4">=</span><span class="s1">weights</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint64</span>
+        <span class="s4">)</span>
+        <span class="s1">uint64_t</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">counts_nz </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint64</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">col_ind </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">col_ind </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">row_ind </span><span class="s4">= </span><span class="s1">X_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s3">if not </span><span class="s1">isnan</span><span class="s4">(</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]):</span>
+                <span class="s1">means</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += &lt;</span><span class="s1">float64_t</span><span class="s4">&gt;(</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]) * </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s2"># sum of weights where X[:, col_ind] is non-zero</span>
+                <span class="s1">sum_weights_nz</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s2"># number of non-zero elements of X[:, col_ind]</span>
+                <span class="s1">counts_nz</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s5">1</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s2"># sum of weights where X[:, col_ind] is not nan</span>
+                <span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] -= </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s2"># number of non nan elements of X[:, col_ind]</span>
+                <span class="s1">counts</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] -= </span><span class="s5">1</span>
+
+    <span class="s3">for </span><span class="s1">feature_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s1">means</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] /= </span><span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+
+    <span class="s3">for </span><span class="s1">col_ind </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">col_ind </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">row_ind </span><span class="s4">= </span><span class="s1">X_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s3">if not </span><span class="s1">isnan</span><span class="s4">(</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]):</span>
+                <span class="s1">diff </span><span class="s4">= </span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] - </span><span class="s1">means</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">]</span>
+                <span class="s2"># correction term of the corrected 2 pass algorithm.</span>
+                <span class="s2"># See &quot;Algorithms for computing the sample variance: analysis</span>
+                <span class="s2"># and recommendations&quot;, by Chan, Golub, and LeVeque.</span>
+                <span class="s1">correction</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s1">diff </span><span class="s4">* </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+                <span class="s1">variances</span><span class="s4">[</span><span class="s1">col_ind</span><span class="s4">] += </span><span class="s1">diff </span><span class="s4">* </span><span class="s1">diff </span><span class="s4">* </span><span class="s1">weights</span><span class="s4">[</span><span class="s1">row_ind</span><span class="s4">]</span>
+
+    <span class="s3">for </span><span class="s1">feature_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">counts</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] != </span><span class="s1">counts_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]:</span>
+            <span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] -= (</span>
+                <span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s1">sum_weights_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+            <span class="s4">) * </span><span class="s1">means</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+        <span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] = </span><span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]**</span><span class="s5">2 </span><span class="s4">/ </span><span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+        <span class="s3">if </span><span class="s1">counts</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] != </span><span class="s1">counts_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]:</span>
+            <span class="s2"># only compute it when it's guaranteed to be non-zero to avoid</span>
+            <span class="s2"># catastrophic cancellation.</span>
+            <span class="s1">variances</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] += (</span>
+                <span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s1">sum_weights_nz</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+            <span class="s4">) * </span><span class="s1">means</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]**</span><span class="s5">2</span>
+        <span class="s1">variances</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] = (</span>
+            <span class="s4">(</span><span class="s1">variances</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s1">correction</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">])</span>
+        <span class="s4">) / </span><span class="s1">sum_weights</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+
+    <span class="s3">if </span><span class="s1">floating </span><span class="s3">is </span><span class="s1">float</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">means</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">),</span>
+                <span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">variances</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">),</span>
+                <span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">sum_weights</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">))</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s4">(</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">means</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">variances</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">sum_weights</span><span class="s4">)</span>
+        <span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">incr_mean_variance_axis0</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">last_mean</span><span class="s4">, </span><span class="s1">last_var</span><span class="s4">, </span><span class="s1">last_n</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Compute mean and variance along axis 0 on a CSR or CSC matrix. 
+ 
+    last_mean, last_var are the statistics computed at the last step by this 
+    function. Both must be initialized to 0.0. last_n is the 
+    number of samples encountered until now and is initialized at 0. 
+ 
+    Parameters 
+    ---------- 
+    X : CSR or CSC sparse matrix, shape (n_samples, n_features) 
+      Input data. 
+ 
+    last_mean : float array with shape (n_features,) 
+      Array of feature-wise means to update with the new data X. 
+ 
+    last_var : float array with shape (n_features,) 
+      Array of feature-wise var to update with the new data X. 
+ 
+    last_n : float array with shape (n_features,) 
+      Sum of the weights seen so far (if weights are all set to 1 
+      this will be the same as number of samples seen so far, before X). 
+ 
+    weights : float array with shape (n_samples,) or None. If it is set 
+      to None samples will be equally weighted. 
+ 
+    Returns 
+    ------- 
+    updated_mean : float array with shape (n_features,) 
+      Feature-wise means 
+ 
+    updated_variance : float array with shape (n_features,) 
+      Feature-wise variances 
+ 
+    updated_n : int array with shape (n_features,) 
+      Updated number of samples seen 
+ 
+    Notes 
+    ----- 
+    NaNs are ignored during the computation. 
+ 
+    References 
+    ---------- 
+    T. Chan, G. Golub, R. LeVeque. Algorithms for computing the sample 
+      variance: recommendations, The American Statistician, Vol. 37, No. 3, 
+      pp. 242-247 
+ 
+    Also, see the non-sparse implementation of this in 
+    `utils.extmath._batch_mean_variance_update`. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype </span><span class="s3">not in </span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">]:</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+    <span class="s1">X_dtype </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span>
+    <span class="s3">if </span><span class="s1">weights </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">X_dtype</span><span class="s4">)</span>
+    <span class="s3">elif </span><span class="s1">weights</span><span class="s4">.</span><span class="s1">dtype </span><span class="s3">not in </span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">]:</span>
+        <span class="s1">weights </span><span class="s4">= </span><span class="s1">weights</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">last_n</span><span class="s4">.</span><span class="s1">dtype </span><span class="s3">not in </span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">]:</span>
+        <span class="s1">last_n </span><span class="s4">= </span><span class="s1">last_n</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">_incr_mean_variance_axis0</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">data</span><span class="s4">,</span>
+                                     <span class="s1">np</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">weights</span><span class="s4">),</span>
+                                     <span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">1</span><span class="s4">],</span>
+                                     <span class="s1">X</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">,</span>
+                                     <span class="s1">X</span><span class="s4">.</span><span class="s1">indptr</span><span class="s4">,</span>
+                                     <span class="s1">X</span><span class="s4">.</span><span class="s1">format</span><span class="s4">,</span>
+                                     <span class="s1">last_mean</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">X_dtype</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">),</span>
+                                     <span class="s1">last_var</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">X_dtype</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">),</span>
+                                     <span class="s1">last_n</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">X_dtype</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">),</span>
+                                     <span class="s1">weights</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">X_dtype</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">))</span>
+
+
+<span class="s3">def </span><span class="s1">_incr_mean_variance_axis0</span><span class="s4">(</span>
+    <span class="s1">const floating</span><span class="s4">[:] </span><span class="s1">X_data</span><span class="s4">,</span>
+    <span class="s1">floating n_samples</span><span class="s4">,</span>
+    <span class="s1">uint64_t n_features</span><span class="s4">,</span>
+    <span class="s1">const int</span><span class="s4">[:] </span><span class="s1">X_indices</span><span class="s4">,</span>
+    <span class="s2"># X_indptr might be either int32 or int64</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indptr</span><span class="s4">,</span>
+    <span class="s1">str X_format</span><span class="s4">,</span>
+    <span class="s1">floating</span><span class="s4">[:] </span><span class="s1">last_mean</span><span class="s4">,</span>
+    <span class="s1">floating</span><span class="s4">[:] </span><span class="s1">last_var</span><span class="s4">,</span>
+    <span class="s1">floating</span><span class="s4">[:] </span><span class="s1">last_n</span><span class="s4">,</span>
+    <span class="s2"># previous sum of the weights (ie float)</span>
+    <span class="s1">const floating</span><span class="s4">[:] </span><span class="s1">weights</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s2"># Implement the function here since variables using fused types</span>
+    <span class="s2"># cannot be declared directly and can only be passed as function arguments</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">uint64_t i</span>
+
+        <span class="s2"># last = stats until now</span>
+        <span class="s2"># new = the current increment</span>
+        <span class="s2"># updated = the aggregated stats</span>
+        <span class="s2"># when arrays, they are indexed by i per-feature</span>
+        <span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">new_mean</span>
+        <span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">new_var</span>
+        <span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">updated_mean</span>
+        <span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">updated_var</span>
+
+    <span class="s3">if </span><span class="s1">floating </span><span class="s3">is </span><span class="s1">float</span><span class="s4">:</span>
+        <span class="s1">dtype </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">dtype </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span>
+
+    <span class="s1">new_mean </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">)</span>
+    <span class="s1">new_var </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros_like</span><span class="s4">(</span><span class="s1">new_mean</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">)</span>
+    <span class="s1">updated_mean </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros_like</span><span class="s4">(</span><span class="s1">new_mean</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">)</span>
+    <span class="s1">updated_var </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros_like</span><span class="s4">(</span><span class="s1">new_mean</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">)</span>
+
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">new_n</span>
+        <span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">updated_n</span>
+        <span class="s1">floating</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">last_over_new_n</span>
+
+    <span class="s2"># Obtain new stats first</span>
+    <span class="s1">updated_n </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">=</span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">)</span>
+    <span class="s1">last_over_new_n </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros_like</span><span class="s4">(</span><span class="s1">updated_n</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">dtype</span><span class="s4">)</span>
+
+    <span class="s2"># X can be a CSR or CSC matrix</span>
+    <span class="s3">if </span><span class="s1">X_format </span><span class="s4">== </span><span class="s6">'csr'</span><span class="s4">:</span>
+        <span class="s1">new_mean</span><span class="s4">, </span><span class="s1">new_var</span><span class="s4">, </span><span class="s1">new_n </span><span class="s4">= </span><span class="s1">_csr_mean_variance_axis0</span><span class="s4">(</span>
+            <span class="s1">X_data</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">X_indices</span><span class="s4">, </span><span class="s1">X_indptr</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:  </span><span class="s2"># X_format == 'csc'</span>
+        <span class="s1">new_mean</span><span class="s4">, </span><span class="s1">new_var</span><span class="s4">, </span><span class="s1">new_n </span><span class="s4">= </span><span class="s1">_csc_mean_variance_axis0</span><span class="s4">(</span>
+            <span class="s1">X_data</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">X_indices</span><span class="s4">, </span><span class="s1">X_indptr</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">)</span>
+
+    <span class="s2"># First pass</span>
+    <span class="s3">cdef </span><span class="s1">bint is_first_pass </span><span class="s4">= </span><span class="s3">True</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">last_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] &gt; </span><span class="s5">0</span><span class="s4">:</span>
+            <span class="s1">is_first_pass </span><span class="s4">= </span><span class="s3">False</span>
+            <span class="s3">break</span>
+
+    <span class="s3">if </span><span class="s1">is_first_pass</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">new_mean</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">new_var</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">new_n</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s1">updated_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">last_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] + </span><span class="s1">new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+
+    <span class="s2"># Next passes</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_features</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] &gt; </span><span class="s5">0</span><span class="s4">:</span>
+            <span class="s1">last_over_new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">dtype</span><span class="s4">(</span><span class="s1">last_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]) / </span><span class="s1">dtype</span><span class="s4">(</span><span class="s1">new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">])</span>
+            <span class="s2"># Unnormalized stats</span>
+            <span class="s1">last_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] *= </span><span class="s1">last_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s1">last_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] *= </span><span class="s1">last_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s1">new_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] *= </span><span class="s1">new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s1">new_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] *= </span><span class="s1">new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s2"># Update stats</span>
+            <span class="s1">updated_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = (</span>
+                <span class="s1">last_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] + </span><span class="s1">new_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] +</span>
+                <span class="s1">last_over_new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] / </span><span class="s1">updated_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] *</span>
+                <span class="s4">(</span><span class="s1">last_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] / </span><span class="s1">last_over_new_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] - </span><span class="s1">new_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">])**</span><span class="s5">2</span>
+            <span class="s4">)</span>
+            <span class="s1">updated_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = (</span><span class="s1">last_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] + </span><span class="s1">new_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]) / </span><span class="s1">updated_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s1">updated_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] /= </span><span class="s1">updated_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">updated_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">last_var</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s1">updated_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">last_mean</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s1">updated_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">last_n</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+
+    <span class="s3">return </span><span class="s4">(</span>
+        <span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">updated_mean</span><span class="s4">),</span>
+        <span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">updated_var</span><span class="s4">),</span>
+        <span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">updated_n</span><span class="s4">),</span>
+    <span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">inplace_csr_row_normalize_l1</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Normalize inplace the rows of a CSR matrix or array by their L1 norm. 
+ 
+    Parameters 
+    ---------- 
+    X : scipy.sparse.csr_matrix and scipy.sparse.csr_array, \ 
+            shape=(n_samples, n_features) 
+        The input matrix or array to be modified inplace. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from scipy.sparse import csr_matrix 
+    &gt;&gt;&gt; from sklearn.utils.sparsefuncs_fast import inplace_csr_row_normalize_l1 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; indptr = np.array([0, 2, 3, 4]) 
+    &gt;&gt;&gt; indices = np.array([0, 1, 2, 3]) 
+    &gt;&gt;&gt; data = np.array([1.0, 2.0, 3.0, 4.0]) 
+    &gt;&gt;&gt; X = csr_matrix((data, indices, indptr), shape=(3, 4)) 
+    &gt;&gt;&gt; X.toarray() 
+    array([[1., 2., 0., 0.], 
+           [0., 0., 3., 0.], 
+           [0., 0., 0., 4.]]) 
+    &gt;&gt;&gt; inplace_csr_row_normalize_l1(X) 
+    &gt;&gt;&gt; X.toarray() 
+    array([[0.33...   , 0.66...   , 0.        , 0.        ], 
+           [0.        , 0.        , 1.        , 0.        ], 
+           [0.        , 0.        , 0.        , 1.        ]]) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_inplace_csr_row_normalize_l1</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">data</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indptr</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_inplace_csr_row_normalize_l1</span><span class="s4">(</span>
+    <span class="s1">floating</span><span class="s4">[:] </span><span class="s1">X_data</span><span class="s4">,</span>
+    <span class="s1">shape</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indices</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indptr</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">uint64_t n_samples </span><span class="s4">= </span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+
+        <span class="s2"># the column indices for row i are stored in:</span>
+        <span class="s2">#    indices[indptr[i]:indices[i+1]]</span>
+        <span class="s2"># and their corresponding values are stored in:</span>
+        <span class="s2">#    data[indptr[i]:indptr[i+1]]</span>
+        <span class="s1">uint64_t i</span>
+        <span class="s1">integral j</span>
+        <span class="s1">double sum_</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">):</span>
+        <span class="s1">sum_ </span><span class="s4">= </span><span class="s5">0.0</span>
+
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">sum_ </span><span class="s4">+= </span><span class="s1">fabs</span><span class="s4">(</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">j</span><span class="s4">])</span>
+
+        <span class="s3">if </span><span class="s1">sum_ </span><span class="s4">== </span><span class="s5">0.0</span><span class="s4">:</span>
+            <span class="s2"># do not normalize empty rows (can happen if CSR is not pruned</span>
+            <span class="s2"># correctly)</span>
+            <span class="s3">continue</span>
+
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">X_data</span><span class="s4">[</span><span class="s1">j</span><span class="s4">] /= </span><span class="s1">sum_</span>
+
+
+<span class="s3">def </span><span class="s1">inplace_csr_row_normalize_l2</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Normalize inplace the rows of a CSR matrix or array by their L2 norm. 
+ 
+    Parameters 
+    ---------- 
+    X : scipy.sparse.csr_matrix, shape=(n_samples, n_features) 
+        The input matrix or array to be modified inplace. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from scipy.sparse import csr_matrix 
+    &gt;&gt;&gt; from sklearn.utils.sparsefuncs_fast import inplace_csr_row_normalize_l2 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; indptr = np.array([0, 2, 3, 4]) 
+    &gt;&gt;&gt; indices = np.array([0, 1, 2, 3]) 
+    &gt;&gt;&gt; data = np.array([1.0, 2.0, 3.0, 4.0]) 
+    &gt;&gt;&gt; X = csr_matrix((data, indices, indptr), shape=(3, 4)) 
+    &gt;&gt;&gt; X.toarray() 
+    array([[1., 2., 0., 0.], 
+           [0., 0., 3., 0.], 
+           [0., 0., 0., 4.]]) 
+    &gt;&gt;&gt; inplace_csr_row_normalize_l2(X) 
+    &gt;&gt;&gt; X.toarray() 
+    array([[0.44...   , 0.89...   , 0.        , 0.        ], 
+           [0.        , 0.        , 1.        , 0.        ], 
+           [0.        , 0.        , 0.        , 1.        ]]) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">_inplace_csr_row_normalize_l2</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">data</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indptr</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_inplace_csr_row_normalize_l2</span><span class="s4">(</span>
+    <span class="s1">floating</span><span class="s4">[:] </span><span class="s1">X_data</span><span class="s4">,</span>
+    <span class="s1">shape</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indices</span><span class="s4">,</span>
+    <span class="s1">const integral</span><span class="s4">[:] </span><span class="s1">X_indptr</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">uint64_t n_samples </span><span class="s4">= </span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s1">uint64_t i</span>
+        <span class="s1">integral j</span>
+        <span class="s1">double sum_</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">):</span>
+        <span class="s1">sum_ </span><span class="s4">= </span><span class="s5">0.0</span>
+
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">sum_ </span><span class="s4">+= (</span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">j</span><span class="s4">] * </span><span class="s1">X_data</span><span class="s4">[</span><span class="s1">j</span><span class="s4">])</span>
+
+        <span class="s3">if </span><span class="s1">sum_ </span><span class="s4">== </span><span class="s5">0.0</span><span class="s4">:</span>
+            <span class="s2"># do not normalize empty rows (can happen if CSR is not pruned</span>
+            <span class="s2"># correctly)</span>
+            <span class="s3">continue</span>
+
+        <span class="s1">sum_ </span><span class="s4">= </span><span class="s1">sqrt</span><span class="s4">(</span><span class="s1">sum_</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i</span><span class="s4">], </span><span class="s1">X_indptr</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+            <span class="s1">X_data</span><span class="s4">[</span><span class="s1">j</span><span class="s4">] /= </span><span class="s1">sum_</span>
+
+
+<span class="s3">def </span><span class="s1">assign_rows_csr</span><span class="s4">(</span>
+    <span class="s1">X</span><span class="s4">,</span>
+    <span class="s1">const intptr_t</span><span class="s4">[:] </span><span class="s1">X_rows</span><span class="s4">,</span>
+    <span class="s1">const intptr_t</span><span class="s4">[:] </span><span class="s1">out_rows</span><span class="s4">,</span>
+    <span class="s1">floating</span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">out</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Densify selected rows of a CSR matrix into a preallocated array. 
+ 
+    Like out[out_rows] = X[X_rows].toarray() but without copying. 
+    No-copy supported for both dtype=np.float32 and dtype=np.float64. 
+ 
+    Parameters 
+    ---------- 
+    X : scipy.sparse.csr_matrix, shape=(n_samples, n_features) 
+    X_rows : array, dtype=np.intp, shape=n_rows 
+    out_rows : array, dtype=np.intp, shape=n_rows 
+    out : array, shape=(arbitrary, n_features) 
+    &quot;&quot;&quot;</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s2"># intptr_t (npy_intp, np.intp in Python) is what np.where returns,</span>
+        <span class="s2"># but int is what scipy.sparse uses.</span>
+        <span class="s1">intp_t i</span><span class="s4">, </span><span class="s1">ind</span><span class="s4">, </span><span class="s1">j</span><span class="s4">, </span><span class="s1">k</span>
+        <span class="s1">intptr_t rX</span>
+        <span class="s1">const floating</span><span class="s4">[:] </span><span class="s1">data </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">data</span>
+        <span class="s1">const int32_t</span><span class="s4">[:] </span><span class="s1">indices </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indices</span>
+        <span class="s1">const int32_t</span><span class="s4">[:] </span><span class="s1">indptr </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">indptr</span>
+
+    <span class="s3">if </span><span class="s1">X_rows</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] != </span><span class="s1">out_rows</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s6">&quot;cannot assign %d rows to %d&quot;</span>
+                         <span class="s4">% (</span><span class="s1">X_rows</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">out_rows</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]))</span>
+
+    <span class="s3">with </span><span class="s1">nogil</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">out_rows</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]):</span>
+            <span class="s1">out</span><span class="s4">[</span><span class="s1">out_rows</span><span class="s4">[</span><span class="s1">k</span><span class="s4">]] = </span><span class="s5">0.0</span>
+
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">X_rows</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]):</span>
+            <span class="s1">rX </span><span class="s4">= </span><span class="s1">X_rows</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+            <span class="s3">for </span><span class="s1">ind </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">indptr</span><span class="s4">[</span><span class="s1">rX</span><span class="s4">], </span><span class="s1">indptr</span><span class="s4">[</span><span class="s1">rX </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]):</span>
+                <span class="s1">j </span><span class="s4">= </span><span class="s1">indices</span><span class="s4">[</span><span class="s1">ind</span><span class="s4">]</span>
+                <span class="s1">out</span><span class="s4">[</span><span class="s1">out_rows</span><span class="s4">[</span><span class="s1">i</span><span class="s4">], </span><span class="s1">j</span><span class="s4">] = </span><span class="s1">data</span><span class="s4">[</span><span class="s1">ind</span><span class="s4">]</span>
+</pre>
+</body>
+</html>

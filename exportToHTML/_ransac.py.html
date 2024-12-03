@@ -1,0 +1,752 @@
+<html>
+<head>
+<title>_ransac.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_ransac.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Author: Johannes Schönberger</span>
+<span class="s0">#</span>
+<span class="s0"># License: BSD 3 clause</span>
+
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s1">numbers </span><span class="s2">import </span><span class="s1">Integral</span><span class="s3">, </span><span class="s1">Real</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s3">..</span><span class="s1">base </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">BaseEstimator</span><span class="s3">,</span>
+    <span class="s1">MetaEstimatorMixin</span><span class="s3">,</span>
+    <span class="s1">MultiOutputMixin</span><span class="s3">,</span>
+    <span class="s1">RegressorMixin</span><span class="s3">,</span>
+    <span class="s1">_fit_context</span><span class="s3">,</span>
+    <span class="s1">clone</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">exceptions </span><span class="s2">import </span><span class="s1">ConvergenceWarning</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils </span><span class="s2">import </span><span class="s1">check_consistent_length</span><span class="s3">, </span><span class="s1">check_random_state</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_bunch </span><span class="s2">import </span><span class="s1">Bunch</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_param_validation </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">HasMethods</span><span class="s3">,</span>
+    <span class="s1">Interval</span><span class="s3">,</span>
+    <span class="s1">Options</span><span class="s3">,</span>
+    <span class="s1">RealNotInt</span><span class="s3">,</span>
+    <span class="s1">StrOptions</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">metadata_routing </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">MetadataRouter</span><span class="s3">,</span>
+    <span class="s1">MethodMapping</span><span class="s3">,</span>
+    <span class="s1">_raise_for_params</span><span class="s3">,</span>
+    <span class="s1">_routing_enabled</span><span class="s3">,</span>
+    <span class="s1">process_routing</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">random </span><span class="s2">import </span><span class="s1">sample_without_replacement</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">validation </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">_check_method_params</span><span class="s3">,</span>
+    <span class="s1">_check_sample_weight</span><span class="s3">,</span>
+    <span class="s1">_deprecate_positional_args</span><span class="s3">,</span>
+    <span class="s1">check_is_fitted</span><span class="s3">,</span>
+    <span class="s1">has_fit_parameter</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">_base </span><span class="s2">import </span><span class="s1">LinearRegression</span>
+
+<span class="s1">_EPSILON </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">spacing</span><span class="s3">(</span><span class="s4">1</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_dynamic_max_trials</span><span class="s3">(</span><span class="s1">n_inliers</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">min_samples</span><span class="s3">, </span><span class="s1">probability</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;Determine number trials such that at least one outlier-free subset is 
+    sampled for the given inlier/outlier ratio. 
+ 
+    Parameters 
+    ---------- 
+    n_inliers : int 
+        Number of inliers in the data. 
+ 
+    n_samples : int 
+        Total number of samples in the data. 
+ 
+    min_samples : int 
+        Minimum number of samples chosen randomly from original data. 
+ 
+    probability : float 
+        Probability (confidence) that one outlier-free sample is generated. 
+ 
+    Returns 
+    ------- 
+    trials : int 
+        Number of trials. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">inlier_ratio </span><span class="s3">= </span><span class="s1">n_inliers </span><span class="s3">/ </span><span class="s1">float</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">)</span>
+    <span class="s1">nom </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">_EPSILON</span><span class="s3">, </span><span class="s4">1 </span><span class="s3">- </span><span class="s1">probability</span><span class="s3">)</span>
+    <span class="s1">denom </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">_EPSILON</span><span class="s3">, </span><span class="s4">1 </span><span class="s3">- </span><span class="s1">inlier_ratio</span><span class="s3">**</span><span class="s1">min_samples</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">nom </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s4">0</span>
+    <span class="s2">if </span><span class="s1">denom </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">float</span><span class="s3">(</span><span class="s6">&quot;inf&quot;</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">float</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ceil</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">nom</span><span class="s3">) / </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">denom</span><span class="s3">))))</span>
+
+
+<span class="s2">class </span><span class="s1">RANSACRegressor</span><span class="s3">(</span>
+    <span class="s1">MetaEstimatorMixin</span><span class="s3">,</span>
+    <span class="s1">RegressorMixin</span><span class="s3">,</span>
+    <span class="s1">MultiOutputMixin</span><span class="s3">,</span>
+    <span class="s1">BaseEstimator</span><span class="s3">,</span>
+<span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot;RANSAC (RANdom SAmple Consensus) algorithm. 
+ 
+    RANSAC is an iterative algorithm for the robust estimation of parameters 
+    from a subset of inliers from the complete data set. 
+ 
+    Read more in the :ref:`User Guide &lt;ransac_regression&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    estimator : object, default=None 
+        Base estimator object which implements the following methods: 
+ 
+         * `fit(X, y)`: Fit model to given training data and target values. 
+         * `score(X, y)`: Returns the mean accuracy on the given test data, 
+           which is used for the stop criterion defined by `stop_score`. 
+           Additionally, the score is used to decide which of two equally 
+           large consensus sets is chosen as the better one. 
+         * `predict(X)`: Returns predicted values using the linear model, 
+           which is used to compute residual error using loss function. 
+ 
+        If `estimator` is None, then 
+        :class:`~sklearn.linear_model.LinearRegression` is used for 
+        target values of dtype float. 
+ 
+        Note that the current implementation only supports regression 
+        estimators. 
+ 
+    min_samples : int (&gt;= 1) or float ([0, 1]), default=None 
+        Minimum number of samples chosen randomly from original data. Treated 
+        as an absolute number of samples for `min_samples &gt;= 1`, treated as a 
+        relative number `ceil(min_samples * X.shape[0])` for 
+        `min_samples &lt; 1`. This is typically chosen as the minimal number of 
+        samples necessary to estimate the given `estimator`. By default a 
+        :class:`~sklearn.linear_model.LinearRegression` estimator is assumed and 
+        `min_samples` is chosen as ``X.shape[1] + 1``. This parameter is highly 
+        dependent upon the model, so if a `estimator` other than 
+        :class:`~sklearn.linear_model.LinearRegression` is used, the user must 
+        provide a value. 
+ 
+    residual_threshold : float, default=None 
+        Maximum residual for a data sample to be classified as an inlier. 
+        By default the threshold is chosen as the MAD (median absolute 
+        deviation) of the target values `y`. Points whose residuals are 
+        strictly equal to the threshold are considered as inliers. 
+ 
+    is_data_valid : callable, default=None 
+        This function is called with the randomly selected data before the 
+        model is fitted to it: `is_data_valid(X, y)`. If its return value is 
+        False the current randomly chosen sub-sample is skipped. 
+ 
+    is_model_valid : callable, default=None 
+        This function is called with the estimated model and the randomly 
+        selected data: `is_model_valid(model, X, y)`. If its return value is 
+        False the current randomly chosen sub-sample is skipped. 
+        Rejecting samples with this function is computationally costlier than 
+        with `is_data_valid`. `is_model_valid` should therefore only be used if 
+        the estimated model is needed for making the rejection decision. 
+ 
+    max_trials : int, default=100 
+        Maximum number of iterations for random sample selection. 
+ 
+    max_skips : int, default=np.inf 
+        Maximum number of iterations that can be skipped due to finding zero 
+        inliers or invalid data defined by ``is_data_valid`` or invalid models 
+        defined by ``is_model_valid``. 
+ 
+        .. versionadded:: 0.19 
+ 
+    stop_n_inliers : int, default=np.inf 
+        Stop iteration if at least this number of inliers are found. 
+ 
+    stop_score : float, default=np.inf 
+        Stop iteration if score is greater equal than this threshold. 
+ 
+    stop_probability : float in range [0, 1], default=0.99 
+        RANSAC iteration stops if at least one outlier-free set of the training 
+        data is sampled in RANSAC. This requires to generate at least N 
+        samples (iterations):: 
+ 
+            N &gt;= log(1 - probability) / log(1 - e**m) 
+ 
+        where the probability (confidence) is typically set to high value such 
+        as 0.99 (the default) and e is the current fraction of inliers w.r.t. 
+        the total number of samples. 
+ 
+    loss : str, callable, default='absolute_error' 
+        String inputs, 'absolute_error' and 'squared_error' are supported which 
+        find the absolute error and squared error per sample respectively. 
+ 
+        If ``loss`` is a callable, then it should be a function that takes 
+        two arrays as inputs, the true and predicted value and returns a 1-D 
+        array with the i-th value of the array corresponding to the loss 
+        on ``X[i]``. 
+ 
+        If the loss on a sample is greater than the ``residual_threshold``, 
+        then this sample is classified as an outlier. 
+ 
+        .. versionadded:: 0.18 
+ 
+    random_state : int, RandomState instance, default=None 
+        The generator used to initialize the centers. 
+        Pass an int for reproducible output across multiple function calls. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+    Attributes 
+    ---------- 
+    estimator_ : object 
+        Best fitted model (copy of the `estimator` object). 
+ 
+    n_trials_ : int 
+        Number of random selection trials until one of the stop criteria is 
+        met. It is always ``&lt;= max_trials``. 
+ 
+    inlier_mask_ : bool array of shape [n_samples] 
+        Boolean mask of inliers classified as ``True``. 
+ 
+    n_skips_no_inliers_ : int 
+        Number of iterations skipped due to finding zero inliers. 
+ 
+        .. versionadded:: 0.19 
+ 
+    n_skips_invalid_data_ : int 
+        Number of iterations skipped due to invalid data defined by 
+        ``is_data_valid``. 
+ 
+        .. versionadded:: 0.19 
+ 
+    n_skips_invalid_model_ : int 
+        Number of iterations skipped due to an invalid model defined by 
+        ``is_model_valid``. 
+ 
+        .. versionadded:: 0.19 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    HuberRegressor : Linear regression model that is robust to outliers. 
+    TheilSenRegressor : Theil-Sen Estimator robust multivariate regression model. 
+    SGDRegressor : Fitted by minimizing a regularized empirical loss with SGD. 
+ 
+    References 
+    ---------- 
+    .. [1] https://en.wikipedia.org/wiki/RANSAC 
+    .. [2] https://www.sri.com/wp-content/uploads/2021/12/ransac-publication.pdf 
+    .. [3] http://www.bmva.org/bmvc/2009/Papers/Paper355/Paper355.pdf 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.linear_model import RANSACRegressor 
+    &gt;&gt;&gt; from sklearn.datasets import make_regression 
+    &gt;&gt;&gt; X, y = make_regression( 
+    ...     n_samples=200, n_features=2, noise=4.0, random_state=0) 
+    &gt;&gt;&gt; reg = RANSACRegressor(random_state=0).fit(X, y) 
+    &gt;&gt;&gt; reg.score(X, y) 
+    0.9885... 
+    &gt;&gt;&gt; reg.predict(X[:1,]) 
+    array([-31.9417...]) 
+ 
+    For a more detailed example, see 
+    :ref:`sphx_glr_auto_examples_linear_model_plot_ransac.py` 
+    &quot;&quot;&quot;  </span><span class="s0"># noqa: E501</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s3">: </span><span class="s1">dict </span><span class="s3">= {</span>
+        <span class="s6">&quot;estimator&quot;</span><span class="s3">: [</span><span class="s1">HasMethods</span><span class="s3">([</span><span class="s6">&quot;fit&quot;</span><span class="s3">, </span><span class="s6">&quot;score&quot;</span><span class="s3">, </span><span class="s6">&quot;predict&quot;</span><span class="s3">]), </span><span class="s2">None</span><span class="s3">],</span>
+        <span class="s6">&quot;min_samples&quot;</span><span class="s3">: [</span>
+            <span class="s1">Interval</span><span class="s3">(</span><span class="s1">Integral</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;left&quot;</span><span class="s3">),</span>
+            <span class="s1">Interval</span><span class="s3">(</span><span class="s1">RealNotInt</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;both&quot;</span><span class="s3">),</span>
+            <span class="s2">None</span><span class="s3">,</span>
+        <span class="s3">],</span>
+        <span class="s6">&quot;residual_threshold&quot;</span><span class="s3">: [</span><span class="s1">Interval</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;left&quot;</span><span class="s3">), </span><span class="s2">None</span><span class="s3">],</span>
+        <span class="s6">&quot;is_data_valid&quot;</span><span class="s3">: [</span><span class="s1">callable</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+        <span class="s6">&quot;is_model_valid&quot;</span><span class="s3">: [</span><span class="s1">callable</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+        <span class="s6">&quot;max_trials&quot;</span><span class="s3">: [</span>
+            <span class="s1">Interval</span><span class="s3">(</span><span class="s1">Integral</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;left&quot;</span><span class="s3">),</span>
+            <span class="s1">Options</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, {</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">}),</span>
+        <span class="s3">],</span>
+        <span class="s6">&quot;max_skips&quot;</span><span class="s3">: [</span>
+            <span class="s1">Interval</span><span class="s3">(</span><span class="s1">Integral</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;left&quot;</span><span class="s3">),</span>
+            <span class="s1">Options</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, {</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">}),</span>
+        <span class="s3">],</span>
+        <span class="s6">&quot;stop_n_inliers&quot;</span><span class="s3">: [</span>
+            <span class="s1">Interval</span><span class="s3">(</span><span class="s1">Integral</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;left&quot;</span><span class="s3">),</span>
+            <span class="s1">Options</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, {</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">}),</span>
+        <span class="s3">],</span>
+        <span class="s6">&quot;stop_score&quot;</span><span class="s3">: [</span><span class="s1">Interval</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;both&quot;</span><span class="s3">)],</span>
+        <span class="s6">&quot;stop_probability&quot;</span><span class="s3">: [</span><span class="s1">Interval</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s6">&quot;both&quot;</span><span class="s3">)],</span>
+        <span class="s6">&quot;loss&quot;</span><span class="s3">: [</span><span class="s1">StrOptions</span><span class="s3">({</span><span class="s6">&quot;absolute_error&quot;</span><span class="s3">, </span><span class="s6">&quot;squared_error&quot;</span><span class="s3">}), </span><span class="s1">callable</span><span class="s3">],</span>
+        <span class="s6">&quot;random_state&quot;</span><span class="s3">: [</span><span class="s6">&quot;random_state&quot;</span><span class="s3">],</span>
+    <span class="s3">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">estimator</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s3">*,</span>
+        <span class="s1">min_samples</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">residual_threshold</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">is_data_valid</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">is_model_valid</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">max_trials</span><span class="s3">=</span><span class="s4">100</span><span class="s3">,</span>
+        <span class="s1">max_skips</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">,</span>
+        <span class="s1">stop_n_inliers</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">,</span>
+        <span class="s1">stop_score</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">,</span>
+        <span class="s1">stop_probability</span><span class="s3">=</span><span class="s4">0.99</span><span class="s3">,</span>
+        <span class="s1">loss</span><span class="s3">=</span><span class="s6">&quot;absolute_error&quot;</span><span class="s3">,</span>
+        <span class="s1">random_state</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">estimator </span><span class="s3">= </span><span class="s1">estimator</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">min_samples </span><span class="s3">= </span><span class="s1">min_samples</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">residual_threshold </span><span class="s3">= </span><span class="s1">residual_threshold</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">is_data_valid </span><span class="s3">= </span><span class="s1">is_data_valid</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">is_model_valid </span><span class="s3">= </span><span class="s1">is_model_valid</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">max_trials </span><span class="s3">= </span><span class="s1">max_trials</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">max_skips </span><span class="s3">= </span><span class="s1">max_skips</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">stop_n_inliers </span><span class="s3">= </span><span class="s1">stop_n_inliers</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">stop_score </span><span class="s3">= </span><span class="s1">stop_score</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">stop_probability </span><span class="s3">= </span><span class="s1">stop_probability</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">random_state </span><span class="s3">= </span><span class="s1">random_state</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">loss </span><span class="s3">= </span><span class="s1">loss</span>
+
+    <span class="s3">@</span><span class="s1">_fit_context</span><span class="s3">(</span>
+        <span class="s0"># RansacRegressor.estimator is not validated yet</span>
+        <span class="s1">prefer_skip_nested_validation</span><span class="s3">=</span><span class="s2">False</span>
+    <span class="s3">)</span>
+    <span class="s0"># TODO(1.7): remove `sample_weight` from the signature after deprecation</span>
+    <span class="s0"># cycle; for backwards compatibility: pop it from `fit_params` before the</span>
+    <span class="s0"># `_raise_for_params` check and reinsert it after the check</span>
+    <span class="s3">@</span><span class="s1">_deprecate_positional_args</span><span class="s3">(</span><span class="s1">version</span><span class="s3">=</span><span class="s6">&quot;1.7&quot;</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">fit</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, *, </span><span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, **</span><span class="s1">fit_params</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Fit estimator using RANSAC algorithm. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target values. 
+ 
+        sample_weight : array-like of shape (n_samples,), default=None 
+            Individual weights for each sample 
+            raises error if sample_weight is passed and estimator 
+            fit method does not support it. 
+ 
+            .. versionadded:: 0.18 
+ 
+        **fit_params : dict 
+            Parameters routed to the `fit` method of the sub-estimator via the 
+            metadata routing API. 
+ 
+            .. versionadded:: 1.5 
+ 
+                Only available if 
+                `sklearn.set_config(enable_metadata_routing=True)` is set. See 
+                :ref:`Metadata Routing User Guide &lt;metadata_routing&gt;` for more 
+                details. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted `RANSACRegressor` estimator. 
+ 
+        Raises 
+        ------ 
+        ValueError 
+            If no valid consensus set could be found. This occurs if 
+            `is_data_valid` and `is_model_valid` return False for all 
+            `max_trials` randomly chosen sub-samples. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Need to validate separately here. We can't pass multi_output=True</span>
+        <span class="s0"># because that would allow y to be csr. Delay expensive finiteness</span>
+        <span class="s0"># check to the estimator's own input validation.</span>
+        <span class="s1">_raise_for_params</span><span class="s3">(</span><span class="s1">fit_params</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s6">&quot;fit&quot;</span><span class="s3">)</span>
+        <span class="s1">check_X_params </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">accept_sparse</span><span class="s3">=</span><span class="s6">&quot;csr&quot;</span><span class="s3">, </span><span class="s1">force_all_finite</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s1">check_y_params </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">ensure_2d</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s1">X</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_validate_data</span><span class="s3">(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">validate_separately</span><span class="s3">=(</span><span class="s1">check_X_params</span><span class="s3">, </span><span class="s1">check_y_params</span><span class="s3">)</span>
+        <span class="s3">)</span>
+        <span class="s1">check_consistent_length</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">estimator </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">estimator </span><span class="s3">= </span><span class="s1">clone</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">estimator</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">estimator </span><span class="s3">= </span><span class="s1">LinearRegression</span><span class="s3">()</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">min_samples </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">estimator</span><span class="s3">, </span><span class="s1">LinearRegression</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                    <span class="s6">&quot;`min_samples` needs to be explicitly set when estimator &quot;</span>
+                    <span class="s6">&quot;is not a LinearRegression.&quot;</span>
+                <span class="s3">)</span>
+            <span class="s1">min_samples </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">] + </span><span class="s4">1</span>
+        <span class="s2">elif </span><span class="s4">0 </span><span class="s3">&lt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">min_samples </span><span class="s3">&lt; </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s1">min_samples </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ceil</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">min_samples </span><span class="s3">* </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+        <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">min_samples </span><span class="s3">&gt;= </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s1">min_samples </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">min_samples</span>
+        <span class="s2">if </span><span class="s1">min_samples </span><span class="s3">&gt; </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s6">&quot;`min_samples` may not be larger than number &quot;</span>
+                <span class="s6">&quot;of samples: n_samples = %d.&quot; </span><span class="s3">% (</span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+            <span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">residual_threshold </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s0"># MAD (median absolute deviation)</span>
+            <span class="s1">residual_threshold </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">median</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">y </span><span class="s3">- </span><span class="s1">np</span><span class="s3">.</span><span class="s1">median</span><span class="s3">(</span><span class="s1">y</span><span class="s3">)))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">residual_threshold </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">residual_threshold</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loss </span><span class="s3">== </span><span class="s6">&quot;absolute_error&quot;</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">y</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s1">loss_function </span><span class="s3">= </span><span class="s2">lambda </span><span class="s1">y_true</span><span class="s3">, </span><span class="s1">y_pred</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">y_true </span><span class="s3">- </span><span class="s1">y_pred</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">loss_function </span><span class="s3">= </span><span class="s2">lambda </span><span class="s1">y_true</span><span class="s3">, </span><span class="s1">y_pred</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span>
+                    <span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">y_true </span><span class="s3">- </span><span class="s1">y_pred</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">1</span>
+                <span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loss </span><span class="s3">== </span><span class="s6">&quot;squared_error&quot;</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">y</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s1">loss_function </span><span class="s3">= </span><span class="s2">lambda </span><span class="s1">y_true</span><span class="s3">, </span><span class="s1">y_pred</span><span class="s3">: (</span><span class="s1">y_true </span><span class="s3">- </span><span class="s1">y_pred</span><span class="s3">) ** </span><span class="s4">2</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">loss_function </span><span class="s3">= </span><span class="s2">lambda </span><span class="s1">y_true</span><span class="s3">, </span><span class="s1">y_pred</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span>
+                    <span class="s3">(</span><span class="s1">y_true </span><span class="s3">- </span><span class="s1">y_pred</span><span class="s3">) ** </span><span class="s4">2</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">1</span>
+                <span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">loss</span><span class="s3">):</span>
+            <span class="s1">loss_function </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">loss</span>
+
+        <span class="s1">random_state </span><span class="s3">= </span><span class="s1">check_random_state</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">random_state</span><span class="s3">)</span>
+
+        <span class="s2">try</span><span class="s3">:  </span><span class="s0"># Not all estimator accept a random_state</span>
+            <span class="s1">estimator</span><span class="s3">.</span><span class="s1">set_params</span><span class="s3">(</span><span class="s1">random_state</span><span class="s3">=</span><span class="s1">random_state</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:</span>
+            <span class="s2">pass</span>
+
+        <span class="s1">estimator_fit_has_sample_weight </span><span class="s3">= </span><span class="s1">has_fit_parameter</span><span class="s3">(</span><span class="s1">estimator</span><span class="s3">, </span><span class="s6">&quot;sample_weight&quot;</span><span class="s3">)</span>
+        <span class="s1">estimator_name </span><span class="s3">= </span><span class="s1">type</span><span class="s3">(</span><span class="s1">estimator</span><span class="s3">).</span><span class="s1">__name__</span>
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is not None and not </span><span class="s1">estimator_fit_has_sample_weight</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s6">&quot;%s does not support sample_weight. Sample&quot;</span>
+                <span class="s6">&quot; weights are only used for the calibration&quot;</span>
+                <span class="s6">&quot; itself.&quot; </span><span class="s3">% </span><span class="s1">estimator_name</span>
+            <span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">fit_params</span><span class="s3">[</span><span class="s6">&quot;sample_weight&quot;</span><span class="s3">] = </span><span class="s1">sample_weight</span>
+
+        <span class="s2">if </span><span class="s1">_routing_enabled</span><span class="s3">():</span>
+            <span class="s1">routed_params </span><span class="s3">= </span><span class="s1">process_routing</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s6">&quot;fit&quot;</span><span class="s3">, **</span><span class="s1">fit_params</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">routed_params </span><span class="s3">= </span><span class="s1">Bunch</span><span class="s3">()</span>
+            <span class="s1">routed_params</span><span class="s3">.</span><span class="s1">estimator </span><span class="s3">= </span><span class="s1">Bunch</span><span class="s3">(</span><span class="s1">fit</span><span class="s3">={}, </span><span class="s1">predict</span><span class="s3">={}, </span><span class="s1">score</span><span class="s3">={})</span>
+            <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">sample_weight </span><span class="s3">= </span><span class="s1">_check_sample_weight</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">, </span><span class="s1">X</span><span class="s3">)</span>
+                <span class="s1">routed_params</span><span class="s3">.</span><span class="s1">estimator</span><span class="s3">.</span><span class="s1">fit </span><span class="s3">= {</span><span class="s6">&quot;sample_weight&quot;</span><span class="s3">: </span><span class="s1">sample_weight</span><span class="s3">}</span>
+
+        <span class="s1">n_inliers_best </span><span class="s3">= </span><span class="s4">1</span>
+        <span class="s1">score_best </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+        <span class="s1">inlier_mask_best </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">X_inlier_best </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">y_inlier_best </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">inlier_best_idxs_subset </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_no_inliers_ </span><span class="s3">= </span><span class="s4">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_data_ </span><span class="s3">= </span><span class="s4">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_model_ </span><span class="s3">= </span><span class="s4">0</span>
+
+        <span class="s0"># number of data samples</span>
+        <span class="s1">n_samples </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+        <span class="s1">sample_idxs </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">n_trials_ </span><span class="s3">= </span><span class="s4">0</span>
+        <span class="s1">max_trials </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">max_trials</span>
+        <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">n_trials_ </span><span class="s3">&lt; </span><span class="s1">max_trials</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">n_trials_ </span><span class="s3">+= </span><span class="s4">1</span>
+
+            <span class="s2">if </span><span class="s3">(</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_no_inliers_</span>
+                <span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_data_</span>
+                <span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_model_</span>
+            <span class="s3">) &gt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">max_skips</span><span class="s3">:</span>
+                <span class="s2">break</span>
+
+            <span class="s0"># choose random sample set</span>
+            <span class="s1">subset_idxs </span><span class="s3">= </span><span class="s1">sample_without_replacement</span><span class="s3">(</span>
+                <span class="s1">n_samples</span><span class="s3">, </span><span class="s1">min_samples</span><span class="s3">, </span><span class="s1">random_state</span><span class="s3">=</span><span class="s1">random_state</span>
+            <span class="s3">)</span>
+            <span class="s1">X_subset </span><span class="s3">= </span><span class="s1">X</span><span class="s3">[</span><span class="s1">subset_idxs</span><span class="s3">]</span>
+            <span class="s1">y_subset </span><span class="s3">= </span><span class="s1">y</span><span class="s3">[</span><span class="s1">subset_idxs</span><span class="s3">]</span>
+
+            <span class="s0"># check if random sample set is valid</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_data_valid </span><span class="s2">is not None and not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_data_valid</span><span class="s3">(</span>
+                <span class="s1">X_subset</span><span class="s3">, </span><span class="s1">y_subset</span>
+            <span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_data_ </span><span class="s3">+= </span><span class="s4">1</span>
+                <span class="s2">continue</span>
+
+            <span class="s0"># cut `fit_params` down to `subset_idxs`</span>
+            <span class="s1">fit_params_subset </span><span class="s3">= </span><span class="s1">_check_method_params</span><span class="s3">(</span>
+                <span class="s1">X</span><span class="s3">, </span><span class="s1">params</span><span class="s3">=</span><span class="s1">routed_params</span><span class="s3">.</span><span class="s1">estimator</span><span class="s3">.</span><span class="s1">fit</span><span class="s3">, </span><span class="s1">indices</span><span class="s3">=</span><span class="s1">subset_idxs</span>
+            <span class="s3">)</span>
+
+            <span class="s0"># fit model for current random sample set</span>
+            <span class="s1">estimator</span><span class="s3">.</span><span class="s1">fit</span><span class="s3">(</span><span class="s1">X_subset</span><span class="s3">, </span><span class="s1">y_subset</span><span class="s3">, **</span><span class="s1">fit_params_subset</span><span class="s3">)</span>
+
+            <span class="s0"># check if estimated model is valid</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_model_valid </span><span class="s2">is not None and not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">is_model_valid</span><span class="s3">(</span>
+                <span class="s1">estimator</span><span class="s3">, </span><span class="s1">X_subset</span><span class="s3">, </span><span class="s1">y_subset</span>
+            <span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_model_ </span><span class="s3">+= </span><span class="s4">1</span>
+                <span class="s2">continue</span>
+
+            <span class="s0"># residuals of all data for current random sample model</span>
+            <span class="s1">y_pred </span><span class="s3">= </span><span class="s1">estimator</span><span class="s3">.</span><span class="s1">predict</span><span class="s3">(</span><span class="s1">X</span><span class="s3">)</span>
+            <span class="s1">residuals_subset </span><span class="s3">= </span><span class="s1">loss_function</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">y_pred</span><span class="s3">)</span>
+
+            <span class="s0"># classify data into inliers and outliers</span>
+            <span class="s1">inlier_mask_subset </span><span class="s3">= </span><span class="s1">residuals_subset </span><span class="s3">&lt;= </span><span class="s1">residual_threshold</span>
+            <span class="s1">n_inliers_subset </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">inlier_mask_subset</span><span class="s3">)</span>
+
+            <span class="s0"># less inliers -&gt; skip current random sample</span>
+            <span class="s2">if </span><span class="s1">n_inliers_subset </span><span class="s3">&lt; </span><span class="s1">n_inliers_best</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_no_inliers_ </span><span class="s3">+= </span><span class="s4">1</span>
+                <span class="s2">continue</span>
+
+            <span class="s0"># extract inlier data set</span>
+            <span class="s1">inlier_idxs_subset </span><span class="s3">= </span><span class="s1">sample_idxs</span><span class="s3">[</span><span class="s1">inlier_mask_subset</span><span class="s3">]</span>
+            <span class="s1">X_inlier_subset </span><span class="s3">= </span><span class="s1">X</span><span class="s3">[</span><span class="s1">inlier_idxs_subset</span><span class="s3">]</span>
+            <span class="s1">y_inlier_subset </span><span class="s3">= </span><span class="s1">y</span><span class="s3">[</span><span class="s1">inlier_idxs_subset</span><span class="s3">]</span>
+
+            <span class="s0"># cut `fit_params` down to `inlier_idxs_subset`</span>
+            <span class="s1">score_params_inlier_subset </span><span class="s3">= </span><span class="s1">_check_method_params</span><span class="s3">(</span>
+                <span class="s1">X</span><span class="s3">, </span><span class="s1">params</span><span class="s3">=</span><span class="s1">routed_params</span><span class="s3">.</span><span class="s1">estimator</span><span class="s3">.</span><span class="s1">score</span><span class="s3">, </span><span class="s1">indices</span><span class="s3">=</span><span class="s1">inlier_idxs_subset</span>
+            <span class="s3">)</span>
+
+            <span class="s0"># score of inlier data set</span>
+            <span class="s1">score_subset </span><span class="s3">= </span><span class="s1">estimator</span><span class="s3">.</span><span class="s1">score</span><span class="s3">(</span>
+                <span class="s1">X_inlier_subset</span><span class="s3">,</span>
+                <span class="s1">y_inlier_subset</span><span class="s3">,</span>
+                <span class="s3">**</span><span class="s1">score_params_inlier_subset</span><span class="s3">,</span>
+            <span class="s3">)</span>
+
+            <span class="s0"># same number of inliers but worse score -&gt; skip current random</span>
+            <span class="s0"># sample</span>
+            <span class="s2">if </span><span class="s1">n_inliers_subset </span><span class="s3">== </span><span class="s1">n_inliers_best </span><span class="s2">and </span><span class="s1">score_subset </span><span class="s3">&lt; </span><span class="s1">score_best</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+
+            <span class="s0"># save current random sample as best sample</span>
+            <span class="s1">n_inliers_best </span><span class="s3">= </span><span class="s1">n_inliers_subset</span>
+            <span class="s1">score_best </span><span class="s3">= </span><span class="s1">score_subset</span>
+            <span class="s1">inlier_mask_best </span><span class="s3">= </span><span class="s1">inlier_mask_subset</span>
+            <span class="s1">X_inlier_best </span><span class="s3">= </span><span class="s1">X_inlier_subset</span>
+            <span class="s1">y_inlier_best </span><span class="s3">= </span><span class="s1">y_inlier_subset</span>
+            <span class="s1">inlier_best_idxs_subset </span><span class="s3">= </span><span class="s1">inlier_idxs_subset</span>
+
+            <span class="s1">max_trials </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span>
+                <span class="s1">max_trials</span><span class="s3">,</span>
+                <span class="s1">_dynamic_max_trials</span><span class="s3">(</span>
+                    <span class="s1">n_inliers_best</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">min_samples</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">stop_probability</span>
+                <span class="s3">),</span>
+            <span class="s3">)</span>
+
+            <span class="s0"># break if sufficient number of inliers or score is reached</span>
+            <span class="s2">if </span><span class="s1">n_inliers_best </span><span class="s3">&gt;= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">stop_n_inliers </span><span class="s2">or </span><span class="s1">score_best </span><span class="s3">&gt;= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">stop_score</span><span class="s3">:</span>
+                <span class="s2">break</span>
+
+        <span class="s0"># if none of the iterations met the required criteria</span>
+        <span class="s2">if </span><span class="s1">inlier_mask_best </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s3">(</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_no_inliers_</span>
+                <span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_data_</span>
+                <span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_model_</span>
+            <span class="s3">) &gt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">max_skips</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                    <span class="s6">&quot;RANSAC skipped more iterations than `max_skips` without&quot;</span>
+                    <span class="s6">&quot; finding a valid consensus set. Iterations were skipped&quot;</span>
+                    <span class="s6">&quot; because each randomly chosen sub-sample failed the&quot;</span>
+                    <span class="s6">&quot; passing criteria. See estimator attributes for&quot;</span>
+                    <span class="s6">&quot; diagnostics (n_skips*).&quot;</span>
+                <span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                    <span class="s6">&quot;RANSAC could not find a valid consensus set. All&quot;</span>
+                    <span class="s6">&quot; `max_trials` iterations were skipped because each&quot;</span>
+                    <span class="s6">&quot; randomly chosen sub-sample failed the passing criteria.&quot;</span>
+                    <span class="s6">&quot; See estimator attributes for diagnostics (n_skips*).&quot;</span>
+                <span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s3">(</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_no_inliers_</span>
+                <span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_data_</span>
+                <span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">n_skips_invalid_model_</span>
+            <span class="s3">) &gt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">max_skips</span><span class="s3">:</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                    <span class="s3">(</span>
+                        <span class="s6">&quot;RANSAC found a valid consensus set but exited&quot;</span>
+                        <span class="s6">&quot; early due to skipping more iterations than&quot;</span>
+                        <span class="s6">&quot; `max_skips`. See estimator attributes for&quot;</span>
+                        <span class="s6">&quot; diagnostics (n_skips*).&quot;</span>
+                    <span class="s3">),</span>
+                    <span class="s1">ConvergenceWarning</span><span class="s3">,</span>
+                <span class="s3">)</span>
+
+        <span class="s0"># estimate final model using all inliers</span>
+        <span class="s1">fit_params_best_idxs_subset </span><span class="s3">= </span><span class="s1">_check_method_params</span><span class="s3">(</span>
+            <span class="s1">X</span><span class="s3">, </span><span class="s1">params</span><span class="s3">=</span><span class="s1">routed_params</span><span class="s3">.</span><span class="s1">estimator</span><span class="s3">.</span><span class="s1">fit</span><span class="s3">, </span><span class="s1">indices</span><span class="s3">=</span><span class="s1">inlier_best_idxs_subset</span>
+        <span class="s3">)</span>
+
+        <span class="s1">estimator</span><span class="s3">.</span><span class="s1">fit</span><span class="s3">(</span><span class="s1">X_inlier_best</span><span class="s3">, </span><span class="s1">y_inlier_best</span><span class="s3">, **</span><span class="s1">fit_params_best_idxs_subset</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">estimator_ </span><span class="s3">= </span><span class="s1">estimator</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">inlier_mask_ </span><span class="s3">= </span><span class="s1">inlier_mask_best</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">predict</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, **</span><span class="s1">params</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Predict using the estimated model. 
+ 
+        This is a wrapper for `estimator_.predict(X)`. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like or sparse matrix} of shape (n_samples, n_features) 
+            Input data. 
+ 
+        **params : dict 
+            Parameters routed to the `predict` method of the sub-estimator via 
+            the metadata routing API. 
+ 
+            .. versionadded:: 1.5 
+ 
+                Only available if 
+                `sklearn.set_config(enable_metadata_routing=True)` is set. See 
+                :ref:`Metadata Routing User Guide &lt;metadata_routing&gt;` for more 
+                details. 
+ 
+        Returns 
+        ------- 
+        y : array, shape = [n_samples] or [n_samples, n_targets] 
+            Returns predicted values. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+        <span class="s1">X </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_validate_data</span><span class="s3">(</span>
+            <span class="s1">X</span><span class="s3">,</span>
+            <span class="s1">force_all_finite</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+            <span class="s1">accept_sparse</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+            <span class="s1">reset</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s1">_raise_for_params</span><span class="s3">(</span><span class="s1">params</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s6">&quot;predict&quot;</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">_routing_enabled</span><span class="s3">():</span>
+            <span class="s1">predict_params </span><span class="s3">= </span><span class="s1">process_routing</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s6">&quot;predict&quot;</span><span class="s3">, **</span><span class="s1">params</span><span class="s3">).</span><span class="s1">estimator</span><span class="s3">[</span>
+                <span class="s6">&quot;predict&quot;</span>
+            <span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">predict_params </span><span class="s3">= {}</span>
+
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">estimator_</span><span class="s3">.</span><span class="s1">predict</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, **</span><span class="s1">predict_params</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">score</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, **</span><span class="s1">params</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Return the score of the prediction. 
+ 
+        This is a wrapper for `estimator_.score(X, y)`. 
+ 
+        Parameters 
+        ---------- 
+        X : (array-like or sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target values. 
+ 
+        **params : dict 
+            Parameters routed to the `score` method of the sub-estimator via 
+            the metadata routing API. 
+ 
+            .. versionadded:: 1.5 
+ 
+                Only available if 
+                `sklearn.set_config(enable_metadata_routing=True)` is set. See 
+                :ref:`Metadata Routing User Guide &lt;metadata_routing&gt;` for more 
+                details. 
+ 
+        Returns 
+        ------- 
+        z : float 
+            Score of the prediction. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+        <span class="s1">X </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_validate_data</span><span class="s3">(</span>
+            <span class="s1">X</span><span class="s3">,</span>
+            <span class="s1">force_all_finite</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+            <span class="s1">accept_sparse</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+            <span class="s1">reset</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+        <span class="s1">_raise_for_params</span><span class="s3">(</span><span class="s1">params</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, </span><span class="s6">&quot;score&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">_routing_enabled</span><span class="s3">():</span>
+            <span class="s1">score_params </span><span class="s3">= </span><span class="s1">process_routing</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s6">&quot;score&quot;</span><span class="s3">, **</span><span class="s1">params</span><span class="s3">).</span><span class="s1">estimator</span><span class="s3">[</span><span class="s6">&quot;score&quot;</span><span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">score_params </span><span class="s3">= {}</span>
+
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">estimator_</span><span class="s3">.</span><span class="s1">score</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, **</span><span class="s1">score_params</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_metadata_routing</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Get metadata routing of this object. 
+ 
+        Please check :ref:`User Guide &lt;metadata_routing&gt;` on how the routing 
+        mechanism works. 
+ 
+        .. versionadded:: 1.5 
+ 
+        Returns 
+        ------- 
+        routing : MetadataRouter 
+            A :class:`~sklearn.utils.metadata_routing.MetadataRouter` encapsulating 
+            routing information. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">router </span><span class="s3">= </span><span class="s1">MetadataRouter</span><span class="s3">(</span><span class="s1">owner</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">).</span><span class="s1">add</span><span class="s3">(</span>
+            <span class="s1">estimator</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">estimator</span><span class="s3">,</span>
+            <span class="s1">method_mapping</span><span class="s3">=</span><span class="s1">MethodMapping</span><span class="s3">()</span>
+            <span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">caller</span><span class="s3">=</span><span class="s6">&quot;fit&quot;</span><span class="s3">, </span><span class="s1">callee</span><span class="s3">=</span><span class="s6">&quot;fit&quot;</span><span class="s3">)</span>
+            <span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">caller</span><span class="s3">=</span><span class="s6">&quot;fit&quot;</span><span class="s3">, </span><span class="s1">callee</span><span class="s3">=</span><span class="s6">&quot;score&quot;</span><span class="s3">)</span>
+            <span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">caller</span><span class="s3">=</span><span class="s6">&quot;score&quot;</span><span class="s3">, </span><span class="s1">callee</span><span class="s3">=</span><span class="s6">&quot;score&quot;</span><span class="s3">)</span>
+            <span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">caller</span><span class="s3">=</span><span class="s6">&quot;predict&quot;</span><span class="s3">, </span><span class="s1">callee</span><span class="s3">=</span><span class="s6">&quot;predict&quot;</span><span class="s3">),</span>
+        <span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">router</span>
+
+    <span class="s2">def </span><span class="s1">_more_tags</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">{</span>
+            <span class="s6">&quot;_xfail_checks&quot;</span><span class="s3">: {</span>
+                <span class="s6">&quot;check_sample_weights_invariance&quot;</span><span class="s3">: (</span>
+                    <span class="s6">&quot;zero sample_weight is not equivalent to removing samples&quot;</span>
+                <span class="s3">),</span>
+            <span class="s3">}</span>
+        <span class="s3">}</span>
+</pre>
+</body>
+</html>

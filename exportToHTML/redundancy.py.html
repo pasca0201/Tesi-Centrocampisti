@@ -1,0 +1,278 @@
+<html>
+<head>
+<title>redundancy.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+redundancy.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># This file is part of Patsy</span>
+<span class="s0"># Copyright (C) 2011 Nathaniel Smith &lt;njs@pobox.com&gt;</span>
+<span class="s0"># See file LICENSE.txt for license information.</span>
+
+<span class="s0"># This file has the code that figures out how each factor in some given Term</span>
+<span class="s0"># should be coded. This is complicated by dealing with models with categorical</span>
+<span class="s0"># factors like:</span>
+<span class="s0">#   1 + a + a:b</span>
+<span class="s0"># then technically 'a' (which represents the space of vectors that can be</span>
+<span class="s0"># produced as linear combinations of the dummy coding of the levels of the</span>
+<span class="s0"># factor a) is collinear with the intercept, and 'a:b' (which represents the</span>
+<span class="s0"># space of vectors that can be produced as linear combinations of the dummy</span>
+<span class="s0"># coding *of a new factor whose levels are the cartesian product of a and b)</span>
+<span class="s0"># is collinear with both 'a' and the intercept.</span>
+<span class="s0">#</span>
+<span class="s0"># In such a case, the rule is that we find some way to code each term so that</span>
+<span class="s0"># the full space of vectors that it represents *is present in the model* BUT</span>
+<span class="s0"># there is no collinearity between the different terms. In effect, we have to</span>
+<span class="s0"># choose a set of vectors that spans everything that that term wants to span,</span>
+<span class="s0"># *except* that part of the vector space which was already spanned by earlier</span>
+<span class="s0"># terms.</span>
+
+<span class="s0"># How? We replace each term with the set of &quot;subterms&quot; that it covers, like</span>
+<span class="s0"># so:</span>
+<span class="s0">#   1 -&gt; ()</span>
+<span class="s0">#   a -&gt; (), a-</span>
+<span class="s0">#   a:b -&gt; (), a-, b-, a-:b-</span>
+<span class="s0"># where &quot;-&quot; means &quot;coded so as not to span the intercept&quot;. So that example</span>
+<span class="s0"># above expands to</span>
+<span class="s0">#   [()] + [() + a-] + [() + a- + b- + a-:b-]</span>
+<span class="s0"># so we go through from left to right, and for each term we:</span>
+<span class="s0">#   1) toss out all the subterms that have already been used (this is a simple</span>
+<span class="s0">#      equality test, no magic)</span>
+<span class="s0">#   2) simplify the terms that are left, according to rules like</span>
+<span class="s0">#        () + a- = a+</span>
+<span class="s0">#      (here + means, &quot;coded to span the intercept&quot;)</span>
+<span class="s0">#   3) use the resulting subterm list as our coding for this term!</span>
+<span class="s0"># So in the above, we go:</span>
+<span class="s0">#   (): stays the same, coded as intercept</span>
+<span class="s0">#   () + a-: reduced to just a-, which is what we code</span>
+<span class="s0">#   () + a- + b- + a-:b-: reduced to b- + a-:b-, which is simplified to a+:b-.</span>
+
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">print_function</span>
+
+<span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">util </span><span class="s2">import </span><span class="s1">no_pickling</span>
+
+<span class="s0"># This should really be a named tuple, but those don't exist until Python</span>
+<span class="s0"># 2.6...</span>
+<span class="s2">class </span><span class="s1">_ExpandedFactor</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot;A factor, with an additional annotation for whether it is coded 
+    full-rank (includes_intercept=True) or not. 
+ 
+    These objects are treated as immutable.&quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">includes_intercept</span><span class="s3">, </span><span class="s1">factor</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">includes_intercept </span><span class="s3">= </span><span class="s1">includes_intercept</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">factor </span><span class="s3">= </span><span class="s1">factor</span>
+
+    <span class="s2">def </span><span class="s1">__hash__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">hash</span><span class="s3">((</span><span class="s1">_ExpandedFactor</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">includes_intercept</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">__eq__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">other</span><span class="s3">, </span><span class="s1">_ExpandedFactor</span><span class="s3">)</span>
+                <span class="s2">and </span><span class="s1">other</span><span class="s3">.</span><span class="s1">includes_intercept </span><span class="s3">== </span><span class="s1">self</span><span class="s3">.</span><span class="s1">includes_intercept</span>
+                <span class="s2">and </span><span class="s1">other</span><span class="s3">.</span><span class="s1">factor </span><span class="s3">== </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__ne__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s2">return not </span><span class="s1">self </span><span class="s3">== </span><span class="s1">other</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">includes_intercept</span><span class="s3">:</span>
+            <span class="s1">suffix </span><span class="s3">= </span><span class="s5">&quot;+&quot;</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">suffix </span><span class="s3">= </span><span class="s5">&quot;-&quot;</span>
+        <span class="s2">return </span><span class="s5">&quot;%r%s&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor</span><span class="s3">, </span><span class="s1">suffix</span><span class="s3">)</span>
+
+    <span class="s1">__getstate__ </span><span class="s3">= </span><span class="s1">no_pickling</span>
+
+<span class="s2">class </span><span class="s1">_Subterm</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s4">&quot;Also immutable.&quot;</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">efactors</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">efactors </span><span class="s3">= </span><span class="s1">frozenset</span><span class="s3">(</span><span class="s1">efactors</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">can_absorb</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s0"># returns True if 'self' is like a-:b-, and 'other' is like a-</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">) - </span><span class="s1">len</span><span class="s3">(</span><span class="s1">other</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">) == </span><span class="s6">1</span>
+                <span class="s2">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">.</span><span class="s1">issuperset</span><span class="s3">(</span><span class="s1">other</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">absorb</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s1">diff </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">.</span><span class="s1">difference</span><span class="s3">(</span><span class="s1">other</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">diff</span><span class="s3">) == </span><span class="s6">1</span>
+        <span class="s1">efactor </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">diff</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">assert not </span><span class="s1">efactor</span><span class="s3">.</span><span class="s1">includes_intercept</span>
+        <span class="s1">new_factors </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">other</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">)</span>
+        <span class="s1">new_factors</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">_ExpandedFactor</span><span class="s3">(</span><span class="s2">True</span><span class="s3">, </span><span class="s1">efactor</span><span class="s3">.</span><span class="s1">factor</span><span class="s3">))</span>
+        <span class="s2">return </span><span class="s1">_Subterm</span><span class="s3">(</span><span class="s1">new_factors</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__hash__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">hash</span><span class="s3">((</span><span class="s1">_Subterm</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">__eq__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">other</span><span class="s3">, </span><span class="s1">_Subterm</span><span class="s3">)</span>
+                <span class="s2">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">efactors </span><span class="s3">== </span><span class="s1">self</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__ne__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s2">return not </span><span class="s1">self </span><span class="s3">== </span><span class="s1">other</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s5">&quot;%s(%r)&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">))</span>
+
+    <span class="s1">__getstate__ </span><span class="s3">= </span><span class="s1">no_pickling</span>
+
+<span class="s0"># For testing: takes a shorthand description of a list of subterms like</span>
+<span class="s0">#   [(), (&quot;a-&quot;,), (&quot;a-&quot;, &quot;b+&quot;)]</span>
+<span class="s0"># and expands it into a list of _Subterm and _ExpandedFactor objects.</span>
+<span class="s2">def </span><span class="s1">_expand_test_abbrevs</span><span class="s3">(</span><span class="s1">short_subterms</span><span class="s3">):</span>
+    <span class="s1">subterms </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">subterm </span><span class="s2">in </span><span class="s1">short_subterms</span><span class="s3">:</span>
+        <span class="s1">factors </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">factor_name </span><span class="s2">in </span><span class="s1">subterm</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">factor_name</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] </span><span class="s2">in </span><span class="s3">(</span><span class="s5">&quot;+&quot;</span><span class="s3">, </span><span class="s5">&quot;-&quot;</span><span class="s3">)</span>
+            <span class="s1">factors</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_ExpandedFactor</span><span class="s3">(</span><span class="s1">factor_name</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] == </span><span class="s5">&quot;+&quot;</span><span class="s3">,</span>
+                                           <span class="s1">factor_name</span><span class="s3">[:-</span><span class="s6">1</span><span class="s3">]))</span>
+        <span class="s1">subterms</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_Subterm</span><span class="s3">(</span><span class="s1">factors</span><span class="s3">))</span>
+    <span class="s2">return </span><span class="s1">subterms</span>
+
+<span class="s2">def </span><span class="s1">test__Subterm</span><span class="s3">():</span>
+    <span class="s1">s_ab </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">([[</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b-&quot;</span><span class="s3">]])[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">s_abc </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">([[</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b-&quot;</span><span class="s3">, </span><span class="s5">&quot;c-&quot;</span><span class="s3">]])[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">s_null </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">([[]])[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">s_cd </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">([[</span><span class="s5">&quot;c-&quot;</span><span class="s3">, </span><span class="s5">&quot;d-&quot;</span><span class="s3">]])[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">s_a </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">([[</span><span class="s5">&quot;a-&quot;</span><span class="s3">]])[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">s_ap </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">([[</span><span class="s5">&quot;a+&quot;</span><span class="s3">]])[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">s_abp </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">([[</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b+&quot;</span><span class="s3">]])[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s2">for </span><span class="s1">bad </span><span class="s2">in </span><span class="s1">s_abc</span><span class="s3">, </span><span class="s1">s_null</span><span class="s3">, </span><span class="s1">s_cd</span><span class="s3">, </span><span class="s1">s_ap</span><span class="s3">, </span><span class="s1">s_abp</span><span class="s3">:</span>
+        <span class="s2">assert not </span><span class="s1">s_ab</span><span class="s3">.</span><span class="s1">can_absorb</span><span class="s3">(</span><span class="s1">bad</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">s_ab</span><span class="s3">.</span><span class="s1">can_absorb</span><span class="s3">(</span><span class="s1">s_a</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">s_ab</span><span class="s3">.</span><span class="s1">absorb</span><span class="s3">(</span><span class="s1">s_a</span><span class="s3">) == </span><span class="s1">s_abp</span>
+
+<span class="s0"># Importantly, this preserves the order of the input. Both the items inside</span>
+<span class="s0"># each subset are in the order they were in the original tuple, and the tuples</span>
+<span class="s0"># are emitted so that they're sorted with respect to their elements position</span>
+<span class="s0"># in the original tuple.</span>
+<span class="s2">def </span><span class="s1">_subsets_sorted</span><span class="s3">(</span><span class="s1">tupl</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">helper</span><span class="s3">(</span><span class="s1">seq</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">seq</span><span class="s3">:</span>
+            <span class="s2">yield </span><span class="s3">()</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">obj </span><span class="s3">= </span><span class="s1">seq</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s2">for </span><span class="s1">subset </span><span class="s2">in </span><span class="s1">_subsets_sorted</span><span class="s3">(</span><span class="s1">seq</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]):</span>
+                <span class="s2">yield </span><span class="s1">subset</span>
+                <span class="s2">yield </span><span class="s3">(</span><span class="s1">obj</span><span class="s3">,) + </span><span class="s1">subset</span>
+    <span class="s0"># Transform each obj -&gt; (idx, obj) tuple, so that we can later sort them</span>
+    <span class="s0"># by their position in the original list.</span>
+    <span class="s1">expanded </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">tupl</span><span class="s3">))</span>
+    <span class="s1">expanded_subsets </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">helper</span><span class="s3">(</span><span class="s1">expanded</span><span class="s3">))</span>
+    <span class="s0"># This exploits Python's stable sort: we want short before long, and ties</span>
+    <span class="s0"># broken by natural ordering on the (idx, obj) entries in each subset. So</span>
+    <span class="s0"># we sort by the latter first, then by the former.</span>
+    <span class="s1">expanded_subsets</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">()</span>
+    <span class="s1">expanded_subsets</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">(</span><span class="s1">key</span><span class="s3">=</span><span class="s1">len</span><span class="s3">)</span>
+    <span class="s0"># And finally, we strip off the idx's:</span>
+    <span class="s2">for </span><span class="s1">subset </span><span class="s2">in </span><span class="s1">expanded_subsets</span><span class="s3">:</span>
+        <span class="s2">yield </span><span class="s1">tuple</span><span class="s3">([</span><span class="s1">obj </span><span class="s2">for </span><span class="s3">(</span><span class="s1">idx</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">) </span><span class="s2">in </span><span class="s1">subset</span><span class="s3">])</span>
+    
+<span class="s2">def </span><span class="s1">test__subsets_sorted</span><span class="s3">():</span>
+    <span class="s2">assert </span><span class="s1">list</span><span class="s3">(</span><span class="s1">_subsets_sorted</span><span class="s3">((</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">))) == [(), (</span><span class="s6">1</span><span class="s3">,), (</span><span class="s6">2</span><span class="s3">,), (</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)]</span>
+    <span class="s2">assert </span><span class="s3">(</span><span class="s1">list</span><span class="s3">(</span><span class="s1">_subsets_sorted</span><span class="s3">((</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)))</span>
+            <span class="s3">== [(), (</span><span class="s6">1</span><span class="s3">,), (</span><span class="s6">2</span><span class="s3">,), (</span><span class="s6">3</span><span class="s3">,), (</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">), (</span><span class="s6">1</span><span class="s3">, </span><span class="s6">3</span><span class="s3">), (</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">), (</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)])</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">list</span><span class="s3">(</span><span class="s1">_subsets_sorted</span><span class="s3">(</span><span class="s1">range</span><span class="s3">(</span><span class="s6">5</span><span class="s3">)))) == </span><span class="s6">2 </span><span class="s3">** </span><span class="s6">5</span>
+
+<span class="s2">def </span><span class="s1">_simplify_one_subterm</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">):</span>
+    <span class="s0"># We simplify greedily from left to right.</span>
+    <span class="s0"># Returns True if succeeded, False otherwise</span>
+    <span class="s2">for </span><span class="s1">short_i</span><span class="s3">, </span><span class="s1">short_subterm </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">long_i</span><span class="s3">, </span><span class="s1">long_subterm </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">[</span><span class="s1">short_i </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">:]):</span>
+            <span class="s2">if </span><span class="s1">long_subterm</span><span class="s3">.</span><span class="s1">can_absorb</span><span class="s3">(</span><span class="s1">short_subterm</span><span class="s3">):</span>
+                <span class="s1">new_subterm </span><span class="s3">= </span><span class="s1">long_subterm</span><span class="s3">.</span><span class="s1">absorb</span><span class="s3">(</span><span class="s1">short_subterm</span><span class="s3">)</span>
+                <span class="s1">subterms</span><span class="s3">[</span><span class="s1">short_i </span><span class="s3">+ </span><span class="s6">1 </span><span class="s3">+ </span><span class="s1">long_i</span><span class="s3">] = </span><span class="s1">new_subterm</span>
+                <span class="s1">subterms</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">short_i</span><span class="s3">)</span>
+                <span class="s2">return True</span>
+    <span class="s2">return False</span>
+            
+<span class="s2">def </span><span class="s1">_simplify_subterms</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">):</span>
+    <span class="s2">while </span><span class="s1">_simplify_one_subterm</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+<span class="s2">def </span><span class="s1">test__simplify_subterms</span><span class="s3">():</span>
+    <span class="s2">def </span><span class="s1">t</span><span class="s3">(</span><span class="s1">given</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">):</span>
+        <span class="s1">given </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">(</span><span class="s1">given</span><span class="s3">)</span>
+        <span class="s1">expected </span><span class="s3">= </span><span class="s1">_expand_test_abbrevs</span><span class="s3">(</span><span class="s1">expected</span><span class="s3">)</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;testing if:&quot;</span><span class="s3">, </span><span class="s1">given</span><span class="s3">, </span><span class="s5">&quot;-&gt;&quot;</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">)</span>
+        <span class="s1">_simplify_subterms</span><span class="s3">(</span><span class="s1">given</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">given </span><span class="s3">== </span><span class="s1">expected</span>
+    <span class="s1">t</span><span class="s3">([(</span><span class="s5">&quot;a-&quot;</span><span class="s3">,)], [(</span><span class="s5">&quot;a-&quot;</span><span class="s3">,)])</span>
+    <span class="s1">t</span><span class="s3">([(), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">,)], [(</span><span class="s5">&quot;a+&quot;</span><span class="s3">,)])</span>
+    <span class="s1">t</span><span class="s3">([(), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">,), (</span><span class="s5">&quot;b-&quot;</span><span class="s3">,), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b-&quot;</span><span class="s3">)], [(</span><span class="s5">&quot;a+&quot;</span><span class="s3">, </span><span class="s5">&quot;b+&quot;</span><span class="s3">)])</span>
+    <span class="s1">t</span><span class="s3">([(), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">,), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b-&quot;</span><span class="s3">)], [(</span><span class="s5">&quot;a+&quot;</span><span class="s3">,), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b-&quot;</span><span class="s3">)])</span>
+    <span class="s1">t</span><span class="s3">([(</span><span class="s5">&quot;a-&quot;</span><span class="s3">,), (</span><span class="s5">&quot;b-&quot;</span><span class="s3">,), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b-&quot;</span><span class="s3">)], [(</span><span class="s5">&quot;b-&quot;</span><span class="s3">,), (</span><span class="s5">&quot;a-&quot;</span><span class="s3">, </span><span class="s5">&quot;b+&quot;</span><span class="s3">)])</span>
+
+<span class="s0"># 'term' is a Term</span>
+<span class="s0"># 'numeric_factors' is any set-like object which lists the</span>
+<span class="s0">#   numeric/non-categorical factors in this term. Such factors are just</span>
+<span class="s0">#   ignored by this routine.</span>
+<span class="s0"># 'used_subterms' is a set which records which subterms have previously been</span>
+<span class="s0">#   used. E.g., a:b has subterms (), a, b, a:b, and if we're processing</span>
+<span class="s0">#    y ~ a + a:b</span>
+<span class="s0">#   then by the time we reach a:b, the () and a subterms will have already</span>
+<span class="s0">#   been used. This is an in/out argument, and should be treated as opaque by</span>
+<span class="s0">#   callers -- really it is a way for multiple invocations of this routine to</span>
+<span class="s0">#   talk to each other. Each time it is called, this routine adds the subterms</span>
+<span class="s0">#   of each factor to this set in place. So the first time this routine is</span>
+<span class="s0">#   called, pass in an empty set, and then just keep passing the same set to</span>
+<span class="s0">#   any future calls.</span>
+<span class="s0"># Returns: a list of dicts. Each dict maps from factors to booleans. The</span>
+<span class="s0"># coding for the given term should use a full-rank contrast for those factors</span>
+<span class="s0"># which map to True, a (n-1)-rank contrast for those factors which map to</span>
+<span class="s0"># False, and any factors which are not mentioned are numeric and should be</span>
+<span class="s0"># added back in. These dicts should add columns to the design matrix from left</span>
+<span class="s0"># to right.</span>
+<span class="s2">def </span><span class="s1">pick_contrasts_for_term</span><span class="s3">(</span><span class="s1">term</span><span class="s3">, </span><span class="s1">numeric_factors</span><span class="s3">, </span><span class="s1">used_subterms</span><span class="s3">):</span>
+    <span class="s1">categorical_factors </span><span class="s3">= [</span><span class="s1">f </span><span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">term</span><span class="s3">.</span><span class="s1">factors </span><span class="s2">if </span><span class="s1">f </span><span class="s2">not in </span><span class="s1">numeric_factors</span><span class="s3">]</span>
+    <span class="s0"># Converts a term into an expanded list of subterms like:</span>
+    <span class="s0">#   a:b  -&gt;  1 + a- + b- + a-:b-</span>
+    <span class="s0"># and discards the ones that have already been used.</span>
+    <span class="s1">subterms </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">subset </span><span class="s2">in </span><span class="s1">_subsets_sorted</span><span class="s3">(</span><span class="s1">categorical_factors</span><span class="s3">):</span>
+        <span class="s1">subterm </span><span class="s3">= </span><span class="s1">_Subterm</span><span class="s3">([</span><span class="s1">_ExpandedFactor</span><span class="s3">(</span><span class="s2">False</span><span class="s3">, </span><span class="s1">f</span><span class="s3">) </span><span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">subset</span><span class="s3">])</span>
+        <span class="s2">if </span><span class="s1">subterm </span><span class="s2">not in </span><span class="s1">used_subterms</span><span class="s3">:</span>
+            <span class="s1">subterms</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">subterm</span><span class="s3">)</span>
+    <span class="s1">used_subterms</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">)</span>
+    <span class="s1">_simplify_subterms</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">)</span>
+    <span class="s1">factor_codings </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">subterm </span><span class="s2">in </span><span class="s1">subterms</span><span class="s3">:</span>
+        <span class="s1">factor_coding </span><span class="s3">= {}</span>
+        <span class="s2">for </span><span class="s1">expanded </span><span class="s2">in </span><span class="s1">subterm</span><span class="s3">.</span><span class="s1">efactors</span><span class="s3">:</span>
+            <span class="s1">factor_coding</span><span class="s3">[</span><span class="s1">expanded</span><span class="s3">.</span><span class="s1">factor</span><span class="s3">] = </span><span class="s1">expanded</span><span class="s3">.</span><span class="s1">includes_intercept</span>
+        <span class="s1">factor_codings</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">factor_coding</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">factor_codings</span>
+
+<span class="s2">def </span><span class="s1">test_pick_contrasts_for_term</span><span class="s3">():</span>
+    <span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">desc </span><span class="s2">import </span><span class="s1">Term</span>
+    <span class="s1">used </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">codings </span><span class="s3">= </span><span class="s1">pick_contrasts_for_term</span><span class="s3">(</span><span class="s1">Term</span><span class="s3">([]), </span><span class="s1">set</span><span class="s3">(), </span><span class="s1">used</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">codings </span><span class="s3">== [{}]</span>
+    <span class="s1">codings </span><span class="s3">= </span><span class="s1">pick_contrasts_for_term</span><span class="s3">(</span><span class="s1">Term</span><span class="s3">([</span><span class="s5">&quot;a&quot;</span><span class="s3">, </span><span class="s5">&quot;x&quot;</span><span class="s3">]), </span><span class="s1">set</span><span class="s3">([</span><span class="s5">&quot;x&quot;</span><span class="s3">]), </span><span class="s1">used</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">codings </span><span class="s3">== [{</span><span class="s5">&quot;a&quot;</span><span class="s3">: </span><span class="s2">False</span><span class="s3">}]</span>
+    <span class="s1">codings </span><span class="s3">= </span><span class="s1">pick_contrasts_for_term</span><span class="s3">(</span><span class="s1">Term</span><span class="s3">([</span><span class="s5">&quot;a&quot;</span><span class="s3">, </span><span class="s5">&quot;b&quot;</span><span class="s3">]), </span><span class="s1">set</span><span class="s3">(), </span><span class="s1">used</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">codings </span><span class="s3">== [{</span><span class="s5">&quot;a&quot;</span><span class="s3">: </span><span class="s2">True</span><span class="s3">, </span><span class="s5">&quot;b&quot;</span><span class="s3">: </span><span class="s2">False</span><span class="s3">}]</span>
+    <span class="s1">used_snapshot </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">used</span><span class="s3">)</span>
+    <span class="s1">codings </span><span class="s3">= </span><span class="s1">pick_contrasts_for_term</span><span class="s3">(</span><span class="s1">Term</span><span class="s3">([</span><span class="s5">&quot;c&quot;</span><span class="s3">, </span><span class="s5">&quot;d&quot;</span><span class="s3">]), </span><span class="s1">set</span><span class="s3">(), </span><span class="s1">used</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">codings </span><span class="s3">== [{</span><span class="s5">&quot;d&quot;</span><span class="s3">: </span><span class="s2">False</span><span class="s3">}, {</span><span class="s5">&quot;c&quot;</span><span class="s3">: </span><span class="s2">False</span><span class="s3">, </span><span class="s5">&quot;d&quot;</span><span class="s3">: </span><span class="s2">True</span><span class="s3">}]</span>
+    <span class="s0"># Do it again backwards, to make sure we're deterministic with respect to</span>
+    <span class="s0"># order:</span>
+    <span class="s1">codings </span><span class="s3">= </span><span class="s1">pick_contrasts_for_term</span><span class="s3">(</span><span class="s1">Term</span><span class="s3">([</span><span class="s5">&quot;d&quot;</span><span class="s3">, </span><span class="s5">&quot;c&quot;</span><span class="s3">]), </span><span class="s1">set</span><span class="s3">(), </span><span class="s1">used_snapshot</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">codings </span><span class="s3">== [{</span><span class="s5">&quot;c&quot;</span><span class="s3">: </span><span class="s2">False</span><span class="s3">}, {</span><span class="s5">&quot;c&quot;</span><span class="s3">: </span><span class="s2">True</span><span class="s3">, </span><span class="s5">&quot;d&quot;</span><span class="s3">: </span><span class="s2">False</span><span class="s3">}]</span>
+</pre>
+</body>
+</html>

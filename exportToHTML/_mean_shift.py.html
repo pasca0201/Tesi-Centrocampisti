@@ -1,0 +1,601 @@
+<html>
+<head>
+<title>_mean_shift.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_mean_shift.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Mean shift clustering algorithm. 
+ 
+Mean shift clustering aims to discover *blobs* in a smooth density of 
+samples. It is a centroid based algorithm, which works by updating candidates 
+for centroids to be the mean of the points within a given region. These 
+candidates are then filtered in a post-processing stage to eliminate 
+near-duplicates to form the final set of centroids. 
+ 
+Seeding is performed using a binning technique for scalability. 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Authors: Conrad Lee &lt;conradlee@gmail.com&gt;</span>
+<span class="s2">#          Alexandre Gramfort &lt;alexandre.gramfort@inria.fr&gt;</span>
+<span class="s2">#          Gael Varoquaux &lt;gael.varoquaux@normalesup.org&gt;</span>
+<span class="s2">#          Martino Sorbaro &lt;martino.sorbaro@ed.ac.uk&gt;</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">collections </span><span class="s3">import </span><span class="s1">defaultdict</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s4">..</span><span class="s1">_config </span><span class="s3">import </span><span class="s1">config_context</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">base </span><span class="s3">import </span><span class="s1">BaseEstimator</span><span class="s4">, </span><span class="s1">ClusterMixin</span><span class="s4">, </span><span class="s1">_fit_context</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">metrics</span><span class="s4">.</span><span class="s1">pairwise </span><span class="s3">import </span><span class="s1">pairwise_distances_argmin</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">neighbors </span><span class="s3">import </span><span class="s1">NearestNeighbors</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils </span><span class="s3">import </span><span class="s1">check_array</span><span class="s4">, </span><span class="s1">check_random_state</span><span class="s4">, </span><span class="s1">gen_batches</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s1">Interval</span><span class="s4">, </span><span class="s1">validate_params</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">parallel </span><span class="s3">import </span><span class="s1">Parallel</span><span class="s4">, </span><span class="s1">delayed</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">validation </span><span class="s3">import </span><span class="s1">check_is_fitted</span>
+
+
+<span class="s4">@</span><span class="s1">validate_params</span><span class="s4">(</span>
+    <span class="s4">{</span>
+        <span class="s5">&quot;X&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;quantile&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;both&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;n_samples&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;random_state&quot;</span><span class="s4">: [</span><span class="s5">&quot;random_state&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;n_jobs&quot;</span><span class="s4">: [</span><span class="s1">Integral</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+    <span class="s4">},</span>
+    <span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">def </span><span class="s1">estimate_bandwidth</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, *, </span><span class="s1">quantile</span><span class="s4">=</span><span class="s6">0.3</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Estimate the bandwidth to use with the mean-shift algorithm. 
+ 
+    This function takes time at least quadratic in `n_samples`. For large 
+    datasets, it is wise to subsample by setting `n_samples`. Alternatively, 
+    the parameter `bandwidth` can be set to a small value without estimating 
+    it. 
+ 
+    Parameters 
+    ---------- 
+    X : array-like of shape (n_samples, n_features) 
+        Input points. 
+ 
+    quantile : float, default=0.3 
+        Should be between [0, 1] 
+        0.5 means that the median of all pairwise distances is used. 
+ 
+    n_samples : int, default=None 
+        The number of samples to use. If not given, all samples are used. 
+ 
+    random_state : int, RandomState instance, default=None 
+        The generator used to randomly select the samples from input points 
+        for bandwidth estimation. Use an int to make the randomness 
+        deterministic. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+    n_jobs : int, default=None 
+        The number of parallel jobs to run for neighbors search. 
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context. 
+        ``-1`` means using all processors. See :term:`Glossary &lt;n_jobs&gt;` 
+        for more details. 
+ 
+    Returns 
+    ------- 
+    bandwidth : float 
+        The bandwidth parameter. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from sklearn.cluster import estimate_bandwidth 
+    &gt;&gt;&gt; X = np.array([[1, 1], [2, 1], [1, 0], 
+    ...               [4, 7], [3, 5], [3, 6]]) 
+    &gt;&gt;&gt; estimate_bandwidth(X, quantile=0.5) 
+    np.float64(1.61...) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">X </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+    <span class="s1">random_state </span><span class="s4">= </span><span class="s1">check_random_state</span><span class="s4">(</span><span class="s1">random_state</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">n_samples </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">idx </span><span class="s4">= </span><span class="s1">random_state</span><span class="s4">.</span><span class="s1">permutation</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">])[:</span><span class="s1">n_samples</span><span class="s4">]</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">[</span><span class="s1">idx</span><span class="s4">]</span>
+    <span class="s1">n_neighbors </span><span class="s4">= </span><span class="s1">int</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] * </span><span class="s1">quantile</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">n_neighbors </span><span class="s4">&lt; </span><span class="s6">1</span><span class="s4">:  </span><span class="s2"># cannot fit NearestNeighbors with n_neighbors = 0</span>
+        <span class="s1">n_neighbors </span><span class="s4">= </span><span class="s6">1</span>
+    <span class="s1">nbrs </span><span class="s4">= </span><span class="s1">NearestNeighbors</span><span class="s4">(</span><span class="s1">n_neighbors</span><span class="s4">=</span><span class="s1">n_neighbors</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">n_jobs</span><span class="s4">)</span>
+    <span class="s1">nbrs</span><span class="s4">.</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+    <span class="s1">bandwidth </span><span class="s4">= </span><span class="s6">0.0</span>
+    <span class="s3">for </span><span class="s1">batch </span><span class="s3">in </span><span class="s1">gen_batches</span><span class="s4">(</span><span class="s1">len</span><span class="s4">(</span><span class="s1">X</span><span class="s4">), </span><span class="s6">500</span><span class="s4">):</span>
+        <span class="s1">d</span><span class="s4">, </span><span class="s1">_ </span><span class="s4">= </span><span class="s1">nbrs</span><span class="s4">.</span><span class="s1">kneighbors</span><span class="s4">(</span><span class="s1">X</span><span class="s4">[</span><span class="s1">batch</span><span class="s4">, :], </span><span class="s1">return_distance</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+        <span class="s1">bandwidth </span><span class="s4">+= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">max</span><span class="s4">(</span><span class="s1">d</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">()</span>
+
+    <span class="s3">return </span><span class="s1">bandwidth </span><span class="s4">/ </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+
+
+<span class="s2"># separate function for each seed's iterative loop</span>
+<span class="s3">def </span><span class="s1">_mean_shift_single_seed</span><span class="s4">(</span><span class="s1">my_mean</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">nbrs</span><span class="s4">, </span><span class="s1">max_iter</span><span class="s4">):</span>
+    <span class="s2"># For each seed, climb gradient until convergence or max_iter</span>
+    <span class="s1">bandwidth </span><span class="s4">= </span><span class="s1">nbrs</span><span class="s4">.</span><span class="s1">get_params</span><span class="s4">()[</span><span class="s5">&quot;radius&quot;</span><span class="s4">]</span>
+    <span class="s1">stop_thresh </span><span class="s4">= </span><span class="s6">1e-3 </span><span class="s4">* </span><span class="s1">bandwidth  </span><span class="s2"># when mean has converged</span>
+    <span class="s1">completed_iterations </span><span class="s4">= </span><span class="s6">0</span>
+    <span class="s3">while True</span><span class="s4">:</span>
+        <span class="s2"># Find mean of points within bandwidth</span>
+        <span class="s1">i_nbrs </span><span class="s4">= </span><span class="s1">nbrs</span><span class="s4">.</span><span class="s1">radius_neighbors</span><span class="s4">([</span><span class="s1">my_mean</span><span class="s4">], </span><span class="s1">bandwidth</span><span class="s4">, </span><span class="s1">return_distance</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)[</span><span class="s6">0</span><span class="s4">]</span>
+        <span class="s1">points_within </span><span class="s4">= </span><span class="s1">X</span><span class="s4">[</span><span class="s1">i_nbrs</span><span class="s4">]</span>
+        <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">points_within</span><span class="s4">) == </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s3">break  </span><span class="s2"># Depending on seeding strategy this condition may occur</span>
+        <span class="s1">my_old_mean </span><span class="s4">= </span><span class="s1">my_mean  </span><span class="s2"># save the old mean</span>
+        <span class="s1">my_mean </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">points_within</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">)</span>
+        <span class="s2"># If converged or at max_iter, adds the cluster</span>
+        <span class="s3">if </span><span class="s4">(</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">norm</span><span class="s4">(</span><span class="s1">my_mean </span><span class="s4">- </span><span class="s1">my_old_mean</span><span class="s4">) &lt;= </span><span class="s1">stop_thresh</span>
+            <span class="s3">or </span><span class="s1">completed_iterations </span><span class="s4">== </span><span class="s1">max_iter</span>
+        <span class="s4">):</span>
+            <span class="s3">break</span>
+        <span class="s1">completed_iterations </span><span class="s4">+= </span><span class="s6">1</span>
+    <span class="s3">return </span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">my_mean</span><span class="s4">), </span><span class="s1">len</span><span class="s4">(</span><span class="s1">points_within</span><span class="s4">), </span><span class="s1">completed_iterations</span>
+
+
+<span class="s4">@</span><span class="s1">validate_params</span><span class="s4">(</span>
+    <span class="s4">{</span><span class="s5">&quot;X&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">]},</span>
+    <span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">def </span><span class="s1">mean_shift</span><span class="s4">(</span>
+    <span class="s1">X</span><span class="s4">,</span>
+    <span class="s4">*,</span>
+    <span class="s1">bandwidth</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">seeds</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">bin_seeding</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+    <span class="s1">min_bin_freq</span><span class="s4">=</span><span class="s6">1</span><span class="s4">,</span>
+    <span class="s1">cluster_all</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">300</span><span class="s4">,</span>
+    <span class="s1">n_jobs</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Perform mean shift clustering of data using a flat kernel. 
+ 
+    Read more in the :ref:`User Guide &lt;mean_shift&gt;`. 
+ 
+    Parameters 
+    ---------- 
+ 
+    X : array-like of shape (n_samples, n_features) 
+        Input data. 
+ 
+    bandwidth : float, default=None 
+        Kernel bandwidth. If not None, must be in the range [0, +inf). 
+ 
+        If None, the bandwidth is determined using a heuristic based on 
+        the median of all pairwise distances. This will take quadratic time in 
+        the number of samples. The sklearn.cluster.estimate_bandwidth function 
+        can be used to do this more efficiently. 
+ 
+    seeds : array-like of shape (n_seeds, n_features) or None 
+        Point used as initial kernel locations. If None and bin_seeding=False, 
+        each data point is used as a seed. If None and bin_seeding=True, 
+        see bin_seeding. 
+ 
+    bin_seeding : bool, default=False 
+        If true, initial kernel locations are not locations of all 
+        points, but rather the location of the discretized version of 
+        points, where points are binned onto a grid whose coarseness 
+        corresponds to the bandwidth. Setting this option to True will speed 
+        up the algorithm because fewer seeds will be initialized. 
+        Ignored if seeds argument is not None. 
+ 
+    min_bin_freq : int, default=1 
+       To speed up the algorithm, accept only those bins with at least 
+       min_bin_freq points as seeds. 
+ 
+    cluster_all : bool, default=True 
+        If true, then all points are clustered, even those orphans that are 
+        not within any kernel. Orphans are assigned to the nearest kernel. 
+        If false, then orphans are given cluster label -1. 
+ 
+    max_iter : int, default=300 
+        Maximum number of iterations, per seed point before the clustering 
+        operation terminates (for that seed point), if has not converged yet. 
+ 
+    n_jobs : int, default=None 
+        The number of jobs to use for the computation. The following tasks benefit 
+        from the parallelization: 
+ 
+        - The search of nearest neighbors for bandwidth estimation and label 
+          assignments. See the details in the docstring of the 
+          ``NearestNeighbors`` class. 
+        - Hill-climbing optimization for all seeds. 
+ 
+        See :term:`Glossary &lt;n_jobs&gt;` for more details. 
+ 
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context. 
+        ``-1`` means using all processors. See :term:`Glossary &lt;n_jobs&gt;` 
+        for more details. 
+ 
+        .. versionadded:: 0.17 
+           Parallel Execution using *n_jobs*. 
+ 
+    Returns 
+    ------- 
+ 
+    cluster_centers : ndarray of shape (n_clusters, n_features) 
+        Coordinates of cluster centers. 
+ 
+    labels : ndarray of shape (n_samples,) 
+        Cluster labels for each point. 
+ 
+    Notes 
+    ----- 
+    For a usage example, see 
+    :ref:`sphx_glr_auto_examples_cluster_plot_mean_shift.py`. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from sklearn.cluster import mean_shift 
+    &gt;&gt;&gt; X = np.array([[1, 1], [2, 1], [1, 0], 
+    ...               [4, 7], [3, 5], [3, 6]]) 
+    &gt;&gt;&gt; cluster_centers, labels = mean_shift(X, bandwidth=2) 
+    &gt;&gt;&gt; cluster_centers 
+    array([[3.33..., 6.     ], 
+           [1.33..., 0.66...]]) 
+    &gt;&gt;&gt; labels 
+    array([1, 1, 1, 0, 0, 0]) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">model </span><span class="s4">= </span><span class="s1">MeanShift</span><span class="s4">(</span>
+        <span class="s1">bandwidth</span><span class="s4">=</span><span class="s1">bandwidth</span><span class="s4">,</span>
+        <span class="s1">seeds</span><span class="s4">=</span><span class="s1">seeds</span><span class="s4">,</span>
+        <span class="s1">min_bin_freq</span><span class="s4">=</span><span class="s1">min_bin_freq</span><span class="s4">,</span>
+        <span class="s1">bin_seeding</span><span class="s4">=</span><span class="s1">bin_seeding</span><span class="s4">,</span>
+        <span class="s1">cluster_all</span><span class="s4">=</span><span class="s1">cluster_all</span><span class="s4">,</span>
+        <span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">n_jobs</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+    <span class="s4">).</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">model</span><span class="s4">.</span><span class="s1">cluster_centers_</span><span class="s4">, </span><span class="s1">model</span><span class="s4">.</span><span class="s1">labels_</span>
+
+
+<span class="s3">def </span><span class="s1">get_bin_seeds</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">bin_size</span><span class="s4">, </span><span class="s1">min_bin_freq</span><span class="s4">=</span><span class="s6">1</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Find seeds for mean_shift. 
+ 
+    Finds seeds by first binning data onto a grid whose lines are 
+    spaced bin_size apart, and then choosing those bins with at least 
+    min_bin_freq points. 
+ 
+    Parameters 
+    ---------- 
+ 
+    X : array-like of shape (n_samples, n_features) 
+        Input points, the same points that will be used in mean_shift. 
+ 
+    bin_size : float 
+        Controls the coarseness of the binning. Smaller values lead 
+        to more seeding (which is computationally more expensive). If you're 
+        not sure how to set this, set it to the value of the bandwidth used 
+        in clustering.mean_shift. 
+ 
+    min_bin_freq : int, default=1 
+        Only bins with at least min_bin_freq will be selected as seeds. 
+        Raising this value decreases the number of seeds found, which 
+        makes mean_shift computationally cheaper. 
+ 
+    Returns 
+    ------- 
+    bin_seeds : array-like of shape (n_samples, n_features) 
+        Points used as initial kernel positions in clustering.mean_shift. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">bin_size </span><span class="s4">== </span><span class="s6">0</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">X</span>
+
+    <span class="s2"># Bin points</span>
+    <span class="s1">bin_sizes </span><span class="s4">= </span><span class="s1">defaultdict</span><span class="s4">(</span><span class="s1">int</span><span class="s4">)</span>
+    <span class="s3">for </span><span class="s1">point </span><span class="s3">in </span><span class="s1">X</span><span class="s4">:</span>
+        <span class="s1">binned_point </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">round</span><span class="s4">(</span><span class="s1">point </span><span class="s4">/ </span><span class="s1">bin_size</span><span class="s4">)</span>
+        <span class="s1">bin_sizes</span><span class="s4">[</span><span class="s1">tuple</span><span class="s4">(</span><span class="s1">binned_point</span><span class="s4">)] += </span><span class="s6">1</span>
+
+    <span class="s2"># Select only those bins as seeds which have enough members</span>
+    <span class="s1">bin_seeds </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span>
+        <span class="s4">[</span><span class="s1">point </span><span class="s3">for </span><span class="s1">point</span><span class="s4">, </span><span class="s1">freq </span><span class="s3">in </span><span class="s1">bin_sizes</span><span class="s4">.</span><span class="s1">items</span><span class="s4">() </span><span class="s3">if </span><span class="s1">freq </span><span class="s4">&gt;= </span><span class="s1">min_bin_freq</span><span class="s4">],</span>
+        <span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">,</span>
+    <span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">bin_seeds</span><span class="s4">) == </span><span class="s1">len</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+            <span class="s5">&quot;Binning data failed with provided bin_size=%f, using data points as seeds.&quot;</span>
+            <span class="s4">% </span><span class="s1">bin_size</span>
+        <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">X</span>
+    <span class="s1">bin_seeds </span><span class="s4">= </span><span class="s1">bin_seeds </span><span class="s4">* </span><span class="s1">bin_size</span>
+    <span class="s3">return </span><span class="s1">bin_seeds</span>
+
+
+<span class="s3">class </span><span class="s1">MeanShift</span><span class="s4">(</span><span class="s1">ClusterMixin</span><span class="s4">, </span><span class="s1">BaseEstimator</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Mean shift clustering using a flat kernel. 
+ 
+    Mean shift clustering aims to discover &quot;blobs&quot; in a smooth density of 
+    samples. It is a centroid-based algorithm, which works by updating 
+    candidates for centroids to be the mean of the points within a given 
+    region. These candidates are then filtered in a post-processing stage to 
+    eliminate near-duplicates to form the final set of centroids. 
+ 
+    Seeding is performed using a binning technique for scalability. 
+ 
+    For an example of how to use MeanShift clustering, refer to: 
+    :ref:`sphx_glr_auto_examples_cluster_plot_mean_shift.py`. 
+ 
+    Read more in the :ref:`User Guide &lt;mean_shift&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    bandwidth : float, default=None 
+        Bandwidth used in the flat kernel. 
+ 
+        If not given, the bandwidth is estimated using 
+        sklearn.cluster.estimate_bandwidth; see the documentation for that 
+        function for hints on scalability (see also the Notes, below). 
+ 
+    seeds : array-like of shape (n_samples, n_features), default=None 
+        Seeds used to initialize kernels. If not set, 
+        the seeds are calculated by clustering.get_bin_seeds 
+        with bandwidth as the grid size and default values for 
+        other parameters. 
+ 
+    bin_seeding : bool, default=False 
+        If true, initial kernel locations are not locations of all 
+        points, but rather the location of the discretized version of 
+        points, where points are binned onto a grid whose coarseness 
+        corresponds to the bandwidth. Setting this option to True will speed 
+        up the algorithm because fewer seeds will be initialized. 
+        The default value is False. 
+        Ignored if seeds argument is not None. 
+ 
+    min_bin_freq : int, default=1 
+       To speed up the algorithm, accept only those bins with at least 
+       min_bin_freq points as seeds. 
+ 
+    cluster_all : bool, default=True 
+        If true, then all points are clustered, even those orphans that are 
+        not within any kernel. Orphans are assigned to the nearest kernel. 
+        If false, then orphans are given cluster label -1. 
+ 
+    n_jobs : int, default=None 
+        The number of jobs to use for the computation. The following tasks benefit 
+        from the parallelization: 
+ 
+        - The search of nearest neighbors for bandwidth estimation and label 
+          assignments. See the details in the docstring of the 
+          ``NearestNeighbors`` class. 
+        - Hill-climbing optimization for all seeds. 
+ 
+        See :term:`Glossary &lt;n_jobs&gt;` for more details. 
+ 
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context. 
+        ``-1`` means using all processors. See :term:`Glossary &lt;n_jobs&gt;` 
+        for more details. 
+ 
+    max_iter : int, default=300 
+        Maximum number of iterations, per seed point before the clustering 
+        operation terminates (for that seed point), if has not converged yet. 
+ 
+        .. versionadded:: 0.22 
+ 
+    Attributes 
+    ---------- 
+    cluster_centers_ : ndarray of shape (n_clusters, n_features) 
+        Coordinates of cluster centers. 
+ 
+    labels_ : ndarray of shape (n_samples,) 
+        Labels of each point. 
+ 
+    n_iter_ : int 
+        Maximum number of iterations performed on each seed. 
+ 
+        .. versionadded:: 0.22 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    KMeans : K-Means clustering. 
+ 
+    Notes 
+    ----- 
+ 
+    Scalability: 
+ 
+    Because this implementation uses a flat kernel and 
+    a Ball Tree to look up members of each kernel, the complexity will tend 
+    towards O(T*n*log(n)) in lower dimensions, with n the number of samples 
+    and T the number of points. In higher dimensions the complexity will 
+    tend towards O(T*n^2). 
+ 
+    Scalability can be boosted by using fewer seeds, for example by using 
+    a higher value of min_bin_freq in the get_bin_seeds function. 
+ 
+    Note that the estimate_bandwidth function is much less scalable than the 
+    mean shift algorithm and will be the bottleneck if it is used. 
+ 
+    References 
+    ---------- 
+ 
+    Dorin Comaniciu and Peter Meer, &quot;Mean Shift: A robust approach toward 
+    feature space analysis&quot;. IEEE Transactions on Pattern Analysis and 
+    Machine Intelligence. 2002. pp. 603-619. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cluster import MeanShift 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; X = np.array([[1, 1], [2, 1], [1, 0], 
+    ...               [4, 7], [3, 5], [3, 6]]) 
+    &gt;&gt;&gt; clustering = MeanShift(bandwidth=2).fit(X) 
+    &gt;&gt;&gt; clustering.labels_ 
+    array([1, 1, 1, 0, 0, 0]) 
+    &gt;&gt;&gt; clustering.predict([[0, 0], [5, 5]]) 
+    array([1, 0]) 
+    &gt;&gt;&gt; clustering 
+    MeanShift(bandwidth=2) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s5">&quot;bandwidth&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;neither&quot;</span><span class="s4">), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;seeds&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;bin_seeding&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;min_bin_freq&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;cluster_all&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;n_jobs&quot;</span><span class="s4">: [</span><span class="s1">Integral</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;max_iter&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">bandwidth</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">seeds</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">bin_seeding</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s1">min_bin_freq</span><span class="s4">=</span><span class="s6">1</span><span class="s4">,</span>
+        <span class="s1">cluster_all</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">n_jobs</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">300</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">bandwidth </span><span class="s4">= </span><span class="s1">bandwidth</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">seeds </span><span class="s4">= </span><span class="s1">seeds</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">bin_seeding </span><span class="s4">= </span><span class="s1">bin_seeding</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_all </span><span class="s4">= </span><span class="s1">cluster_all</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">min_bin_freq </span><span class="s4">= </span><span class="s1">min_bin_freq</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs </span><span class="s4">= </span><span class="s1">n_jobs</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter </span><span class="s4">= </span><span class="s1">max_iter</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Perform clustering. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Samples to cluster. 
+ 
+        y : Ignored 
+            Not used, present for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        self : object 
+               Fitted instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s1">bandwidth </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">bandwidth</span>
+        <span class="s3">if </span><span class="s1">bandwidth </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">bandwidth </span><span class="s4">= </span><span class="s1">estimate_bandwidth</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs</span><span class="s4">)</span>
+
+        <span class="s1">seeds </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">seeds</span>
+        <span class="s3">if </span><span class="s1">seeds </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">bin_seeding</span><span class="s4">:</span>
+                <span class="s1">seeds </span><span class="s4">= </span><span class="s1">get_bin_seeds</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">bandwidth</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_bin_freq</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">seeds </span><span class="s4">= </span><span class="s1">X</span>
+        <span class="s1">n_samples</span><span class="s4">, </span><span class="s1">n_features </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span>
+        <span class="s1">center_intensity_dict </span><span class="s4">= {}</span>
+
+        <span class="s2"># We use n_jobs=1 because this will be used in nested calls under</span>
+        <span class="s2"># parallel calls to _mean_shift_single_seed so there is no need for</span>
+        <span class="s2"># for further parallelism.</span>
+        <span class="s1">nbrs </span><span class="s4">= </span><span class="s1">NearestNeighbors</span><span class="s4">(</span><span class="s1">radius</span><span class="s4">=</span><span class="s1">bandwidth</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s6">1</span><span class="s4">).</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s2"># execute iterations on all seeds in parallel</span>
+        <span class="s1">all_res </span><span class="s4">= </span><span class="s1">Parallel</span><span class="s4">(</span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs</span><span class="s4">)(</span>
+            <span class="s1">delayed</span><span class="s4">(</span><span class="s1">_mean_shift_single_seed</span><span class="s4">)(</span><span class="s1">seed</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">nbrs</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter</span><span class="s4">)</span>
+            <span class="s3">for </span><span class="s1">seed </span><span class="s3">in </span><span class="s1">seeds</span>
+        <span class="s4">)</span>
+        <span class="s2"># copy results in a dictionary</span>
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">len</span><span class="s4">(</span><span class="s1">seeds</span><span class="s4">)):</span>
+            <span class="s3">if </span><span class="s1">all_res</span><span class="s4">[</span><span class="s1">i</span><span class="s4">][</span><span class="s6">1</span><span class="s4">]:  </span><span class="s2"># i.e. len(points_within) &gt; 0</span>
+                <span class="s1">center_intensity_dict</span><span class="s4">[</span><span class="s1">all_res</span><span class="s4">[</span><span class="s1">i</span><span class="s4">][</span><span class="s6">0</span><span class="s4">]] = </span><span class="s1">all_res</span><span class="s4">[</span><span class="s1">i</span><span class="s4">][</span><span class="s6">1</span><span class="s4">]</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_iter_ </span><span class="s4">= </span><span class="s1">max</span><span class="s4">([</span><span class="s1">x</span><span class="s4">[</span><span class="s6">2</span><span class="s4">] </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">all_res</span><span class="s4">])</span>
+
+        <span class="s3">if not </span><span class="s1">center_intensity_dict</span><span class="s4">:</span>
+            <span class="s2"># nothing near seeds</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;No point was within bandwidth=%f of any seed. Try a different seeding&quot;</span>
+                <span class="s5">&quot; strategy                              or increase the bandwidth.&quot;</span>
+                <span class="s4">% </span><span class="s1">bandwidth</span>
+            <span class="s4">)</span>
+
+        <span class="s2"># POST PROCESSING: remove near duplicate points</span>
+        <span class="s2"># If the distance between two kernels is less than the bandwidth,</span>
+        <span class="s2"># then we have to remove one because it is a duplicate. Remove the</span>
+        <span class="s2"># one with fewer points.</span>
+
+        <span class="s1">sorted_by_intensity </span><span class="s4">= </span><span class="s1">sorted</span><span class="s4">(</span>
+            <span class="s1">center_intensity_dict</span><span class="s4">.</span><span class="s1">items</span><span class="s4">(),</span>
+            <span class="s1">key</span><span class="s4">=</span><span class="s3">lambda </span><span class="s1">tup</span><span class="s4">: (</span><span class="s1">tup</span><span class="s4">[</span><span class="s6">1</span><span class="s4">], </span><span class="s1">tup</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]),</span>
+            <span class="s1">reverse</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">sorted_centers </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">([</span><span class="s1">tup</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] </span><span class="s3">for </span><span class="s1">tup </span><span class="s3">in </span><span class="s1">sorted_by_intensity</span><span class="s4">])</span>
+        <span class="s1">unique </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">len</span><span class="s4">(</span><span class="s1">sorted_centers</span><span class="s4">), </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">bool</span><span class="s4">)</span>
+        <span class="s1">nbrs </span><span class="s4">= </span><span class="s1">NearestNeighbors</span><span class="s4">(</span><span class="s1">radius</span><span class="s4">=</span><span class="s1">bandwidth</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs</span><span class="s4">).</span><span class="s1">fit</span><span class="s4">(</span>
+            <span class="s1">sorted_centers</span>
+        <span class="s4">)</span>
+        <span class="s3">for </span><span class="s1">i</span><span class="s4">, </span><span class="s1">center </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">sorted_centers</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">unique</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]:</span>
+                <span class="s1">neighbor_idxs </span><span class="s4">= </span><span class="s1">nbrs</span><span class="s4">.</span><span class="s1">radius_neighbors</span><span class="s4">([</span><span class="s1">center</span><span class="s4">], </span><span class="s1">return_distance</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)[</span>
+                    <span class="s6">0</span>
+                <span class="s4">]</span>
+                <span class="s1">unique</span><span class="s4">[</span><span class="s1">neighbor_idxs</span><span class="s4">] = </span><span class="s6">0</span>
+                <span class="s1">unique</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s6">1  </span><span class="s2"># leave the current point as unique</span>
+        <span class="s1">cluster_centers </span><span class="s4">= </span><span class="s1">sorted_centers</span><span class="s4">[</span><span class="s1">unique</span><span class="s4">]</span>
+
+        <span class="s2"># ASSIGN LABELS: a point belongs to the cluster that it is closest to</span>
+        <span class="s1">nbrs </span><span class="s4">= </span><span class="s1">NearestNeighbors</span><span class="s4">(</span><span class="s1">n_neighbors</span><span class="s4">=</span><span class="s6">1</span><span class="s4">, </span><span class="s1">n_jobs</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_jobs</span><span class="s4">).</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">cluster_centers</span><span class="s4">)</span>
+        <span class="s1">labels </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">int</span><span class="s4">)</span>
+        <span class="s1">distances</span><span class="s4">, </span><span class="s1">idxs </span><span class="s4">= </span><span class="s1">nbrs</span><span class="s4">.</span><span class="s1">kneighbors</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_all</span><span class="s4">:</span>
+            <span class="s1">labels </span><span class="s4">= </span><span class="s1">idxs</span><span class="s4">.</span><span class="s1">flatten</span><span class="s4">()</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">labels</span><span class="s4">.</span><span class="s1">fill</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s1">bool_selector </span><span class="s4">= </span><span class="s1">distances</span><span class="s4">.</span><span class="s1">flatten</span><span class="s4">() &lt;= </span><span class="s1">bandwidth</span>
+            <span class="s1">labels</span><span class="s4">[</span><span class="s1">bool_selector</span><span class="s4">] = </span><span class="s1">idxs</span><span class="s4">.</span><span class="s1">flatten</span><span class="s4">()[</span><span class="s1">bool_selector</span><span class="s4">]</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_centers_</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">labels_ </span><span class="s4">= </span><span class="s1">cluster_centers</span><span class="s4">, </span><span class="s1">labels</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict the closest cluster each sample in X belongs to. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            New data to predict. 
+ 
+        Returns 
+        ------- 
+        labels : ndarray of shape (n_samples,) 
+            Index of the cluster each sample belongs to. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">reset</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s3">with </span><span class="s1">config_context</span><span class="s4">(</span><span class="s1">assume_finite</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+            <span class="s3">return </span><span class="s1">pairwise_distances_argmin</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_centers_</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,984 @@
+<html>
+<head>
+<title>_cd_fast.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #5f826b; font-style: italic;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_cd_fast.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0"># Author: Alexandre Gramfort &lt;alexandre.gramfort@inria.fr&gt;</span>
+<span class="s0">#         Fabian Pedregosa &lt;fabian.pedregosa@inria.fr&gt;</span>
+<span class="s0">#         Olivier Grisel &lt;olivier.grisel@ensta.org&gt;</span>
+<span class="s0">#         Alexis Mignon &lt;alexis.mignon@gmail.com&gt;</span>
+<span class="s0">#         Manoj Kumar &lt;manojkumarsivaraj334@gmail.com&gt;</span>
+<span class="s0">#</span>
+<span class="s0"># License: BSD 3 clause</span>
+
+<span class="s2">from </span><span class="s1">libc</span><span class="s3">.</span><span class="s1">math </span><span class="s2">cimport </span><span class="s1">fabs</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">cython </span><span class="s2">cimport </span><span class="s1">floating</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">exceptions </span><span class="s2">import </span><span class="s1">ConvergenceWarning</span>
+
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_cython_blas </span><span class="s2">cimport </span><span class="s3">(</span>
+    <span class="s1">_axpy</span><span class="s3">, </span><span class="s1">_dot</span><span class="s3">, </span><span class="s1">_asum</span><span class="s3">, </span><span class="s1">_gemv</span><span class="s3">, </span><span class="s1">_nrm2</span><span class="s3">, </span><span class="s1">_copy</span><span class="s3">, </span><span class="s1">_scal</span>
+<span class="s3">)</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_cython_blas </span><span class="s2">cimport </span><span class="s1">ColMajor</span><span class="s3">, </span><span class="s1">Trans</span><span class="s3">, </span><span class="s1">NoTrans</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_typedefs </span><span class="s2">cimport </span><span class="s1">uint32_t</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_random </span><span class="s2">cimport </span><span class="s1">our_rand_r</span>
+
+
+<span class="s0"># The following two functions are shamelessly copied from the tree code.</span>
+
+<span class="s2">cdef </span><span class="s1">enum</span><span class="s3">:</span>
+    <span class="s0"># Max value for our rand_r replacement (near the bottom).</span>
+    <span class="s0"># We don't use RAND_MAX because it's different across platforms and</span>
+    <span class="s0"># particularly tiny on Windows/MSVC.</span>
+    <span class="s0"># It corresponds to the maximum representable value for</span>
+    <span class="s0"># 32-bit signed integers (i.e. 2^31 - 1).</span>
+    <span class="s1">RAND_R_MAX </span><span class="s3">= </span><span class="s4">2147483647</span>
+
+
+<span class="s2">cdef </span><span class="s1">inline uint32_t rand_int</span><span class="s3">(</span><span class="s1">uint32_t end</span><span class="s3">, </span><span class="s1">uint32_t</span><span class="s3">* </span><span class="s1">random_state</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s5">&quot;&quot;&quot;Generate a random integer in [0; end).&quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">our_rand_r</span><span class="s3">(</span><span class="s1">random_state</span><span class="s3">) % </span><span class="s1">end</span>
+
+
+<span class="s2">cdef </span><span class="s1">inline floating fmax</span><span class="s3">(</span><span class="s1">floating x</span><span class="s3">, </span><span class="s1">floating y</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s2">if </span><span class="s1">x </span><span class="s3">&gt; </span><span class="s1">y</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">x</span>
+    <span class="s2">return </span><span class="s1">y</span>
+
+
+<span class="s2">cdef </span><span class="s1">inline floating fsign</span><span class="s3">(</span><span class="s1">floating f</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s2">if </span><span class="s1">f </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s4">0</span>
+    <span class="s2">elif </span><span class="s1">f </span><span class="s3">&gt; </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s4">1.0</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">-</span><span class="s4">1.0</span>
+
+
+<span class="s2">cdef </span><span class="s1">floating abs_max</span><span class="s3">(</span><span class="s1">int n</span><span class="s3">, </span><span class="s1">const floating</span><span class="s3">* </span><span class="s1">a</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s5">&quot;&quot;&quot;np.max(np.abs(a))&quot;&quot;&quot;</span>
+    <span class="s2">cdef </span><span class="s1">int i</span>
+    <span class="s2">cdef </span><span class="s1">floating m </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+    <span class="s2">cdef </span><span class="s1">floating d</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s1">i</span><span class="s3">])</span>
+        <span class="s2">if </span><span class="s1">d </span><span class="s3">&gt; </span><span class="s1">m</span><span class="s3">:</span>
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">d</span>
+    <span class="s2">return </span><span class="s1">m</span>
+
+
+<span class="s2">cdef </span><span class="s1">floating max</span><span class="s3">(</span><span class="s1">int n</span><span class="s3">, </span><span class="s1">floating</span><span class="s3">* </span><span class="s1">a</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s5">&quot;&quot;&quot;np.max(a)&quot;&quot;&quot;</span>
+    <span class="s2">cdef </span><span class="s1">int i</span>
+    <span class="s2">cdef </span><span class="s1">floating m </span><span class="s3">= </span><span class="s1">a</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">floating d</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">a</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">d </span><span class="s3">&gt; </span><span class="s1">m</span><span class="s3">:</span>
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">d</span>
+    <span class="s2">return </span><span class="s1">m</span>
+
+
+<span class="s2">cdef </span><span class="s1">floating diff_abs_max</span><span class="s3">(</span><span class="s1">int n</span><span class="s3">, </span><span class="s1">const floating</span><span class="s3">* </span><span class="s1">a</span><span class="s3">, </span><span class="s1">floating</span><span class="s3">* </span><span class="s1">b</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s5">&quot;&quot;&quot;np.max(np.abs(a - b))&quot;&quot;&quot;</span>
+    <span class="s2">cdef </span><span class="s1">int i</span>
+    <span class="s2">cdef </span><span class="s1">floating m </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] - </span><span class="s1">b</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+    <span class="s2">cdef </span><span class="s1">floating d</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">n</span><span class="s3">):</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">a</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] - </span><span class="s1">b</span><span class="s3">[</span><span class="s1">i</span><span class="s3">])</span>
+        <span class="s2">if </span><span class="s1">d </span><span class="s3">&gt; </span><span class="s1">m</span><span class="s3">:</span>
+            <span class="s1">m </span><span class="s3">= </span><span class="s1">d</span>
+    <span class="s2">return </span><span class="s1">m</span>
+
+
+<span class="s2">def </span><span class="s1">enet_coordinate_descent</span><span class="s3">(</span>
+    <span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">w</span><span class="s3">,</span>
+    <span class="s1">floating alpha</span><span class="s3">,</span>
+    <span class="s1">floating beta</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">, :] </span><span class="s1">X</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">y</span><span class="s3">,</span>
+    <span class="s1">unsigned int max_iter</span><span class="s3">,</span>
+    <span class="s1">floating tol</span><span class="s3">,</span>
+    <span class="s1">object rng</span><span class="s3">,</span>
+    <span class="s1">bint random</span><span class="s3">=</span><span class="s4">0</span><span class="s3">,</span>
+    <span class="s1">bint positive</span><span class="s3">=</span><span class="s4">0</span>
+<span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot;Cython version of the coordinate descent algorithm 
+        for Elastic-Net regression 
+ 
+        We minimize 
+ 
+        (1/2) * norm(y - X w, 2)^2 + alpha norm(w, 1) + (beta/2) norm(w, 2)^2 
+ 
+    Returns 
+    ------- 
+    w : ndarray of shape (n_features,) 
+        ElasticNet coefficients. 
+    gap : float 
+        Achieved dual gap. 
+    tol : float 
+        Equals input `tol` times `np.dot(y, y)`. The tolerance used for the dual gap. 
+    n_iter : int 
+        Number of coordinate descent iterations. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">floating </span><span class="s2">is </span><span class="s1">float</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span>
+
+    <span class="s0"># get the data information into easy vars</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_samples </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_features </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">]</span>
+
+    <span class="s0"># compute norms of the columns of X</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">norm_cols_X </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">square</span><span class="s3">(</span><span class="s1">X</span><span class="s3">).</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)</span>
+
+    <span class="s0"># initial value of the residuals</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">R </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">XtA </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+
+    <span class="s2">cdef </span><span class="s1">floating tmp</span>
+    <span class="s2">cdef </span><span class="s1">floating w_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating gap </span><span class="s3">= </span><span class="s1">tol </span><span class="s3">+ </span><span class="s4">1.0</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_tol </span><span class="s3">= </span><span class="s1">tol</span>
+    <span class="s2">cdef </span><span class="s1">floating dual_norm_XtA</span>
+    <span class="s2">cdef </span><span class="s1">floating R_norm2</span>
+    <span class="s2">cdef </span><span class="s1">floating w_norm2</span>
+    <span class="s2">cdef </span><span class="s1">floating l1_norm</span>
+    <span class="s2">cdef </span><span class="s1">floating const</span>
+    <span class="s2">cdef </span><span class="s1">floating A_norm2</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int ii</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_iter </span><span class="s3">= </span><span class="s4">0</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int f_iter</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t rand_r_state_seed </span><span class="s3">= </span><span class="s1">rng</span><span class="s3">.</span><span class="s1">randint</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">RAND_R_MAX</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t</span><span class="s3">* </span><span class="s1">rand_r_state </span><span class="s3">= &amp;</span><span class="s1">rand_r_state_seed</span>
+
+    <span class="s2">if </span><span class="s1">alpha </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">beta </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s5">&quot;Coordinate descent with no regularization may lead to &quot;</span>
+                      <span class="s5">&quot;unexpected results and is discouraged.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">nogil</span><span class="s3">:</span>
+        <span class="s0"># R = y - np.dot(X, w)</span>
+        <span class="s1">_copy</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">_gemv</span><span class="s3">(</span><span class="s1">ColMajor</span><span class="s3">, </span><span class="s1">NoTrans</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features</span><span class="s3">, -</span><span class="s4">1.0</span><span class="s3">, &amp;</span><span class="s1">X</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">],</span>
+              <span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, </span><span class="s4">1.0</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+        <span class="s0"># tol *= np.dot(y, y)</span>
+        <span class="s1">tol </span><span class="s3">*= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">n_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">max_iter</span><span class="s3">):</span>
+            <span class="s1">w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s1">d_w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s2">for </span><span class="s1">f_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):  </span><span class="s0"># Loop over coordinates</span>
+                <span class="s2">if </span><span class="s1">random</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">rand_int</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">rand_r_state</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">f_iter</span>
+
+                <span class="s2">if </span><span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] == </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s2">continue</span>
+
+                <span class="s1">w_ii </span><span class="s3">= </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]  </span><span class="s0"># Store previous value</span>
+
+                <span class="s2">if </span><span class="s1">w_ii </span><span class="s3">!= </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s0"># R += w_ii * X[:,ii]</span>
+                    <span class="s1">_axpy</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">w_ii</span><span class="s3">, &amp;</span><span class="s1">X</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># tmp = (X[:,ii]*R).sum()</span>
+                <span class="s1">tmp </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">X</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">positive </span><span class="s2">and </span><span class="s1">tmp </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">:</span>
+                    <span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s4">0.0</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = (</span><span class="s1">fsign</span><span class="s3">(</span><span class="s1">tmp</span><span class="s3">) * </span><span class="s1">fmax</span><span class="s3">(</span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">tmp</span><span class="s3">) - </span><span class="s1">alpha</span><span class="s3">, </span><span class="s4">0</span><span class="s3">)</span>
+                             <span class="s3">/ (</span><span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] + </span><span class="s1">beta</span><span class="s3">))</span>
+
+                <span class="s2">if </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] != </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s0"># R -=  w[ii] * X[:,ii] # Update residual</span>
+                    <span class="s1">_axpy</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, -</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">], &amp;</span><span class="s1">X</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># update the maximum absolute coefficient update</span>
+                <span class="s1">d_w_ii </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] - </span><span class="s1">w_ii</span><span class="s3">)</span>
+                <span class="s1">d_w_max </span><span class="s3">= </span><span class="s1">fmax</span><span class="s3">(</span><span class="s1">d_w_max</span><span class="s3">, </span><span class="s1">d_w_ii</span><span class="s3">)</span>
+
+                <span class="s1">w_max </span><span class="s3">= </span><span class="s1">fmax</span><span class="s3">(</span><span class="s1">w_max</span><span class="s3">, </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]))</span>
+
+            <span class="s2">if </span><span class="s3">(</span>
+                <span class="s1">w_max </span><span class="s3">== </span><span class="s4">0.0</span>
+                <span class="s2">or </span><span class="s1">d_w_max </span><span class="s3">/ </span><span class="s1">w_max </span><span class="s3">&lt; </span><span class="s1">d_w_tol</span>
+                <span class="s2">or </span><span class="s1">n_iter </span><span class="s3">== </span><span class="s1">max_iter </span><span class="s3">- </span><span class="s4">1</span>
+            <span class="s3">):</span>
+                <span class="s0"># the biggest coordinate update of this iteration was smaller</span>
+                <span class="s0"># than the tolerance: check the duality gap as ultimate</span>
+                <span class="s0"># stopping criterion</span>
+
+                <span class="s0"># XtA = np.dot(X.T, R) - beta * w</span>
+                <span class="s1">_copy</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s1">_gemv</span><span class="s3">(</span><span class="s1">ColMajor</span><span class="s3">, </span><span class="s1">Trans</span><span class="s3">,</span>
+                      <span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features</span><span class="s3">, </span><span class="s4">1.0</span><span class="s3">, &amp;</span><span class="s1">X</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">], </span><span class="s1">n_samples</span><span class="s3">,</span>
+                      <span class="s3">&amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">,</span>
+                      <span class="s3">-</span><span class="s1">beta</span><span class="s3">, &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">positive</span><span class="s3">:</span>
+                    <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s1">abs_max</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+
+                <span class="s0"># R_norm2 = np.dot(R, R)</span>
+                <span class="s1">R_norm2 </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># w_norm2 = np.dot(w, w)</span>
+                <span class="s1">w_norm2 </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">dual_norm_XtA </span><span class="s3">&gt; </span><span class="s1">alpha</span><span class="s3">):</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s1">alpha </span><span class="s3">/ </span><span class="s1">dual_norm_XtA</span>
+                    <span class="s1">A_norm2 </span><span class="s3">= </span><span class="s1">R_norm2 </span><span class="s3">* (</span><span class="s1">const </span><span class="s3">** </span><span class="s4">2</span><span class="s3">)</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s4">0.5 </span><span class="s3">* (</span><span class="s1">R_norm2 </span><span class="s3">+ </span><span class="s1">A_norm2</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s4">1.0</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s1">R_norm2</span>
+
+                <span class="s1">l1_norm </span><span class="s3">= </span><span class="s1">_asum</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># np.dot(R.T, y)</span>
+                <span class="s1">gap </span><span class="s3">+= (</span><span class="s1">alpha </span><span class="s3">* </span><span class="s1">l1_norm</span>
+                        <span class="s3">- </span><span class="s1">const </span><span class="s3">* </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                        <span class="s3">+ </span><span class="s4">0.5 </span><span class="s3">* </span><span class="s1">beta </span><span class="s3">* (</span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">const </span><span class="s3">** </span><span class="s4">2</span><span class="s3">) * (</span><span class="s1">w_norm2</span><span class="s3">))</span>
+
+                <span class="s2">if </span><span class="s1">gap </span><span class="s3">&lt; </span><span class="s1">tol</span><span class="s3">:</span>
+                    <span class="s0"># return if we reached desired tolerance</span>
+                    <span class="s2">break</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0"># for/else, runs if for doesn't end with a `break`</span>
+            <span class="s2">with </span><span class="s1">gil</span><span class="s3">:</span>
+                <span class="s1">message </span><span class="s3">= (</span>
+                    <span class="s5">&quot;Objective did not converge. You might want to increase &quot;</span>
+                    <span class="s5">&quot;the number of iterations, check the scale of the &quot;</span>
+                    <span class="s5">&quot;features or consider increasing regularisation. &quot;</span>
+                    <span class="s5">f&quot;Duality gap: </span><span class="s2">{</span><span class="s1">gap</span><span class="s2">:</span><span class="s5">.3e</span><span class="s2">}</span><span class="s5">, tolerance: </span><span class="s2">{</span><span class="s1">tol</span><span class="s2">:</span><span class="s5">.3e</span><span class="s2">}</span><span class="s5">&quot;</span>
+                <span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">alpha </span><span class="s3">&lt; </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">).</span><span class="s1">eps</span><span class="s3">:</span>
+                    <span class="s1">message </span><span class="s3">+= (</span>
+                        <span class="s5">&quot; Linear regression models with null weight for the &quot;</span>
+                        <span class="s5">&quot;l1 regularization term are more efficiently fitted &quot;</span>
+                        <span class="s5">&quot;using one of the solvers implemented in &quot;</span>
+                        <span class="s5">&quot;sklearn.linear_model.Ridge/RidgeCV instead.&quot;</span>
+                    <span class="s3">)</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">message</span><span class="s3">, </span><span class="s1">ConvergenceWarning</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">w</span><span class="s3">), </span><span class="s1">gap</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">, </span><span class="s1">n_iter </span><span class="s3">+ </span><span class="s4">1</span>
+
+
+<span class="s2">def </span><span class="s1">sparse_enet_coordinate_descent</span><span class="s3">(</span>
+    <span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">w</span><span class="s3">,</span>
+    <span class="s1">floating alpha</span><span class="s3">,</span>
+    <span class="s1">floating beta</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">X_data</span><span class="s3">,</span>
+    <span class="s1">const int</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">X_indices</span><span class="s3">,</span>
+    <span class="s1">const int</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">X_indptr</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">y</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">sample_weight</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">X_mean</span><span class="s3">,</span>
+    <span class="s1">unsigned int max_iter</span><span class="s3">,</span>
+    <span class="s1">floating tol</span><span class="s3">,</span>
+    <span class="s1">object rng</span><span class="s3">,</span>
+    <span class="s1">bint random</span><span class="s3">=</span><span class="s4">0</span><span class="s3">,</span>
+    <span class="s1">bint positive</span><span class="s3">=</span><span class="s4">0</span><span class="s3">,</span>
+<span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot;Cython version of the coordinate descent algorithm for Elastic-Net 
+ 
+    We minimize: 
+ 
+        1/2 * norm(y - Z w, 2)^2 + alpha * norm(w, 1) + (beta/2) * norm(w, 2)^2 
+ 
+    where Z = X - X_mean. 
+    With sample weights sw, this becomes 
+ 
+        1/2 * sum(sw * (y - Z w)^2, axis=0) + alpha * norm(w, 1) 
+        + (beta/2) * norm(w, 2)^2 
+ 
+    and X_mean is the weighted average of X (per column). 
+ 
+    Returns 
+    ------- 
+    w : ndarray of shape (n_features,) 
+        ElasticNet coefficients. 
+    gap : float 
+        Achieved dual gap. 
+    tol : float 
+        Equals input `tol` times `np.dot(y, y)`. The tolerance used for the dual gap. 
+    n_iter : int 
+        Number of coordinate descent iterations. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Notes for sample_weight:</span>
+    <span class="s0"># For dense X, one centers X and y and then rescales them by sqrt(sample_weight).</span>
+    <span class="s0"># Here, for sparse X, we get the sample_weight averaged center X_mean. We take care</span>
+    <span class="s0"># that every calculation results as if we had rescaled y and X (and therefore also</span>
+    <span class="s0"># X_mean) by sqrt(sample_weight) without actually calculating the square root.</span>
+    <span class="s0"># We work with:</span>
+    <span class="s0">#     yw = sample_weight</span>
+    <span class="s0">#     R = sample_weight * residual</span>
+    <span class="s0">#     norm_cols_X = np.sum(sample_weight * (X - X_mean)**2, axis=0)</span>
+
+    <span class="s0"># get the data information into easy vars</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_samples </span><span class="s3">= </span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_features </span><span class="s3">= </span><span class="s1">w</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+
+    <span class="s0"># compute norms of the columns of X</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int ii</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[:] </span><span class="s1">norm_cols_X</span>
+
+    <span class="s2">cdef </span><span class="s1">unsigned int startptr </span><span class="s3">= </span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int endptr</span>
+
+    <span class="s0"># initial value of the residuals</span>
+    <span class="s0"># R = y - Zw, weighted version R = sample_weight * (y - Zw)</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">R</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">XtA</span>
+    <span class="s2">cdef </span><span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">yw</span>
+
+    <span class="s2">if </span><span class="s1">floating </span><span class="s2">is </span><span class="s1">float</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span>
+
+    <span class="s1">norm_cols_X </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s1">XtA </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+
+    <span class="s2">cdef </span><span class="s1">floating tmp</span>
+    <span class="s2">cdef </span><span class="s1">floating w_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating X_mean_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating R_sum </span><span class="s3">= </span><span class="s4">0.0</span>
+    <span class="s2">cdef </span><span class="s1">floating R_norm2</span>
+    <span class="s2">cdef </span><span class="s1">floating w_norm2</span>
+    <span class="s2">cdef </span><span class="s1">floating A_norm2</span>
+    <span class="s2">cdef </span><span class="s1">floating l1_norm</span>
+    <span class="s2">cdef </span><span class="s1">floating normalize_sum</span>
+    <span class="s2">cdef </span><span class="s1">floating gap </span><span class="s3">= </span><span class="s1">tol </span><span class="s3">+ </span><span class="s4">1.0</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_tol </span><span class="s3">= </span><span class="s1">tol</span>
+    <span class="s2">cdef </span><span class="s1">floating dual_norm_XtA</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int jj</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_iter </span><span class="s3">= </span><span class="s4">0</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int f_iter</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t rand_r_state_seed </span><span class="s3">= </span><span class="s1">rng</span><span class="s3">.</span><span class="s1">randint</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">RAND_R_MAX</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t</span><span class="s3">* </span><span class="s1">rand_r_state </span><span class="s3">= &amp;</span><span class="s1">rand_r_state_seed</span>
+    <span class="s2">cdef </span><span class="s1">bint center </span><span class="s3">= </span><span class="s2">False</span>
+    <span class="s2">cdef </span><span class="s1">bint no_sample_weights </span><span class="s3">= </span><span class="s1">sample_weight </span><span class="s2">is None</span>
+    <span class="s2">cdef </span><span class="s1">int kk</span>
+
+    <span class="s2">if </span><span class="s1">no_sample_weights</span><span class="s3">:</span>
+        <span class="s1">yw </span><span class="s3">= </span><span class="s1">y</span>
+        <span class="s1">R </span><span class="s3">= </span><span class="s1">y</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">yw </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">multiply</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s1">R </span><span class="s3">= </span><span class="s1">yw</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+    <span class="s2">with </span><span class="s1">nogil</span><span class="s3">:</span>
+        <span class="s0"># center = (X_mean != 0).any()</span>
+        <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">X_mean</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]:</span>
+                <span class="s1">center </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s2">break</span>
+
+        <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+            <span class="s1">X_mean_ii </span><span class="s3">= </span><span class="s1">X_mean</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+            <span class="s1">endptr </span><span class="s3">= </span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s1">ii </span><span class="s3">+ </span><span class="s4">1</span><span class="s3">]</span>
+            <span class="s1">normalize_sum </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s1">w_ii </span><span class="s3">= </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+
+            <span class="s2">if </span><span class="s1">no_sample_weights</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">startptr</span><span class="s3">, </span><span class="s1">endptr</span><span class="s3">):</span>
+                    <span class="s1">normalize_sum </span><span class="s3">+= (</span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] - </span><span class="s1">X_mean_ii</span><span class="s3">) ** </span><span class="s4">2</span>
+                    <span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]] -= </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">w_ii</span>
+                <span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s1">normalize_sum </span><span class="s3">+ </span><span class="s1">\</span>
+                    <span class="s3">(</span><span class="s1">n_samples </span><span class="s3">- </span><span class="s1">endptr </span><span class="s3">+ </span><span class="s1">startptr</span><span class="s3">) * </span><span class="s1">X_mean_ii </span><span class="s3">** </span><span class="s4">2</span>
+                <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                    <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                        <span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] += </span><span class="s1">X_mean_ii </span><span class="s3">* </span><span class="s1">w_ii</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">startptr</span><span class="s3">, </span><span class="s1">endptr</span><span class="s3">):</span>
+                    <span class="s1">tmp </span><span class="s3">= </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]]</span>
+                    <span class="s0"># second term will be subtracted by loop over range(n_samples)</span>
+                    <span class="s1">normalize_sum </span><span class="s3">+= (</span><span class="s1">tmp </span><span class="s3">* (</span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] - </span><span class="s1">X_mean_ii</span><span class="s3">) ** </span><span class="s4">2</span>
+                                      <span class="s3">- </span><span class="s1">tmp </span><span class="s3">* </span><span class="s1">X_mean_ii </span><span class="s3">** </span><span class="s4">2</span><span class="s3">)</span>
+                    <span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]] -= </span><span class="s1">tmp </span><span class="s3">* </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">w_ii</span>
+                <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                    <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                        <span class="s1">normalize_sum </span><span class="s3">+= </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">X_mean_ii </span><span class="s3">** </span><span class="s4">2</span>
+                        <span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] += </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">X_mean_ii </span><span class="s3">* </span><span class="s1">w_ii</span>
+                <span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s1">normalize_sum</span>
+            <span class="s1">startptr </span><span class="s3">= </span><span class="s1">endptr</span>
+
+        <span class="s0"># tol *= np.dot(y, y)</span>
+        <span class="s0"># with sample weights: tol *= y @ (sw * y)</span>
+        <span class="s1">tol </span><span class="s3">*= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">yw</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">n_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">max_iter</span><span class="s3">):</span>
+
+            <span class="s1">w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s1">d_w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+
+            <span class="s2">for </span><span class="s1">f_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):  </span><span class="s0"># Loop over coordinates</span>
+                <span class="s2">if </span><span class="s1">random</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">rand_int</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">rand_r_state</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">f_iter</span>
+
+                <span class="s2">if </span><span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] == </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s2">continue</span>
+
+                <span class="s1">startptr </span><span class="s3">= </span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+                <span class="s1">endptr </span><span class="s3">= </span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s1">ii </span><span class="s3">+ </span><span class="s4">1</span><span class="s3">]</span>
+                <span class="s1">w_ii </span><span class="s3">= </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]  </span><span class="s0"># Store previous value</span>
+                <span class="s1">X_mean_ii </span><span class="s3">= </span><span class="s1">X_mean</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+
+                <span class="s2">if </span><span class="s1">w_ii </span><span class="s3">!= </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s0"># R += w_ii * X[:,ii]</span>
+                    <span class="s2">if </span><span class="s1">no_sample_weights</span><span class="s3">:</span>
+                        <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">startptr</span><span class="s3">, </span><span class="s1">endptr</span><span class="s3">):</span>
+                            <span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]] += </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">w_ii</span>
+                        <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                            <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                                <span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] -= </span><span class="s1">X_mean_ii </span><span class="s3">* </span><span class="s1">w_ii</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">startptr</span><span class="s3">, </span><span class="s1">endptr</span><span class="s3">):</span>
+                            <span class="s1">tmp </span><span class="s3">= </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]]</span>
+                            <span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]] += </span><span class="s1">tmp </span><span class="s3">* </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">w_ii</span>
+                        <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                            <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                                <span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] -= </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">X_mean_ii </span><span class="s3">* </span><span class="s1">w_ii</span>
+
+                <span class="s0"># tmp = (X[:,ii] * R).sum()</span>
+                <span class="s1">tmp </span><span class="s3">= </span><span class="s4">0.0</span>
+                <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">startptr</span><span class="s3">, </span><span class="s1">endptr</span><span class="s3">):</span>
+                    <span class="s1">tmp </span><span class="s3">+= </span><span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]] * </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]</span>
+
+                <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                    <span class="s1">R_sum </span><span class="s3">= </span><span class="s4">0.0</span>
+                    <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                        <span class="s1">R_sum </span><span class="s3">+= </span><span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]</span>
+                    <span class="s1">tmp </span><span class="s3">-= </span><span class="s1">R_sum </span><span class="s3">* </span><span class="s1">X_mean_ii</span>
+
+                <span class="s2">if </span><span class="s1">positive </span><span class="s2">and </span><span class="s1">tmp </span><span class="s3">&lt; </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s4">0.0</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s1">fsign</span><span class="s3">(</span><span class="s1">tmp</span><span class="s3">) * </span><span class="s1">fmax</span><span class="s3">(</span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">tmp</span><span class="s3">) - </span><span class="s1">alpha</span><span class="s3">, </span><span class="s4">0</span><span class="s3">) </span><span class="s1">\</span>
+                            <span class="s3">/ (</span><span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] + </span><span class="s1">beta</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] != </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s0"># R -=  w[ii] * X[:,ii] # Update residual</span>
+                    <span class="s2">if </span><span class="s1">no_sample_weights</span><span class="s3">:</span>
+                        <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">startptr</span><span class="s3">, </span><span class="s1">endptr</span><span class="s3">):</span>
+                            <span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]] -= </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+                        <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                            <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                                <span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] += </span><span class="s1">X_mean_ii </span><span class="s3">* </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">startptr</span><span class="s3">, </span><span class="s1">endptr</span><span class="s3">):</span>
+                            <span class="s1">tmp </span><span class="s3">= </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]]</span>
+                            <span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]] -= </span><span class="s1">tmp </span><span class="s3">* </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+                        <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                            <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                                <span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] += </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] * </span><span class="s1">X_mean_ii </span><span class="s3">* </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+
+                <span class="s0"># update the maximum absolute coefficient update</span>
+                <span class="s1">d_w_ii </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] - </span><span class="s1">w_ii</span><span class="s3">)</span>
+                <span class="s1">d_w_max </span><span class="s3">= </span><span class="s1">fmax</span><span class="s3">(</span><span class="s1">d_w_max</span><span class="s3">, </span><span class="s1">d_w_ii</span><span class="s3">)</span>
+
+                <span class="s1">w_max </span><span class="s3">= </span><span class="s1">fmax</span><span class="s3">(</span><span class="s1">w_max</span><span class="s3">, </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]))</span>
+
+            <span class="s2">if </span><span class="s1">w_max </span><span class="s3">== </span><span class="s4">0.0 </span><span class="s2">or </span><span class="s1">d_w_max </span><span class="s3">/ </span><span class="s1">w_max </span><span class="s3">&lt; </span><span class="s1">d_w_tol </span><span class="s2">or </span><span class="s1">n_iter </span><span class="s3">== </span><span class="s1">max_iter </span><span class="s3">- </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s0"># the biggest coordinate update of this iteration was smaller than</span>
+                <span class="s0"># the tolerance: check the duality gap as ultimate stopping</span>
+                <span class="s0"># criterion</span>
+
+                <span class="s0"># sparse X.T / dense R dot product</span>
+                <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                    <span class="s1">R_sum </span><span class="s3">= </span><span class="s4">0.0</span>
+                    <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                        <span class="s1">R_sum </span><span class="s3">+= </span><span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]</span>
+
+                <span class="s0"># XtA = X.T @ R - beta * w</span>
+                <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+                    <span class="s1">XtA</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s4">0.0</span>
+                    <span class="s2">for </span><span class="s1">kk </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">], </span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s1">ii </span><span class="s3">+ </span><span class="s4">1</span><span class="s3">]):</span>
+                        <span class="s1">XtA</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] += </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">kk</span><span class="s3">] * </span><span class="s1">R</span><span class="s3">[</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">kk</span><span class="s3">]]</span>
+
+                    <span class="s2">if </span><span class="s1">center</span><span class="s3">:</span>
+                        <span class="s1">XtA</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] -= </span><span class="s1">X_mean</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] * </span><span class="s1">R_sum</span>
+                    <span class="s1">XtA</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] -= </span><span class="s1">beta </span><span class="s3">* </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+
+                <span class="s2">if </span><span class="s1">positive</span><span class="s3">:</span>
+                    <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s1">abs_max</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+
+                <span class="s0"># R_norm2 = np.dot(R, R)</span>
+                <span class="s2">if </span><span class="s1">no_sample_weights</span><span class="s3">:</span>
+                    <span class="s1">R_norm2 </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">R_norm2 </span><span class="s3">= </span><span class="s4">0.0</span>
+                    <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                        <span class="s0"># R is already multiplied by sample_weight</span>
+                        <span class="s2">if </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] != </span><span class="s4">0</span><span class="s3">:</span>
+                            <span class="s1">R_norm2 </span><span class="s3">+= (</span><span class="s1">R</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] ** </span><span class="s4">2</span><span class="s3">) / </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">]</span>
+
+                <span class="s0"># w_norm2 = np.dot(w, w)</span>
+                <span class="s1">w_norm2 </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">dual_norm_XtA </span><span class="s3">&gt; </span><span class="s1">alpha</span><span class="s3">):</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s1">alpha </span><span class="s3">/ </span><span class="s1">dual_norm_XtA</span>
+                    <span class="s1">A_norm2 </span><span class="s3">= </span><span class="s1">R_norm2 </span><span class="s3">* </span><span class="s1">const</span><span class="s3">**</span><span class="s4">2</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s4">0.5 </span><span class="s3">* (</span><span class="s1">R_norm2 </span><span class="s3">+ </span><span class="s1">A_norm2</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s4">1.0</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s1">R_norm2</span>
+
+                <span class="s1">l1_norm </span><span class="s3">= </span><span class="s1">_asum</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s1">gap </span><span class="s3">+= (</span><span class="s1">alpha </span><span class="s3">* </span><span class="s1">l1_norm </span><span class="s3">- </span><span class="s1">const </span><span class="s3">* </span><span class="s1">_dot</span><span class="s3">(</span>
+                            <span class="s1">n_samples</span><span class="s3">,</span>
+                            <span class="s3">&amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">,</span>
+                            <span class="s3">&amp;</span><span class="s1">y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span>
+                            <span class="s3">)</span>
+                        <span class="s3">+ </span><span class="s4">0.5 </span><span class="s3">* </span><span class="s1">beta </span><span class="s3">* (</span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">const </span><span class="s3">** </span><span class="s4">2</span><span class="s3">) * </span><span class="s1">w_norm2</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">gap </span><span class="s3">&lt; </span><span class="s1">tol</span><span class="s3">:</span>
+                    <span class="s0"># return if we reached desired tolerance</span>
+                    <span class="s2">break</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0"># for/else, runs if for doesn't end with a `break`</span>
+            <span class="s2">with </span><span class="s1">gil</span><span class="s3">:</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s5">&quot;Objective did not converge. You might want to &quot;</span>
+                              <span class="s5">&quot;increase the number of iterations. Duality &quot;</span>
+                              <span class="s5">&quot;gap: {}, tolerance: {}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">gap</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">),</span>
+                              <span class="s1">ConvergenceWarning</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">w</span><span class="s3">), </span><span class="s1">gap</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">, </span><span class="s1">n_iter </span><span class="s3">+ </span><span class="s4">1</span>
+
+
+<span class="s2">def </span><span class="s1">enet_coordinate_descent_gram</span><span class="s3">(</span>
+    <span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">w</span><span class="s3">,</span>
+    <span class="s1">floating alpha</span><span class="s3">,</span>
+    <span class="s1">floating beta</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[:, ::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">Q</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">q</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[:] </span><span class="s1">y</span><span class="s3">,</span>
+    <span class="s1">unsigned int max_iter</span><span class="s3">,</span>
+    <span class="s1">floating tol</span><span class="s3">,</span>
+    <span class="s1">object rng</span><span class="s3">,</span>
+    <span class="s1">bint random</span><span class="s3">=</span><span class="s4">0</span><span class="s3">,</span>
+    <span class="s1">bint positive</span><span class="s3">=</span><span class="s4">0</span>
+<span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot;Cython version of the coordinate descent algorithm 
+        for Elastic-Net regression 
+ 
+        We minimize 
+ 
+        (1/2) * w^T Q w - q^T w + alpha norm(w, 1) + (beta/2) * norm(w, 2)^2 
+ 
+        which amount to the Elastic-Net problem when: 
+        Q = X^T X (Gram matrix) 
+        q = X^T y 
+ 
+    Returns 
+    ------- 
+    w : ndarray of shape (n_features,) 
+        ElasticNet coefficients. 
+    gap : float 
+        Achieved dual gap. 
+    tol : float 
+        Equals input `tol` times `np.dot(y, y)`. The tolerance used for the dual gap. 
+    n_iter : int 
+        Number of coordinate descent iterations. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">floating </span><span class="s2">is </span><span class="s1">float</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span>
+
+    <span class="s0"># get the data information into easy vars</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_features </span><span class="s3">= </span><span class="s1">Q</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+
+    <span class="s0"># initial value &quot;Q w&quot; which will be kept of up to date in the iterations</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[:] </span><span class="s1">H </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">Q</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[:] </span><span class="s1">XtA </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">floating tmp</span>
+    <span class="s2">cdef </span><span class="s1">floating w_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating q_dot_w</span>
+    <span class="s2">cdef </span><span class="s1">floating w_norm2</span>
+    <span class="s2">cdef </span><span class="s1">floating gap </span><span class="s3">= </span><span class="s1">tol </span><span class="s3">+ </span><span class="s4">1.0</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_tol </span><span class="s3">= </span><span class="s1">tol</span>
+    <span class="s2">cdef </span><span class="s1">floating dual_norm_XtA</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int ii</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_iter </span><span class="s3">= </span><span class="s4">0</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int f_iter</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t rand_r_state_seed </span><span class="s3">= </span><span class="s1">rng</span><span class="s3">.</span><span class="s1">randint</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">RAND_R_MAX</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t</span><span class="s3">* </span><span class="s1">rand_r_state </span><span class="s3">= &amp;</span><span class="s1">rand_r_state_seed</span>
+
+    <span class="s2">cdef </span><span class="s1">floating y_norm2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">* </span><span class="s1">w_ptr </span><span class="s3">= &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">const floating</span><span class="s3">* </span><span class="s1">Q_ptr </span><span class="s3">= &amp;</span><span class="s1">Q</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">const floating</span><span class="s3">* </span><span class="s1">q_ptr </span><span class="s3">= &amp;</span><span class="s1">q</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">* </span><span class="s1">H_ptr </span><span class="s3">= &amp;</span><span class="s1">H</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">* </span><span class="s1">XtA_ptr </span><span class="s3">= &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">tol </span><span class="s3">= </span><span class="s1">tol </span><span class="s3">* </span><span class="s1">y_norm2</span>
+
+    <span class="s2">if </span><span class="s1">alpha </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+            <span class="s5">&quot;Coordinate descent without L1 regularization may &quot;</span>
+            <span class="s5">&quot;lead to unexpected results and is discouraged. &quot;</span>
+            <span class="s5">&quot;Set l1_ratio &gt; 0 to add L1 regularization.&quot;</span>
+        <span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">nogil</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">n_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">max_iter</span><span class="s3">):</span>
+            <span class="s1">w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s1">d_w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s2">for </span><span class="s1">f_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):  </span><span class="s0"># Loop over coordinates</span>
+                <span class="s2">if </span><span class="s1">random</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">rand_int</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">rand_r_state</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">f_iter</span>
+
+                <span class="s2">if </span><span class="s1">Q</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">] == </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s2">continue</span>
+
+                <span class="s1">w_ii </span><span class="s3">= </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]  </span><span class="s0"># Store previous value</span>
+
+                <span class="s2">if </span><span class="s1">w_ii </span><span class="s3">!= </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s0"># H -= w_ii * Q[ii]</span>
+                    <span class="s1">_axpy</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, -</span><span class="s1">w_ii</span><span class="s3">, </span><span class="s1">Q_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_features</span><span class="s3">, </span><span class="s4">1</span><span class="s3">,</span>
+                          <span class="s1">H_ptr</span><span class="s3">, </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s1">tmp </span><span class="s3">= </span><span class="s1">q</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] - </span><span class="s1">H</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+
+                <span class="s2">if </span><span class="s1">positive </span><span class="s2">and </span><span class="s1">tmp </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">:</span>
+                    <span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s4">0.0</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s1">fsign</span><span class="s3">(</span><span class="s1">tmp</span><span class="s3">) * </span><span class="s1">fmax</span><span class="s3">(</span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">tmp</span><span class="s3">) - </span><span class="s1">alpha</span><span class="s3">, </span><span class="s4">0</span><span class="s3">) </span><span class="s1">\</span>
+                        <span class="s3">/ (</span><span class="s1">Q</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">] + </span><span class="s1">beta</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] != </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s0"># H +=  w[ii] * Q[ii] # Update H = X.T X w</span>
+                    <span class="s1">_axpy</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">], </span><span class="s1">Q_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_features</span><span class="s3">, </span><span class="s4">1</span><span class="s3">,</span>
+                          <span class="s1">H_ptr</span><span class="s3">, </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># update the maximum absolute coefficient update</span>
+                <span class="s1">d_w_ii </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] - </span><span class="s1">w_ii</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">d_w_ii </span><span class="s3">&gt; </span><span class="s1">d_w_max</span><span class="s3">:</span>
+                    <span class="s1">d_w_max </span><span class="s3">= </span><span class="s1">d_w_ii</span>
+
+                <span class="s2">if </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]) &gt; </span><span class="s1">w_max</span><span class="s3">:</span>
+                    <span class="s1">w_max </span><span class="s3">= </span><span class="s1">fabs</span><span class="s3">(</span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">])</span>
+
+            <span class="s2">if </span><span class="s1">w_max </span><span class="s3">== </span><span class="s4">0.0 </span><span class="s2">or </span><span class="s1">d_w_max </span><span class="s3">/ </span><span class="s1">w_max </span><span class="s3">&lt; </span><span class="s1">d_w_tol </span><span class="s2">or </span><span class="s1">n_iter </span><span class="s3">== </span><span class="s1">max_iter </span><span class="s3">- </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s0"># the biggest coordinate update of this iteration was smaller than</span>
+                <span class="s0"># the tolerance: check the duality gap as ultimate stopping</span>
+                <span class="s0"># criterion</span>
+
+                <span class="s0"># q_dot_w = np.dot(w, q)</span>
+                <span class="s1">q_dot_w </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">w_ptr</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s1">q_ptr</span><span class="s3">, </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+                    <span class="s1">XtA</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s1">q</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] - </span><span class="s1">H</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] - </span><span class="s1">beta </span><span class="s3">* </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+                <span class="s2">if </span><span class="s1">positive</span><span class="s3">:</span>
+                    <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">XtA_ptr</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s1">abs_max</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">XtA_ptr</span><span class="s3">)</span>
+
+                <span class="s0"># temp = np.sum(w * H)</span>
+                <span class="s1">tmp </span><span class="s3">= </span><span class="s4">0.0</span>
+                <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+                    <span class="s1">tmp </span><span class="s3">+= </span><span class="s1">w</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] * </span><span class="s1">H</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">]</span>
+                <span class="s1">R_norm2 </span><span class="s3">= </span><span class="s1">y_norm2 </span><span class="s3">+ </span><span class="s1">tmp </span><span class="s3">- </span><span class="s4">2.0 </span><span class="s3">* </span><span class="s1">q_dot_w</span>
+
+                <span class="s0"># w_norm2 = np.dot(w, w)</span>
+                <span class="s1">w_norm2 </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">dual_norm_XtA </span><span class="s3">&gt; </span><span class="s1">alpha</span><span class="s3">):</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s1">alpha </span><span class="s3">/ </span><span class="s1">dual_norm_XtA</span>
+                    <span class="s1">A_norm2 </span><span class="s3">= </span><span class="s1">R_norm2 </span><span class="s3">* (</span><span class="s1">const </span><span class="s3">** </span><span class="s4">2</span><span class="s3">)</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s4">0.5 </span><span class="s3">* (</span><span class="s1">R_norm2 </span><span class="s3">+ </span><span class="s1">A_norm2</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s4">1.0</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s1">R_norm2</span>
+
+                <span class="s0"># The call to asum is equivalent to the L1 norm of w</span>
+                <span class="s1">gap </span><span class="s3">+= (</span>
+                    <span class="s1">alpha </span><span class="s3">* </span><span class="s1">_asum</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, &amp;</span><span class="s1">w</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                    <span class="s3">- </span><span class="s1">const </span><span class="s3">* </span><span class="s1">y_norm2</span>
+                    <span class="s3">+ </span><span class="s1">const </span><span class="s3">* </span><span class="s1">q_dot_w</span>
+                    <span class="s3">+ </span><span class="s4">0.5 </span><span class="s3">* </span><span class="s1">beta </span><span class="s3">* (</span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">const </span><span class="s3">** </span><span class="s4">2</span><span class="s3">) * </span><span class="s1">w_norm2</span>
+                <span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">gap </span><span class="s3">&lt; </span><span class="s1">tol</span><span class="s3">:</span>
+                    <span class="s0"># return if we reached desired tolerance</span>
+                    <span class="s2">break</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0"># for/else, runs if for doesn't end with a `break`</span>
+            <span class="s2">with </span><span class="s1">gil</span><span class="s3">:</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s5">&quot;Objective did not converge. You might want to &quot;</span>
+                              <span class="s5">&quot;increase the number of iterations. Duality &quot;</span>
+                              <span class="s5">&quot;gap: {}, tolerance: {}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">gap</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">),</span>
+                              <span class="s1">ConvergenceWarning</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">w</span><span class="s3">), </span><span class="s1">gap</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">, </span><span class="s1">n_iter </span><span class="s3">+ </span><span class="s4">1</span>
+
+
+<span class="s2">def </span><span class="s1">enet_coordinate_descent_multi_task</span><span class="s3">(</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">, :] </span><span class="s1">W</span><span class="s3">,</span>
+    <span class="s1">floating l1_reg</span><span class="s3">,</span>
+    <span class="s1">floating l2_reg</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">, :] </span><span class="s1">X</span><span class="s3">,</span>
+    <span class="s1">const floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">, :] </span><span class="s1">Y</span><span class="s3">,</span>
+    <span class="s1">unsigned int max_iter</span><span class="s3">,</span>
+    <span class="s1">floating tol</span><span class="s3">,</span>
+    <span class="s1">object rng</span><span class="s3">,</span>
+    <span class="s1">bint random</span><span class="s3">=</span><span class="s4">0</span>
+<span class="s3">):</span>
+    <span class="s6">&quot;&quot;&quot;Cython version of the coordinate descent algorithm 
+        for Elastic-Net mult-task regression 
+ 
+        We minimize 
+ 
+        0.5 * norm(Y - X W.T, 2)^2 + l1_reg ||W.T||_21 + 0.5 * l2_reg norm(W.T, 2)^2 
+ 
+    Returns 
+    ------- 
+    W : ndarray of shape (n_tasks, n_features) 
+        ElasticNet coefficients. 
+    gap : float 
+        Achieved dual gap. 
+    tol : float 
+        Equals input `tol` times `np.dot(y, y)`. The tolerance used for the dual gap. 
+    n_iter : int 
+        Number of coordinate descent iterations. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">floating </span><span class="s2">is </span><span class="s1">float</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span>
+
+    <span class="s0"># get the data information into easy vars</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_samples </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_features </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_tasks </span><span class="s3">= </span><span class="s1">Y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">]</span>
+
+    <span class="s0"># to store XtA</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[:, ::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">XtA </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">n_tasks</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">floating XtA_axis1norm</span>
+    <span class="s2">cdef </span><span class="s1">floating dual_norm_XtA</span>
+
+    <span class="s0"># initial value of the residuals</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">, :] </span><span class="s1">R </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_tasks</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">'F'</span><span class="s3">)</span>
+
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">norm_cols_X </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">tmp </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">floating</span><span class="s3">[::</span><span class="s4">1</span><span class="s3">] </span><span class="s1">w_ii </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating w_max</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_ii</span>
+    <span class="s2">cdef </span><span class="s1">floating nn</span>
+    <span class="s2">cdef </span><span class="s1">floating W_ii_abs_max</span>
+    <span class="s2">cdef </span><span class="s1">floating gap </span><span class="s3">= </span><span class="s1">tol </span><span class="s3">+ </span><span class="s4">1.0</span>
+    <span class="s2">cdef </span><span class="s1">floating d_w_tol </span><span class="s3">= </span><span class="s1">tol</span>
+    <span class="s2">cdef </span><span class="s1">floating R_norm</span>
+    <span class="s2">cdef </span><span class="s1">floating w_norm</span>
+    <span class="s2">cdef </span><span class="s1">floating ry_sum</span>
+    <span class="s2">cdef </span><span class="s1">floating l21_norm</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int ii</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int jj</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int n_iter </span><span class="s3">= </span><span class="s4">0</span>
+    <span class="s2">cdef </span><span class="s1">unsigned int f_iter</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t rand_r_state_seed </span><span class="s3">= </span><span class="s1">rng</span><span class="s3">.</span><span class="s1">randint</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">RAND_R_MAX</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">uint32_t</span><span class="s3">* </span><span class="s1">rand_r_state </span><span class="s3">= &amp;</span><span class="s1">rand_r_state_seed</span>
+
+    <span class="s2">cdef </span><span class="s1">const floating</span><span class="s3">* </span><span class="s1">X_ptr </span><span class="s3">= &amp;</span><span class="s1">X</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s2">cdef </span><span class="s1">const floating</span><span class="s3">* </span><span class="s1">Y_ptr </span><span class="s3">= &amp;</span><span class="s1">Y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">l1_reg </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+            <span class="s5">&quot;Coordinate descent with l1_reg=0 may lead to unexpected&quot;</span>
+            <span class="s5">&quot; results and is discouraged.&quot;</span>
+        <span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">nogil</span><span class="s3">:</span>
+        <span class="s0"># norm_cols_X = (np.asarray(X) ** 2).sum(axis=0)</span>
+        <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+            <span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] = </span><span class="s1">_nrm2</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">X_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s4">1</span><span class="s3">) ** </span><span class="s4">2</span>
+
+        <span class="s0"># R = Y - np.dot(X, W.T)</span>
+        <span class="s1">_copy</span><span class="s3">(</span><span class="s1">n_samples </span><span class="s3">* </span><span class="s1">n_tasks</span><span class="s3">, </span><span class="s1">Y_ptr</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">W</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">] != </span><span class="s4">0</span><span class="s3">:</span>
+                    <span class="s1">_axpy</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, -</span><span class="s1">W</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s1">X_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s4">1</span><span class="s3">,</span>
+                          <span class="s3">&amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">jj</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+        <span class="s0"># tol = tol * linalg.norm(Y, ord='fro') ** 2</span>
+        <span class="s1">tol </span><span class="s3">= </span><span class="s1">tol </span><span class="s3">* </span><span class="s1">_nrm2</span><span class="s3">(</span><span class="s1">n_samples </span><span class="s3">* </span><span class="s1">n_tasks</span><span class="s3">, </span><span class="s1">Y_ptr</span><span class="s3">, </span><span class="s4">1</span><span class="s3">) ** </span><span class="s4">2</span>
+
+        <span class="s2">for </span><span class="s1">n_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">max_iter</span><span class="s3">):</span>
+            <span class="s1">w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s1">d_w_max </span><span class="s3">= </span><span class="s4">0.0</span>
+            <span class="s2">for </span><span class="s1">f_iter </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):  </span><span class="s0"># Loop over coordinates</span>
+                <span class="s2">if </span><span class="s1">random</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">rand_int</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">, </span><span class="s1">rand_r_state</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">ii </span><span class="s3">= </span><span class="s1">f_iter</span>
+
+                <span class="s2">if </span><span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] == </span><span class="s4">0.0</span><span class="s3">:</span>
+                    <span class="s2">continue</span>
+
+                <span class="s0"># w_ii = W[:, ii] # Store previous value</span>
+                <span class="s1">_copy</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">W</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">w_ii</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># Using Numpy:</span>
+                <span class="s0"># R += np.dot(X[:, ii][:, None], w_ii[None, :]) # rank 1 update</span>
+                <span class="s0"># Using Blas Level2:</span>
+                <span class="s0"># _ger(RowMajor, n_samples, n_tasks, 1.0,</span>
+                <span class="s0">#      &amp;X[0, ii], 1,</span>
+                <span class="s0">#      &amp;w_ii[0], 1, &amp;R[0, 0], n_tasks)</span>
+                <span class="s0"># Using Blas Level1 and for loop to avoid slower threads</span>
+                <span class="s0"># for such small vectors</span>
+                <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">w_ii</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] != </span><span class="s4">0</span><span class="s3">:</span>
+                        <span class="s1">_axpy</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">w_ii</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">], </span><span class="s1">X_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s4">1</span><span class="s3">,</span>
+                              <span class="s3">&amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">jj</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># Using numpy:</span>
+                <span class="s0"># tmp = np.dot(X[:, ii][None, :], R).ravel()</span>
+                <span class="s0"># Using BLAS Level 2:</span>
+                <span class="s0"># _gemv(RowMajor, Trans, n_samples, n_tasks, 1.0, &amp;R[0, 0],</span>
+                <span class="s0">#       n_tasks, &amp;X[0, ii], 1, 0.0, &amp;tmp[0], 1)</span>
+                <span class="s0"># Using BLAS Level 1 (faster for small vectors like here):</span>
+                <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">):</span>
+                    <span class="s1">tmp</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">] = </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">X_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s4">1</span><span class="s3">,</span>
+                                   <span class="s3">&amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">jj</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># nn = sqrt(np.sum(tmp ** 2))</span>
+                <span class="s1">nn </span><span class="s3">= </span><span class="s1">_nrm2</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">tmp</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># W[:, ii] = tmp * fmax(1. - l1_reg / nn, 0) / (norm_cols_X[ii] + l2_reg)</span>
+                <span class="s1">_copy</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">tmp</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">W</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s1">_scal</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, </span><span class="s1">fmax</span><span class="s3">(</span><span class="s4">1. </span><span class="s3">- </span><span class="s1">l1_reg </span><span class="s3">/ </span><span class="s1">nn</span><span class="s3">, </span><span class="s4">0</span><span class="s3">) / (</span><span class="s1">norm_cols_X</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">] + </span><span class="s1">l2_reg</span><span class="s3">),</span>
+                      <span class="s3">&amp;</span><span class="s1">W</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># Using numpy:</span>
+                <span class="s0"># R -= np.dot(X[:, ii][:, None], W[:, ii][None, :])</span>
+                <span class="s0"># Using BLAS Level 2:</span>
+                <span class="s0"># Update residual : rank 1 update</span>
+                <span class="s0"># _ger(RowMajor, n_samples, n_tasks, -1.0,</span>
+                <span class="s0">#      &amp;X[0, ii], 1, &amp;W[0, ii], 1,</span>
+                <span class="s0">#      &amp;R[0, 0], n_tasks)</span>
+                <span class="s0"># Using BLAS Level 1 (faster for small vectors like here):</span>
+                <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">W</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">] != </span><span class="s4">0</span><span class="s3">:</span>
+                        <span class="s1">_axpy</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, -</span><span class="s1">W</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s1">X_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s4">1</span><span class="s3">,</span>
+                              <span class="s3">&amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">jj</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># update the maximum absolute coefficient update</span>
+                <span class="s1">d_w_ii </span><span class="s3">= </span><span class="s1">diff_abs_max</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">W</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], &amp;</span><span class="s1">w_ii</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])</span>
+
+                <span class="s2">if </span><span class="s1">d_w_ii </span><span class="s3">&gt; </span><span class="s1">d_w_max</span><span class="s3">:</span>
+                    <span class="s1">d_w_max </span><span class="s3">= </span><span class="s1">d_w_ii</span>
+
+                <span class="s1">W_ii_abs_max </span><span class="s3">= </span><span class="s1">abs_max</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">W</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">])</span>
+                <span class="s2">if </span><span class="s1">W_ii_abs_max </span><span class="s3">&gt; </span><span class="s1">w_max</span><span class="s3">:</span>
+                    <span class="s1">w_max </span><span class="s3">= </span><span class="s1">W_ii_abs_max</span>
+
+            <span class="s2">if </span><span class="s1">w_max </span><span class="s3">== </span><span class="s4">0.0 </span><span class="s2">or </span><span class="s1">d_w_max </span><span class="s3">/ </span><span class="s1">w_max </span><span class="s3">&lt; </span><span class="s1">d_w_tol </span><span class="s2">or </span><span class="s1">n_iter </span><span class="s3">== </span><span class="s1">max_iter </span><span class="s3">- </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s0"># the biggest coordinate update of this iteration was smaller than</span>
+                <span class="s0"># the tolerance: check the duality gap as ultimate stopping</span>
+                <span class="s0"># criterion</span>
+
+                <span class="s0"># XtA = np.dot(X.T, R) - l2_reg * W.T</span>
+                <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+                    <span class="s2">for </span><span class="s1">jj </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">):</span>
+                        <span class="s1">XtA</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">, </span><span class="s1">jj</span><span class="s3">] = </span><span class="s1">_dot</span><span class="s3">(</span>
+                            <span class="s1">n_samples</span><span class="s3">, </span><span class="s1">X_ptr </span><span class="s3">+ </span><span class="s1">ii </span><span class="s3">* </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">jj</span><span class="s3">], </span><span class="s4">1</span>
+                            <span class="s3">) - </span><span class="s1">l2_reg </span><span class="s3">* </span><span class="s1">W</span><span class="s3">[</span><span class="s1">jj</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">]</span>
+
+                <span class="s0"># dual_norm_XtA = np.max(np.sqrt(np.sum(XtA ** 2, axis=1)))</span>
+                <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s4">0.0</span>
+                <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+                    <span class="s0"># np.sqrt(np.sum(XtA ** 2, axis=1))</span>
+                    <span class="s1">XtA_axis1norm </span><span class="s3">= </span><span class="s1">_nrm2</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">XtA</span><span class="s3">[</span><span class="s1">ii</span><span class="s3">, </span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">XtA_axis1norm </span><span class="s3">&gt; </span><span class="s1">dual_norm_XtA</span><span class="s3">:</span>
+                        <span class="s1">dual_norm_XtA </span><span class="s3">= </span><span class="s1">XtA_axis1norm</span>
+
+                <span class="s0"># TODO: use squared L2 norm directly</span>
+                <span class="s0"># R_norm = linalg.norm(R, ord='fro')</span>
+                <span class="s0"># w_norm = linalg.norm(W, ord='fro')</span>
+                <span class="s1">R_norm </span><span class="s3">= </span><span class="s1">_nrm2</span><span class="s3">(</span><span class="s1">n_samples </span><span class="s3">* </span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s1">w_norm </span><span class="s3">= </span><span class="s1">_nrm2</span><span class="s3">(</span><span class="s1">n_features </span><span class="s3">* </span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">W</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">dual_norm_XtA </span><span class="s3">&gt; </span><span class="s1">l1_reg</span><span class="s3">):</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s1">l1_reg </span><span class="s3">/ </span><span class="s1">dual_norm_XtA</span>
+                    <span class="s1">A_norm </span><span class="s3">= </span><span class="s1">R_norm </span><span class="s3">* </span><span class="s1">const</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s4">0.5 </span><span class="s3">* (</span><span class="s1">R_norm </span><span class="s3">** </span><span class="s4">2 </span><span class="s3">+ </span><span class="s1">A_norm </span><span class="s3">** </span><span class="s4">2</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">const </span><span class="s3">= </span><span class="s4">1.0</span>
+                    <span class="s1">gap </span><span class="s3">= </span><span class="s1">R_norm </span><span class="s3">** </span><span class="s4">2</span>
+
+                <span class="s0"># ry_sum = np.sum(R * y)</span>
+                <span class="s1">ry_sum </span><span class="s3">= </span><span class="s1">_dot</span><span class="s3">(</span><span class="s1">n_samples </span><span class="s3">* </span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">R</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">, &amp;</span><span class="s1">Y</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s0"># l21_norm = np.sqrt(np.sum(W ** 2, axis=0)).sum()</span>
+                <span class="s1">l21_norm </span><span class="s3">= </span><span class="s4">0.0</span>
+                <span class="s2">for </span><span class="s1">ii </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_features</span><span class="s3">):</span>
+                    <span class="s1">l21_norm </span><span class="s3">+= </span><span class="s1">_nrm2</span><span class="s3">(</span><span class="s1">n_tasks</span><span class="s3">, &amp;</span><span class="s1">W</span><span class="s3">[</span><span class="s4">0</span><span class="s3">, </span><span class="s1">ii</span><span class="s3">], </span><span class="s4">1</span><span class="s3">)</span>
+
+                <span class="s1">gap </span><span class="s3">+= (</span>
+                    <span class="s1">l1_reg </span><span class="s3">* </span><span class="s1">l21_norm</span>
+                    <span class="s3">- </span><span class="s1">const </span><span class="s3">* </span><span class="s1">ry_sum</span>
+                    <span class="s3">+ </span><span class="s4">0.5 </span><span class="s3">* </span><span class="s1">l2_reg </span><span class="s3">* (</span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">const </span><span class="s3">** </span><span class="s4">2</span><span class="s3">) * (</span><span class="s1">w_norm </span><span class="s3">** </span><span class="s4">2</span><span class="s3">)</span>
+                <span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">gap </span><span class="s3">&lt; </span><span class="s1">tol</span><span class="s3">:</span>
+                    <span class="s0"># return if we reached desired tolerance</span>
+                    <span class="s2">break</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0"># for/else, runs if for doesn't end with a `break`</span>
+            <span class="s2">with </span><span class="s1">gil</span><span class="s3">:</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s5">&quot;Objective did not converge. You might want to &quot;</span>
+                              <span class="s5">&quot;increase the number of iterations. Duality &quot;</span>
+                              <span class="s5">&quot;gap: {}, tolerance: {}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">gap</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">),</span>
+                              <span class="s1">ConvergenceWarning</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">W</span><span class="s3">), </span><span class="s1">gap</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">, </span><span class="s1">n_iter </span><span class="s3">+ </span><span class="s4">1</span>
+</pre>
+</body>
+</html>

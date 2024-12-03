@@ -1,0 +1,1131 @@
+<html>
+<head>
+<title>dviread.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+dviread.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A module for reading dvi files output by TeX. Several limitations make 
+this not (currently) useful as a general-purpose dvi preprocessor, but 
+it is currently used by the pdf backend for processing usetex text. 
+ 
+Interface:: 
+ 
+  with Dvi(filename, 72) as dvi: 
+      # iterate over pages: 
+      for page in dvi: 
+          w, h, d = page.width, page.height, page.descent 
+          for x, y, font, glyph, width in page.text: 
+              fontname = font.texname 
+              pointsize = font.size 
+              ... 
+          for x, y, height, width in page.boxes: 
+              ... 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span>
+<span class="s2">import </span><span class="s1">enum</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">lru_cache</span><span class="s3">, </span><span class="s1">partial</span><span class="s3">, </span><span class="s1">wraps</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">from </span><span class="s1">pathlib </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">struct</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">import </span><span class="s1">sys</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s3">, </span><span class="s1">cbook</span>
+
+<span class="s1">_log </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s1">__name__</span><span class="s3">)</span>
+
+<span class="s4"># Many dvi related files are looked for by external processes, require</span>
+<span class="s4"># additional parsing, and are used many times per rendering, which is why they</span>
+<span class="s4"># are cached using lru_cache().</span>
+
+<span class="s4"># Dvi is a bytecode format documented in</span>
+<span class="s4"># https://ctan.org/pkg/dvitype</span>
+<span class="s4"># https://texdoc.org/serve/dvitype.pdf/0</span>
+<span class="s4">#</span>
+<span class="s4"># The file consists of a preamble, some number of pages, a postamble,</span>
+<span class="s4"># and a finale. Different opcodes are allowed in different contexts,</span>
+<span class="s4"># so the Dvi object has a parser state:</span>
+<span class="s4">#</span>
+<span class="s4">#   pre:       expecting the preamble</span>
+<span class="s4">#   outer:     between pages (followed by a page or the postamble,</span>
+<span class="s4">#              also e.g. font definitions are allowed)</span>
+<span class="s4">#   page:      processing a page</span>
+<span class="s4">#   post_post: state after the postamble (our current implementation</span>
+<span class="s4">#              just stops reading)</span>
+<span class="s4">#   finale:    the finale (unimplemented in our current implementation)</span>
+
+<span class="s1">_dvistate </span><span class="s3">= </span><span class="s1">enum</span><span class="s3">.</span><span class="s1">Enum</span><span class="s3">(</span><span class="s5">'DviState'</span><span class="s3">, </span><span class="s5">'pre outer inpage post_post finale'</span><span class="s3">)</span>
+
+<span class="s4"># The marks on a page consist of text and boxes. A page also has dimensions.</span>
+<span class="s1">Page </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'Page'</span><span class="s3">, </span><span class="s5">'text boxes height width descent'</span><span class="s3">)</span>
+<span class="s1">Box </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'Box'</span><span class="s3">, </span><span class="s5">'x y height width'</span><span class="s3">)</span>
+
+
+<span class="s4"># Also a namedtuple, for backcompat.</span>
+<span class="s2">class </span><span class="s1">Text</span><span class="s3">(</span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'Text'</span><span class="s3">, </span><span class="s5">'x y font glyph width'</span><span class="s3">)):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A glyph in the dvi file. 
+ 
+    The *x* and *y* attributes directly position the glyph.  The *font*, 
+    *glyph*, and *width* attributes are kept public for back-compatibility, 
+    but users wanting to draw the glyph themselves are encouraged to instead 
+    load the font specified by `font_path` at `font_size`, warp it with the 
+    effects specified by `font_effects`, and load the glyph specified by 
+    `glyph_name_or_index`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_get_pdftexmap_entry</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">PsfontsMap</span><span class="s3">(</span><span class="s1">find_tex_file</span><span class="s3">(</span><span class="s5">&quot;pdftex.map&quot;</span><span class="s3">))[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">font</span><span class="s3">.</span><span class="s1">texname</span><span class="s3">]</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">font_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;The `~pathlib.Path` to the font for this glyph.&quot;&quot;&quot;</span>
+        <span class="s1">psfont </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_get_pdftexmap_entry</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">psfont</span><span class="s3">.</span><span class="s1">filename </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;No usable font file found for {} ({}); &quot;</span>
+                             <span class="s5">&quot;the font may lack a Type-1 version&quot;</span>
+                             <span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">psfont</span><span class="s3">.</span><span class="s1">psname</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">&quot;ascii&quot;</span><span class="s3">),</span>
+                                     <span class="s1">psfont</span><span class="s3">.</span><span class="s1">texname</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">&quot;ascii&quot;</span><span class="s3">)))</span>
+        <span class="s2">return </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">psfont</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">font_size</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;The font size.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">font</span><span class="s3">.</span><span class="s1">size</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">font_effects</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        The &quot;font effects&quot; dict for this glyph. 
+ 
+        This dict contains the values for this glyph of SlantFont and 
+        ExtendFont (if any), read off :file:`pdftex.map`. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_get_pdftexmap_entry</span><span class="s3">().</span><span class="s1">effects</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">glyph_name_or_index</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Either the glyph name or the native charmap glyph index. 
+ 
+        If :file:`pdftex.map` specifies an encoding for this glyph's font, that 
+        is a mapping of glyph indices to Adobe glyph names; use it to convert 
+        dvi indices to glyph names.  Callers can then convert glyph names to 
+        glyph indices (with FT_Get_Name_Index/get_name_index), and load the 
+        glyph using FT_Load_Glyph/load_glyph. 
+ 
+        If :file:`pdftex.map` specifies no encoding, the indices directly map 
+        to the font's &quot;native&quot; charmap; glyphs should directly load using 
+        FT_Load_Char/load_char after selecting the native charmap. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">entry </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_get_pdftexmap_entry</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">_parse_enc</span><span class="s3">(</span><span class="s1">entry</span><span class="s3">.</span><span class="s1">encoding</span><span class="s3">)[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">glyph</span><span class="s3">]</span>
+                <span class="s2">if </span><span class="s1">entry</span><span class="s3">.</span><span class="s1">encoding </span><span class="s2">is not None else </span><span class="s1">self</span><span class="s3">.</span><span class="s1">glyph</span><span class="s3">)</span>
+
+
+<span class="s4"># Opcode argument parsing</span>
+<span class="s4">#</span>
+<span class="s4"># Each of the following functions takes a Dvi object and delta, which is the</span>
+<span class="s4"># difference between the opcode and the minimum opcode with the same meaning.</span>
+<span class="s4"># Dvi opcodes often encode the number of argument bytes in this delta.</span>
+<span class="s1">_arg_mapping </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span>
+    <span class="s4"># raw: Return delta as is.</span>
+    <span class="s1">raw</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">delta</span><span class="s3">,</span>
+    <span class="s4"># u1: Read 1 byte as an unsigned number.</span>
+    <span class="s1">u1</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">dvi</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s4"># u4: Read 4 bytes as an unsigned number.</span>
+    <span class="s1">u4</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">dvi</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">4</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s4"># s4: Read 4 bytes as a signed number.</span>
+    <span class="s1">s4</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">dvi</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">4</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s4"># slen: Read delta bytes as a signed number, or None if delta is None.</span>
+    <span class="s1">slen</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">dvi</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">delta</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">if </span><span class="s1">delta </span><span class="s2">else None</span><span class="s3">,</span>
+    <span class="s4"># slen1: Read (delta + 1) bytes as a signed number.</span>
+    <span class="s1">slen1</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">dvi</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">delta </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s2">True</span><span class="s3">),</span>
+    <span class="s4"># ulen1: Read (delta + 1) bytes as an unsigned number.</span>
+    <span class="s1">ulen1</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">dvi</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">delta </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s2">False</span><span class="s3">),</span>
+    <span class="s4"># olen1: Read (delta + 1) bytes as an unsigned number if less than 4 bytes,</span>
+    <span class="s4"># as a signed number if 4 bytes.</span>
+    <span class="s1">olen1</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">dvi</span><span class="s3">, </span><span class="s1">delta</span><span class="s3">: </span><span class="s1">dvi</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">delta </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=(</span><span class="s1">delta </span><span class="s3">== </span><span class="s6">3</span><span class="s3">)),</span>
+<span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">table</span><span class="s3">, </span><span class="s1">min</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'raw'</span><span class="s3">,)):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Decorator for dispatch by opcode. Sets the values in *table* 
+    from *min* to *max* to this method, adds a check that the Dvi state 
+    matches *state* if not None, reads arguments from the file according 
+    to *args*. 
+ 
+    Parameters 
+    ---------- 
+    table : dict[int, callable] 
+        The dispatch table to be filled in. 
+ 
+    min, max : int 
+        Range of opcodes that calls the registered function; *max* defaults to 
+        *min*. 
+ 
+    state : _dvistate, optional 
+        State of the Dvi object in which these opcodes are allowed. 
+ 
+    args : list[str], default: ['raw'] 
+        Sequence of argument specifications: 
+ 
+        - 'raw': opcode minus minimum 
+        - 'u1': read one unsigned byte 
+        - 'u4': read four bytes, treat as an unsigned number 
+        - 's4': read four bytes, treat as a signed number 
+        - 'slen': read (opcode - minimum) bytes, treat as signed 
+        - 'slen1': read (opcode - minimum + 1) bytes, treat as signed 
+        - 'ulen1': read (opcode - minimum + 1) bytes, treat as unsigned 
+        - 'olen1': read (opcode - minimum + 1) bytes, treat as unsigned 
+          if under four bytes, signed if four bytes 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">decorate</span><span class="s3">(</span><span class="s1">method</span><span class="s3">):</span>
+        <span class="s1">get_args </span><span class="s3">= [</span><span class="s1">_arg_mapping</span><span class="s3">[</span><span class="s1">x</span><span class="s3">] </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">args</span><span class="s3">]</span>
+
+        <span class="s3">@</span><span class="s1">wraps</span><span class="s3">(</span><span class="s1">method</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">wrapper</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">byte</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">state </span><span class="s2">is not None and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">!= </span><span class="s1">state</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;state precondition failed&quot;</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">method</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *[</span><span class="s1">f</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">byte</span><span class="s3">-</span><span class="s1">min</span><span class="s3">) </span><span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">get_args</span><span class="s3">])</span>
+        <span class="s2">if </span><span class="s1">max </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">table</span><span class="s3">[</span><span class="s1">min</span><span class="s3">] = </span><span class="s1">wrapper</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">min</span><span class="s3">, </span><span class="s1">max</span><span class="s3">+</span><span class="s6">1</span><span class="s3">):</span>
+                <span class="s2">assert </span><span class="s1">table</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] </span><span class="s2">is None</span>
+                <span class="s1">table</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">wrapper</span>
+        <span class="s2">return </span><span class="s1">wrapper</span>
+    <span class="s2">return </span><span class="s1">decorate</span>
+
+
+<span class="s2">class </span><span class="s1">Dvi</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A reader for a dvi (&quot;device-independent&quot;) file, as produced by TeX. 
+ 
+    The current implementation can only iterate through pages in order, 
+    and does not even attempt to verify the postamble. 
+ 
+    This class can be used as a context manager to close the underlying 
+    file upon exit. Pages can be read via iteration. Here is an overly 
+    simple way to extract text without trying to detect whitespace:: 
+ 
+        &gt;&gt;&gt; with matplotlib.dviread.Dvi('input.dvi', 72) as dvi: 
+        ...     for page in dvi: 
+        ...         print(''.join(chr(t.glyph) for t in page.text)) 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># dispatch table</span>
+    <span class="s1">_dtable </span><span class="s3">= [</span><span class="s2">None</span><span class="s3">] * </span><span class="s6">256</span>
+    <span class="s1">_dispatch </span><span class="s3">= </span><span class="s1">partial</span><span class="s3">(</span><span class="s1">_dispatch</span><span class="s3">, </span><span class="s1">_dtable</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read the data from the file named *filename* and convert 
+        TeX's internal units to units of *dpi* per inch. 
+        *dpi* only sets the units and does not limit the resolution. 
+        Use None to return TeX's internal units. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">'Dvi: %s'</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">file </span><span class="s3">= </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s5">'rb'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">dpi</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">fonts </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">pre</span>
+
+    <span class="s2">def </span><span class="s1">__enter__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Context manager enter method, does nothing.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">__exit__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">etype</span><span class="s3">, </span><span class="s1">evalue</span><span class="s3">, </span><span class="s1">etrace</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Context manager exit method, closes the underlying file if it is open. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__iter__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Iterate through the pages of the file. 
+ 
+        Yields 
+        ------ 
+        Page 
+            Details of all the text and box objects on the page. 
+            The Page tuple contains lists of Text and Box tuples and 
+            the page dimensions, and the Text and Box tuples contain 
+            coordinates transformed into a standard Cartesian 
+            coordinate system at the dpi value given when initializing. 
+            The coordinates are floating point numbers, but otherwise 
+            precision is not lost and coordinate values are not clipped to 
+            integers. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_read</span><span class="s3">():</span>
+            <span class="s2">yield </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_output</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">close</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Close the underlying file if it is open.&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">closed</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">_output</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Output the text and boxes belonging to the most recent page. 
+        page = dvi._output() 
+        &quot;&quot;&quot;</span>
+        <span class="s1">minx</span><span class="s3">, </span><span class="s1">miny</span><span class="s3">, </span><span class="s1">maxx</span><span class="s3">, </span><span class="s1">maxy </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+        <span class="s1">maxy_pure </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+        <span class="s2">for </span><span class="s1">elt </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">text </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">elt</span><span class="s3">, </span><span class="s1">Box</span><span class="s3">):</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">w </span><span class="s3">= </span><span class="s1">elt</span>
+                <span class="s1">e </span><span class="s3">= </span><span class="s6">0  </span><span class="s4"># zero depth</span>
+            <span class="s2">else</span><span class="s3">:  </span><span class="s4"># glyph</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">g</span><span class="s3">, </span><span class="s1">w </span><span class="s3">= </span><span class="s1">elt</span>
+                <span class="s1">h</span><span class="s3">, </span><span class="s1">e </span><span class="s3">= </span><span class="s1">font</span><span class="s3">.</span><span class="s1">_height_depth_of</span><span class="s3">(</span><span class="s1">g</span><span class="s3">)</span>
+            <span class="s1">minx </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">minx</span><span class="s3">, </span><span class="s1">x</span><span class="s3">)</span>
+            <span class="s1">miny </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">miny</span><span class="s3">, </span><span class="s1">y </span><span class="s3">- </span><span class="s1">h</span><span class="s3">)</span>
+            <span class="s1">maxx </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">maxx</span><span class="s3">, </span><span class="s1">x </span><span class="s3">+ </span><span class="s1">w</span><span class="s3">)</span>
+            <span class="s1">maxy </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">maxy</span><span class="s3">, </span><span class="s1">y </span><span class="s3">+ </span><span class="s1">e</span><span class="s3">)</span>
+            <span class="s1">maxy_pure </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">maxy_pure</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_baseline_v </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">maxy_pure </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_baseline_v  </span><span class="s4"># This should normally be the case.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_baseline_v </span><span class="s3">= </span><span class="s2">None</span>
+
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">text </span><span class="s2">and not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">:  </span><span class="s4"># Avoid infs/nans from inf+/-inf.</span>
+            <span class="s2">return </span><span class="s1">Page</span><span class="s3">(</span><span class="s1">text</span><span class="s3">=[], </span><span class="s1">boxes</span><span class="s3">=[], </span><span class="s1">width</span><span class="s3">=</span><span class="s6">0</span><span class="s3">, </span><span class="s1">height</span><span class="s3">=</span><span class="s6">0</span><span class="s3">, </span><span class="s1">descent</span><span class="s3">=</span><span class="s6">0</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dpi </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s4"># special case for ease of debugging: output raw dvi coordinates</span>
+            <span class="s2">return </span><span class="s1">Page</span><span class="s3">(</span><span class="s1">text</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">text</span><span class="s3">, </span><span class="s1">boxes</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">,</span>
+                        <span class="s1">width</span><span class="s3">=</span><span class="s1">maxx</span><span class="s3">-</span><span class="s1">minx</span><span class="s3">, </span><span class="s1">height</span><span class="s3">=</span><span class="s1">maxy_pure</span><span class="s3">-</span><span class="s1">miny</span><span class="s3">,</span>
+                        <span class="s1">descent</span><span class="s3">=</span><span class="s1">maxy</span><span class="s3">-</span><span class="s1">maxy_pure</span><span class="s3">)</span>
+
+        <span class="s4"># convert from TeX's &quot;scaled points&quot; to dpi units</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">/ (</span><span class="s6">72.27 </span><span class="s3">* </span><span class="s6">2</span><span class="s3">**</span><span class="s6">16</span><span class="s3">)</span>
+        <span class="s1">descent </span><span class="s3">= (</span><span class="s1">maxy </span><span class="s3">- </span><span class="s1">maxy_pure</span><span class="s3">) * </span><span class="s1">d</span>
+
+        <span class="s1">text </span><span class="s3">= [</span><span class="s1">Text</span><span class="s3">((</span><span class="s1">x</span><span class="s3">-</span><span class="s1">minx</span><span class="s3">)*</span><span class="s1">d</span><span class="s3">, (</span><span class="s1">maxy</span><span class="s3">-</span><span class="s1">y</span><span class="s3">)*</span><span class="s1">d </span><span class="s3">- </span><span class="s1">descent</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">g</span><span class="s3">, </span><span class="s1">w</span><span class="s3">*</span><span class="s1">d</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">g</span><span class="s3">, </span><span class="s1">w</span><span class="s3">) </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">text</span><span class="s3">]</span>
+        <span class="s1">boxes </span><span class="s3">= [</span><span class="s1">Box</span><span class="s3">((</span><span class="s1">x</span><span class="s3">-</span><span class="s1">minx</span><span class="s3">)*</span><span class="s1">d</span><span class="s3">, (</span><span class="s1">maxy</span><span class="s3">-</span><span class="s1">y</span><span class="s3">)*</span><span class="s1">d </span><span class="s3">- </span><span class="s1">descent</span><span class="s3">, </span><span class="s1">h</span><span class="s3">*</span><span class="s1">d</span><span class="s3">, </span><span class="s1">w</span><span class="s3">*</span><span class="s1">d</span><span class="s3">)</span>
+                 <span class="s2">for </span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">w</span><span class="s3">) </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">]</span>
+
+        <span class="s2">return </span><span class="s1">Page</span><span class="s3">(</span><span class="s1">text</span><span class="s3">=</span><span class="s1">text</span><span class="s3">, </span><span class="s1">boxes</span><span class="s3">=</span><span class="s1">boxes</span><span class="s3">, </span><span class="s1">width</span><span class="s3">=(</span><span class="s1">maxx</span><span class="s3">-</span><span class="s1">minx</span><span class="s3">)*</span><span class="s1">d</span><span class="s3">,</span>
+                    <span class="s1">height</span><span class="s3">=(</span><span class="s1">maxy_pure</span><span class="s3">-</span><span class="s1">miny</span><span class="s3">)*</span><span class="s1">d</span><span class="s3">, </span><span class="s1">descent</span><span class="s3">=</span><span class="s1">descent</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read one page from the file. Return True if successful, 
+        False if there were no more pages. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># Pages appear to start with the sequence</span>
+        <span class="s4">#   bop (begin of page)</span>
+        <span class="s4">#   xxx comment</span>
+        <span class="s4">#   &lt;push, ..., pop&gt;  # if using chemformula</span>
+        <span class="s4">#   down</span>
+        <span class="s4">#   push</span>
+        <span class="s4">#     down</span>
+        <span class="s4">#     &lt;push, push, xxx, right, xxx, pop, pop&gt;  # if using xcolor</span>
+        <span class="s4">#     down</span>
+        <span class="s4">#     push</span>
+        <span class="s4">#       down (possibly multiple)</span>
+        <span class="s4">#       push  &lt;=  here, v is the baseline position.</span>
+        <span class="s4">#         etc.</span>
+        <span class="s4"># (dviasm is useful to explore this structure.)</span>
+        <span class="s4"># Thus, we use the vertical position at the first time the stack depth</span>
+        <span class="s4"># reaches 3, while at least three &quot;downs&quot; have been executed (excluding</span>
+        <span class="s4"># those popped out (corresponding to the chemformula preamble)), as the</span>
+        <span class="s4"># baseline (the &quot;down&quot; count is necessary to handle xcolor).</span>
+        <span class="s1">down_stack </span><span class="s3">= [</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_baseline_v </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">while True</span><span class="s3">:</span>
+            <span class="s1">byte </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_dtable</span><span class="s3">[</span><span class="s1">byte</span><span class="s3">](</span><span class="s1">self</span><span class="s3">, </span><span class="s1">byte</span><span class="s3">)</span>
+            <span class="s1">name </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_dtable</span><span class="s3">[</span><span class="s1">byte</span><span class="s3">].</span><span class="s1">__name__</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s3">== </span><span class="s5">&quot;_push&quot;</span><span class="s3">:</span>
+                <span class="s1">down_stack</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">down_stack</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">])</span>
+            <span class="s2">elif </span><span class="s1">name </span><span class="s3">== </span><span class="s5">&quot;_pop&quot;</span><span class="s3">:</span>
+                <span class="s1">down_stack</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">()</span>
+            <span class="s2">elif </span><span class="s1">name </span><span class="s3">== </span><span class="s5">&quot;_down&quot;</span><span class="s3">:</span>
+                <span class="s1">down_stack</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] += </span><span class="s6">1</span>
+            <span class="s2">if </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_baseline_v </span><span class="s2">is None</span>
+                    <span class="s2">and </span><span class="s1">len</span><span class="s3">(</span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s5">&quot;stack&quot;</span><span class="s3">, [])) == </span><span class="s6">3</span>
+                    <span class="s2">and </span><span class="s1">down_stack</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] &gt;= </span><span class="s6">4</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_baseline_v </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span>
+            <span class="s2">if </span><span class="s1">byte </span><span class="s3">== </span><span class="s6">140</span><span class="s3">:                         </span><span class="s4"># end of page</span>
+                <span class="s2">return True</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s2">is </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">post_post</span><span class="s3">:   </span><span class="s4"># end of file</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+                <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">nbytes</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read and return a big-endian integer *nbytes* long. 
+        Signedness is determined by the *signed* keyword. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">int</span><span class="s3">.</span><span class="s1">from_bytes</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">nbytes</span><span class="s3">), </span><span class="s5">&quot;big&quot;</span><span class="s3">, </span><span class="s1">signed</span><span class="s3">=</span><span class="s1">signed</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">0</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">127</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_set_char_immediate</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">char</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_put_char_real</span><span class="s3">(</span><span class="s1">char</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fonts</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">f</span><span class="s3">].</span><span class="s1">_width_of</span><span class="s3">(</span><span class="s1">char</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">128</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">131</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'olen1'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_set_char</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">char</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_put_char_real</span><span class="s3">(</span><span class="s1">char</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fonts</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">f</span><span class="s3">].</span><span class="s1">_width_of</span><span class="s3">(</span><span class="s1">char</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">132</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'s4'</span><span class="s3">, </span><span class="s5">'s4'</span><span class="s3">))</span>
+    <span class="s2">def </span><span class="s1">_set_rule</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_put_rule_real</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+= </span><span class="s1">b</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">133</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">136</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'olen1'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_put_char</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">char</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_put_char_real</span><span class="s3">(</span><span class="s1">char</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_put_char_real</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">char</span><span class="s3">):</span>
+        <span class="s1">font </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fonts</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">f</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">font</span><span class="s3">.</span><span class="s1">_vf </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">text</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">Text</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span><span class="s3">, </span><span class="s1">font</span><span class="s3">, </span><span class="s1">char</span><span class="s3">,</span>
+                                  <span class="s1">font</span><span class="s3">.</span><span class="s1">_width_of</span><span class="s3">(</span><span class="s1">char</span><span class="s3">)))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">scale </span><span class="s3">= </span><span class="s1">font</span><span class="s3">.</span><span class="s1">_scale</span>
+            <span class="s2">for </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">g</span><span class="s3">, </span><span class="s1">w </span><span class="s2">in </span><span class="s1">font</span><span class="s3">.</span><span class="s1">_vf</span><span class="s3">[</span><span class="s1">char</span><span class="s3">].</span><span class="s1">text</span><span class="s3">:</span>
+                <span class="s1">newf </span><span class="s3">= </span><span class="s1">DviFont</span><span class="s3">(</span><span class="s1">scale</span><span class="s3">=</span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">scale</span><span class="s3">, </span><span class="s1">f</span><span class="s3">.</span><span class="s1">_scale</span><span class="s3">),</span>
+                               <span class="s1">tfm</span><span class="s3">=</span><span class="s1">f</span><span class="s3">.</span><span class="s1">_tfm</span><span class="s3">, </span><span class="s1">texname</span><span class="s3">=</span><span class="s1">f</span><span class="s3">.</span><span class="s1">texname</span><span class="s3">, </span><span class="s1">vf</span><span class="s3">=</span><span class="s1">f</span><span class="s3">.</span><span class="s1">_vf</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">text</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">Text</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+ </span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">),</span>
+                                      <span class="s1">self</span><span class="s3">.</span><span class="s1">v </span><span class="s3">+ </span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">),</span>
+                                      <span class="s1">newf</span><span class="s3">, </span><span class="s1">g</span><span class="s3">, </span><span class="s1">newf</span><span class="s3">.</span><span class="s1">_width_of</span><span class="s3">(</span><span class="s1">g</span><span class="s3">)))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">([</span><span class="s1">Box</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+ </span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">),</span>
+                                   <span class="s1">self</span><span class="s3">.</span><span class="s1">v </span><span class="s3">+ </span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">),</span>
+                                   <span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">), </span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">))</span>
+                               <span class="s2">for </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b </span><span class="s2">in </span><span class="s1">font</span><span class="s3">.</span><span class="s1">_vf</span><span class="s3">[</span><span class="s1">char</span><span class="s3">].</span><span class="s1">boxes</span><span class="s3">])</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">137</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'s4'</span><span class="s3">, </span><span class="s5">'s4'</span><span class="s3">))</span>
+    <span class="s2">def </span><span class="s1">_put_rule</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_put_rule_real</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_put_rule_real</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">a </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">b </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">Box</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">))</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">138</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_nop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">_</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">139</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">outer</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'s4'</span><span class="s3">,)*</span><span class="s6">11</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_bop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">c0</span><span class="s3">, </span><span class="s1">c1</span><span class="s3">, </span><span class="s1">c2</span><span class="s3">, </span><span class="s1">c3</span><span class="s3">, </span><span class="s1">c4</span><span class="s3">, </span><span class="s1">c5</span><span class="s3">, </span><span class="s1">c6</span><span class="s3">, </span><span class="s1">c7</span><span class="s3">, </span><span class="s1">c8</span><span class="s3">, </span><span class="s1">c9</span><span class="s3">, </span><span class="s1">p</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">w</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z </span><span class="s3">= </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">stack </span><span class="s3">= []</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">text </span><span class="s3">= []          </span><span class="s4"># list of Text objects</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">boxes </span><span class="s3">= []         </span><span class="s4"># list of Box objects</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">140</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_eop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">_</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">outer</span>
+        <span class="s2">del </span><span class="s1">self</span><span class="s3">.</span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">w</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">stack</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">141</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_push</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">_</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">stack</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">self</span><span class="s3">.</span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">w</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z</span><span class="s3">))</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">142</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_pop</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">_</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">w</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">stack</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">143</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">146</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'slen1'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_right</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+= </span><span class="s1">b</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">147</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">151</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'slen'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_right_w</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">new_w</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">new_w </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">w </span><span class="s3">= </span><span class="s1">new_w</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">w</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">152</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">156</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'slen'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_right_x</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">new_x</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">new_x </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">x </span><span class="s3">= </span><span class="s1">new_x</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">157</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">160</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'slen1'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_down</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">a</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">v </span><span class="s3">+= </span><span class="s1">a</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">161</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">165</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'slen'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_down_y</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">new_y</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">new_y </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">y </span><span class="s3">= </span><span class="s1">new_y</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">v </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">166</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">170</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'slen'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_down_z</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">new_z</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">new_z </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">z </span><span class="s3">= </span><span class="s1">new_z</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">v </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">171</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">234</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_fnt_num_immediate</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">k</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">f </span><span class="s3">= </span><span class="s1">k</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">235</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">238</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'olen1'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_fnt_num</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">new_f</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">f </span><span class="s3">= </span><span class="s1">new_f</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">239</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">242</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'ulen1'</span><span class="s3">,))</span>
+    <span class="s2">def </span><span class="s1">_xxx</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">datalen</span><span class="s3">):</span>
+        <span class="s1">special </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">datalen</span><span class="s3">)</span>
+        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+            <span class="s5">'Dvi._xxx: encountered special: %s'</span><span class="s3">,</span>
+            <span class="s5">''</span><span class="s3">.</span><span class="s1">join</span><span class="s3">([</span><span class="s1">chr</span><span class="s3">(</span><span class="s1">ch</span><span class="s3">) </span><span class="s2">if </span><span class="s6">32 </span><span class="s3">&lt;= </span><span class="s1">ch </span><span class="s3">&lt; </span><span class="s6">127 </span><span class="s2">else </span><span class="s5">'&lt;%02x&gt;' </span><span class="s3">% </span><span class="s1">ch</span>
+                     <span class="s2">for </span><span class="s1">ch </span><span class="s2">in </span><span class="s1">special</span><span class="s3">]))</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">243</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">246</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'olen1'</span><span class="s3">, </span><span class="s5">'u4'</span><span class="s3">, </span><span class="s5">'u4'</span><span class="s3">, </span><span class="s5">'u4'</span><span class="s3">, </span><span class="s5">'u1'</span><span class="s3">, </span><span class="s5">'u1'</span><span class="s3">))</span>
+    <span class="s2">def </span><span class="s1">_fnt_def</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">l</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_fnt_def_real</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">l</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_fnt_def_real</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">l</span><span class="s3">):</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">a </span><span class="s3">+ </span><span class="s1">l</span><span class="s3">)</span>
+        <span class="s1">fontname </span><span class="s3">= </span><span class="s1">n</span><span class="s3">[-</span><span class="s1">l</span><span class="s3">:].</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">'ascii'</span><span class="s3">)</span>
+        <span class="s1">tfm </span><span class="s3">= </span><span class="s1">_tfmfile</span><span class="s3">(</span><span class="s1">fontname</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">c </span><span class="s3">!= </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">tfm</span><span class="s3">.</span><span class="s1">checksum </span><span class="s3">!= </span><span class="s6">0 </span><span class="s2">and </span><span class="s1">c </span><span class="s3">!= </span><span class="s1">tfm</span><span class="s3">.</span><span class="s1">checksum</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'tfm checksum mismatch: %s' </span><span class="s3">% </span><span class="s1">n</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">vf </span><span class="s3">= </span><span class="s1">_vffile</span><span class="s3">(</span><span class="s1">fontname</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">FileNotFoundError</span><span class="s3">:</span>
+            <span class="s1">vf </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">fonts</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">DviFont</span><span class="s3">(</span><span class="s1">scale</span><span class="s3">=</span><span class="s1">s</span><span class="s3">, </span><span class="s1">tfm</span><span class="s3">=</span><span class="s1">tfm</span><span class="s3">, </span><span class="s1">texname</span><span class="s3">=</span><span class="s1">n</span><span class="s3">, </span><span class="s1">vf</span><span class="s3">=</span><span class="s1">vf</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">247</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">pre</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(</span><span class="s5">'u1'</span><span class="s3">, </span><span class="s5">'u4'</span><span class="s3">, </span><span class="s5">'u4'</span><span class="s3">, </span><span class="s5">'u4'</span><span class="s3">, </span><span class="s5">'u1'</span><span class="s3">))</span>
+    <span class="s2">def </span><span class="s1">_pre</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">i</span><span class="s3">, </span><span class="s1">num</span><span class="s3">, </span><span class="s1">den</span><span class="s3">, </span><span class="s1">mag</span><span class="s3">, </span><span class="s1">k</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">k</span><span class="s3">)  </span><span class="s4"># comment in the dvi file</span>
+        <span class="s2">if </span><span class="s1">i </span><span class="s3">!= </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Unknown dvi format %d&quot; </span><span class="s3">% </span><span class="s1">i</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">num </span><span class="s3">!= </span><span class="s6">25400000 </span><span class="s2">or </span><span class="s1">den </span><span class="s3">!= </span><span class="s6">7227 </span><span class="s3">* </span><span class="s6">2</span><span class="s3">**</span><span class="s6">16</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Nonstandard units in dvi file&quot;</span><span class="s3">)</span>
+            <span class="s4"># meaning: TeX always uses those exact values, so it</span>
+            <span class="s4"># should be enough for us to support those</span>
+            <span class="s4"># (There are 72.27 pt to an inch so 7227 pt =</span>
+            <span class="s4"># 7227 * 2**16 sp to 100 in. The numerator is multiplied</span>
+            <span class="s4"># by 10^5 to get units of 10**-7 meters.)</span>
+        <span class="s2">if </span><span class="s1">mag </span><span class="s3">!= </span><span class="s6">1000</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Nonstandard magnification in dvi file&quot;</span><span class="s3">)</span>
+            <span class="s4"># meaning: LaTeX seems to frown on setting \mag, so</span>
+            <span class="s4"># I think we can assume this is constant</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">outer</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">248</span><span class="s3">, </span><span class="s1">state</span><span class="s3">=</span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">outer</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_post</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">_</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">post_post</span>
+        <span class="s4"># TODO: actually read the postamble and finale?</span>
+        <span class="s4"># currently post_post just triggers closing the file</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s6">249</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_post_post</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">_</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s3">@</span><span class="s1">_dispatch</span><span class="s3">(</span><span class="s1">min</span><span class="s3">=</span><span class="s6">250</span><span class="s3">, </span><span class="s1">max</span><span class="s3">=</span><span class="s6">255</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">_malformed</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">offset</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;unknown command: byte </span><span class="s2">{</span><span class="s6">250 </span><span class="s3">+ </span><span class="s1">offset</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">DviFont</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Encapsulation of a font that a DVI file can refer to. 
+ 
+    This class holds a font's texname and size, supports comparison, 
+    and knows the widths of glyphs in the same units as the AFM file. 
+    There are also internal attributes (for use by dviread.py) that 
+    are *not* used for comparison. 
+ 
+    The size is in Adobe points (converted from TeX points). 
+ 
+    Parameters 
+    ---------- 
+    scale : float 
+        Factor by which the font is scaled from its natural size. 
+    tfm : Tfm 
+        TeX font metrics for this font 
+    texname : bytes 
+       Name of the font as used internally by TeX and friends, as an ASCII 
+       bytestring.  This is usually very different from any external font 
+       names; `PsfontsMap` can be used to find the external name of the font. 
+    vf : Vf 
+       A TeX &quot;virtual font&quot; file, or None if this font is not virtual. 
+ 
+    Attributes 
+    ---------- 
+    texname : bytes 
+    size : float 
+       Size of the font in Adobe points, converted from the slightly 
+       smaller TeX points. 
+    widths : list 
+       Widths of glyphs in glyph-space units, typically 1/1000ths of 
+       the point size. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= (</span><span class="s5">'texname'</span><span class="s3">, </span><span class="s5">'size'</span><span class="s3">, </span><span class="s5">'widths'</span><span class="s3">, </span><span class="s5">'_scale'</span><span class="s3">, </span><span class="s5">'_vf'</span><span class="s3">, </span><span class="s5">'_tfm'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">tfm</span><span class="s3">, </span><span class="s1">texname</span><span class="s3">, </span><span class="s1">vf</span><span class="s3">):</span>
+        <span class="s1">_api</span><span class="s3">.</span><span class="s1">check_isinstance</span><span class="s3">(</span><span class="s1">bytes</span><span class="s3">, </span><span class="s1">texname</span><span class="s3">=</span><span class="s1">texname</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_scale </span><span class="s3">= </span><span class="s1">scale</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_tfm </span><span class="s3">= </span><span class="s1">tfm</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">texname </span><span class="s3">= </span><span class="s1">texname</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_vf </span><span class="s3">= </span><span class="s1">vf</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">size </span><span class="s3">= </span><span class="s1">scale </span><span class="s3">* (</span><span class="s6">72.0 </span><span class="s3">/ (</span><span class="s6">72.27 </span><span class="s3">* </span><span class="s6">2</span><span class="s3">**</span><span class="s6">16</span><span class="s3">))</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">nchars </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">tfm</span><span class="s3">.</span><span class="s1">width</span><span class="s3">) + </span><span class="s6">1</span>
+        <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:</span>
+            <span class="s1">nchars </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">widths </span><span class="s3">= [(</span><span class="s6">1000</span><span class="s3">*</span><span class="s1">tfm</span><span class="s3">.</span><span class="s1">width</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">char</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)) &gt;&gt; </span><span class="s6">20</span>
+                       <span class="s2">for </span><span class="s1">char </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">nchars</span><span class="s3">)]</span>
+
+    <span class="s2">def </span><span class="s1">__eq__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s2">is </span><span class="s1">type</span><span class="s3">(</span><span class="s1">other</span><span class="s3">)</span>
+                <span class="s2">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">texname </span><span class="s3">== </span><span class="s1">other</span><span class="s3">.</span><span class="s1">texname </span><span class="s2">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s1">other</span><span class="s3">.</span><span class="s1">size</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__ne__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">other</span><span class="s3">):</span>
+        <span class="s2">return not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">__eq__</span><span class="s3">(</span><span class="s1">other</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s5">f&quot;&lt;</span><span class="s2">{</span><span class="s1">type</span><span class="s3">(</span><span class="s1">self</span><span class="s3">).</span><span class="s1">__name__</span><span class="s2">}</span><span class="s5">: </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">texname</span><span class="s2">}</span><span class="s5">&gt;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">_width_of</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">char</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Width of char in dvi units.&quot;&quot;&quot;</span>
+        <span class="s1">width </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_tfm</span><span class="s3">.</span><span class="s1">width</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">char</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">width </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">width</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_scale</span><span class="s3">)</span>
+        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">'No width for char %d in font %s.'</span><span class="s3">, </span><span class="s1">char</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">texname</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s6">0</span>
+
+    <span class="s2">def </span><span class="s1">_height_depth_of</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">char</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Height and depth of char in dvi units.&quot;&quot;&quot;</span>
+        <span class="s1">result </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">metric</span><span class="s3">, </span><span class="s1">name </span><span class="s2">in </span><span class="s3">((</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_tfm</span><span class="s3">.</span><span class="s1">height</span><span class="s3">, </span><span class="s5">&quot;height&quot;</span><span class="s3">),</span>
+                             <span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_tfm</span><span class="s3">.</span><span class="s1">depth</span><span class="s3">, </span><span class="s5">&quot;depth&quot;</span><span class="s3">)):</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">metric</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">char</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">value </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">'No %s for char %d in font %s'</span><span class="s3">,</span>
+                           <span class="s1">name</span><span class="s3">, </span><span class="s1">char</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">texname</span><span class="s3">)</span>
+                <span class="s1">result</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">result</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_scale</span><span class="s3">))</span>
+        <span class="s4"># cmsyXX (symbols font) glyph 0 (&quot;minus&quot;) has a nonzero descent</span>
+        <span class="s4"># so that TeX aligns equations properly</span>
+        <span class="s4"># (https://tex.stackexchange.com/q/526103/)</span>
+        <span class="s4"># but we actually care about the rasterization depth to align</span>
+        <span class="s4"># the dvipng-generated images.</span>
+        <span class="s2">if </span><span class="s1">re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s7">br'^cmsy\d+$'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">texname</span><span class="s3">) </span><span class="s2">and </span><span class="s1">char </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">result</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] = </span><span class="s6">0</span>
+        <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s2">class </span><span class="s1">Vf</span><span class="s3">(</span><span class="s1">Dvi</span><span class="s3">):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    A virtual font (\*.vf file) containing subroutines for dvi files. 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Notes 
+    ----- 
+    The virtual font format is a derivative of dvi: 
+    http://mirrors.ctan.org/info/knuth/virtual-fonts 
+    This class reuses some of the machinery of `Dvi` 
+    but replaces the `_read` loop and dispatch mechanism. 
+ 
+    Examples 
+    -------- 
+    :: 
+ 
+        vf = Vf(filename) 
+        glyph = vf[code] 
+        glyph.text, glyph.boxes, glyph.width 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_first_font </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_chars </span><span class="s3">= {}</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_read</span><span class="s3">()</span>
+        <span class="s2">finally</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__getitem__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">code</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_chars</span><span class="s3">[</span><span class="s1">code</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">_read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Read one page from the file. Return True if successful, 
+        False if there were no more pages. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">packet_char</span><span class="s3">, </span><span class="s1">packet_ends </span><span class="s3">= </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span>
+        <span class="s1">packet_len</span><span class="s3">, </span><span class="s1">packet_width </span><span class="s3">= </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span>
+        <span class="s2">while True</span><span class="s3">:</span>
+            <span class="s1">byte </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s4"># If we are in a packet, execute the dvi instructions</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s2">is </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span><span class="s3">:</span>
+                <span class="s1">byte_at </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">tell</span><span class="s3">()-</span><span class="s6">1</span>
+                <span class="s2">if </span><span class="s1">byte_at </span><span class="s3">== </span><span class="s1">packet_ends</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_finalize_packet</span><span class="s3">(</span><span class="s1">packet_char</span><span class="s3">, </span><span class="s1">packet_width</span><span class="s3">)</span>
+                    <span class="s1">packet_len</span><span class="s3">, </span><span class="s1">packet_char</span><span class="s3">, </span><span class="s1">packet_width </span><span class="s3">= </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span>
+                    <span class="s4"># fall through to out-of-packet code</span>
+                <span class="s2">elif </span><span class="s1">byte_at </span><span class="s3">&gt; </span><span class="s1">packet_ends</span><span class="s3">:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Packet length mismatch in vf file&quot;</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">byte </span><span class="s2">in </span><span class="s3">(</span><span class="s6">139</span><span class="s3">, </span><span class="s6">140</span><span class="s3">) </span><span class="s2">or </span><span class="s1">byte </span><span class="s3">&gt;= </span><span class="s6">243</span><span class="s3">:</span>
+                        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                            <span class="s5">&quot;Inappropriate opcode %d in vf file&quot; </span><span class="s3">% </span><span class="s1">byte</span><span class="s3">)</span>
+                    <span class="s1">Dvi</span><span class="s3">.</span><span class="s1">_dtable</span><span class="s3">[</span><span class="s1">byte</span><span class="s3">](</span><span class="s1">self</span><span class="s3">, </span><span class="s1">byte</span><span class="s3">)</span>
+                    <span class="s2">continue</span>
+
+            <span class="s4"># We are outside a packet</span>
+            <span class="s2">if </span><span class="s1">byte </span><span class="s3">&lt; </span><span class="s6">242</span><span class="s3">:          </span><span class="s4"># a short packet (length given by byte)</span>
+                <span class="s1">packet_len </span><span class="s3">= </span><span class="s1">byte</span>
+                <span class="s1">packet_char</span><span class="s3">, </span><span class="s1">packet_width </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">1</span><span class="s3">), </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">3</span><span class="s3">)</span>
+                <span class="s1">packet_ends </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_init_packet</span><span class="s3">(</span><span class="s1">byte</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">inpage</span>
+            <span class="s2">elif </span><span class="s1">byte </span><span class="s3">== </span><span class="s6">242</span><span class="s3">:       </span><span class="s4"># a long packet</span>
+                <span class="s1">packet_len</span><span class="s3">, </span><span class="s1">packet_char</span><span class="s3">, </span><span class="s1">packet_width </span><span class="s3">= </span><span class="s1">\</span>
+                            <span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s3">(</span><span class="s6">4</span><span class="s3">, </span><span class="s6">4</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)]</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_init_packet</span><span class="s3">(</span><span class="s1">packet_len</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s6">243 </span><span class="s3">&lt;= </span><span class="s1">byte </span><span class="s3">&lt;= </span><span class="s6">246</span><span class="s3">:</span>
+                <span class="s1">k </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">byte </span><span class="s3">- </span><span class="s6">242</span><span class="s3">, </span><span class="s1">byte </span><span class="s3">== </span><span class="s6">246</span><span class="s3">)</span>
+                <span class="s1">c</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">l </span><span class="s3">= [</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s3">(</span><span class="s6">4</span><span class="s3">, </span><span class="s6">4</span><span class="s3">, </span><span class="s6">4</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)]</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_fnt_def_real</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">l</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_first_font </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_first_font </span><span class="s3">= </span><span class="s1">k</span>
+            <span class="s2">elif </span><span class="s1">byte </span><span class="s3">== </span><span class="s6">247</span><span class="s3">:       </span><span class="s4"># preamble</span>
+                <span class="s1">i</span><span class="s3">, </span><span class="s1">k </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">1</span><span class="s3">), </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)</span>
+                <span class="s1">x </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">k</span><span class="s3">)</span>
+                <span class="s1">cs</span><span class="s3">, </span><span class="s1">ds </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">4</span><span class="s3">), </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_arg</span><span class="s3">(</span><span class="s6">4</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_pre</span><span class="s3">(</span><span class="s1">i</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">cs</span><span class="s3">, </span><span class="s1">ds</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">byte </span><span class="s3">== </span><span class="s6">248</span><span class="s3">:       </span><span class="s4"># postamble (just some number of 248s)</span>
+                <span class="s2">break</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Unknown vf opcode %d&quot; </span><span class="s3">% </span><span class="s1">byte</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_init_packet</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">pl</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">!= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">outer</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Misplaced packet in vf file&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">h</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">v</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">w</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">z </span><span class="s3">= </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">stack</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">text</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">boxes </span><span class="s3">= [], [], []</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">f </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_first_font</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">file</span><span class="s3">.</span><span class="s1">tell</span><span class="s3">() + </span><span class="s1">pl</span>
+
+    <span class="s2">def </span><span class="s1">_finalize_packet</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">packet_char</span><span class="s3">, </span><span class="s1">packet_width</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_chars</span><span class="s3">[</span><span class="s1">packet_char</span><span class="s3">] = </span><span class="s1">Page</span><span class="s3">(</span>
+            <span class="s1">text</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">text</span><span class="s3">, </span><span class="s1">boxes</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">, </span><span class="s1">width</span><span class="s3">=</span><span class="s1">packet_width</span><span class="s3">,</span>
+            <span class="s1">height</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">descent</span><span class="s3">=</span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">outer</span>
+
+    <span class="s2">def </span><span class="s1">_pre</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">i</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">cs</span><span class="s3">, </span><span class="s1">ds</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s2">is not </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">pre</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;pre command in middle of vf file&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">i </span><span class="s3">!= </span><span class="s6">202</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Unknown vf format %d&quot; </span><span class="s3">% </span><span class="s1">i</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">'vf file comment: %s'</span><span class="s3">, </span><span class="s1">x</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">_dvistate</span><span class="s3">.</span><span class="s1">outer</span>
+        <span class="s4"># cs = checksum, ds = design size</span>
+
+
+<span class="s2">def </span><span class="s1">_mul2012</span><span class="s3">(</span><span class="s1">num1</span><span class="s3">, </span><span class="s1">num2</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Multiply two numbers in 20.12 fixed point format.&quot;&quot;&quot;</span>
+    <span class="s4"># Separated into a function because &gt;&gt; has surprising precedence</span>
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">num1</span><span class="s3">*</span><span class="s1">num2</span><span class="s3">) &gt;&gt; </span><span class="s6">20</span>
+
+
+<span class="s2">class </span><span class="s1">Tfm</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A TeX Font Metric file. 
+ 
+    This implementation covers only the bare minimum needed by the Dvi class. 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Attributes 
+    ---------- 
+    checksum : int 
+       Used for verifying against the dvi file. 
+    design_size : int 
+       Design size of the font (unknown units) 
+    width, height, depth : dict 
+       Dimensions of each character, need to be scaled by the factor 
+       specified in the dvi file. These are dicts because indexing may 
+       not start from 0. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= (</span><span class="s5">'checksum'</span><span class="s3">, </span><span class="s5">'design_size'</span><span class="s3">, </span><span class="s5">'width'</span><span class="s3">, </span><span class="s5">'height'</span><span class="s3">, </span><span class="s5">'depth'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">):</span>
+        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">'opening tfm file %s'</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s5">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">file</span><span class="s3">:</span>
+            <span class="s1">header1 </span><span class="s3">= </span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">24</span><span class="s3">)</span>
+            <span class="s1">lh</span><span class="s3">, </span><span class="s1">bc</span><span class="s3">, </span><span class="s1">ec</span><span class="s3">, </span><span class="s1">nw</span><span class="s3">, </span><span class="s1">nh</span><span class="s3">, </span><span class="s1">nd </span><span class="s3">= </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s5">'!6H'</span><span class="s3">, </span><span class="s1">header1</span><span class="s3">[</span><span class="s6">2</span><span class="s3">:</span><span class="s6">14</span><span class="s3">])</span>
+            <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s5">'lh=%d, bc=%d, ec=%d, nw=%d, nh=%d, nd=%d'</span><span class="s3">,</span>
+                       <span class="s1">lh</span><span class="s3">, </span><span class="s1">bc</span><span class="s3">, </span><span class="s1">ec</span><span class="s3">, </span><span class="s1">nw</span><span class="s3">, </span><span class="s1">nh</span><span class="s3">, </span><span class="s1">nd</span><span class="s3">)</span>
+            <span class="s1">header2 </span><span class="s3">= </span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">4</span><span class="s3">*</span><span class="s1">lh</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">checksum</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">design_size </span><span class="s3">= </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s5">'!2I'</span><span class="s3">, </span><span class="s1">header2</span><span class="s3">[:</span><span class="s6">8</span><span class="s3">])</span>
+            <span class="s4"># there is also encoding information etc.</span>
+            <span class="s1">char_info </span><span class="s3">= </span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">4</span><span class="s3">*(</span><span class="s1">ec</span><span class="s3">-</span><span class="s1">bc</span><span class="s3">+</span><span class="s6">1</span><span class="s3">))</span>
+            <span class="s1">widths </span><span class="s3">= </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s5">f'!</span><span class="s2">{</span><span class="s1">nw</span><span class="s2">}</span><span class="s5">i'</span><span class="s3">, </span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">4</span><span class="s3">*</span><span class="s1">nw</span><span class="s3">))</span>
+            <span class="s1">heights </span><span class="s3">= </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s5">f'!</span><span class="s2">{</span><span class="s1">nh</span><span class="s2">}</span><span class="s5">i'</span><span class="s3">, </span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">4</span><span class="s3">*</span><span class="s1">nh</span><span class="s3">))</span>
+            <span class="s1">depths </span><span class="s3">= </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s5">f'!</span><span class="s2">{</span><span class="s1">nd</span><span class="s2">}</span><span class="s5">i'</span><span class="s3">, </span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s6">4</span><span class="s3">*</span><span class="s1">nd</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">width</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">height</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">depth </span><span class="s3">= {}, {}, {}</span>
+        <span class="s2">for </span><span class="s1">idx</span><span class="s3">, </span><span class="s1">char </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">range</span><span class="s3">(</span><span class="s1">bc</span><span class="s3">, </span><span class="s1">ec</span><span class="s3">+</span><span class="s6">1</span><span class="s3">)):</span>
+            <span class="s1">byte0 </span><span class="s3">= </span><span class="s1">char_info</span><span class="s3">[</span><span class="s6">4</span><span class="s3">*</span><span class="s1">idx</span><span class="s3">]</span>
+            <span class="s1">byte1 </span><span class="s3">= </span><span class="s1">char_info</span><span class="s3">[</span><span class="s6">4</span><span class="s3">*</span><span class="s1">idx</span><span class="s3">+</span><span class="s6">1</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">width</span><span class="s3">[</span><span class="s1">char</span><span class="s3">] = </span><span class="s1">widths</span><span class="s3">[</span><span class="s1">byte0</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">height</span><span class="s3">[</span><span class="s1">char</span><span class="s3">] = </span><span class="s1">heights</span><span class="s3">[</span><span class="s1">byte1 </span><span class="s3">&gt;&gt; </span><span class="s6">4</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">depth</span><span class="s3">[</span><span class="s1">char</span><span class="s3">] = </span><span class="s1">depths</span><span class="s3">[</span><span class="s1">byte1 </span><span class="s3">&amp; </span><span class="s6">0xf</span><span class="s3">]</span>
+
+
+<span class="s1">PsFont </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s5">'PsFont'</span><span class="s3">, </span><span class="s5">'texname psname effects encoding filename'</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">PsfontsMap</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A psfonts.map formatted file, mapping TeX fonts to PS fonts. 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Notes 
+    ----- 
+    For historical reasons, TeX knows many Type-1 fonts by different 
+    names than the outside world. (For one thing, the names have to 
+    fit in eight characters.) Also, TeX's native fonts are not Type-1 
+    but Metafont, which is nontrivial to convert to PostScript except 
+    as a bitmap. While high-quality conversions to Type-1 format exist 
+    and are shipped with modern TeX distributions, we need to know 
+    which Type-1 fonts are the counterparts of which native fonts. For 
+    these reasons a mapping is needed from internal font names to font 
+    file names. 
+ 
+    A texmf tree typically includes mapping files called e.g. 
+    :file:`psfonts.map`, :file:`pdftex.map`, or :file:`dvipdfm.map`. 
+    The file :file:`psfonts.map` is used by :program:`dvips`, 
+    :file:`pdftex.map` by :program:`pdfTeX`, and :file:`dvipdfm.map` 
+    by :program:`dvipdfm`. :file:`psfonts.map` might avoid embedding 
+    the 35 PostScript fonts (i.e., have no filename for them, as in 
+    the Times-Bold example above), while the pdf-related files perhaps 
+    only avoid the &quot;Base 14&quot; pdf fonts. But the user may have 
+    configured these files differently. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; map = PsfontsMap(find_tex_file('pdftex.map')) 
+    &gt;&gt;&gt; entry = map[b'ptmbo8r'] 
+    &gt;&gt;&gt; entry.texname 
+    b'ptmbo8r' 
+    &gt;&gt;&gt; entry.psname 
+    b'Times-Bold' 
+    &gt;&gt;&gt; entry.encoding 
+    '/usr/local/texlive/2008/texmf-dist/fonts/enc/dvips/base/8r.enc' 
+    &gt;&gt;&gt; entry.effects 
+    {'slant': 0.16700000000000001} 
+    &gt;&gt;&gt; entry.filename 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= (</span><span class="s5">'_filename'</span><span class="s3">, </span><span class="s5">'_unparsed'</span><span class="s3">, </span><span class="s5">'_parsed'</span><span class="s3">)</span>
+
+    <span class="s4"># Create a filename -&gt; PsfontsMap cache, so that calling</span>
+    <span class="s4"># `PsfontsMap(filename)` with the same filename a second time immediately</span>
+    <span class="s4"># returns the same object.</span>
+    <span class="s3">@</span><span class="s1">lru_cache</span>
+    <span class="s2">def </span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">):</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">object</span><span class="s3">.</span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">fsdecode</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+        <span class="s4"># Some TeX distributions have enormous pdftex.map files which would</span>
+        <span class="s4"># take hundreds of milliseconds to parse, but it is easy enough to just</span>
+        <span class="s4"># store the unparsed lines (keyed by the first word, which is the</span>
+        <span class="s4"># texname) and parse them on-demand.</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s5">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">file</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_unparsed </span><span class="s3">= {}</span>
+            <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">file</span><span class="s3">:</span>
+                <span class="s1">tfmname </span><span class="s3">= </span><span class="s1">line</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s7">b' '</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_unparsed</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s1">tfmname</span><span class="s3">, []).</span><span class="s1">append</span><span class="s3">(</span><span class="s1">line</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_parsed </span><span class="s3">= {}</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">__getitem__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">texname</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">texname</span><span class="s3">, </span><span class="s1">bytes</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">texname </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_unparsed</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_unparsed</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">texname</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_parse_and_cache_line</span><span class="s3">(</span><span class="s1">line</span><span class="s3">):</span>
+                    <span class="s2">break</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_parsed</span><span class="s3">[</span><span class="s1">texname</span><span class="s3">]</span>
+        <span class="s2">except </span><span class="s1">KeyError</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">LookupError</span><span class="s3">(</span>
+                <span class="s5">f&quot;An associated PostScript font (required by Matplotlib) &quot;</span>
+                <span class="s5">f&quot;could not be found for TeX font </span><span class="s2">{</span><span class="s1">texname</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">'ascii'</span><span class="s3">)</span><span class="s2">!r} </span><span class="s5">&quot;</span>
+                <span class="s5">f&quot;in </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_filename</span><span class="s2">!r}</span><span class="s5">; this problem can often be solved by &quot;</span>
+                <span class="s5">f&quot;installing a suitable PostScript font package in your TeX &quot;</span>
+                <span class="s5">f&quot;package manager&quot;</span><span class="s3">) </span><span class="s2">from None</span>
+
+    <span class="s2">def </span><span class="s1">_parse_and_cache_line</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">line</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Parse a line in the font mapping file. 
+ 
+        The format is (partially) documented at 
+        http://mirrors.ctan.org/systems/doc/pdftex/manual/pdftex-a.pdf 
+        https://tug.org/texinfohtml/dvips.html#psfonts_002emap 
+        Each line can have the following fields: 
+ 
+        - tfmname (first, only required field), 
+        - psname (defaults to tfmname, must come immediately after tfmname if 
+          present), 
+        - fontflags (integer, must come immediately after psname if present, 
+          ignored by us), 
+        - special (SlantFont and ExtendFont, only field that is double-quoted), 
+        - fontfile, encodingfile (optional, prefixed by &lt;, &lt;&lt;, or &lt;[; &lt;&lt; always 
+          precedes a font, &lt;[ always precedes an encoding, &lt; can precede either 
+          but then an encoding file must have extension .enc; &lt; and &lt;&lt; also 
+          request different font subsetting behaviors but we ignore that; &lt; can 
+          be separated from the filename by whitespace). 
+ 
+        special, fontfile, and encodingfile can appear in any order. 
+        &quot;&quot;&quot;</span>
+        <span class="s4"># If the map file specifies multiple encodings for a font, we</span>
+        <span class="s4"># follow pdfTeX in choosing the last one specified. Such</span>
+        <span class="s4"># entries are probably mistakes but they have occurred.</span>
+        <span class="s4"># https://tex.stackexchange.com/q/10826/</span>
+
+        <span class="s2">if not </span><span class="s1">line </span><span class="s2">or </span><span class="s1">line</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">((</span><span class="s7">b&quot; &quot;</span><span class="s3">, </span><span class="s7">b&quot;%&quot;</span><span class="s3">, </span><span class="s7">b&quot;*&quot;</span><span class="s3">, </span><span class="s7">b&quot;;&quot;</span><span class="s3">, </span><span class="s7">b&quot;#&quot;</span><span class="s3">)):</span>
+            <span class="s2">return</span>
+        <span class="s1">tfmname </span><span class="s3">= </span><span class="s1">basename </span><span class="s3">= </span><span class="s1">special </span><span class="s3">= </span><span class="s1">encodingfile </span><span class="s3">= </span><span class="s1">fontfile </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">is_subsetted </span><span class="s3">= </span><span class="s1">is_t1 </span><span class="s3">= </span><span class="s1">is_truetype </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s1">matches </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">finditer</span><span class="s3">(</span><span class="s7">br'&quot;([^&quot;]*)(?:&quot;|$)|(\S+)'</span><span class="s3">, </span><span class="s1">line</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">match </span><span class="s2">in </span><span class="s1">matches</span><span class="s3">:</span>
+            <span class="s1">quoted</span><span class="s3">, </span><span class="s1">unquoted </span><span class="s3">= </span><span class="s1">match</span><span class="s3">.</span><span class="s1">groups</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">unquoted</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">unquoted</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s7">b&quot;&lt;&lt;&quot;</span><span class="s3">):  </span><span class="s4"># font</span>
+                    <span class="s1">fontfile </span><span class="s3">= </span><span class="s1">unquoted</span><span class="s3">[</span><span class="s6">2</span><span class="s3">:]</span>
+                <span class="s2">elif </span><span class="s1">unquoted</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s7">b&quot;&lt;[&quot;</span><span class="s3">):  </span><span class="s4"># encoding</span>
+                    <span class="s1">encodingfile </span><span class="s3">= </span><span class="s1">unquoted</span><span class="s3">[</span><span class="s6">2</span><span class="s3">:]</span>
+                <span class="s2">elif </span><span class="s1">unquoted</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s7">b&quot;&lt;&quot;</span><span class="s3">):  </span><span class="s4"># font or encoding</span>
+                    <span class="s1">word </span><span class="s3">= (</span>
+                        <span class="s4"># &lt;foo =&gt; foo</span>
+                        <span class="s1">unquoted</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+                        <span class="s4"># &lt; by itself =&gt; read the next word</span>
+                        <span class="s2">or </span><span class="s1">next</span><span class="s3">(</span><span class="s1">filter</span><span class="s3">(</span><span class="s2">None</span><span class="s3">, </span><span class="s1">next</span><span class="s3">(</span><span class="s1">matches</span><span class="s3">).</span><span class="s1">groups</span><span class="s3">())))</span>
+                    <span class="s2">if </span><span class="s1">word</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s7">b&quot;.enc&quot;</span><span class="s3">):</span>
+                        <span class="s1">encodingfile </span><span class="s3">= </span><span class="s1">word</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">fontfile </span><span class="s3">= </span><span class="s1">word</span>
+                        <span class="s1">is_subsetted </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s2">elif </span><span class="s1">tfmname </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s1">tfmname </span><span class="s3">= </span><span class="s1">unquoted</span>
+                <span class="s2">elif </span><span class="s1">basename </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s1">basename </span><span class="s3">= </span><span class="s1">unquoted</span>
+            <span class="s2">elif </span><span class="s1">quoted</span><span class="s3">:</span>
+                <span class="s1">special </span><span class="s3">= </span><span class="s1">quoted</span>
+        <span class="s1">effects </span><span class="s3">= {}</span>
+        <span class="s2">if </span><span class="s1">special</span><span class="s3">:</span>
+            <span class="s1">words </span><span class="s3">= </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">special</span><span class="s3">.</span><span class="s1">split</span><span class="s3">())</span>
+            <span class="s2">for </span><span class="s1">word </span><span class="s2">in </span><span class="s1">words</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">word </span><span class="s3">== </span><span class="s7">b&quot;SlantFont&quot;</span><span class="s3">:</span>
+                    <span class="s1">effects</span><span class="s3">[</span><span class="s5">&quot;slant&quot;</span><span class="s3">] = </span><span class="s1">float</span><span class="s3">(</span><span class="s1">next</span><span class="s3">(</span><span class="s1">words</span><span class="s3">))</span>
+                <span class="s2">elif </span><span class="s1">word </span><span class="s3">== </span><span class="s7">b&quot;ExtendFont&quot;</span><span class="s3">:</span>
+                    <span class="s1">effects</span><span class="s3">[</span><span class="s5">&quot;extend&quot;</span><span class="s3">] = </span><span class="s1">float</span><span class="s3">(</span><span class="s1">next</span><span class="s3">(</span><span class="s1">words</span><span class="s3">))</span>
+
+        <span class="s4"># Verify some properties of the line that would cause it to be ignored</span>
+        <span class="s4"># otherwise.</span>
+        <span class="s2">if </span><span class="s1">fontfile </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">fontfile</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">((</span><span class="s7">b&quot;.ttf&quot;</span><span class="s3">, </span><span class="s7">b&quot;.ttc&quot;</span><span class="s3">)):</span>
+                <span class="s1">is_truetype </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">elif not </span><span class="s1">fontfile</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s7">b&quot;.otf&quot;</span><span class="s3">):</span>
+                <span class="s1">is_t1 </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">elif </span><span class="s1">basename </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">is_t1 </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">if </span><span class="s1">is_truetype </span><span class="s2">and </span><span class="s1">is_subsetted </span><span class="s2">and </span><span class="s1">encodingfile </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s2">if not </span><span class="s1">is_t1 </span><span class="s2">and </span><span class="s3">(</span><span class="s5">&quot;slant&quot; </span><span class="s2">in </span><span class="s1">effects </span><span class="s2">or </span><span class="s5">&quot;extend&quot; </span><span class="s2">in </span><span class="s1">effects</span><span class="s3">):</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">effects</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s5">&quot;slant&quot;</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)) &gt; </span><span class="s6">1</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s2">if </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">effects</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s5">&quot;extend&quot;</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)) &gt; </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s2">if </span><span class="s1">basename </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">basename </span><span class="s3">= </span><span class="s1">tfmname</span>
+        <span class="s2">if </span><span class="s1">encodingfile </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">encodingfile </span><span class="s3">= </span><span class="s1">find_tex_file</span><span class="s3">(</span><span class="s1">encodingfile</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">fontfile </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">fontfile </span><span class="s3">= </span><span class="s1">find_tex_file</span><span class="s3">(</span><span class="s1">fontfile</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_parsed</span><span class="s3">[</span><span class="s1">tfmname</span><span class="s3">] = </span><span class="s1">PsFont</span><span class="s3">(</span>
+            <span class="s1">texname</span><span class="s3">=</span><span class="s1">tfmname</span><span class="s3">, </span><span class="s1">psname</span><span class="s3">=</span><span class="s1">basename</span><span class="s3">, </span><span class="s1">effects</span><span class="s3">=</span><span class="s1">effects</span><span class="s3">,</span>
+            <span class="s1">encoding</span><span class="s3">=</span><span class="s1">encodingfile</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">=</span><span class="s1">fontfile</span><span class="s3">)</span>
+        <span class="s2">return True</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_enc</span><span class="s3">(</span><span class="s1">path</span><span class="s3">):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Parse a \*.enc file referenced from a psfonts.map style file. 
+ 
+    The format supported by this function is a tiny subset of PostScript. 
+ 
+    Parameters 
+    ---------- 
+    path : `os.PathLike` 
+ 
+    Returns 
+    ------- 
+    list 
+        The nth entry of the list is the PostScript glyph name of the nth 
+        glyph. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">no_comments </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">sub</span><span class="s3">(</span><span class="s5">&quot;%.*&quot;</span><span class="s3">, </span><span class="s5">&quot;&quot;</span><span class="s3">, </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">path</span><span class="s3">).</span><span class="s1">read_text</span><span class="s3">(</span><span class="s1">encoding</span><span class="s3">=</span><span class="s5">&quot;ascii&quot;</span><span class="s3">))</span>
+    <span class="s1">array </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">search</span><span class="s3">(</span><span class="s5">r&quot;(?s)\[(.*)\]&quot;</span><span class="s3">, </span><span class="s1">no_comments</span><span class="s3">).</span><span class="s1">group</span><span class="s3">(</span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s1">lines </span><span class="s3">= [</span><span class="s1">line </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">array</span><span class="s3">.</span><span class="s1">split</span><span class="s3">() </span><span class="s2">if </span><span class="s1">line</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">all</span><span class="s3">(</span><span class="s1">line</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s5">&quot;/&quot;</span><span class="s3">) </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">lines</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">[</span><span class="s1">line</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:] </span><span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">lines</span><span class="s3">]</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;Failed to parse </span><span class="s2">{</span><span class="s1">path</span><span class="s2">} </span><span class="s5">as Postscript encoding&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">_LuatexKpsewhich</span><span class="s3">:</span>
+    <span class="s3">@</span><span class="s1">lru_cache  </span><span class="s4"># A singleton.</span>
+    <span class="s2">def </span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">object</span><span class="s3">.</span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_proc </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_new_proc</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">_new_proc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">subprocess</span><span class="s3">.</span><span class="s1">Popen</span><span class="s3">(</span>
+            <span class="s3">[</span><span class="s5">&quot;luatex&quot;</span><span class="s3">, </span><span class="s5">&quot;--luaonly&quot;</span><span class="s3">,</span>
+             <span class="s1">str</span><span class="s3">(</span><span class="s1">cbook</span><span class="s3">.</span><span class="s1">_get_data_path</span><span class="s3">(</span><span class="s5">&quot;kpsewhich.lua&quot;</span><span class="s3">))],</span>
+            <span class="s1">stdin</span><span class="s3">=</span><span class="s1">subprocess</span><span class="s3">.</span><span class="s1">PIPE</span><span class="s3">, </span><span class="s1">stdout</span><span class="s3">=</span><span class="s1">subprocess</span><span class="s3">.</span><span class="s1">PIPE</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">search</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_proc</span><span class="s3">.</span><span class="s1">poll</span><span class="s3">() </span><span class="s2">is not None</span><span class="s3">:  </span><span class="s4"># Dead, restart it.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_proc </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_new_proc</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_proc</span><span class="s3">.</span><span class="s1">stdin</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">fsencode</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">) + </span><span class="s7">b&quot;</span><span class="s2">\n</span><span class="s7">&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_proc</span><span class="s3">.</span><span class="s1">stdin</span><span class="s3">.</span><span class="s1">flush</span><span class="s3">()</span>
+        <span class="s1">out </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_proc</span><span class="s3">.</span><span class="s1">stdout</span><span class="s3">.</span><span class="s1">readline</span><span class="s3">().</span><span class="s1">rstrip</span><span class="s3">()</span>
+        <span class="s2">return None if </span><span class="s1">out </span><span class="s3">== </span><span class="s7">b&quot;nil&quot; </span><span class="s2">else </span><span class="s1">os</span><span class="s3">.</span><span class="s1">fsdecode</span><span class="s3">(</span><span class="s1">out</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">lru_cache</span>
+<span class="s2">def </span><span class="s1">find_tex_file</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Find a file in the texmf tree using kpathsea_. 
+ 
+    The kpathsea library, provided by most existing TeX distributions, both 
+    on Unix-like systems and on Windows (MikTeX), is invoked via a long-lived 
+    luatex process if luatex is installed, or via kpsewhich otherwise. 
+ 
+    .. _kpathsea: https://www.tug.org/kpathsea/ 
+ 
+    Parameters 
+    ---------- 
+    filename : str or path-like 
+ 
+    Raises 
+    ------ 
+    FileNotFoundError 
+        If the file is not found. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># we expect these to always be ascii encoded, but use utf-8</span>
+    <span class="s4"># out of caution</span>
+    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">bytes</span><span class="s3">):</span>
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">filename</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">'utf-8'</span><span class="s3">, </span><span class="s1">errors</span><span class="s3">=</span><span class="s5">'replace'</span><span class="s3">)</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">lk </span><span class="s3">= </span><span class="s1">_LuatexKpsewhich</span><span class="s3">()</span>
+    <span class="s2">except </span><span class="s1">FileNotFoundError</span><span class="s3">:</span>
+        <span class="s1">lk </span><span class="s3">= </span><span class="s2">None  </span><span class="s4"># Fallback to directly calling kpsewhich, as below.</span>
+
+    <span class="s2">if </span><span class="s1">lk</span><span class="s3">:</span>
+        <span class="s1">path </span><span class="s3">= </span><span class="s1">lk</span><span class="s3">.</span><span class="s1">search</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform </span><span class="s3">== </span><span class="s5">'win32'</span><span class="s3">:</span>
+            <span class="s4"># On Windows only, kpathsea can use utf-8 for cmd args and output.</span>
+            <span class="s4"># The `command_line_encoding` environment variable is set to force</span>
+            <span class="s4"># it to always use utf-8 encoding.  See Matplotlib issue #11848.</span>
+            <span class="s1">kwargs </span><span class="s3">= {</span><span class="s5">'env'</span><span class="s3">: {**</span><span class="s1">os</span><span class="s3">.</span><span class="s1">environ</span><span class="s3">, </span><span class="s5">'command_line_encoding'</span><span class="s3">: </span><span class="s5">'utf-8'</span><span class="s3">},</span>
+                      <span class="s5">'encoding'</span><span class="s3">: </span><span class="s5">'utf-8'</span><span class="s3">}</span>
+        <span class="s2">else</span><span class="s3">:  </span><span class="s4"># On POSIX, run through the equivalent of os.fsdecode().</span>
+            <span class="s1">kwargs </span><span class="s3">= {</span><span class="s5">'encoding'</span><span class="s3">: </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">getfilesystemencoding</span><span class="s3">(),</span>
+                      <span class="s5">'errors'</span><span class="s3">: </span><span class="s5">'surrogateescape'</span><span class="s3">}</span>
+
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">path </span><span class="s3">= (</span><span class="s1">cbook</span><span class="s3">.</span><span class="s1">_check_and_log_subprocess</span><span class="s3">([</span><span class="s5">'kpsewhich'</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">],</span>
+                                                    <span class="s1">_log</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+                    <span class="s3">.</span><span class="s1">rstrip</span><span class="s3">(</span><span class="s5">'</span><span class="s2">\n</span><span class="s5">'</span><span class="s3">))</span>
+        <span class="s2">except </span><span class="s3">(</span><span class="s1">FileNotFoundError</span><span class="s3">, </span><span class="s1">RuntimeError</span><span class="s3">):</span>
+            <span class="s1">path </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">if </span><span class="s1">path</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">path</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">FileNotFoundError</span><span class="s3">(</span>
+            <span class="s5">f&quot;Matplotlib's TeX implementation searched for a file named &quot;</span>
+            <span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">filename</span><span class="s2">!r} </span><span class="s5">in your texmf tree, but could not find it&quot;</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">lru_cache</span>
+<span class="s2">def </span><span class="s1">_fontfile</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">suffix</span><span class="s3">, </span><span class="s1">texname</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">cls</span><span class="s3">(</span><span class="s1">find_tex_file</span><span class="s3">(</span><span class="s1">texname </span><span class="s3">+ </span><span class="s1">suffix</span><span class="s3">))</span>
+
+
+<span class="s1">_tfmfile </span><span class="s3">= </span><span class="s1">partial</span><span class="s3">(</span><span class="s1">_fontfile</span><span class="s3">, </span><span class="s1">Tfm</span><span class="s3">, </span><span class="s5">&quot;.tfm&quot;</span><span class="s3">)</span>
+<span class="s1">_vffile </span><span class="s3">= </span><span class="s1">partial</span><span class="s3">(</span><span class="s1">_fontfile</span><span class="s3">, </span><span class="s1">Vf</span><span class="s3">, </span><span class="s5">&quot;.vf&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ </span><span class="s3">== </span><span class="s5">'__main__'</span><span class="s3">:</span>
+    <span class="s2">from </span><span class="s1">argparse </span><span class="s2">import </span><span class="s1">ArgumentParser</span>
+    <span class="s2">import </span><span class="s1">itertools</span>
+
+    <span class="s1">parser </span><span class="s3">= </span><span class="s1">ArgumentParser</span><span class="s3">()</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span><span class="s5">&quot;filename&quot;</span><span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span><span class="s5">&quot;dpi&quot;</span><span class="s3">, </span><span class="s1">nargs</span><span class="s3">=</span><span class="s5">&quot;?&quot;</span><span class="s3">, </span><span class="s1">type</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">default</span><span class="s3">=</span><span class="s2">None</span><span class="s3">)</span>
+    <span class="s1">args </span><span class="s3">= </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">parse_args</span><span class="s3">()</span>
+    <span class="s2">with </span><span class="s1">Dvi</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">args</span><span class="s3">.</span><span class="s1">dpi</span><span class="s3">) </span><span class="s2">as </span><span class="s1">dvi</span><span class="s3">:</span>
+        <span class="s1">fontmap </span><span class="s3">= </span><span class="s1">PsfontsMap</span><span class="s3">(</span><span class="s1">find_tex_file</span><span class="s3">(</span><span class="s5">'pdftex.map'</span><span class="s3">))</span>
+        <span class="s2">for </span><span class="s1">page </span><span class="s2">in </span><span class="s1">dvi</span><span class="s3">:</span>
+            <span class="s1">print</span><span class="s3">(</span><span class="s5">f&quot;=== new page === &quot;</span>
+                  <span class="s5">f&quot;(w: </span><span class="s2">{</span><span class="s1">page</span><span class="s3">.</span><span class="s1">width</span><span class="s2">}</span><span class="s5">, h: </span><span class="s2">{</span><span class="s1">page</span><span class="s3">.</span><span class="s1">height</span><span class="s2">}</span><span class="s5">, d: </span><span class="s2">{</span><span class="s1">page</span><span class="s3">.</span><span class="s1">descent</span><span class="s2">}</span><span class="s5">)&quot;</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">font</span><span class="s3">, </span><span class="s1">group </span><span class="s2">in </span><span class="s1">itertools</span><span class="s3">.</span><span class="s1">groupby</span><span class="s3">(</span>
+                    <span class="s1">page</span><span class="s3">.</span><span class="s1">text</span><span class="s3">, </span><span class="s2">lambda </span><span class="s1">text</span><span class="s3">: </span><span class="s1">text</span><span class="s3">.</span><span class="s1">font</span><span class="s3">):</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">f&quot;font: </span><span class="s2">{</span><span class="s1">font</span><span class="s3">.</span><span class="s1">texname</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s5">'latin-1'</span><span class="s3">)</span><span class="s2">!r}\t</span><span class="s5">&quot;</span>
+                      <span class="s5">f&quot;scale: </span><span class="s2">{</span><span class="s1">font</span><span class="s3">.</span><span class="s1">_scale </span><span class="s3">/ </span><span class="s6">2 </span><span class="s3">** </span><span class="s6">20</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;x&quot;</span><span class="s3">, </span><span class="s5">&quot;y&quot;</span><span class="s3">, </span><span class="s5">&quot;glyph&quot;</span><span class="s3">, </span><span class="s5">&quot;chr&quot;</span><span class="s3">, </span><span class="s5">&quot;w&quot;</span><span class="s3">, </span><span class="s5">&quot;(glyphs)&quot;</span><span class="s3">, </span><span class="s1">sep</span><span class="s3">=</span><span class="s5">&quot;</span><span class="s2">\t</span><span class="s5">&quot;</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">text </span><span class="s2">in </span><span class="s1">group</span><span class="s3">:</span>
+                    <span class="s1">print</span><span class="s3">(</span><span class="s1">text</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">text</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">text</span><span class="s3">.</span><span class="s1">glyph</span><span class="s3">,</span>
+                          <span class="s1">chr</span><span class="s3">(</span><span class="s1">text</span><span class="s3">.</span><span class="s1">glyph</span><span class="s3">) </span><span class="s2">if </span><span class="s1">chr</span><span class="s3">(</span><span class="s1">text</span><span class="s3">.</span><span class="s1">glyph</span><span class="s3">).</span><span class="s1">isprintable</span><span class="s3">()</span>
+                          <span class="s2">else </span><span class="s5">&quot;.&quot;</span><span class="s3">,</span>
+                          <span class="s1">text</span><span class="s3">.</span><span class="s1">width</span><span class="s3">, </span><span class="s1">sep</span><span class="s3">=</span><span class="s5">&quot;</span><span class="s2">\t</span><span class="s5">&quot;</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">page</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s5">&quot;x&quot;</span><span class="s3">, </span><span class="s5">&quot;y&quot;</span><span class="s3">, </span><span class="s5">&quot;h&quot;</span><span class="s3">, </span><span class="s5">&quot;w&quot;</span><span class="s3">, </span><span class="s5">&quot;&quot;</span><span class="s3">, </span><span class="s5">&quot;(boxes)&quot;</span><span class="s3">, </span><span class="s1">sep</span><span class="s3">=</span><span class="s5">&quot;</span><span class="s2">\t</span><span class="s5">&quot;</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">box </span><span class="s2">in </span><span class="s1">page</span><span class="s3">.</span><span class="s1">boxes</span><span class="s3">:</span>
+                    <span class="s1">print</span><span class="s3">(</span><span class="s1">box</span><span class="s3">.</span><span class="s1">x</span><span class="s3">, </span><span class="s1">box</span><span class="s3">.</span><span class="s1">y</span><span class="s3">, </span><span class="s1">box</span><span class="s3">.</span><span class="s1">height</span><span class="s3">, </span><span class="s1">box</span><span class="s3">.</span><span class="s1">width</span><span class="s3">, </span><span class="s1">sep</span><span class="s3">=</span><span class="s5">&quot;</span><span class="s2">\t</span><span class="s5">&quot;</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

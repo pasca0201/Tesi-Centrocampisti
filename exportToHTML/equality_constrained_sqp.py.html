@@ -1,0 +1,254 @@
+<html>
+<head>
+<title>equality_constrained_sqp.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+equality_constrained_sqp.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Byrd-Omojokun Trust-Region SQP method.&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">sparse </span><span class="s2">import </span><span class="s1">eye </span><span class="s2">as </span><span class="s1">speye</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">projections </span><span class="s2">import </span><span class="s1">projections</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">qp_subproblem </span><span class="s2">import </span><span class="s1">modified_dogleg</span><span class="s3">, </span><span class="s1">projected_cg</span><span class="s3">, </span><span class="s1">box_intersections</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">norm</span>
+
+<span class="s1">__all__ </span><span class="s3">= [</span><span class="s4">'equality_constrained_sqp'</span><span class="s3">]</span>
+
+
+<span class="s2">def </span><span class="s1">default_scaling</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+    <span class="s1">n</span><span class="s3">, = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">speye</span><span class="s3">(</span><span class="s1">n</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">equality_constrained_sqp</span><span class="s3">(</span><span class="s1">fun_and_constr</span><span class="s3">, </span><span class="s1">grad_and_jac</span><span class="s3">, </span><span class="s1">lagr_hess</span><span class="s3">,</span>
+                             <span class="s1">x0</span><span class="s3">, </span><span class="s1">fun0</span><span class="s3">, </span><span class="s1">grad0</span><span class="s3">, </span><span class="s1">constr0</span><span class="s3">,</span>
+                             <span class="s1">jac0</span><span class="s3">, </span><span class="s1">stop_criteria</span><span class="s3">,</span>
+                             <span class="s1">state</span><span class="s3">,</span>
+                             <span class="s1">initial_penalty</span><span class="s3">,</span>
+                             <span class="s1">initial_trust_radius</span><span class="s3">,</span>
+                             <span class="s1">factorization_method</span><span class="s3">,</span>
+                             <span class="s1">trust_lb</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                             <span class="s1">trust_ub</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                             <span class="s1">scaling</span><span class="s3">=</span><span class="s1">default_scaling</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Solve nonlinear equality-constrained problem using trust-region SQP. 
+ 
+    Solve optimization problem: 
+ 
+        minimize fun(x) 
+        subject to: constr(x) = 0 
+ 
+    using Byrd-Omojokun Trust-Region SQP method described in [1]_. Several 
+    implementation details are based on [2]_ and [3]_, p. 549. 
+ 
+    References 
+    ---------- 
+    .. [1] Lalee, Marucha, Jorge Nocedal, and Todd Plantenga. &quot;On the 
+           implementation of an algorithm for large-scale equality 
+           constrained optimization.&quot; SIAM Journal on 
+           Optimization 8.3 (1998): 682-706. 
+    .. [2] Byrd, Richard H., Mary E. Hribar, and Jorge Nocedal. 
+           &quot;An interior point algorithm for large-scale nonlinear 
+           programming.&quot; SIAM Journal on Optimization 9.4 (1999): 877-900. 
+    .. [3] Nocedal, Jorge, and Stephen J. Wright. &quot;Numerical optimization&quot; 
+           Second Edition (2006). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">PENALTY_FACTOR </span><span class="s3">= </span><span class="s5">0.3  </span><span class="s6"># Rho from formula (3.51), reference [2]_, p.891.</span>
+    <span class="s1">LARGE_REDUCTION_RATIO </span><span class="s3">= </span><span class="s5">0.9</span>
+    <span class="s1">INTERMEDIARY_REDUCTION_RATIO </span><span class="s3">= </span><span class="s5">0.3</span>
+    <span class="s1">SUFFICIENT_REDUCTION_RATIO </span><span class="s3">= </span><span class="s5">1e-8  </span><span class="s6"># Eta from reference [2]_, p.892.</span>
+    <span class="s1">TRUST_ENLARGEMENT_FACTOR_L </span><span class="s3">= </span><span class="s5">7.0</span>
+    <span class="s1">TRUST_ENLARGEMENT_FACTOR_S </span><span class="s3">= </span><span class="s5">2.0</span>
+    <span class="s1">MAX_TRUST_REDUCTION </span><span class="s3">= </span><span class="s5">0.5</span>
+    <span class="s1">MIN_TRUST_REDUCTION </span><span class="s3">= </span><span class="s5">0.1</span>
+    <span class="s1">SOC_THRESHOLD </span><span class="s3">= </span><span class="s5">0.1</span>
+    <span class="s1">TR_FACTOR </span><span class="s3">= </span><span class="s5">0.8  </span><span class="s6"># Zeta from formula (3.21), reference [2]_, p.885.</span>
+    <span class="s1">BOX_FACTOR </span><span class="s3">= </span><span class="s5">0.5</span>
+
+    <span class="s1">n</span><span class="s3">, = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">)  </span><span class="s6"># Number of parameters</span>
+
+    <span class="s6"># Set default lower and upper bounds.</span>
+    <span class="s2">if </span><span class="s1">trust_lb </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">trust_lb </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n</span><span class="s3">, -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">trust_ub </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">trust_ub </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+
+    <span class="s6"># Initial values</span>
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">)</span>
+    <span class="s1">trust_radius </span><span class="s3">= </span><span class="s1">initial_trust_radius</span>
+    <span class="s1">penalty </span><span class="s3">= </span><span class="s1">initial_penalty</span>
+    <span class="s6"># Compute Values</span>
+    <span class="s1">f </span><span class="s3">= </span><span class="s1">fun0</span>
+    <span class="s1">c </span><span class="s3">= </span><span class="s1">grad0</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">constr0</span>
+    <span class="s1">A </span><span class="s3">= </span><span class="s1">jac0</span>
+    <span class="s1">S </span><span class="s3">= </span><span class="s1">scaling</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+    <span class="s6"># Get projections</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">Z</span><span class="s3">, </span><span class="s1">LS</span><span class="s3">, </span><span class="s1">Y </span><span class="s3">= </span><span class="s1">projections</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">factorization_method</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">str</span><span class="s3">(</span><span class="s1">e</span><span class="s3">) == </span><span class="s4">&quot;expected square matrix&quot;</span><span class="s3">:</span>
+            <span class="s6"># can be the case if there are more equality</span>
+            <span class="s6"># constraints than independent variables</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;The 'expected square matrix' error can occur if there are&quot;</span>
+                <span class="s4">&quot; more equality constraints than independent variables.&quot;</span>
+                <span class="s4">&quot; Consider how your constraints are set up, or use&quot;</span>
+                <span class="s4">&quot; factorization_method='SVDFactorization'.&quot;</span>
+            <span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">e</span>
+
+    <span class="s6"># Compute least-square lagrange multipliers</span>
+    <span class="s1">v </span><span class="s3">= -</span><span class="s1">LS</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">c</span><span class="s3">)</span>
+    <span class="s6"># Compute Hessian</span>
+    <span class="s1">H </span><span class="s3">= </span><span class="s1">lagr_hess</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">v</span><span class="s3">)</span>
+
+    <span class="s6"># Update state parameters</span>
+    <span class="s1">optimality </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">c </span><span class="s3">+ </span><span class="s1">A</span><span class="s3">.</span><span class="s1">T</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">v</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+    <span class="s1">constr_violation </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">) </span><span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">b</span><span class="s3">) &gt; </span><span class="s5">0 </span><span class="s2">else </span><span class="s5">0</span>
+    <span class="s1">cg_info </span><span class="s3">= {</span><span class="s4">'niter'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">, </span><span class="s4">'stop_cond'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">,</span>
+               <span class="s4">'hits_boundary'</span><span class="s3">: </span><span class="s2">False</span><span class="s3">}</span>
+
+    <span class="s1">last_iteration_failed </span><span class="s3">= </span><span class="s2">False</span>
+    <span class="s2">while not </span><span class="s1">stop_criteria</span><span class="s3">(</span><span class="s1">state</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">last_iteration_failed</span><span class="s3">,</span>
+                            <span class="s1">optimality</span><span class="s3">, </span><span class="s1">constr_violation</span><span class="s3">,</span>
+                            <span class="s1">trust_radius</span><span class="s3">, </span><span class="s1">penalty</span><span class="s3">, </span><span class="s1">cg_info</span><span class="s3">):</span>
+        <span class="s6"># Normal Step - `dn`</span>
+        <span class="s6"># minimize 1/2*||A dn + b||^2</span>
+        <span class="s6"># subject to:</span>
+        <span class="s6"># ||dn|| &lt;= TR_FACTOR * trust_radius</span>
+        <span class="s6"># BOX_FACTOR * lb &lt;= dn &lt;= BOX_FACTOR * ub.</span>
+        <span class="s1">dn </span><span class="s3">= </span><span class="s1">modified_dogleg</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">b</span><span class="s3">,</span>
+                             <span class="s1">TR_FACTOR</span><span class="s3">*</span><span class="s1">trust_radius</span><span class="s3">,</span>
+                             <span class="s1">BOX_FACTOR</span><span class="s3">*</span><span class="s1">trust_lb</span><span class="s3">,</span>
+                             <span class="s1">BOX_FACTOR</span><span class="s3">*</span><span class="s1">trust_ub</span><span class="s3">)</span>
+
+        <span class="s6"># Tangential Step - `dt`</span>
+        <span class="s6"># Solve the QP problem:</span>
+        <span class="s6"># minimize 1/2 dt.T H dt + dt.T (H dn + c)</span>
+        <span class="s6"># subject to:</span>
+        <span class="s6"># A dt = 0</span>
+        <span class="s6"># ||dt|| &lt;= sqrt(trust_radius**2 - ||dn||**2)</span>
+        <span class="s6"># lb - dn &lt;= dt &lt;= ub - dn</span>
+        <span class="s1">c_t </span><span class="s3">= </span><span class="s1">H</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">dn</span><span class="s3">) + </span><span class="s1">c</span>
+        <span class="s1">b_t </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)</span>
+        <span class="s1">trust_radius_t </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sqrt</span><span class="s3">(</span><span class="s1">trust_radius</span><span class="s3">**</span><span class="s5">2 </span><span class="s3">- </span><span class="s1">np</span><span class="s3">.</span><span class="s1">linalg</span><span class="s3">.</span><span class="s1">norm</span><span class="s3">(</span><span class="s1">dn</span><span class="s3">)**</span><span class="s5">2</span><span class="s3">)</span>
+        <span class="s1">lb_t </span><span class="s3">= </span><span class="s1">trust_lb </span><span class="s3">- </span><span class="s1">dn</span>
+        <span class="s1">ub_t </span><span class="s3">= </span><span class="s1">trust_ub </span><span class="s3">- </span><span class="s1">dn</span>
+        <span class="s1">dt</span><span class="s3">, </span><span class="s1">cg_info </span><span class="s3">= </span><span class="s1">projected_cg</span><span class="s3">(</span><span class="s1">H</span><span class="s3">, </span><span class="s1">c_t</span><span class="s3">, </span><span class="s1">Z</span><span class="s3">, </span><span class="s1">Y</span><span class="s3">, </span><span class="s1">b_t</span><span class="s3">,</span>
+                                   <span class="s1">trust_radius_t</span><span class="s3">,</span>
+                                   <span class="s1">lb_t</span><span class="s3">, </span><span class="s1">ub_t</span><span class="s3">)</span>
+
+        <span class="s6"># Compute update (normal + tangential steps).</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">dn </span><span class="s3">+ </span><span class="s1">dt</span>
+
+        <span class="s6"># Compute second order model: 1/2 d H d + c.T d + f.</span>
+        <span class="s1">quadratic_model </span><span class="s3">= </span><span class="s5">1</span><span class="s3">/</span><span class="s5">2</span><span class="s3">*(</span><span class="s1">H</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">d</span><span class="s3">)).</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">d</span><span class="s3">) + </span><span class="s1">c</span><span class="s3">.</span><span class="s1">T</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">d</span><span class="s3">)</span>
+        <span class="s6"># Compute linearized constraint: l = A d + b.</span>
+        <span class="s1">linearized_constr </span><span class="s3">= </span><span class="s1">A</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">d</span><span class="s3">)+</span><span class="s1">b</span>
+        <span class="s6"># Compute new penalty parameter according to formula (3.52),</span>
+        <span class="s6"># reference [2]_, p.891.</span>
+        <span class="s1">vpred </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">b</span><span class="s3">) - </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">linearized_constr</span><span class="s3">)</span>
+        <span class="s6"># Guarantee `vpred` always positive,</span>
+        <span class="s6"># regardless of roundoff errors.</span>
+        <span class="s1">vpred </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s5">1e-16</span><span class="s3">, </span><span class="s1">vpred</span><span class="s3">)</span>
+        <span class="s1">previous_penalty </span><span class="s3">= </span><span class="s1">penalty</span>
+        <span class="s2">if </span><span class="s1">quadratic_model </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">new_penalty </span><span class="s3">= </span><span class="s1">quadratic_model </span><span class="s3">/ ((</span><span class="s5">1</span><span class="s3">-</span><span class="s1">PENALTY_FACTOR</span><span class="s3">)*</span><span class="s1">vpred</span><span class="s3">)</span>
+            <span class="s1">penalty </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">penalty</span><span class="s3">, </span><span class="s1">new_penalty</span><span class="s3">)</span>
+        <span class="s6"># Compute predicted reduction according to formula (3.52),</span>
+        <span class="s6"># reference [2]_, p.891.</span>
+        <span class="s1">predicted_reduction </span><span class="s3">= -</span><span class="s1">quadratic_model </span><span class="s3">+ </span><span class="s1">penalty</span><span class="s3">*</span><span class="s1">vpred</span>
+
+        <span class="s6"># Compute merit function at current point</span>
+        <span class="s1">merit_function </span><span class="s3">= </span><span class="s1">f </span><span class="s3">+ </span><span class="s1">penalty</span><span class="s3">*</span><span class="s1">norm</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)</span>
+        <span class="s6"># Evaluate function and constraints at trial point</span>
+        <span class="s1">x_next </span><span class="s3">= </span><span class="s1">x </span><span class="s3">+ </span><span class="s1">S</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">d</span><span class="s3">)</span>
+        <span class="s1">f_next</span><span class="s3">, </span><span class="s1">b_next </span><span class="s3">= </span><span class="s1">fun_and_constr</span><span class="s3">(</span><span class="s1">x_next</span><span class="s3">)</span>
+        <span class="s6"># Compute merit function at trial point</span>
+        <span class="s1">merit_function_next </span><span class="s3">= </span><span class="s1">f_next </span><span class="s3">+ </span><span class="s1">penalty</span><span class="s3">*</span><span class="s1">norm</span><span class="s3">(</span><span class="s1">b_next</span><span class="s3">)</span>
+        <span class="s6"># Compute actual reduction according to formula (3.54),</span>
+        <span class="s6"># reference [2]_, p.892.</span>
+        <span class="s1">actual_reduction </span><span class="s3">= </span><span class="s1">merit_function </span><span class="s3">- </span><span class="s1">merit_function_next</span>
+        <span class="s6"># Compute reduction ratio</span>
+        <span class="s1">reduction_ratio </span><span class="s3">= </span><span class="s1">actual_reduction </span><span class="s3">/ </span><span class="s1">predicted_reduction</span>
+
+        <span class="s6"># Second order correction (SOC), reference [2]_, p.892.</span>
+        <span class="s2">if </span><span class="s1">reduction_ratio </span><span class="s3">&lt; </span><span class="s1">SUFFICIENT_REDUCTION_RATIO </span><span class="s2">and </span><span class="s1">\</span>
+           <span class="s1">norm</span><span class="s3">(</span><span class="s1">dn</span><span class="s3">) &lt;= </span><span class="s1">SOC_THRESHOLD </span><span class="s3">* </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">dt</span><span class="s3">):</span>
+            <span class="s6"># Compute second order correction</span>
+            <span class="s1">y </span><span class="s3">= -</span><span class="s1">Y</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">b_next</span><span class="s3">)</span>
+            <span class="s6"># Make sure increment is inside box constraints</span>
+            <span class="s1">_</span><span class="s3">, </span><span class="s1">t</span><span class="s3">, </span><span class="s1">intersect </span><span class="s3">= </span><span class="s1">box_intersections</span><span class="s3">(</span><span class="s1">d</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">trust_lb</span><span class="s3">, </span><span class="s1">trust_ub</span><span class="s3">)</span>
+            <span class="s6"># Compute tentative point</span>
+            <span class="s1">x_soc </span><span class="s3">= </span><span class="s1">x </span><span class="s3">+ </span><span class="s1">S</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">d </span><span class="s3">+ </span><span class="s1">t</span><span class="s3">*</span><span class="s1">y</span><span class="s3">)</span>
+            <span class="s1">f_soc</span><span class="s3">, </span><span class="s1">b_soc </span><span class="s3">= </span><span class="s1">fun_and_constr</span><span class="s3">(</span><span class="s1">x_soc</span><span class="s3">)</span>
+            <span class="s6"># Recompute actual reduction</span>
+            <span class="s1">merit_function_soc </span><span class="s3">= </span><span class="s1">f_soc </span><span class="s3">+ </span><span class="s1">penalty</span><span class="s3">*</span><span class="s1">norm</span><span class="s3">(</span><span class="s1">b_soc</span><span class="s3">)</span>
+            <span class="s1">actual_reduction_soc </span><span class="s3">= </span><span class="s1">merit_function </span><span class="s3">- </span><span class="s1">merit_function_soc</span>
+            <span class="s6"># Recompute reduction ratio</span>
+            <span class="s1">reduction_ratio_soc </span><span class="s3">= </span><span class="s1">actual_reduction_soc </span><span class="s3">/ </span><span class="s1">predicted_reduction</span>
+            <span class="s2">if </span><span class="s1">intersect </span><span class="s2">and </span><span class="s1">reduction_ratio_soc </span><span class="s3">&gt;= </span><span class="s1">SUFFICIENT_REDUCTION_RATIO</span><span class="s3">:</span>
+                <span class="s1">x_next </span><span class="s3">= </span><span class="s1">x_soc</span>
+                <span class="s1">f_next </span><span class="s3">= </span><span class="s1">f_soc</span>
+                <span class="s1">b_next </span><span class="s3">= </span><span class="s1">b_soc</span>
+                <span class="s1">reduction_ratio </span><span class="s3">= </span><span class="s1">reduction_ratio_soc</span>
+
+        <span class="s6"># Readjust trust region step, formula (3.55), reference [2]_, p.892.</span>
+        <span class="s2">if </span><span class="s1">reduction_ratio </span><span class="s3">&gt;= </span><span class="s1">LARGE_REDUCTION_RATIO</span><span class="s3">:</span>
+            <span class="s1">trust_radius </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">TRUST_ENLARGEMENT_FACTOR_L </span><span class="s3">* </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">d</span><span class="s3">),</span>
+                               <span class="s1">trust_radius</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">reduction_ratio </span><span class="s3">&gt;= </span><span class="s1">INTERMEDIARY_REDUCTION_RATIO</span><span class="s3">:</span>
+            <span class="s1">trust_radius </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">TRUST_ENLARGEMENT_FACTOR_S </span><span class="s3">* </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">d</span><span class="s3">),</span>
+                               <span class="s1">trust_radius</span><span class="s3">)</span>
+        <span class="s6"># Reduce trust region step, according to reference [3]_, p.696.</span>
+        <span class="s2">elif </span><span class="s1">reduction_ratio </span><span class="s3">&lt; </span><span class="s1">SUFFICIENT_REDUCTION_RATIO</span><span class="s3">:</span>
+            <span class="s1">trust_reduction </span><span class="s3">= ((</span><span class="s5">1</span><span class="s3">-</span><span class="s1">SUFFICIENT_REDUCTION_RATIO</span><span class="s3">) /</span>
+                               <span class="s3">(</span><span class="s5">1</span><span class="s3">-</span><span class="s1">reduction_ratio</span><span class="s3">))</span>
+            <span class="s1">new_trust_radius </span><span class="s3">= </span><span class="s1">trust_reduction </span><span class="s3">* </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">d</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">new_trust_radius </span><span class="s3">&gt;= </span><span class="s1">MAX_TRUST_REDUCTION </span><span class="s3">* </span><span class="s1">trust_radius</span><span class="s3">:</span>
+                <span class="s1">trust_radius </span><span class="s3">*= </span><span class="s1">MAX_TRUST_REDUCTION</span>
+            <span class="s2">elif </span><span class="s1">new_trust_radius </span><span class="s3">&gt;= </span><span class="s1">MIN_TRUST_REDUCTION </span><span class="s3">* </span><span class="s1">trust_radius</span><span class="s3">:</span>
+                <span class="s1">trust_radius </span><span class="s3">= </span><span class="s1">new_trust_radius</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">trust_radius </span><span class="s3">*= </span><span class="s1">MIN_TRUST_REDUCTION</span>
+
+        <span class="s6"># Update iteration</span>
+        <span class="s2">if </span><span class="s1">reduction_ratio </span><span class="s3">&gt;= </span><span class="s1">SUFFICIENT_REDUCTION_RATIO</span><span class="s3">:</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x_next</span>
+            <span class="s1">f</span><span class="s3">, </span><span class="s1">b </span><span class="s3">= </span><span class="s1">f_next</span><span class="s3">, </span><span class="s1">b_next</span>
+            <span class="s1">c</span><span class="s3">, </span><span class="s1">A </span><span class="s3">= </span><span class="s1">grad_and_jac</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+            <span class="s1">S </span><span class="s3">= </span><span class="s1">scaling</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+            <span class="s6"># Get projections</span>
+            <span class="s1">Z</span><span class="s3">, </span><span class="s1">LS</span><span class="s3">, </span><span class="s1">Y </span><span class="s3">= </span><span class="s1">projections</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">factorization_method</span><span class="s3">)</span>
+            <span class="s6"># Compute least-square lagrange multipliers</span>
+            <span class="s1">v </span><span class="s3">= -</span><span class="s1">LS</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">c</span><span class="s3">)</span>
+            <span class="s6"># Compute Hessian</span>
+            <span class="s1">H </span><span class="s3">= </span><span class="s1">lagr_hess</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">v</span><span class="s3">)</span>
+            <span class="s6"># Set Flag</span>
+            <span class="s1">last_iteration_failed </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s6"># Otimality values</span>
+            <span class="s1">optimality </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">c </span><span class="s3">+ </span><span class="s1">A</span><span class="s3">.</span><span class="s1">T</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">v</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+            <span class="s1">constr_violation </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">) </span><span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">b</span><span class="s3">) &gt; </span><span class="s5">0 </span><span class="s2">else </span><span class="s5">0</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">penalty </span><span class="s3">= </span><span class="s1">previous_penalty</span>
+            <span class="s1">last_iteration_failed </span><span class="s3">= </span><span class="s2">True</span>
+
+    <span class="s2">return </span><span class="s1">x</span><span class="s3">, </span><span class="s1">state</span>
+</pre>
+</body>
+</html>

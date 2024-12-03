@@ -1,0 +1,497 @@
+<html>
+<head>
+<title>_store_backends.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_store_backends.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Storage providers backends for Memory caching.&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">pickle </span><span class="s2">import </span><span class="s1">PicklingError</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span>
+<span class="s2">import </span><span class="s1">datetime</span>
+<span class="s2">import </span><span class="s1">json</span>
+<span class="s2">import </span><span class="s1">shutil</span>
+<span class="s2">import </span><span class="s1">time</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">collections</span>
+<span class="s2">import </span><span class="s1">operator</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">from </span><span class="s1">abc </span><span class="s2">import </span><span class="s1">ABCMeta</span><span class="s3">, </span><span class="s1">abstractmethod</span>
+
+<span class="s2">from </span><span class="s3">.</span><span class="s1">backports </span><span class="s2">import </span><span class="s1">concurrency_safe_rename</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">disk </span><span class="s2">import </span><span class="s1">mkdirp</span><span class="s3">, </span><span class="s1">memstr_to_bytes</span><span class="s3">, </span><span class="s1">rm_subdirs</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">logger </span><span class="s2">import </span><span class="s1">format_time</span>
+<span class="s2">from </span><span class="s3">. </span><span class="s2">import </span><span class="s1">numpy_pickle</span>
+
+<span class="s1">CacheItemInfo </span><span class="s3">= </span><span class="s1">collections</span><span class="s3">.</span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s4">'CacheItemInfo'</span><span class="s3">,</span>
+                                       <span class="s4">'path size last_access'</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">CacheWarning</span><span class="s3">(</span><span class="s1">Warning</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Warning to capture dump failures except for PicklingError.&quot;&quot;&quot;</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">def </span><span class="s1">concurrency_safe_write</span><span class="s3">(</span><span class="s1">object_to_write</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">write_func</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Writes an object into a unique file in a concurrency-safe way.&quot;&quot;&quot;</span>
+    <span class="s1">thread_id </span><span class="s3">= </span><span class="s1">id</span><span class="s3">(</span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">())</span>
+    <span class="s1">temporary_filename </span><span class="s3">= </span><span class="s4">'{}.thread-{}-pid-{}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+        <span class="s1">filename</span><span class="s3">, </span><span class="s1">thread_id</span><span class="s3">, </span><span class="s1">os</span><span class="s3">.</span><span class="s1">getpid</span><span class="s3">())</span>
+    <span class="s1">write_func</span><span class="s3">(</span><span class="s1">object_to_write</span><span class="s3">, </span><span class="s1">temporary_filename</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">temporary_filename</span>
+
+
+<span class="s2">class </span><span class="s1">StoreBackendBase</span><span class="s3">(</span><span class="s1">metaclass</span><span class="s3">=</span><span class="s1">ABCMeta</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Helper Abstract Base Class which defines all methods that 
+       a StorageBackend must implement.&quot;&quot;&quot;</span>
+
+    <span class="s1">location </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">_open_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Opens an item on the store and return a file-like object. 
+ 
+        This method is private and only used by the StoreBackendMixin object. 
+ 
+        Parameters 
+        ---------- 
+        f: a file-like object 
+            The file-like object where an item is stored and retrieved 
+        mode: string, optional 
+            the mode in which the file-like object is opened allowed valued are 
+            'rb', 'wb' 
+ 
+        Returns 
+        ------- 
+        a file-like object 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">_item_exists</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Checks if an item location exists in the store. 
+ 
+        This method is private and only used by the StoreBackendMixin object. 
+ 
+        Parameters 
+        ---------- 
+        location: string 
+            The location of an item. On a filesystem, this corresponds to the 
+            absolute path, including the filename, of a file. 
+ 
+        Returns 
+        ------- 
+        True if the item exists, False otherwise 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">_move_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">src</span><span class="s3">, </span><span class="s1">dst</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Moves an item from src to dst in the store. 
+ 
+        This method is private and only used by the StoreBackendMixin object. 
+ 
+        Parameters 
+        ---------- 
+        src: string 
+            The source location of an item 
+        dst: string 
+            The destination location of an item 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">create_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Creates a location on the store. 
+ 
+        Parameters 
+        ---------- 
+        location: string 
+            The location in the store. On a filesystem, this corresponds to a 
+            directory. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">clear_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Clears a location on the store. 
+ 
+        Parameters 
+        ---------- 
+        location: string 
+            The location in the store. On a filesystem, this corresponds to a 
+            directory or a filename absolute path 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">get_items</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns the whole list of items available in the store. 
+ 
+        Returns 
+        ------- 
+        The list of items identified by their ids (e.g filename in a 
+        filesystem). 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s2">def </span><span class="s1">configure</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">backend_options</span><span class="s3">=</span><span class="s1">dict</span><span class="s3">()):</span>
+        <span class="s0">&quot;&quot;&quot;Configures the store. 
+ 
+        Parameters 
+        ---------- 
+        location: string 
+            The base location used by the store. On a filesystem, this 
+            corresponds to a directory. 
+        verbose: int 
+            The level of verbosity of the store 
+        backend_options: dict 
+            Contains a dictionary of named parameters used to configure the 
+            store backend. 
+        &quot;&quot;&quot;</span>
+
+
+<span class="s2">class </span><span class="s1">StoreBackendMixin</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Class providing all logic for managing the store in a generic way. 
+ 
+    The StoreBackend subclass has to implement 3 methods: create_location, 
+    clear_location and configure. The StoreBackend also has to provide 
+    a private _open_item, _item_exists and _move_item methods. The _open_item 
+    method has to have the same signature as the builtin open and return a 
+    file-like object. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">load_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">timestamp</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">metadata</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Load an item from the store given its id as a list of str.&quot;&quot;&quot;</span>
+        <span class="s1">full_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s1">ts_string </span><span class="s3">= (</span><span class="s4">'{: &lt;16}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">format_time</span><span class="s3">(</span><span class="s1">time</span><span class="s3">.</span><span class="s1">time</span><span class="s3">() - </span><span class="s1">timestamp</span><span class="s3">))</span>
+                         <span class="s2">if </span><span class="s1">timestamp </span><span class="s2">is not None else </span><span class="s4">''</span><span class="s3">)</span>
+            <span class="s1">signature </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">basename</span><span class="s3">(</span><span class="s1">call_id</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+            <span class="s2">if </span><span class="s1">metadata </span><span class="s2">is not None and </span><span class="s4">'input_args' </span><span class="s2">in </span><span class="s1">metadata</span><span class="s3">:</span>
+                <span class="s1">kwargs </span><span class="s3">= </span><span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s4">'{}={}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(*</span><span class="s1">item</span><span class="s3">)</span>
+                                   <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">metadata</span><span class="s3">[</span><span class="s4">'input_args'</span><span class="s3">].</span><span class="s1">items</span><span class="s3">())</span>
+                <span class="s1">signature </span><span class="s3">+= </span><span class="s4">'({})'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">kwargs</span><span class="s3">)</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s4">'[Memory]{}: Loading {}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">ts_string</span><span class="s3">, </span><span class="s1">signature</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&lt; </span><span class="s5">10</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s4">'{0}...'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">))</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s4">'{0} from {1}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">, </span><span class="s1">full_path</span><span class="s3">))</span>
+
+        <span class="s1">mmap_mode </span><span class="s3">= (</span><span class="s2">None if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s4">'mmap_mode'</span><span class="s3">)</span>
+                     <span class="s2">else </span><span class="s1">self</span><span class="s3">.</span><span class="s1">mmap_mode</span><span class="s3">)</span>
+
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">full_path</span><span class="s3">, </span><span class="s4">'output.pkl'</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_item_exists</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">KeyError</span><span class="s3">(</span><span class="s4">&quot;Non-existing item (may have been &quot;</span>
+                           <span class="s4">&quot;cleared).</span><span class="s2">\n</span><span class="s4">File %s does not exist&quot; </span><span class="s3">% </span><span class="s1">filename</span><span class="s3">)</span>
+
+        <span class="s6"># file-like object cannot be used when mmap_mode is set</span>
+        <span class="s2">if </span><span class="s1">mmap_mode </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_item</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s1">item </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">item </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s1">mmap_mode</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">item</span>
+
+    <span class="s2">def </span><span class="s1">dump_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">, </span><span class="s1">item</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">=</span><span class="s5">1</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Dump an item in the store at the id given as a list of str.&quot;&quot;&quot;</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">item_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_item_exists</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">create_location</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">)</span>
+            <span class="s1">filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">, </span><span class="s4">'output.pkl'</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s4">'Persisting in %s' </span><span class="s3">% </span><span class="s1">item_path</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">write_func</span><span class="s3">(</span><span class="s1">to_write</span><span class="s3">, </span><span class="s1">dest_filename</span><span class="s3">):</span>
+                <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_item</span><span class="s3">(</span><span class="s1">dest_filename</span><span class="s3">, </span><span class="s4">&quot;wb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">to_write</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">compress</span><span class="s3">)</span>
+                    <span class="s2">except </span><span class="s1">PicklingError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                        <span class="s6"># TODO(1.5) turn into error</span>
+                        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                            <span class="s4">&quot;Unable to cache to disk: failed to pickle &quot;</span>
+                            <span class="s4">&quot;output. In version 1.5 this will raise an &quot;</span>
+                            <span class="s4">f&quot;exception. Exception: </span><span class="s2">{</span><span class="s1">e</span><span class="s2">}</span><span class="s4">.&quot;</span><span class="s3">,</span>
+                            <span class="s1">FutureWarning</span>
+                        <span class="s3">)</span>
+
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_concurrency_safe_write</span><span class="s3">(</span><span class="s1">item</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">write_func</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:  </span><span class="s6"># noqa: E722</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                <span class="s4">&quot;Unable to cache to disk. Possibly a race condition in the &quot;</span>
+                <span class="s4">f&quot;creation of the directory. Exception: </span><span class="s2">{</span><span class="s1">e</span><span class="s2">}</span><span class="s4">.&quot;</span><span class="s3">,</span>
+                <span class="s1">CacheWarning</span>
+            <span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">clear_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Clear the item at the id, given as a list of str.&quot;&quot;&quot;</span>
+        <span class="s1">item_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_item_exists</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">clear_location</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">contains_item</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Check if there is an item at the id, given as a list of str.&quot;&quot;&quot;</span>
+        <span class="s1">item_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">, </span><span class="s4">'output.pkl'</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_item_exists</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_item_info</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return information about item.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s3">{</span><span class="s4">'location'</span><span class="s3">: </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)}</span>
+
+    <span class="s2">def </span><span class="s1">get_metadata</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return actual metadata of an item.&quot;&quot;&quot;</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">item_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+            <span class="s1">filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">, </span><span class="s4">'metadata.json'</span><span class="s3">)</span>
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_item</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">json</span><span class="s3">.</span><span class="s1">loads</span><span class="s3">(</span><span class="s1">f</span><span class="s3">.</span><span class="s1">read</span><span class="s3">().</span><span class="s1">decode</span><span class="s3">(</span><span class="s4">'utf-8'</span><span class="s3">))</span>
+        <span class="s2">except</span><span class="s3">:  </span><span class="s6"># noqa: E722</span>
+            <span class="s2">return </span><span class="s3">{}</span>
+
+    <span class="s2">def </span><span class="s1">store_metadata</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">, </span><span class="s1">metadata</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Store metadata of a computation.&quot;&quot;&quot;</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">item_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">create_location</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">)</span>
+            <span class="s1">filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">item_path</span><span class="s3">, </span><span class="s4">'metadata.json'</span><span class="s3">)</span>
+
+            <span class="s2">def </span><span class="s1">write_func</span><span class="s3">(</span><span class="s1">to_write</span><span class="s3">, </span><span class="s1">dest_filename</span><span class="s3">):</span>
+                <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_item</span><span class="s3">(</span><span class="s1">dest_filename</span><span class="s3">, </span><span class="s4">&quot;wb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                    <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">json</span><span class="s3">.</span><span class="s1">dumps</span><span class="s3">(</span><span class="s1">to_write</span><span class="s3">).</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">'utf-8'</span><span class="s3">))</span>
+
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_concurrency_safe_write</span><span class="s3">(</span><span class="s1">metadata</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">write_func</span><span class="s3">)</span>
+        <span class="s2">except</span><span class="s3">:  </span><span class="s6"># noqa: E722</span>
+            <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">contains_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Check cached function is available in store.&quot;&quot;&quot;</span>
+        <span class="s1">func_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">object_exists</span><span class="s3">(</span><span class="s1">func_path</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">clear_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Clear all items with a common path in the store.&quot;&quot;&quot;</span>
+        <span class="s1">func_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_item_exists</span><span class="s3">(</span><span class="s1">func_path</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">clear_location</span><span class="s3">(</span><span class="s1">func_path</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">store_cached_func_code</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">, </span><span class="s1">func_code</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Store the code of the cached function.&quot;&quot;&quot;</span>
+        <span class="s1">func_path </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_item_exists</span><span class="s3">(</span><span class="s1">func_path</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">create_location</span><span class="s3">(</span><span class="s1">func_path</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">func_code </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">func_path</span><span class="s3">, </span><span class="s4">&quot;func_code.py&quot;</span><span class="s3">)</span>
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_item</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">func_code</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">'utf-8'</span><span class="s3">))</span>
+
+    <span class="s2">def </span><span class="s1">get_cached_func_code</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Store the code of the cached function.&quot;&quot;&quot;</span>
+        <span class="s1">filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">, </span><span class="s4">'func_code.py'</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_open_item</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">f</span><span class="s3">.</span><span class="s1">read</span><span class="s3">().</span><span class="s1">decode</span><span class="s3">(</span><span class="s4">'utf-8'</span><span class="s3">)</span>
+        <span class="s2">except</span><span class="s3">:  </span><span class="s6"># noqa: E722</span>
+            <span class="s2">raise</span>
+
+    <span class="s2">def </span><span class="s1">get_cached_func_info</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">call_id</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return information related to the cached function if it exists.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s3">{</span><span class="s4">'location'</span><span class="s3">: </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">, *</span><span class="s1">call_id</span><span class="s3">)}</span>
+
+    <span class="s2">def </span><span class="s1">clear</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Clear the whole store content.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">clear_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">enforce_store_limits</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">, </span><span class="s1">bytes_limit</span><span class="s3">, </span><span class="s1">items_limit</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">age_limit</span><span class="s3">=</span><span class="s2">None</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Remove the store's oldest files to enforce item, byte, and age limits. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">items_to_delete </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_get_items_to_delete</span><span class="s3">(</span>
+            <span class="s1">bytes_limit</span><span class="s3">, </span><span class="s1">items_limit</span><span class="s3">, </span><span class="s1">age_limit</span>
+        <span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">items_to_delete</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+                <span class="s1">print</span><span class="s3">(</span><span class="s4">'Deleting item {0}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">item</span><span class="s3">))</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">clear_location</span><span class="s3">(</span><span class="s1">item</span><span class="s3">.</span><span class="s1">path</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+                <span class="s6"># Even with ignore_errors=True shutil.rmtree can raise OSError</span>
+                <span class="s6"># with:</span>
+                <span class="s6"># [Errno 116] Stale file handle if another process has deleted</span>
+                <span class="s6"># the folder already.</span>
+                <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">_get_items_to_delete</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">, </span><span class="s1">bytes_limit</span><span class="s3">, </span><span class="s1">items_limit</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">age_limit</span><span class="s3">=</span><span class="s2">None</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Get items to delete to keep the store under size, file, &amp; age limits. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">bytes_limit</span><span class="s3">, </span><span class="s1">str</span><span class="s3">):</span>
+            <span class="s1">bytes_limit </span><span class="s3">= </span><span class="s1">memstr_to_bytes</span><span class="s3">(</span><span class="s1">bytes_limit</span><span class="s3">)</span>
+
+        <span class="s1">items </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_items</span><span class="s3">()</span>
+        <span class="s2">if not </span><span class="s1">items</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s3">[]</span>
+
+        <span class="s1">size </span><span class="s3">= </span><span class="s1">sum</span><span class="s3">(</span><span class="s1">item</span><span class="s3">.</span><span class="s1">size </span><span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">items</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">bytes_limit </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">to_delete_size </span><span class="s3">= </span><span class="s1">size </span><span class="s3">- </span><span class="s1">bytes_limit</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">to_delete_size </span><span class="s3">= </span><span class="s5">0</span>
+
+        <span class="s2">if </span><span class="s1">items_limit </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">to_delete_items </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">items</span><span class="s3">) - </span><span class="s1">items_limit</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">to_delete_items </span><span class="s3">= </span><span class="s5">0</span>
+
+        <span class="s2">if </span><span class="s1">age_limit </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">older_item </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">item</span><span class="s3">.</span><span class="s1">last_access </span><span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">items</span><span class="s3">)</span>
+            <span class="s1">deadline </span><span class="s3">= </span><span class="s1">datetime</span><span class="s3">.</span><span class="s1">datetime</span><span class="s3">.</span><span class="s1">now</span><span class="s3">() - </span><span class="s1">age_limit</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">deadline </span><span class="s3">= </span><span class="s2">None</span>
+
+        <span class="s2">if </span><span class="s3">(</span>
+            <span class="s1">to_delete_size </span><span class="s3">&lt;= </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">to_delete_items </span><span class="s3">&lt;= </span><span class="s5">0</span>
+            <span class="s2">and </span><span class="s3">(</span><span class="s1">deadline </span><span class="s2">is None or </span><span class="s1">older_item </span><span class="s3">&gt; </span><span class="s1">deadline</span><span class="s3">)</span>
+        <span class="s3">):</span>
+            <span class="s2">return </span><span class="s3">[]</span>
+
+        <span class="s6"># We want to delete first the cache items that were accessed a</span>
+        <span class="s6"># long time ago</span>
+        <span class="s1">items</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">(</span><span class="s1">key</span><span class="s3">=</span><span class="s1">operator</span><span class="s3">.</span><span class="s1">attrgetter</span><span class="s3">(</span><span class="s4">'last_access'</span><span class="s3">))</span>
+
+        <span class="s1">items_to_delete </span><span class="s3">= []</span>
+        <span class="s1">size_so_far </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">items_so_far </span><span class="s3">= </span><span class="s5">0</span>
+
+        <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">items</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s3">(</span>
+                <span class="s3">(</span><span class="s1">size_so_far </span><span class="s3">&gt;= </span><span class="s1">to_delete_size</span><span class="s3">)</span>
+                <span class="s2">and </span><span class="s1">items_so_far </span><span class="s3">&gt;= </span><span class="s1">to_delete_items</span>
+                <span class="s2">and </span><span class="s3">(</span><span class="s1">deadline </span><span class="s2">is None or </span><span class="s1">deadline </span><span class="s3">&lt; </span><span class="s1">item</span><span class="s3">.</span><span class="s1">last_access</span><span class="s3">)</span>
+            <span class="s3">):</span>
+                <span class="s2">break</span>
+
+            <span class="s1">items_to_delete</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">item</span><span class="s3">)</span>
+            <span class="s1">size_so_far </span><span class="s3">+= </span><span class="s1">item</span><span class="s3">.</span><span class="s1">size</span>
+            <span class="s1">items_so_far </span><span class="s3">+= </span><span class="s5">1</span>
+
+        <span class="s2">return </span><span class="s1">items_to_delete</span>
+
+    <span class="s2">def </span><span class="s1">_concurrency_safe_write</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">to_write</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">write_func</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Writes an object into a file in a concurrency-safe way.&quot;&quot;&quot;</span>
+        <span class="s1">temporary_filename </span><span class="s3">= </span><span class="s1">concurrency_safe_write</span><span class="s3">(</span><span class="s1">to_write</span><span class="s3">,</span>
+                                                    <span class="s1">filename</span><span class="s3">, </span><span class="s1">write_func</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_move_item</span><span class="s3">(</span><span class="s1">temporary_filename</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Printable representation of the store location.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s4">'{class_name}(location=&quot;{location}&quot;)'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+            <span class="s1">class_name</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">location</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">FileSystemStoreBackend</span><span class="s3">(</span><span class="s1">StoreBackendBase</span><span class="s3">, </span><span class="s1">StoreBackendMixin</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;A StoreBackend used with local or network file systems.&quot;&quot;&quot;</span>
+
+    <span class="s1">_open_item </span><span class="s3">= </span><span class="s1">staticmethod</span><span class="s3">(</span><span class="s1">open</span><span class="s3">)</span>
+    <span class="s1">_item_exists </span><span class="s3">= </span><span class="s1">staticmethod</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">)</span>
+    <span class="s1">_move_item </span><span class="s3">= </span><span class="s1">staticmethod</span><span class="s3">(</span><span class="s1">concurrency_safe_rename</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">clear_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Delete location on store.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">location </span><span class="s3">== </span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">):</span>
+            <span class="s1">rm_subdirs</span><span class="s3">(</span><span class="s1">location</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">shutil</span><span class="s3">.</span><span class="s1">rmtree</span><span class="s3">(</span><span class="s1">location</span><span class="s3">, </span><span class="s1">ignore_errors</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">create_location</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Create object location on store&quot;&quot;&quot;</span>
+        <span class="s1">mkdirp</span><span class="s3">(</span><span class="s1">location</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_items</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns the whole list of items available in the store.&quot;&quot;&quot;</span>
+        <span class="s1">items </span><span class="s3">= []</span>
+
+        <span class="s2">for </span><span class="s1">dirpath</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">filenames </span><span class="s2">in </span><span class="s1">os</span><span class="s3">.</span><span class="s1">walk</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">):</span>
+            <span class="s1">is_cache_hash_dir </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s4">'[a-f0-9]{32}'</span><span class="s3">,</span>
+                                         <span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">basename</span><span class="s3">(</span><span class="s1">dirpath</span><span class="s3">))</span>
+
+            <span class="s2">if </span><span class="s1">is_cache_hash_dir</span><span class="s3">:</span>
+                <span class="s1">output_filename </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">dirpath</span><span class="s3">, </span><span class="s4">'output.pkl'</span><span class="s3">)</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">last_access </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">getatime</span><span class="s3">(</span><span class="s1">output_filename</span><span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">last_access </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">getatime</span><span class="s3">(</span><span class="s1">dirpath</span><span class="s3">)</span>
+                    <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+                        <span class="s6"># The directory has already been deleted</span>
+                        <span class="s2">continue</span>
+
+                <span class="s1">last_access </span><span class="s3">= </span><span class="s1">datetime</span><span class="s3">.</span><span class="s1">datetime</span><span class="s3">.</span><span class="s1">fromtimestamp</span><span class="s3">(</span><span class="s1">last_access</span><span class="s3">)</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">full_filenames </span><span class="s3">= [</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">dirpath</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">)</span>
+                                      <span class="s2">for </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">filenames</span><span class="s3">]</span>
+                    <span class="s1">dirsize </span><span class="s3">= </span><span class="s1">sum</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">getsize</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">)</span>
+                                  <span class="s2">for </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">full_filenames</span><span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+                    <span class="s6"># Either output_filename or one of the files in</span>
+                    <span class="s6"># dirpath does not exist any more. We assume this</span>
+                    <span class="s6"># directory is being cleaned by another process already</span>
+                    <span class="s2">continue</span>
+
+                <span class="s1">items</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">CacheItemInfo</span><span class="s3">(</span><span class="s1">dirpath</span><span class="s3">, </span><span class="s1">dirsize</span><span class="s3">,</span>
+                                           <span class="s1">last_access</span><span class="s3">))</span>
+
+        <span class="s2">return </span><span class="s1">items</span>
+
+    <span class="s2">def </span><span class="s1">configure</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">location</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">backend_options</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Configure the store backend. 
+ 
+        For this backend, valid store options are 'compress' and 'mmap_mode' 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">backend_options </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">backend_options </span><span class="s3">= {}</span>
+
+        <span class="s6"># setup location directory</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">location </span><span class="s3">= </span><span class="s1">location</span>
+        <span class="s2">if not </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">):</span>
+            <span class="s1">mkdirp</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">location</span><span class="s3">)</span>
+
+        <span class="s6"># item can be stored compressed for faster I/O</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">compress </span><span class="s3">= </span><span class="s1">backend_options</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'compress'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+
+        <span class="s6"># FileSystemStoreBackend can be used with mmap_mode options under</span>
+        <span class="s6"># certain conditions.</span>
+        <span class="s1">mmap_mode </span><span class="s3">= </span><span class="s1">backend_options</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'mmap_mode'</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">compress </span><span class="s2">and </span><span class="s1">mmap_mode </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s4">'Compressed items cannot be memmapped in a '</span>
+                          <span class="s4">'filesystem store. Option will be ignored.'</span><span class="s3">,</span>
+                          <span class="s1">stacklevel</span><span class="s3">=</span><span class="s5">2</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">mmap_mode </span><span class="s3">= </span><span class="s1">mmap_mode</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">verbose </span><span class="s3">= </span><span class="s1">verbose</span>
+</pre>
+</body>
+</html>

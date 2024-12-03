@@ -1,0 +1,391 @@
+<html>
+<head>
+<title>texmanager.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+texmanager.py</font>
+</center></td></tr></table>
+<pre><span class="s0">r&quot;&quot;&quot; 
+Support for embedded TeX expressions in Matplotlib. 
+ 
+Requirements: 
+ 
+* LaTeX. 
+* \*Agg backends: dvipng&gt;=1.6. 
+* PS backend: PSfrag, dvips, and Ghostscript&gt;=9.0. 
+* PDF and SVG backends: if LuaTeX is present, it will be used to speed up some 
+  post-processing steps, but note that it is not used to parse the TeX string 
+  itself (only LaTeX is supported). 
+ 
+To enable TeX rendering of all text in your Matplotlib figure, set 
+:rc:`text.usetex` to True. 
+ 
+TeX and dvipng/dvips processing results are cached 
+in ~/.matplotlib/tex.cache for reuse between sessions. 
+ 
+`TexManager.get_rgba` can also be used to directly obtain raster output as RGBA 
+NumPy arrays. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">hashlib</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">from </span><span class="s1">pathlib </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">import </span><span class="s1">subprocess</span>
+<span class="s2">from </span><span class="s1">tempfile </span><span class="s2">import </span><span class="s1">TemporaryDirectory</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">import </span><span class="s1">matplotlib </span><span class="s2">as </span><span class="s1">mpl</span>
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s3">, </span><span class="s1">cbook</span><span class="s3">, </span><span class="s1">dviread</span>
+
+<span class="s1">_log </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_usepackage_if_not_loaded</span><span class="s3">(</span><span class="s1">package</span><span class="s3">, *, </span><span class="s1">option</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Output LaTeX code that loads a package (possibly with an option) if it 
+    hasn't been loaded yet. 
+ 
+    LaTeX cannot load twice a package with different options, so this helper 
+    can be used to protect against users loading arbitrary packages/options in 
+    their custom preamble. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">option </span><span class="s3">= </span><span class="s4">f&quot;[</span><span class="s2">{</span><span class="s1">option</span><span class="s2">}</span><span class="s4">]&quot; </span><span class="s2">if </span><span class="s1">option </span><span class="s2">is not None else </span><span class="s4">&quot;&quot;</span>
+    <span class="s2">return </span><span class="s3">(</span>
+        <span class="s4">r&quot;\makeatletter&quot;</span>
+        <span class="s4">r&quot;\@ifpackageloaded{%(package)s}{}{\usepackage%(option)s{%(package)s}}&quot;</span>
+        <span class="s4">r&quot;\makeatother&quot;</span>
+    <span class="s3">) % {</span><span class="s4">&quot;package&quot;</span><span class="s3">: </span><span class="s1">package</span><span class="s3">, </span><span class="s4">&quot;option&quot;</span><span class="s3">: </span><span class="s1">option</span><span class="s3">}</span>
+
+
+<span class="s2">class </span><span class="s1">TexManager</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Convert strings to dvi files using TeX, caching the results to a directory. 
+ 
+    The cache directory is called ``tex.cache`` and is located in the directory 
+    returned by `.get_cachedir`. 
+ 
+    Repeated calls to this constructor always return the same instance. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">texcache </span><span class="s3">= </span><span class="s1">_api</span><span class="s3">.</span><span class="s1">deprecate_privatize_attribute</span><span class="s3">(</span><span class="s4">&quot;3.8&quot;</span><span class="s3">)</span>
+    <span class="s1">_texcache </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">get_cachedir</span><span class="s3">(), </span><span class="s4">'tex.cache'</span><span class="s3">)</span>
+    <span class="s1">_grey_arrayd </span><span class="s3">= {}</span>
+
+    <span class="s1">_font_families </span><span class="s3">= (</span><span class="s4">'serif'</span><span class="s3">, </span><span class="s4">'sans-serif'</span><span class="s3">, </span><span class="s4">'cursive'</span><span class="s3">, </span><span class="s4">'monospace'</span><span class="s3">)</span>
+    <span class="s1">_font_preambles </span><span class="s3">= {</span>
+        <span class="s4">'new century schoolbook'</span><span class="s3">: </span><span class="s4">r'\renewcommand{\rmdefault}{pnc}'</span><span class="s3">,</span>
+        <span class="s4">'bookman'</span><span class="s3">: </span><span class="s4">r'\renewcommand{\rmdefault}{pbk}'</span><span class="s3">,</span>
+        <span class="s4">'times'</span><span class="s3">: </span><span class="s4">r'\usepackage{mathptmx}'</span><span class="s3">,</span>
+        <span class="s4">'palatino'</span><span class="s3">: </span><span class="s4">r'\usepackage{mathpazo}'</span><span class="s3">,</span>
+        <span class="s4">'zapf chancery'</span><span class="s3">: </span><span class="s4">r'\usepackage{chancery}'</span><span class="s3">,</span>
+        <span class="s4">'cursive'</span><span class="s3">: </span><span class="s4">r'\usepackage{chancery}'</span><span class="s3">,</span>
+        <span class="s4">'charter'</span><span class="s3">: </span><span class="s4">r'\usepackage{charter}'</span><span class="s3">,</span>
+        <span class="s4">'serif'</span><span class="s3">: </span><span class="s4">''</span><span class="s3">,</span>
+        <span class="s4">'sans-serif'</span><span class="s3">: </span><span class="s4">''</span><span class="s3">,</span>
+        <span class="s4">'helvetica'</span><span class="s3">: </span><span class="s4">r'\usepackage{helvet}'</span><span class="s3">,</span>
+        <span class="s4">'avant garde'</span><span class="s3">: </span><span class="s4">r'\usepackage{avant}'</span><span class="s3">,</span>
+        <span class="s4">'courier'</span><span class="s3">: </span><span class="s4">r'\usepackage{courier}'</span><span class="s3">,</span>
+        <span class="s5"># Loading the type1ec package ensures that cm-super is installed, which</span>
+        <span class="s5"># is necessary for Unicode computer modern.  (It also allows the use of</span>
+        <span class="s5"># computer modern at arbitrary sizes, but that's just a side effect.)</span>
+        <span class="s4">'monospace'</span><span class="s3">: </span><span class="s4">r'\usepackage{type1ec}'</span><span class="s3">,</span>
+        <span class="s4">'computer modern roman'</span><span class="s3">: </span><span class="s4">r'\usepackage{type1ec}'</span><span class="s3">,</span>
+        <span class="s4">'computer modern sans serif'</span><span class="s3">: </span><span class="s4">r'\usepackage{type1ec}'</span><span class="s3">,</span>
+        <span class="s4">'computer modern typewriter'</span><span class="s3">: </span><span class="s4">r'\usepackage{type1ec}'</span><span class="s3">,</span>
+    <span class="s3">}</span>
+    <span class="s1">_font_types </span><span class="s3">= {</span>
+        <span class="s4">'new century schoolbook'</span><span class="s3">: </span><span class="s4">'serif'</span><span class="s3">,</span>
+        <span class="s4">'bookman'</span><span class="s3">: </span><span class="s4">'serif'</span><span class="s3">,</span>
+        <span class="s4">'times'</span><span class="s3">: </span><span class="s4">'serif'</span><span class="s3">,</span>
+        <span class="s4">'palatino'</span><span class="s3">: </span><span class="s4">'serif'</span><span class="s3">,</span>
+        <span class="s4">'zapf chancery'</span><span class="s3">: </span><span class="s4">'cursive'</span><span class="s3">,</span>
+        <span class="s4">'charter'</span><span class="s3">: </span><span class="s4">'serif'</span><span class="s3">,</span>
+        <span class="s4">'helvetica'</span><span class="s3">: </span><span class="s4">'sans-serif'</span><span class="s3">,</span>
+        <span class="s4">'avant garde'</span><span class="s3">: </span><span class="s4">'sans-serif'</span><span class="s3">,</span>
+        <span class="s4">'courier'</span><span class="s3">: </span><span class="s4">'monospace'</span><span class="s3">,</span>
+        <span class="s4">'computer modern roman'</span><span class="s3">: </span><span class="s4">'serif'</span><span class="s3">,</span>
+        <span class="s4">'computer modern sans serif'</span><span class="s3">: </span><span class="s4">'sans-serif'</span><span class="s3">,</span>
+        <span class="s4">'computer modern typewriter'</span><span class="s3">: </span><span class="s4">'monospace'</span><span class="s3">,</span>
+    <span class="s3">}</span>
+
+    <span class="s3">@</span><span class="s1">functools</span><span class="s3">.</span><span class="s1">lru_cache  </span><span class="s5"># Always return the same instance.</span>
+    <span class="s2">def </span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s1">Path</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_texcache</span><span class="s3">).</span><span class="s1">mkdir</span><span class="s3">(</span><span class="s1">parents</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">exist_ok</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">object</span><span class="s3">.</span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_font_family_and_reduced</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the font family name and whether the font is reduced.&quot;&quot;&quot;</span>
+        <span class="s1">ff </span><span class="s3">= </span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">rcParams</span><span class="s3">[</span><span class="s4">'font.family'</span><span class="s3">]</span>
+        <span class="s1">ff_val </span><span class="s3">= </span><span class="s1">ff</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">lower</span><span class="s3">() </span><span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ff</span><span class="s3">) == </span><span class="s6">1 </span><span class="s2">else None</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ff</span><span class="s3">) == </span><span class="s6">1 </span><span class="s2">and </span><span class="s1">ff_val </span><span class="s2">in </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_families</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">ff_val</span><span class="s3">, </span><span class="s2">False</span>
+        <span class="s2">elif </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ff</span><span class="s3">) == </span><span class="s6">1 </span><span class="s2">and </span><span class="s1">ff_val </span><span class="s2">in </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_preambles</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_types</span><span class="s3">[</span><span class="s1">ff_val</span><span class="s3">], </span><span class="s2">True</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">_log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">'font.family must be one of (%s) when text.usetex is '</span>
+                      <span class="s4">'True. serif will be used by default.'</span><span class="s3">,</span>
+                      <span class="s4">', '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_families</span><span class="s3">))</span>
+            <span class="s2">return </span><span class="s4">'serif'</span><span class="s3">, </span><span class="s2">False</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_font_preamble_and_command</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s1">requested_family</span><span class="s3">, </span><span class="s1">is_reduced_font </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_get_font_family_and_reduced</span><span class="s3">()</span>
+
+        <span class="s1">preambles </span><span class="s3">= {}</span>
+        <span class="s2">for </span><span class="s1">font_family </span><span class="s2">in </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_families</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">is_reduced_font </span><span class="s2">and </span><span class="s1">font_family </span><span class="s3">== </span><span class="s1">requested_family</span><span class="s3">:</span>
+                <span class="s1">preambles</span><span class="s3">[</span><span class="s1">font_family</span><span class="s3">] = </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_preambles</span><span class="s3">[</span>
+                    <span class="s1">mpl</span><span class="s3">.</span><span class="s1">rcParams</span><span class="s3">[</span><span class="s4">'font.family'</span><span class="s3">][</span><span class="s6">0</span><span class="s3">].</span><span class="s1">lower</span><span class="s3">()]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">font </span><span class="s2">in </span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">rcParams</span><span class="s3">[</span><span class="s4">'font.' </span><span class="s3">+ </span><span class="s1">font_family</span><span class="s3">]:</span>
+                    <span class="s2">if </span><span class="s1">font</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">() </span><span class="s2">in </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_preambles</span><span class="s3">:</span>
+                        <span class="s1">preambles</span><span class="s3">[</span><span class="s1">font_family</span><span class="s3">] = </span><span class="s1">\</span>
+                            <span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_preambles</span><span class="s3">[</span><span class="s1">font</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">()]</span>
+                        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+                            <span class="s4">'family: %s, font: %s, info: %s'</span><span class="s3">,</span>
+                            <span class="s1">font_family</span><span class="s3">, </span><span class="s1">font</span><span class="s3">,</span>
+                            <span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_preambles</span><span class="s3">[</span><span class="s1">font</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">()])</span>
+                        <span class="s2">break</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">'%s font is not compatible with usetex.'</span><span class="s3">,</span>
+                                   <span class="s1">font</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">_log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">'No LaTeX-compatible font found for the %s font'</span>
+                              <span class="s4">'family in rcParams. Using default.'</span><span class="s3">,</span>
+                              <span class="s1">font_family</span><span class="s3">)</span>
+                    <span class="s1">preambles</span><span class="s3">[</span><span class="s1">font_family</span><span class="s3">] = </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_font_preambles</span><span class="s3">[</span><span class="s1">font_family</span><span class="s3">]</span>
+
+        <span class="s5"># The following packages and commands need to be included in the latex</span>
+        <span class="s5"># file's preamble:</span>
+        <span class="s1">cmd </span><span class="s3">= {</span><span class="s1">preambles</span><span class="s3">[</span><span class="s1">family</span><span class="s3">]</span>
+               <span class="s2">for </span><span class="s1">family </span><span class="s2">in </span><span class="s3">[</span><span class="s4">'serif'</span><span class="s3">, </span><span class="s4">'sans-serif'</span><span class="s3">, </span><span class="s4">'monospace'</span><span class="s3">]}</span>
+        <span class="s2">if </span><span class="s1">requested_family </span><span class="s3">== </span><span class="s4">'cursive'</span><span class="s3">:</span>
+            <span class="s1">cmd</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">preambles</span><span class="s3">[</span><span class="s4">'cursive'</span><span class="s3">])</span>
+        <span class="s1">cmd</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s4">r'\usepackage{type1cm}'</span><span class="s3">)</span>
+        <span class="s1">preamble </span><span class="s3">= </span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">cmd</span><span class="s3">))</span>
+        <span class="s1">fontcmd </span><span class="s3">= (</span><span class="s4">r'\sffamily' </span><span class="s2">if </span><span class="s1">requested_family </span><span class="s3">== </span><span class="s4">'sans-serif' </span><span class="s2">else</span>
+                   <span class="s4">r'\ttfamily' </span><span class="s2">if </span><span class="s1">requested_family </span><span class="s3">== </span><span class="s4">'monospace' </span><span class="s2">else</span>
+                   <span class="s4">r'\rmfamily'</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">preamble</span><span class="s3">, </span><span class="s1">fontcmd</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">get_basefile</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a filename based on a hash of the string, fontsize, and dpi. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">src </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_get_tex_source</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">) + </span><span class="s1">str</span><span class="s3">(</span><span class="s1">dpi</span><span class="s3">)</span>
+        <span class="s1">filehash </span><span class="s3">= </span><span class="s1">hashlib</span><span class="s3">.</span><span class="s1">md5</span><span class="s3">(</span><span class="s1">src</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">'utf-8'</span><span class="s3">)).</span><span class="s1">hexdigest</span><span class="s3">()</span>
+        <span class="s1">filepath </span><span class="s3">= </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_texcache</span><span class="s3">)</span>
+
+        <span class="s1">num_letters</span><span class="s3">, </span><span class="s1">num_levels </span><span class="s3">= </span><span class="s6">2</span><span class="s3">, </span><span class="s6">2</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s1">num_letters</span><span class="s3">*</span><span class="s1">num_levels</span><span class="s3">, </span><span class="s1">num_letters</span><span class="s3">):</span>
+            <span class="s1">filepath </span><span class="s3">= </span><span class="s1">filepath </span><span class="s3">/ </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">filehash</span><span class="s3">[</span><span class="s1">i</span><span class="s3">:</span><span class="s1">i</span><span class="s3">+</span><span class="s6">2</span><span class="s3">])</span>
+
+        <span class="s1">filepath</span><span class="s3">.</span><span class="s1">mkdir</span><span class="s3">(</span><span class="s1">parents</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">exist_ok</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">filepath</span><span class="s3">, </span><span class="s1">filehash</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">get_font_preamble</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a string containing font configuration for the tex preamble. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">font_preamble</span><span class="s3">, </span><span class="s1">command </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_get_font_preamble_and_command</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">font_preamble</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">get_custom_preamble</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return a string containing user additions to the tex preamble.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">rcParams</span><span class="s3">[</span><span class="s4">'text.latex.preamble'</span><span class="s3">]</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_get_tex_source</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the complete TeX source for processing a TeX string.&quot;&quot;&quot;</span>
+        <span class="s1">font_preamble</span><span class="s3">, </span><span class="s1">fontcmd </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_get_font_preamble_and_command</span><span class="s3">()</span>
+        <span class="s1">baselineskip </span><span class="s3">= </span><span class="s6">1.25 </span><span class="s3">* </span><span class="s1">fontsize</span>
+        <span class="s2">return </span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">([</span>
+            <span class="s4">r&quot;\documentclass{article}&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% Pass-through \mathdefault, which is used in non-usetex mode&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% to use the default text font but was historically suppressed&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% in usetex mode.&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;\newcommand{\mathdefault}[1]{#1}&quot;</span><span class="s3">,</span>
+            <span class="s1">font_preamble</span><span class="s3">,</span>
+            <span class="s4">r&quot;\usepackage[utf8]{inputenc}&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;\DeclareUnicodeCharacter{2212}{\ensuremath{-}}&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% geometry is loaded before the custom preamble as &quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% convert_psfrags relies on a custom preamble to change the &quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% geometry.&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;\usepackage[papersize=72in, margin=1in]{geometry}&quot;</span><span class="s3">,</span>
+            <span class="s1">cls</span><span class="s3">.</span><span class="s1">get_custom_preamble</span><span class="s3">(),</span>
+            <span class="s4">r&quot;% Use `underscore` package to take care of underscores in text.&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% The [strings] option allows to use underscores in file names.&quot;</span><span class="s3">,</span>
+            <span class="s1">_usepackage_if_not_loaded</span><span class="s3">(</span><span class="s4">&quot;underscore&quot;</span><span class="s3">, </span><span class="s1">option</span><span class="s3">=</span><span class="s4">&quot;strings&quot;</span><span class="s3">),</span>
+            <span class="s4">r&quot;% Custom packages (e.g. newtxtext) may already have loaded &quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% textcomp with different options.&quot;</span><span class="s3">,</span>
+            <span class="s1">_usepackage_if_not_loaded</span><span class="s3">(</span><span class="s4">&quot;textcomp&quot;</span><span class="s3">),</span>
+            <span class="s4">r&quot;\pagestyle{empty}&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;\begin{document}&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% The empty hbox ensures that a page is printed even for empty&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% inputs, except when using psfrag which gets confused by it.&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% matplotlibbaselinemarker is used by dviread to detect the&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;% last line's baseline.&quot;</span><span class="s3">,</span>
+            <span class="s4">rf&quot;\fontsize</span><span class="s2">{{{</span><span class="s1">fontsize</span><span class="s2">}}}{{{</span><span class="s1">baselineskip</span><span class="s2">}}}</span><span class="s4">%&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;\ifdefined\psfrag\else\hbox{}\fi%&quot;</span><span class="s3">,</span>
+            <span class="s4">rf&quot;</span><span class="s2">{{{</span><span class="s1">fontcmd</span><span class="s2">} {</span><span class="s1">tex</span><span class="s2">}}}</span><span class="s4">%&quot;</span><span class="s3">,</span>
+            <span class="s4">r&quot;\end{document}&quot;</span><span class="s3">,</span>
+        <span class="s3">])</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">make_tex</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generate a tex file to render the tex string at a specific font size. 
+ 
+        Return the file name. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">texfile </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">get_basefile</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">) + </span><span class="s4">&quot;.tex&quot;</span>
+        <span class="s1">Path</span><span class="s3">(</span><span class="s1">texfile</span><span class="s3">).</span><span class="s1">write_text</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_get_tex_source</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">),</span>
+                                 <span class="s1">encoding</span><span class="s3">=</span><span class="s4">'utf-8'</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">texfile</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_run_checked_subprocess</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">command</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, *, </span><span class="s1">cwd</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s1">cbook</span><span class="s3">.</span><span class="s1">_pformat_subprocess</span><span class="s3">(</span><span class="s1">command</span><span class="s3">))</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">report </span><span class="s3">= </span><span class="s1">subprocess</span><span class="s3">.</span><span class="s1">check_output</span><span class="s3">(</span>
+                <span class="s1">command</span><span class="s3">, </span><span class="s1">cwd</span><span class="s3">=</span><span class="s1">cwd </span><span class="s2">if </span><span class="s1">cwd </span><span class="s2">is not None else </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_texcache</span><span class="s3">,</span>
+                <span class="s1">stderr</span><span class="s3">=</span><span class="s1">subprocess</span><span class="s3">.</span><span class="s1">STDOUT</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">FileNotFoundError </span><span class="s2">as </span><span class="s1">exc</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                <span class="s4">f'Failed to process string with tex because </span><span class="s2">{</span><span class="s1">command</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span><span class="s2">} </span><span class="s4">'</span>
+                <span class="s4">'could not be found'</span><span class="s3">) </span><span class="s2">from </span><span class="s1">exc</span>
+        <span class="s2">except </span><span class="s1">subprocess</span><span class="s3">.</span><span class="s1">CalledProcessError </span><span class="s2">as </span><span class="s1">exc</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                <span class="s4">'{prog} was not able to process the following string:</span><span class="s2">\n</span><span class="s4">'</span>
+                <span class="s4">'{tex!r}</span><span class="s2">\n\n</span><span class="s4">'</span>
+                <span class="s4">'Here is the full command invocation and its output:</span><span class="s2">\n\n</span><span class="s4">'</span>
+                <span class="s4">'{format_command}</span><span class="s2">\n\n</span><span class="s4">'</span>
+                <span class="s4">'{exc}</span><span class="s2">\n\n</span><span class="s4">'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+                    <span class="s1">prog</span><span class="s3">=</span><span class="s1">command</span><span class="s3">[</span><span class="s6">0</span><span class="s3">],</span>
+                    <span class="s1">format_command</span><span class="s3">=</span><span class="s1">cbook</span><span class="s3">.</span><span class="s1">_pformat_subprocess</span><span class="s3">(</span><span class="s1">command</span><span class="s3">),</span>
+                    <span class="s1">tex</span><span class="s3">=</span><span class="s1">tex</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">'unicode_escape'</span><span class="s3">),</span>
+                    <span class="s1">exc</span><span class="s3">=</span><span class="s1">exc</span><span class="s3">.</span><span class="s1">output</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s4">'utf-8'</span><span class="s3">, </span><span class="s4">'backslashreplace'</span><span class="s3">))</span>
+                <span class="s3">) </span><span class="s2">from None</span>
+        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s1">report</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">report</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">make_dvi</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generate a dvi file containing latex's layout of tex string. 
+ 
+        Return the file name. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">basefile </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">get_basefile</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">)</span>
+        <span class="s1">dvifile </span><span class="s3">= </span><span class="s4">'%s.dvi' </span><span class="s3">% </span><span class="s1">basefile</span>
+        <span class="s2">if not </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">(</span><span class="s1">dvifile</span><span class="s3">):</span>
+            <span class="s1">texfile </span><span class="s3">= </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">make_tex</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">))</span>
+            <span class="s5"># Generate the dvi in a temporary directory to avoid race</span>
+            <span class="s5"># conditions e.g. if multiple processes try to process the same tex</span>
+            <span class="s5"># string at the same time.  Having tmpdir be a subdirectory of the</span>
+            <span class="s5"># final output dir ensures that they are on the same filesystem,</span>
+            <span class="s5"># and thus replace() works atomically.  It also allows referring to</span>
+            <span class="s5"># the texfile with a relative path (for pathological MPLCONFIGDIRs,</span>
+            <span class="s5"># the absolute path may contain characters (e.g. ~) that TeX does</span>
+            <span class="s5"># not support; n.b. relative paths cannot traverse parents, or it</span>
+            <span class="s5"># will be blocked when `openin_any = p` in texmf.cnf).</span>
+            <span class="s1">cwd </span><span class="s3">= </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">dvifile</span><span class="s3">).</span><span class="s1">parent</span>
+            <span class="s2">with </span><span class="s1">TemporaryDirectory</span><span class="s3">(</span><span class="s1">dir</span><span class="s3">=</span><span class="s1">cwd</span><span class="s3">) </span><span class="s2">as </span><span class="s1">tmpdir</span><span class="s3">:</span>
+                <span class="s1">tmppath </span><span class="s3">= </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">)</span>
+                <span class="s1">cls</span><span class="s3">.</span><span class="s1">_run_checked_subprocess</span><span class="s3">(</span>
+                    <span class="s3">[</span><span class="s4">&quot;latex&quot;</span><span class="s3">, </span><span class="s4">&quot;-interaction=nonstopmode&quot;</span><span class="s3">, </span><span class="s4">&quot;--halt-on-error&quot;</span><span class="s3">,</span>
+                     <span class="s4">f&quot;--output-directory=</span><span class="s2">{</span><span class="s1">tmppath</span><span class="s3">.</span><span class="s1">name</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">,</span>
+                     <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">texfile</span><span class="s3">.</span><span class="s1">name</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">], </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">cwd</span><span class="s3">=</span><span class="s1">cwd</span><span class="s3">)</span>
+                <span class="s3">(</span><span class="s1">tmppath </span><span class="s3">/ </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">dvifile</span><span class="s3">).</span><span class="s1">name</span><span class="s3">).</span><span class="s1">replace</span><span class="s3">(</span><span class="s1">dvifile</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">dvifile</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">make_png</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Generate a png file containing latex's rendering of tex string. 
+ 
+        Return the file name. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">basefile </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">get_basefile</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">)</span>
+        <span class="s1">pngfile </span><span class="s3">= </span><span class="s4">'%s.png' </span><span class="s3">% </span><span class="s1">basefile</span>
+        <span class="s5"># see get_rgba for a discussion of the background</span>
+        <span class="s2">if not </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">(</span><span class="s1">pngfile</span><span class="s3">):</span>
+            <span class="s1">dvifile </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">make_dvi</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">)</span>
+            <span class="s1">cmd </span><span class="s3">= [</span><span class="s4">&quot;dvipng&quot;</span><span class="s3">, </span><span class="s4">&quot;-bg&quot;</span><span class="s3">, </span><span class="s4">&quot;Transparent&quot;</span><span class="s3">, </span><span class="s4">&quot;-D&quot;</span><span class="s3">, </span><span class="s1">str</span><span class="s3">(</span><span class="s1">dpi</span><span class="s3">),</span>
+                   <span class="s4">&quot;-T&quot;</span><span class="s3">, </span><span class="s4">&quot;tight&quot;</span><span class="s3">, </span><span class="s4">&quot;-o&quot;</span><span class="s3">, </span><span class="s1">pngfile</span><span class="s3">, </span><span class="s1">dvifile</span><span class="s3">]</span>
+            <span class="s5"># When testing, disable FreeType rendering for reproducibility; but</span>
+            <span class="s5"># dvipng 1.16 has a bug (fixed in f3ff241) that breaks --freetype0</span>
+            <span class="s5"># mode, so for it we keep FreeType enabled; the image will be</span>
+            <span class="s5"># slightly off.</span>
+            <span class="s2">if </span><span class="s3">(</span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">mpl</span><span class="s3">, </span><span class="s4">&quot;_called_from_pytest&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">) </span><span class="s2">and</span>
+                    <span class="s1">mpl</span><span class="s3">.</span><span class="s1">_get_executable_info</span><span class="s3">(</span><span class="s4">&quot;dvipng&quot;</span><span class="s3">).</span><span class="s1">raw_version </span><span class="s3">!= </span><span class="s4">&quot;1.16&quot;</span><span class="s3">):</span>
+                <span class="s1">cmd</span><span class="s3">.</span><span class="s1">insert</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s4">&quot;--freetype0&quot;</span><span class="s3">)</span>
+            <span class="s1">cls</span><span class="s3">.</span><span class="s1">_run_checked_subprocess</span><span class="s3">(</span><span class="s1">cmd</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">pngfile</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">get_grey</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the alpha channel.&quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">fontsize</span><span class="s3">:</span>
+            <span class="s1">fontsize </span><span class="s3">= </span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">rcParams</span><span class="s3">[</span><span class="s4">'font.size'</span><span class="s3">]</span>
+        <span class="s2">if not </span><span class="s1">dpi</span><span class="s3">:</span>
+            <span class="s1">dpi </span><span class="s3">= </span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">rcParams</span><span class="s3">[</span><span class="s4">'savefig.dpi'</span><span class="s3">]</span>
+        <span class="s1">key </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_get_tex_source</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">), </span><span class="s1">dpi</span>
+        <span class="s1">alpha </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_grey_arrayd</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">key</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">alpha </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">pngfile </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">make_png</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">)</span>
+            <span class="s1">rgba </span><span class="s3">= </span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">image</span><span class="s3">.</span><span class="s1">imread</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_texcache</span><span class="s3">, </span><span class="s1">pngfile</span><span class="s3">))</span>
+            <span class="s1">cls</span><span class="s3">.</span><span class="s1">_grey_arrayd</span><span class="s3">[</span><span class="s1">key</span><span class="s3">] = </span><span class="s1">alpha </span><span class="s3">= </span><span class="s1">rgba</span><span class="s3">[:, :, -</span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s2">return </span><span class="s1">alpha</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">get_rgba</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">rgb</span><span class="s3">=(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)):</span>
+        <span class="s0">r&quot;&quot;&quot; 
+        Return latex's rendering of the tex string as an RGBA array. 
+ 
+        Examples 
+        -------- 
+        &gt;&gt;&gt; texmanager = TexManager() 
+        &gt;&gt;&gt; s = r&quot;\TeX\ is $\displaystyle\sum_n\frac{-e^{i\pi}}{2^n}$!&quot; 
+        &gt;&gt;&gt; Z = texmanager.get_rgba(s, fontsize=12, dpi=80, rgb=(1, 0, 0)) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">alpha </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">get_grey</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">)</span>
+        <span class="s1">rgba </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((*</span><span class="s1">alpha</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s6">4</span><span class="s3">))</span>
+        <span class="s1">rgba</span><span class="s3">[..., :</span><span class="s6">3</span><span class="s3">] = </span><span class="s1">mpl</span><span class="s3">.</span><span class="s1">colors</span><span class="s3">.</span><span class="s1">to_rgb</span><span class="s3">(</span><span class="s1">rgb</span><span class="s3">)</span>
+        <span class="s1">rgba</span><span class="s3">[..., -</span><span class="s6">1</span><span class="s3">] = </span><span class="s1">alpha</span>
+        <span class="s2">return </span><span class="s1">rgba</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">get_text_width_height_descent</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return width, height and descent of the text.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">tex</span><span class="s3">.</span><span class="s1">strip</span><span class="s3">() == </span><span class="s4">''</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span>
+        <span class="s1">dvifile </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">make_dvi</span><span class="s3">(</span><span class="s1">tex</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">)</span>
+        <span class="s1">dpi_fraction </span><span class="s3">= </span><span class="s1">renderer</span><span class="s3">.</span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s6">1.</span><span class="s3">) </span><span class="s2">if </span><span class="s1">renderer </span><span class="s2">else </span><span class="s6">1</span>
+        <span class="s2">with </span><span class="s1">dviread</span><span class="s3">.</span><span class="s1">Dvi</span><span class="s3">(</span><span class="s1">dvifile</span><span class="s3">, </span><span class="s6">72 </span><span class="s3">* </span><span class="s1">dpi_fraction</span><span class="s3">) </span><span class="s2">as </span><span class="s1">dvi</span><span class="s3">:</span>
+            <span class="s1">page</span><span class="s3">, = </span><span class="s1">dvi</span>
+        <span class="s5"># A total height (including the descent) needs to be returned.</span>
+        <span class="s2">return </span><span class="s1">page</span><span class="s3">.</span><span class="s1">width</span><span class="s3">, </span><span class="s1">page</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s1">page</span><span class="s3">.</span><span class="s1">descent</span><span class="s3">, </span><span class="s1">page</span><span class="s3">.</span><span class="s1">descent</span>
+</pre>
+</body>
+</html>

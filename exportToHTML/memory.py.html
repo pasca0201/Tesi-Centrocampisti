@@ -1,0 +1,1195 @@
+<html>
+<head>
+<title>memory.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+memory.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A context object for caching a function's return value each time it 
+is called with the same input arguments. 
+ 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Gael Varoquaux &lt;gael dot varoquaux at normalesup dot org&gt;</span>
+<span class="s2"># Copyright (c) 2009 Gael Varoquaux</span>
+<span class="s2"># License: BSD Style, 3 clauses.</span>
+
+
+<span class="s3">import </span><span class="s1">asyncio</span>
+<span class="s3">import </span><span class="s1">datetime</span>
+<span class="s3">import </span><span class="s1">functools</span>
+<span class="s3">import </span><span class="s1">inspect</span>
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">pathlib</span>
+<span class="s3">import </span><span class="s1">pydoc</span>
+<span class="s3">import </span><span class="s1">re</span>
+<span class="s3">import </span><span class="s1">textwrap</span>
+<span class="s3">import </span><span class="s1">time</span>
+<span class="s3">import </span><span class="s1">tokenize</span>
+<span class="s3">import </span><span class="s1">traceback</span>
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">import </span><span class="s1">weakref</span>
+
+<span class="s3">from </span><span class="s4">. </span><span class="s3">import </span><span class="s1">hashing</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_store_backends </span><span class="s3">import </span><span class="s1">CacheWarning  </span><span class="s2"># noqa</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_store_backends </span><span class="s3">import </span><span class="s1">FileSystemStoreBackend</span><span class="s4">, </span><span class="s1">StoreBackendBase</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">func_inspect </span><span class="s3">import </span><span class="s4">(</span><span class="s1">filter_args</span><span class="s4">, </span><span class="s1">format_call</span><span class="s4">, </span><span class="s1">format_signature</span><span class="s4">,</span>
+                           <span class="s1">get_func_code</span><span class="s4">, </span><span class="s1">get_func_name</span><span class="s4">)</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">logger </span><span class="s3">import </span><span class="s1">Logger</span><span class="s4">, </span><span class="s1">format_time</span><span class="s4">, </span><span class="s1">pformat</span>
+
+<span class="s1">FIRST_LINE_TEXT </span><span class="s4">= </span><span class="s5">&quot;# first line:&quot;</span>
+
+<span class="s2"># TODO: The following object should have a data store object as a sub</span>
+<span class="s2"># object, and the interface to persist and query should be separated in</span>
+<span class="s2"># the data store.</span>
+<span class="s2">#</span>
+<span class="s2"># This would enable creating 'Memory' objects with a different logic for</span>
+<span class="s2"># pickling that would simply span a MemorizedFunc with the same</span>
+<span class="s2"># store (or do we want to copy it to avoid cross-talks?), for instance to</span>
+<span class="s2"># implement HDF5 pickling.</span>
+
+<span class="s2"># TODO: Same remark for the logger, and probably use the Python logging</span>
+<span class="s2"># mechanism.</span>
+
+
+<span class="s3">def </span><span class="s1">extract_first_line</span><span class="s4">(</span><span class="s1">func_code</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; Extract the first line information from the function code 
+        text if available. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">func_code</span><span class="s4">.</span><span class="s1">startswith</span><span class="s4">(</span><span class="s1">FIRST_LINE_TEXT</span><span class="s4">):</span>
+        <span class="s1">func_code </span><span class="s4">= </span><span class="s1">func_code</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s5">'</span><span class="s3">\n</span><span class="s5">'</span><span class="s4">)</span>
+        <span class="s1">first_line </span><span class="s4">= </span><span class="s1">int</span><span class="s4">(</span><span class="s1">func_code</span><span class="s4">[</span><span class="s6">0</span><span class="s4">][</span><span class="s1">len</span><span class="s4">(</span><span class="s1">FIRST_LINE_TEXT</span><span class="s4">):])</span>
+        <span class="s1">func_code </span><span class="s4">= </span><span class="s5">'</span><span class="s3">\n</span><span class="s5">'</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">func_code</span><span class="s4">[</span><span class="s6">1</span><span class="s4">:])</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">first_line </span><span class="s4">= -</span><span class="s6">1</span>
+    <span class="s3">return </span><span class="s1">func_code</span><span class="s4">, </span><span class="s1">first_line</span>
+
+
+<span class="s3">class </span><span class="s1">JobLibCollisionWarning</span><span class="s4">(</span><span class="s1">UserWarning</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; Warn that there might be a collision between names of functions. 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s1">_STORE_BACKENDS </span><span class="s4">= {</span><span class="s5">'local'</span><span class="s4">: </span><span class="s1">FileSystemStoreBackend</span><span class="s4">}</span>
+
+
+<span class="s3">def </span><span class="s1">register_store_backend</span><span class="s4">(</span><span class="s1">backend_name</span><span class="s4">, </span><span class="s1">backend</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Extend available store backends. 
+ 
+    The Memory, MemorizeResult and MemorizeFunc objects are designed to be 
+    agnostic to the type of store used behind. By default, the local file 
+    system is used but this function gives the possibility to extend joblib's 
+    memory pattern with other types of storage such as cloud storage (S3, GCS, 
+    OpenStack, HadoopFS, etc) or blob DBs. 
+ 
+    Parameters 
+    ---------- 
+    backend_name: str 
+        The name identifying the store backend being registered. For example, 
+        'local' is used with FileSystemStoreBackend. 
+    backend: StoreBackendBase subclass 
+        The name of a class that implements the StoreBackendBase interface. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">backend_name</span><span class="s4">, </span><span class="s1">str</span><span class="s4">):</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;Store backend name should be a string, &quot;</span>
+                         <span class="s5">&quot;'{0}' given.&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">backend_name</span><span class="s4">))</span>
+    <span class="s3">if </span><span class="s1">backend </span><span class="s3">is None or not </span><span class="s1">issubclass</span><span class="s4">(</span><span class="s1">backend</span><span class="s4">, </span><span class="s1">StoreBackendBase</span><span class="s4">):</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;Store backend should inherit &quot;</span>
+                         <span class="s5">&quot;StoreBackendBase, &quot;</span>
+                         <span class="s5">&quot;'{0}' given.&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">backend</span><span class="s4">))</span>
+
+    <span class="s1">_STORE_BACKENDS</span><span class="s4">[</span><span class="s1">backend_name</span><span class="s4">] = </span><span class="s1">backend</span>
+
+
+<span class="s3">def </span><span class="s1">_store_backend_factory</span><span class="s4">(</span><span class="s1">backend</span><span class="s4">, </span><span class="s1">location</span><span class="s4">, </span><span class="s1">verbose</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">backend_options</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Return the correct store object for the given location.&quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">backend_options </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">backend_options </span><span class="s4">= {}</span>
+
+    <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">location</span><span class="s4">, </span><span class="s1">pathlib</span><span class="s4">.</span><span class="s1">Path</span><span class="s4">):</span>
+        <span class="s1">location </span><span class="s4">= </span><span class="s1">str</span><span class="s4">(</span><span class="s1">location</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">location</span><span class="s4">, </span><span class="s1">StoreBackendBase</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">location</span>
+    <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">location</span><span class="s4">, </span><span class="s1">str</span><span class="s4">):</span>
+        <span class="s1">obj </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">location </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">expanduser</span><span class="s4">(</span><span class="s1">location</span><span class="s4">)</span>
+        <span class="s2"># The location is not a local file system, we look in the</span>
+        <span class="s2"># registered backends if there's one matching the given backend</span>
+        <span class="s2"># name.</span>
+        <span class="s3">for </span><span class="s1">backend_key</span><span class="s4">, </span><span class="s1">backend_obj </span><span class="s3">in </span><span class="s1">_STORE_BACKENDS</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s3">if </span><span class="s1">backend </span><span class="s4">== </span><span class="s1">backend_key</span><span class="s4">:</span>
+                <span class="s1">obj </span><span class="s4">= </span><span class="s1">backend_obj</span><span class="s4">()</span>
+
+        <span class="s2"># By default, we assume the FileSystemStoreBackend can be used if no</span>
+        <span class="s2"># matching backend could be found.</span>
+        <span class="s3">if </span><span class="s1">obj </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span><span class="s5">'Unknown location {0} or backend {1}'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+                            <span class="s1">location</span><span class="s4">, </span><span class="s1">backend</span><span class="s4">))</span>
+
+        <span class="s2"># The store backend is configured with the extra named parameters,</span>
+        <span class="s2"># some of them are specific to the underlying store backend.</span>
+        <span class="s1">obj</span><span class="s4">.</span><span class="s1">configure</span><span class="s4">(</span><span class="s1">location</span><span class="s4">, </span><span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">,</span>
+                      <span class="s1">backend_options</span><span class="s4">=</span><span class="s1">backend_options</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">obj</span>
+    <span class="s3">elif </span><span class="s1">location </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+            <span class="s5">&quot;Instantiating a backend using a {} as a location is not &quot;</span>
+            <span class="s5">&quot;supported by joblib. Returning None instead.&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+                <span class="s1">location</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">), </span><span class="s1">UserWarning</span><span class="s4">)</span>
+
+    <span class="s3">return None</span>
+
+
+<span class="s3">def </span><span class="s1">_build_func_identifier</span><span class="s4">(</span><span class="s1">func</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Build a roughly unique identifier for the cached function.&quot;&quot;&quot;</span>
+    <span class="s1">modules</span><span class="s4">, </span><span class="s1">funcname </span><span class="s4">= </span><span class="s1">get_func_name</span><span class="s4">(</span><span class="s1">func</span><span class="s4">)</span>
+    <span class="s2"># We reuse historical fs-like way of building a function identifier</span>
+    <span class="s3">return </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(*</span><span class="s1">modules</span><span class="s4">, </span><span class="s1">funcname</span><span class="s4">)</span>
+
+
+<span class="s2"># An in-memory store to avoid looking at the disk-based function</span>
+<span class="s2"># source code to check if a function definition has changed</span>
+<span class="s1">_FUNCTION_HASHES </span><span class="s4">= </span><span class="s1">weakref</span><span class="s4">.</span><span class="s1">WeakKeyDictionary</span><span class="s4">()</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># class `MemorizedResult`</span>
+<span class="s2">###############################################################################</span>
+<span class="s3">class </span><span class="s1">MemorizedResult</span><span class="s4">(</span><span class="s1">Logger</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Object representing a cached value. 
+ 
+    Attributes 
+    ---------- 
+    location: str 
+        The location of joblib cache. Depends on the store backend used. 
+ 
+    func: function or str 
+        function whose output is cached. The string case is intended only for 
+        instantiation based on the output of repr() on another instance. 
+        (namely eval(repr(memorized_instance)) works). 
+ 
+    argument_hash: str 
+        hash of the function arguments. 
+ 
+    backend: str 
+        Type of store backend for reading/writing cache files. 
+        Default is 'local'. 
+ 
+    mmap_mode: {None, 'r+', 'r', 'w+', 'c'} 
+        The memmapping mode used when loading from cache numpy arrays. See 
+        numpy.load for the meaning of the different values. 
+ 
+    verbose: int 
+        verbosity level (0 means no message). 
+ 
+    timestamp, metadata: string 
+        for internal use only. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">location</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">backend</span><span class="s4">=</span><span class="s5">'local'</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+                 <span class="s1">verbose</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">timestamp</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s1">Logger</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id </span><span class="s4">= </span><span class="s1">call_id</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s4">= </span><span class="s1">_store_backend_factory</span><span class="s4">(</span><span class="s1">backend</span><span class="s4">, </span><span class="s1">location</span><span class="s4">,</span>
+                                                    <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s4">= </span><span class="s1">mmap_mode</span>
+
+        <span class="s3">if </span><span class="s1">metadata </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">metadata </span><span class="s4">= </span><span class="s1">metadata</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">metadata </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">get_metadata</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id</span><span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">duration </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">metadata</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">'duration'</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">verbose </span><span class="s4">= </span><span class="s1">verbose</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">timestamp </span><span class="s4">= </span><span class="s1">timestamp</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">func</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">func_id</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">args_id</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">argument_hash</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+            <span class="s5">&quot;The 'argument_hash' attribute has been deprecated in version &quot;</span>
+            <span class="s5">&quot;0.12 and will be removed in version 0.14.</span><span class="s3">\n</span><span class="s5">&quot;</span>
+            <span class="s5">&quot;Use `args_id` attribute instead.&quot;</span><span class="s4">,</span>
+            <span class="s1">DeprecationWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">2</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">args_id</span>
+
+    <span class="s3">def </span><span class="s1">get</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Read value from cache and return it.&quot;&quot;&quot;</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">load_item</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id</span><span class="s4">,</span>
+                <span class="s1">timestamp</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">timestamp</span><span class="s4">,</span>
+                <span class="s1">metadata</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">metadata</span><span class="s4">,</span>
+                <span class="s1">verbose</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">verbose</span>
+            <span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">ValueError </span><span class="s3">as </span><span class="s1">exc</span><span class="s4">:</span>
+            <span class="s1">new_exc </span><span class="s4">= </span><span class="s1">KeyError</span><span class="s4">(</span>
+                <span class="s5">&quot;Error while trying to load a MemorizedResult's value. &quot;</span>
+                <span class="s5">&quot;It seems that this folder is corrupted : {}&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+                    <span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">location</span><span class="s4">, *</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id</span><span class="s4">)))</span>
+            <span class="s3">raise </span><span class="s1">new_exc </span><span class="s3">from </span><span class="s1">exc</span>
+
+    <span class="s3">def </span><span class="s1">clear</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Clear value from cache&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">clear_item</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s5">'{}(location=&quot;{}&quot;, func=&quot;{}&quot;, args_id=&quot;{}&quot;)'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">location</span><span class="s4">,</span>
+            <span class="s4">*</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call_id</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__getstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">state </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">__dict__</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+        <span class="s1">state</span><span class="s4">[</span><span class="s5">'timestamp'</span><span class="s4">] = </span><span class="s3">None</span>
+        <span class="s3">return </span><span class="s1">state</span>
+
+
+<span class="s3">class </span><span class="s1">NotMemorizedResult</span><span class="s4">(</span><span class="s1">object</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Class representing an arbitrary value. 
+ 
+    This class is a replacement for MemorizedResult when there is no cache. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s4">= (</span><span class="s5">'value'</span><span class="s4">, </span><span class="s5">'valid'</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">value</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">value </span><span class="s4">= </span><span class="s1">value</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">valid </span><span class="s4">= </span><span class="s3">True</span>
+
+    <span class="s3">def </span><span class="s1">get</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">valid</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">value</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">KeyError</span><span class="s4">(</span><span class="s5">&quot;No value stored.&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">clear</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">valid </span><span class="s4">= </span><span class="s3">False</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">value </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">valid</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s4">(</span><span class="s5">'{class_name}({value})'</span>
+                    <span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">class_name</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">,</span>
+                            <span class="s1">value</span><span class="s4">=</span><span class="s1">pformat</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">value</span><span class="s4">)))</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__ </span><span class="s4">+ </span><span class="s5">' with no value'</span>
+
+    <span class="s2"># __getstate__ and __setstate__ are required because of __slots__</span>
+    <span class="s3">def </span><span class="s1">__getstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s4">{</span><span class="s5">&quot;valid&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">valid</span><span class="s4">, </span><span class="s5">&quot;value&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">value</span><span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__setstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">state</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">valid </span><span class="s4">= </span><span class="s1">state</span><span class="s4">[</span><span class="s5">&quot;valid&quot;</span><span class="s4">]</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">value </span><span class="s4">= </span><span class="s1">state</span><span class="s4">[</span><span class="s5">&quot;value&quot;</span><span class="s4">]</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># class `NotMemorizedFunc`</span>
+<span class="s2">###############################################################################</span>
+<span class="s3">class </span><span class="s1">NotMemorizedFunc</span><span class="s4">(</span><span class="s1">object</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;No-op object decorating a function. 
+ 
+    This class replaces MemorizedFunc when there is no cache. It provides an 
+    identical API but does not write anything on disk. 
+ 
+    Attributes 
+    ---------- 
+    func: callable 
+        Original undecorated function. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># Should be a light as possible (for speed)</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">func</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">func </span><span class="s4">= </span><span class="s1">func</span>
+
+    <span class="s3">def </span><span class="s1">__call__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">call_and_shelve</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">NotMemorizedResult</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s5">'{0}(func={1})'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">clear</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">warn</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s2"># Argument &quot;warn&quot; is for compatibility with MemorizedFunc.clear</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">), {}</span>
+
+    <span class="s3">def </span><span class="s1">check_call_in_cache</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s3">return False</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># class `AsyncNotMemorizedFunc`</span>
+<span class="s2">###############################################################################</span>
+<span class="s3">class </span><span class="s1">AsyncNotMemorizedFunc</span><span class="s4">(</span><span class="s1">NotMemorizedFunc</span><span class="s4">):</span>
+    <span class="s3">async def </span><span class="s1">call_and_shelve</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">NotMemorizedResult</span><span class="s4">(</span><span class="s3">await </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">))</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># class `MemorizedFunc`</span>
+<span class="s2">###############################################################################</span>
+<span class="s3">class </span><span class="s1">MemorizedFunc</span><span class="s4">(</span><span class="s1">Logger</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Callable object decorating a function for caching its return value 
+    each time it is called. 
+ 
+    Methods are provided to inspect the cache or clean it. 
+ 
+    Attributes 
+    ---------- 
+    func: callable 
+        The original, undecorated, function. 
+ 
+    location: string 
+        The location of joblib cache. Depends on the store backend used. 
+ 
+    backend: str 
+        Type of store backend for reading/writing cache files. 
+        Default is 'local', in which case the location is the path to a 
+        disk storage. 
+ 
+    ignore: list or None 
+        List of variable names to ignore when choosing whether to 
+        recompute. 
+ 
+    mmap_mode: {None, 'r+', 'r', 'w+', 'c'} 
+        The memmapping mode used when loading from cache 
+        numpy arrays. See numpy.load for the meaning of the different 
+        values. 
+ 
+    compress: boolean, or integer 
+        Whether to zip the stored data on disk. If an integer is 
+        given, it should be between 1 and 9, and sets the amount 
+        of compression. Note that compressed arrays cannot be 
+        read by memmapping. 
+ 
+    verbose: int, optional 
+        The verbosity flag, controls messages that are issued as 
+        the function is evaluated. 
+ 
+    cache_validation_callback: callable, optional 
+        Callable to check if a result in cache is valid or is to be recomputed. 
+        When the function is called with arguments for which a cache exists, 
+        the callback is called with the cache entry's metadata as its sole 
+        argument. If it returns True, the cached result is returned, else the 
+        cache for these arguments is cleared and the result is recomputed. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># ------------------------------------------------------------------------</span>
+    <span class="s2"># Public interface</span>
+    <span class="s2"># ------------------------------------------------------------------------</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">func</span><span class="s4">, </span><span class="s1">location</span><span class="s4">, </span><span class="s1">backend</span><span class="s4">=</span><span class="s5">'local'</span><span class="s4">, </span><span class="s1">ignore</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+                 <span class="s1">mmap_mode</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">compress</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">verbose</span><span class="s4">=</span><span class="s6">1</span><span class="s4">, </span><span class="s1">timestamp</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+                 <span class="s1">cache_validation_callback</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s1">Logger</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s4">= </span><span class="s1">mmap_mode</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">compress </span><span class="s4">= </span><span class="s1">compress</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">func </span><span class="s4">= </span><span class="s1">func</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">cache_validation_callback </span><span class="s4">= </span><span class="s1">cache_validation_callback</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">func_id </span><span class="s4">= </span><span class="s1">_build_func_identifier</span><span class="s4">(</span><span class="s1">func</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">ignore </span><span class="s4">= </span><span class="s1">ignore </span><span class="s3">if </span><span class="s1">ignore </span><span class="s3">is not None else </span><span class="s4">[]</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">= </span><span class="s1">verbose</span>
+
+        <span class="s2"># retrieve store object from backend type and location.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s4">= </span><span class="s1">_store_backend_factory</span><span class="s4">(</span><span class="s1">backend</span><span class="s4">, </span><span class="s1">location</span><span class="s4">,</span>
+                                                    <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">,</span>
+                                                    <span class="s1">backend_options</span><span class="s4">=</span><span class="s1">dict</span><span class="s4">(</span>
+                                                        <span class="s1">compress</span><span class="s4">=</span><span class="s1">compress</span><span class="s4">,</span>
+                                                        <span class="s1">mmap_mode</span><span class="s4">=</span><span class="s1">mmap_mode</span><span class="s4">),</span>
+                                                    <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s2"># Create func directory on demand.</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">store_cached_func_code</span><span class="s4">([</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">])</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">timestamp </span><span class="s4">= </span><span class="s1">timestamp </span><span class="s3">if </span><span class="s1">timestamp </span><span class="s3">is not None else </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">()</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">functools</span><span class="s4">.</span><span class="s1">update_wrapper</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">func</span><span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">Exception</span><span class="s4">:</span>
+            <span class="s3">pass  </span><span class="s2"># Objects like ufunc don't like that</span>
+        <span class="s3">if </span><span class="s1">inspect</span><span class="s4">.</span><span class="s1">isfunction</span><span class="s4">(</span><span class="s1">func</span><span class="s4">):</span>
+            <span class="s1">doc </span><span class="s4">= </span><span class="s1">pydoc</span><span class="s4">.</span><span class="s1">TextDoc</span><span class="s4">().</span><span class="s1">document</span><span class="s4">(</span><span class="s1">func</span><span class="s4">)</span>
+            <span class="s2"># Remove blank line</span>
+            <span class="s1">doc </span><span class="s4">= </span><span class="s1">doc</span><span class="s4">.</span><span class="s1">replace</span><span class="s4">(</span><span class="s5">'</span><span class="s3">\n</span><span class="s5">'</span><span class="s4">, </span><span class="s5">'</span><span class="s3">\n\n</span><span class="s5">'</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s2"># Strip backspace-overprints for compatibility with autodoc</span>
+            <span class="s1">doc </span><span class="s4">= </span><span class="s1">re</span><span class="s4">.</span><span class="s1">sub</span><span class="s4">(</span><span class="s5">'</span><span class="s3">\x08</span><span class="s5">.'</span><span class="s4">, </span><span class="s5">''</span><span class="s4">, </span><span class="s1">doc</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s2"># Pydoc does a poor job on other objects</span>
+            <span class="s1">doc </span><span class="s4">= </span><span class="s1">func</span><span class="s4">.</span><span class="s1">__doc__</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">__doc__ </span><span class="s4">= </span><span class="s5">'Memoized version of %s' </span><span class="s4">% </span><span class="s1">doc</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_info </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_id </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">_is_in_cache_and_valid</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check if the function call is cached and valid for given arguments. 
+ 
+        - Compare the function code with the one from the cached function, 
+        asserting if it has changed. 
+        - Check if the function call is present in the cache. 
+        - Call `cache_validation_callback` for user define cache validation. 
+ 
+        Returns True if the function call is in cache and can be used, and 
+        returns False otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># Check if the code of the function has changed</span>
+        <span class="s3">if not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_previous_func_code</span><span class="s4">(</span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">4</span><span class="s4">):</span>
+            <span class="s3">return False</span>
+
+        <span class="s2"># Check if this specific call is in the cache</span>
+        <span class="s3">if not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">contains_item</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">):</span>
+            <span class="s3">return False</span>
+
+        <span class="s2"># Call the user defined cache validation callback</span>
+        <span class="s1">metadata </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">get_metadata</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">cache_validation_callback </span><span class="s3">is not None and</span>
+                <span class="s3">not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">cache_validation_callback</span><span class="s4">(</span><span class="s1">metadata</span><span class="s4">)):</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">clear_item</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">)</span>
+            <span class="s3">return False</span>
+
+        <span class="s3">return True</span>
+
+    <span class="s3">def </span><span class="s1">_cached_call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Call wrapped function and cache result, or read cache if available. 
+ 
+        This function returns the wrapped function output or a reference to 
+        the cached result. 
+ 
+        Arguments: 
+        ---------- 
+ 
+        args, kwargs: list and dict 
+            input arguments for wrapped function 
+ 
+        shelving: bool 
+            True when called via the call_and_shelve function. 
+ 
+ 
+        Returns 
+        ------- 
+        output: Output of the wrapped function if shelving is false, or a 
+            MemorizedResult reference to the value if shelving is true. 
+        metadata: dict containing the metadata associated with the call. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">args_id </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_args_id</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s1">call_id </span><span class="s4">= (</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">, </span><span class="s1">args_id</span><span class="s4">)</span>
+        <span class="s1">_</span><span class="s4">, </span><span class="s1">func_name </span><span class="s4">= </span><span class="s1">get_func_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">)</span>
+        <span class="s1">func_info </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">get_cached_func_info</span><span class="s4">([</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">])</span>
+        <span class="s1">location </span><span class="s4">= </span><span class="s1">func_info</span><span class="s4">[</span><span class="s5">'location'</span><span class="s4">]</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">&gt;= </span><span class="s6">20</span><span class="s4">:</span>
+            <span class="s1">logging</span><span class="s4">.</span><span class="s1">basicConfig</span><span class="s4">(</span><span class="s1">level</span><span class="s4">=</span><span class="s1">logging</span><span class="s4">.</span><span class="s1">INFO</span><span class="s4">)</span>
+            <span class="s1">_</span><span class="s4">, </span><span class="s1">signature </span><span class="s4">= </span><span class="s1">format_signature</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">info</span><span class="s4">(</span>
+                <span class="s1">textwrap</span><span class="s4">.</span><span class="s1">dedent</span><span class="s4">(</span>
+                    <span class="s5">f&quot;&quot;&quot;</span>
+                        <span class="s5">Querying </span><span class="s3">{</span><span class="s1">func_name</span><span class="s3">} </span><span class="s5">with signature</span>
+                        <span class="s3">{</span><span class="s1">signature</span><span class="s3">}</span><span class="s5">.</span>
+
+                        <span class="s5">(argument hash </span><span class="s3">{</span><span class="s1">args_id</span><span class="s3">}</span><span class="s5">)</span>
+
+                        <span class="s5">The store location is </span><span class="s3">{</span><span class="s1">location</span><span class="s3">}</span><span class="s5">.</span>
+                        <span class="s5">&quot;&quot;&quot;</span>
+                <span class="s4">)</span>
+            <span class="s4">)</span>
+
+        <span class="s2"># Compare the function code with the previous to see if the</span>
+        <span class="s2"># function code has changed and check if the results are present in</span>
+        <span class="s2"># the cache.</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_is_in_cache_and_valid</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">shelving</span><span class="s4">:</span>
+                <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_memorized_result</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">), {}</span>
+
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s1">start_time </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">()</span>
+                <span class="s1">output </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_load_item</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">)</span>
+                <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">&gt; </span><span class="s6">4</span><span class="s4">:</span>
+                    <span class="s1">self</span><span class="s4">.</span><span class="s1">_print_duration</span><span class="s4">(</span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">() - </span><span class="s1">start_time</span><span class="s4">,</span>
+                                         <span class="s1">context</span><span class="s4">=</span><span class="s5">'cache loaded '</span><span class="s4">)</span>
+                <span class="s3">return </span><span class="s1">output</span><span class="s4">, {}</span>
+            <span class="s3">except </span><span class="s1">Exception</span><span class="s4">:</span>
+                <span class="s2"># XXX: Should use an exception logger</span>
+                <span class="s1">_</span><span class="s4">, </span><span class="s1">signature </span><span class="s4">= </span><span class="s1">format_signature</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">'Exception while loading results for '</span>
+                          <span class="s5">'{}</span><span class="s3">\n </span><span class="s5">{}'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">signature</span><span class="s4">, </span><span class="s1">traceback</span><span class="s4">.</span><span class="s1">format_exc</span><span class="s4">()))</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">&gt; </span><span class="s6">10</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                <span class="s5">f&quot;Computing func </span><span class="s3">{</span><span class="s1">func_name</span><span class="s3">}</span><span class="s5">, argument hash </span><span class="s3">{</span><span class="s1">args_id</span><span class="s3">} </span><span class="s5">&quot;</span>
+                <span class="s5">f&quot;in location </span><span class="s3">{</span><span class="s1">location</span><span class="s3">}</span><span class="s5">&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s2"># Returns the output but not the metadata</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">func_code_info</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2"># 3-tuple property containing: the function source code, source file,</span>
+        <span class="s2"># and first line of the code inside the source file</span>
+        <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s5">'__code__'</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_id </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_id </span><span class="s4">= </span><span class="s1">id</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">.</span><span class="s1">__code__</span><span class="s4">)</span>
+            <span class="s3">elif </span><span class="s1">id</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">.</span><span class="s1">__code__</span><span class="s4">) != </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_id</span><span class="s4">:</span>
+                <span class="s2"># Be robust to dynamic reassignments of self.func.__code__</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_info </span><span class="s4">= </span><span class="s3">None</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_info </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s2"># Cache the source code of self.func . Provided that get_func_code</span>
+            <span class="s2"># (which should be called once on self) gets called in the process</span>
+            <span class="s2"># in which self.func was defined, this caching mechanism prevents</span>
+            <span class="s2"># undesired cache clearing when the cached function is called in</span>
+            <span class="s2"># an environment where the introspection utilities get_func_code</span>
+            <span class="s2"># relies on do not work (typically, in joblib child processes).</span>
+            <span class="s2"># See #1035 for  more info</span>
+            <span class="s2"># TODO (pierreglaser): do the same with get_func_name?</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_info </span><span class="s4">= </span><span class="s1">get_func_code</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_func_code_info</span>
+
+    <span class="s3">def </span><span class="s1">call_and_shelve</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Call wrapped function, cache result and return a reference. 
+ 
+        This method returns a reference to the cached result instead of the 
+        result itself. The reference object is small and pickeable, allowing 
+        to send or store it easily. Call .get() on reference object to get 
+        result. 
+ 
+        Returns 
+        ------- 
+        cached_result: MemorizedResult or NotMemorizedResult 
+            reference to the value returned by the wrapped function. The 
+            class &quot;NotMemorizedResult&quot; is used when there is no cache 
+            activated (e.g. location=None in Memory). 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># Return the wrapped output, without the metadata</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cached_call</span><span class="s4">(</span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)[</span><span class="s6">0</span><span class="s4">]</span>
+
+    <span class="s3">def </span><span class="s1">__call__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s2"># Return the output, without the metadata</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cached_call</span><span class="s4">(</span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)[</span><span class="s6">0</span><span class="s4">]</span>
+
+    <span class="s3">def </span><span class="s1">__getstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2"># Make sure self.func's source is introspected prior to being pickled -</span>
+        <span class="s2"># code introspection utilities typically do not work inside child</span>
+        <span class="s2"># processes</span>
+        <span class="s1">_ </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_code_info</span>
+
+        <span class="s2"># We don't store the timestamp when pickling, to avoid the hash</span>
+        <span class="s2"># depending from it.</span>
+        <span class="s1">state </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">__dict__</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+        <span class="s1">state</span><span class="s4">[</span><span class="s5">'timestamp'</span><span class="s4">] = </span><span class="s3">None</span>
+
+        <span class="s2"># Invalidate the code id as id(obj) will be different in the child</span>
+        <span class="s1">state</span><span class="s4">[</span><span class="s5">'_func_code_id'</span><span class="s4">] = </span><span class="s3">None</span>
+
+        <span class="s3">return </span><span class="s1">state</span>
+
+    <span class="s3">def </span><span class="s1">check_call_in_cache</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check if function call is in the memory cache. 
+ 
+        Does not call the function or do any work besides func inspection 
+        and arg hashing. 
+ 
+        Returns 
+        ------- 
+        is_call_in_cache: bool 
+            Whether or not the result of the function has been cached 
+            for the input arguments that have been passed. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">call_id </span><span class="s4">= (</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_args_id</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">))</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">contains_item</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">)</span>
+
+    <span class="s2"># ------------------------------------------------------------------------</span>
+    <span class="s2"># Private interface</span>
+    <span class="s2"># ------------------------------------------------------------------------</span>
+
+    <span class="s3">def </span><span class="s1">_get_args_id</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the input parameter hash of a result.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">hashing</span><span class="s4">.</span><span class="s1">hash</span><span class="s4">(</span><span class="s1">filter_args</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ignore</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">),</span>
+                            <span class="s1">coerce_mmap</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s3">is not None</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_hash_func</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Hash a function to key the online cache&quot;&quot;&quot;</span>
+        <span class="s1">func_code_h </span><span class="s4">= </span><span class="s1">hash</span><span class="s4">(</span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s5">'__code__'</span><span class="s4">, </span><span class="s3">None</span><span class="s4">))</span>
+        <span class="s3">return </span><span class="s1">id</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">), </span><span class="s1">hash</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">), </span><span class="s1">func_code_h</span>
+
+    <span class="s3">def </span><span class="s1">_write_func_code</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">func_code</span><span class="s4">, </span><span class="s1">first_line</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; Write the function code and the filename to a file. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># We store the first line because the filename and the function</span>
+        <span class="s2"># name is not always enough to identify a function: people</span>
+        <span class="s2"># sometimes have several functions named the same way in a</span>
+        <span class="s2"># file. This is bad practice, but joblib should be robust to bad</span>
+        <span class="s2"># practice.</span>
+        <span class="s1">func_code </span><span class="s4">= </span><span class="s5">u'%s %i</span><span class="s3">\n</span><span class="s5">%s' </span><span class="s4">% (</span><span class="s1">FIRST_LINE_TEXT</span><span class="s4">, </span><span class="s1">first_line</span><span class="s4">, </span><span class="s1">func_code</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">store_cached_func_code</span><span class="s4">([</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">], </span><span class="s1">func_code</span><span class="s4">)</span>
+
+        <span class="s2"># Also store in the in-memory store of function hashes</span>
+        <span class="s1">is_named_callable </span><span class="s4">= (</span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s5">'__name__'</span><span class="s4">) </span><span class="s3">and</span>
+                             <span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">.</span><span class="s1">__name__ </span><span class="s4">!= </span><span class="s5">'&lt;lambda&gt;'</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">is_named_callable</span><span class="s4">:</span>
+            <span class="s2"># Don't do this for lambda functions or strange callable</span>
+            <span class="s2"># objects, as it ends up being too fragile</span>
+            <span class="s1">func_hash </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_hash_func</span><span class="s4">()</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s1">_FUNCTION_HASHES</span><span class="s4">[</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">] = </span><span class="s1">func_hash</span>
+            <span class="s3">except </span><span class="s1">TypeError</span><span class="s4">:</span>
+                <span class="s2"># Some callable are not hashable</span>
+                <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">_check_previous_func_code</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">2</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+            stacklevel is the depth a which this function is called, to 
+            issue useful warnings to the user. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># First check if our function is in the in-memory store.</span>
+        <span class="s2"># Using the in-memory store not only makes things faster, but it</span>
+        <span class="s2"># also renders us robust to variations of the files when the</span>
+        <span class="s2"># in-memory version of the code does not vary</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func </span><span class="s3">in </span><span class="s1">_FUNCTION_HASHES</span><span class="s4">:</span>
+                <span class="s2"># We use as an identifier the id of the function and its</span>
+                <span class="s2"># hash. This is more likely to falsely change than have hash</span>
+                <span class="s2"># collisions, thus we are on the safe side.</span>
+                <span class="s1">func_hash </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_hash_func</span><span class="s4">()</span>
+                <span class="s3">if </span><span class="s1">func_hash </span><span class="s4">== </span><span class="s1">_FUNCTION_HASHES</span><span class="s4">[</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">]:</span>
+                    <span class="s3">return True</span>
+        <span class="s3">except </span><span class="s1">TypeError</span><span class="s4">:</span>
+            <span class="s2"># Some callables are not hashable</span>
+            <span class="s3">pass</span>
+
+        <span class="s2"># Here, we go through some effort to be robust to dynamically</span>
+        <span class="s2"># changing code and collision. We cannot inspect.getsource</span>
+        <span class="s2"># because it is not reliable when using IPython's magic &quot;%run&quot;.</span>
+        <span class="s1">func_code</span><span class="s4">, </span><span class="s1">source_file</span><span class="s4">, </span><span class="s1">first_line </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_code_info</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">old_func_code</span><span class="s4">, </span><span class="s1">old_first_line </span><span class="s4">= </span><span class="s1">extract_first_line</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">get_cached_func_code</span><span class="s4">([</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">]))</span>
+        <span class="s3">except </span><span class="s4">(</span><span class="s1">IOError</span><span class="s4">, </span><span class="s1">OSError</span><span class="s4">):  </span><span class="s2"># some backend can also raise OSError</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_write_func_code</span><span class="s4">(</span><span class="s1">func_code</span><span class="s4">, </span><span class="s1">first_line</span><span class="s4">)</span>
+            <span class="s3">return False</span>
+        <span class="s3">if </span><span class="s1">old_func_code </span><span class="s4">== </span><span class="s1">func_code</span><span class="s4">:</span>
+            <span class="s3">return True</span>
+
+        <span class="s2"># We have differing code, is this because we are referring to</span>
+        <span class="s2"># different functions, or because the function we are referring to has</span>
+        <span class="s2"># changed?</span>
+
+        <span class="s1">_</span><span class="s4">, </span><span class="s1">func_name </span><span class="s4">= </span><span class="s1">get_func_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s1">resolv_alias</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+                                     <span class="s1">win_characters</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">old_first_line </span><span class="s4">== </span><span class="s1">first_line </span><span class="s4">== -</span><span class="s6">1 </span><span class="s3">or </span><span class="s1">func_name </span><span class="s4">== </span><span class="s5">'&lt;lambda&gt;'</span><span class="s4">:</span>
+            <span class="s3">if not </span><span class="s1">first_line </span><span class="s4">== -</span><span class="s6">1</span><span class="s4">:</span>
+                <span class="s1">func_description </span><span class="s4">= (</span><span class="s5">&quot;{0} ({1}:{2})&quot;</span>
+                                    <span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">func_name</span><span class="s4">, </span><span class="s1">source_file</span><span class="s4">,</span>
+                                            <span class="s1">first_line</span><span class="s4">))</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">func_description </span><span class="s4">= </span><span class="s1">func_name</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s1">JobLibCollisionWarning</span><span class="s4">(</span>
+                <span class="s5">&quot;Cannot detect name collisions for function '{0}'&quot;</span>
+                <span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">func_description</span><span class="s4">)), </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s1">stacklevel</span><span class="s4">)</span>
+
+        <span class="s2"># Fetch the code at the old location and compare it. If it is the</span>
+        <span class="s2"># same than the code store, we have a collision: the code in the</span>
+        <span class="s2"># file has not changed, but the name we have is pointing to a new</span>
+        <span class="s2"># code block.</span>
+        <span class="s3">if not </span><span class="s1">old_first_line </span><span class="s4">== </span><span class="s1">first_line </span><span class="s3">and </span><span class="s1">source_file </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">exists</span><span class="s4">(</span><span class="s1">source_file</span><span class="s4">):</span>
+                <span class="s1">_</span><span class="s4">, </span><span class="s1">func_name </span><span class="s4">= </span><span class="s1">get_func_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s1">resolv_alias</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+                <span class="s1">num_lines </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">func_code</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s5">'</span><span class="s3">\n</span><span class="s5">'</span><span class="s4">))</span>
+                <span class="s3">with </span><span class="s1">tokenize</span><span class="s4">.</span><span class="s1">open</span><span class="s4">(</span><span class="s1">source_file</span><span class="s4">) </span><span class="s3">as </span><span class="s1">f</span><span class="s4">:</span>
+                    <span class="s1">on_disk_func_code </span><span class="s4">= </span><span class="s1">f</span><span class="s4">.</span><span class="s1">readlines</span><span class="s4">()[</span>
+                        <span class="s1">old_first_line </span><span class="s4">- </span><span class="s6">1</span><span class="s4">:</span><span class="s1">old_first_line </span><span class="s4">- </span><span class="s6">1 </span><span class="s4">+ </span><span class="s1">num_lines </span><span class="s4">- </span><span class="s6">1</span><span class="s4">]</span>
+                <span class="s1">on_disk_func_code </span><span class="s4">= </span><span class="s5">''</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">on_disk_func_code</span><span class="s4">)</span>
+                <span class="s1">possible_collision </span><span class="s4">= (</span><span class="s1">on_disk_func_code</span><span class="s4">.</span><span class="s1">rstrip</span><span class="s4">() ==</span>
+                                      <span class="s1">old_func_code</span><span class="s4">.</span><span class="s1">rstrip</span><span class="s4">())</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">possible_collision </span><span class="s4">= </span><span class="s1">source_file</span><span class="s4">.</span><span class="s1">startswith</span><span class="s4">(</span><span class="s5">'&lt;doctest '</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">possible_collision</span><span class="s4">:</span>
+                <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s1">JobLibCollisionWarning</span><span class="s4">(</span>
+                    <span class="s5">'Possible name collisions between functions '</span>
+                    <span class="s5">&quot;'%s' (%s:%i) and '%s' (%s:%i)&quot; </span><span class="s4">%</span>
+                    <span class="s4">(</span><span class="s1">func_name</span><span class="s4">, </span><span class="s1">source_file</span><span class="s4">, </span><span class="s1">old_first_line</span><span class="s4">,</span>
+                     <span class="s1">func_name</span><span class="s4">, </span><span class="s1">source_file</span><span class="s4">, </span><span class="s1">first_line</span><span class="s4">)),</span>
+                    <span class="s1">stacklevel</span><span class="s4">=</span><span class="s1">stacklevel</span><span class="s4">)</span>
+
+        <span class="s2"># The function has changed, wipe the cache directory.</span>
+        <span class="s2"># XXX: Should be using warnings, and giving stacklevel</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">&gt; </span><span class="s6">10</span><span class="s4">:</span>
+            <span class="s1">_</span><span class="s4">, </span><span class="s1">func_name </span><span class="s4">= </span><span class="s1">get_func_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s1">resolv_alias</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Function {0} (identified by {1}) has changed&quot;</span>
+                      <span class="s5">&quot;.&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">func_name</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">))</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">clear</span><span class="s4">(</span><span class="s1">warn</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+        <span class="s3">return False</span>
+
+    <span class="s3">def </span><span class="s1">clear</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">warn</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Empty the function's cache.&quot;&quot;&quot;</span>
+        <span class="s1">func_id </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">&gt; </span><span class="s6">0 </span><span class="s3">and </span><span class="s1">warn</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Clearing function cache identified by %s&quot; </span><span class="s4">% </span><span class="s1">func_id</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">clear_path</span><span class="s4">([</span><span class="s1">func_id</span><span class="s4">, ])</span>
+
+        <span class="s1">func_code</span><span class="s4">, </span><span class="s1">_</span><span class="s4">, </span><span class="s1">first_line </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_code_info</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_write_func_code</span><span class="s4">(</span><span class="s1">func_code</span><span class="s4">, </span><span class="s1">first_line</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Force the execution of the function with the given arguments. 
+ 
+        The output values will be persisted, i.e., the cache will be updated 
+        with any new values. 
+ 
+        Parameters 
+        ---------- 
+        *args: arguments 
+            The arguments. 
+        **kwargs: keyword arguments 
+            Keyword arguments. 
+ 
+        Returns 
+        ------- 
+        output : object 
+            The output of the function call. 
+        metadata : dict 
+            The metadata associated with the call. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">call_id </span><span class="s4">= (</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func_id</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_args_id</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">))</span>
+
+        <span class="s2"># Return the output and the metadata</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_call</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+        <span class="s2"># Return the output and the metadata</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_before_call</span><span class="s4">(</span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s1">start_time </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">()</span>
+        <span class="s1">output </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_after_call</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">,</span>
+                                <span class="s1">output</span><span class="s4">, </span><span class="s1">start_time</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_before_call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">&gt; </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s1">print</span><span class="s4">(</span><span class="s1">format_call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">_after_call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">, </span><span class="s1">output</span><span class="s4">, </span><span class="s1">start_time</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">dump_item</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">output</span><span class="s4">, </span><span class="s1">verbose</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose</span><span class="s4">)</span>
+        <span class="s1">duration </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">() - </span><span class="s1">start_time</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">&gt; </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_print_duration</span><span class="s4">(</span><span class="s1">duration</span><span class="s4">)</span>
+        <span class="s1">metadata </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_persist_input</span><span class="s4">(</span><span class="s1">duration</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">shelving</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_memorized_result</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">), </span><span class="s1">metadata</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s2"># Memmap the output at the first call to be consistent with</span>
+            <span class="s2"># later calls</span>
+            <span class="s1">output </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_load_item</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">output</span><span class="s4">, </span><span class="s1">metadata</span>
+
+    <span class="s3">def </span><span class="s1">_persist_input</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">duration</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">,</span>
+                       <span class="s1">this_duration_limit</span><span class="s4">=</span><span class="s6">0.5</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; Save a small summary of the call using json format in the 
+            output directory. 
+ 
+            output_dir: string 
+                directory where to write metadata. 
+ 
+            duration: float 
+                time taken by hashing input arguments, calling the wrapped 
+                function and persisting its output. 
+ 
+            args, kwargs: list and dict 
+                input arguments for wrapped function 
+ 
+            this_duration_limit: float 
+                Max execution time for this function before issuing a warning. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">start_time </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">()</span>
+        <span class="s1">argument_dict </span><span class="s4">= </span><span class="s1">filter_args</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ignore</span><span class="s4">,</span>
+                                    <span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">)</span>
+
+        <span class="s1">input_repr </span><span class="s4">= </span><span class="s1">dict</span><span class="s4">((</span><span class="s1">k</span><span class="s4">, </span><span class="s1">repr</span><span class="s4">(</span><span class="s1">v</span><span class="s4">)) </span><span class="s3">for </span><span class="s1">k</span><span class="s4">, </span><span class="s1">v </span><span class="s3">in </span><span class="s1">argument_dict</span><span class="s4">.</span><span class="s1">items</span><span class="s4">())</span>
+        <span class="s2"># This can fail due to race-conditions with multiple</span>
+        <span class="s2"># concurrent joblibs removing the file or the directory</span>
+        <span class="s1">metadata </span><span class="s4">= {</span>
+            <span class="s5">&quot;duration&quot;</span><span class="s4">: </span><span class="s1">duration</span><span class="s4">, </span><span class="s5">&quot;input_args&quot;</span><span class="s4">: </span><span class="s1">input_repr</span><span class="s4">, </span><span class="s5">&quot;time&quot;</span><span class="s4">: </span><span class="s1">start_time</span><span class="s4">,</span>
+        <span class="s4">}</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">store_metadata</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">)</span>
+
+        <span class="s1">this_duration </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">() - </span><span class="s1">start_time</span>
+        <span class="s3">if </span><span class="s1">this_duration </span><span class="s4">&gt; </span><span class="s1">this_duration_limit</span><span class="s4">:</span>
+            <span class="s2"># This persistence should be fast. It will not be if repr() takes</span>
+            <span class="s2"># time and its output is large, because json.dump will have to</span>
+            <span class="s2"># write a large file. This should not be an issue with numpy arrays</span>
+            <span class="s2"># for which repr() always output a short representation, but can</span>
+            <span class="s2"># be with complex dictionaries. Fixing the problem should be a</span>
+            <span class="s2"># matter of replacing repr() above by something smarter.</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Persisting input arguments took %.2fs to run.&quot;</span>
+                          <span class="s5">&quot;If this happens often in your code, it can cause &quot;</span>
+                          <span class="s5">&quot;performance problems &quot;</span>
+                          <span class="s5">&quot;(results will be correct in all cases). &quot;</span>
+                          <span class="s5">&quot;The reason for this is probably some large input &quot;</span>
+                          <span class="s5">&quot;arguments for a wrapped function.&quot;</span>
+                          <span class="s4">% </span><span class="s1">this_duration</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">5</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">metadata</span>
+
+    <span class="s3">def </span><span class="s1">_get_memorized_result</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">MemorizedResult</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">,</span>
+                               <span class="s1">metadata</span><span class="s4">=</span><span class="s1">metadata</span><span class="s4">, </span><span class="s1">timestamp</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">timestamp</span><span class="s4">,</span>
+                               <span class="s1">verbose</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">- </span><span class="s6">1</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_load_item</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">load_item</span><span class="s4">(</span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">=</span><span class="s1">metadata</span><span class="s4">,</span>
+                                            <span class="s1">timestamp</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">timestamp</span><span class="s4">,</span>
+                                            <span class="s1">verbose</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_print_duration</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">duration</span><span class="s4">, </span><span class="s1">context</span><span class="s4">=</span><span class="s5">''</span><span class="s4">):</span>
+        <span class="s1">_</span><span class="s4">, </span><span class="s1">name </span><span class="s4">= </span><span class="s1">get_func_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">)</span>
+        <span class="s1">msg </span><span class="s4">= </span><span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">name</span><span class="s3">} {</span><span class="s1">context</span><span class="s3">}</span><span class="s5">- </span><span class="s3">{</span><span class="s1">format_time</span><span class="s4">(</span><span class="s1">duration</span><span class="s4">)</span><span class="s3">}</span><span class="s5">&quot;</span>
+        <span class="s1">print</span><span class="s4">(</span><span class="s1">max</span><span class="s4">(</span><span class="s6">0</span><span class="s4">, (</span><span class="s6">80 </span><span class="s4">- </span><span class="s1">len</span><span class="s4">(</span><span class="s1">msg</span><span class="s4">))) * </span><span class="s5">'_' </span><span class="s4">+ </span><span class="s1">msg</span><span class="s4">)</span>
+
+    <span class="s2"># ------------------------------------------------------------------------</span>
+    <span class="s2"># Private `object` interface</span>
+    <span class="s2"># ------------------------------------------------------------------------</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s5">'{class_name}(func={func}, location={location})'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+            <span class="s1">class_name</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">,</span>
+            <span class="s1">func</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">,</span>
+            <span class="s1">location</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">location</span><span class="s4">,)</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># class `AsyncMemorizedFunc`</span>
+<span class="s2">###############################################################################</span>
+<span class="s3">class </span><span class="s1">AsyncMemorizedFunc</span><span class="s4">(</span><span class="s1">MemorizedFunc</span><span class="s4">):</span>
+    <span class="s3">async def </span><span class="s1">__call__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s1">out </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cached_call</span><span class="s4">(</span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s1">out </span><span class="s4">= </span><span class="s3">await </span><span class="s1">out </span><span class="s3">if </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">iscoroutine</span><span class="s4">(</span><span class="s1">out</span><span class="s4">) </span><span class="s3">else </span><span class="s1">out</span>
+        <span class="s3">return </span><span class="s1">out</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]  </span><span class="s2"># Don't return metadata</span>
+
+    <span class="s3">async def </span><span class="s1">call_and_shelve</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s1">out </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cached_call</span><span class="s4">(</span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+        <span class="s1">out </span><span class="s4">= </span><span class="s3">await </span><span class="s1">out </span><span class="s3">if </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">iscoroutine</span><span class="s4">(</span><span class="s1">out</span><span class="s4">) </span><span class="s3">else </span><span class="s1">out</span>
+        <span class="s3">return </span><span class="s1">out</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]  </span><span class="s2"># Don't return metadata</span>
+
+    <span class="s3">async def </span><span class="s1">call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s1">out </span><span class="s4">= </span><span class="s1">super</span><span class="s4">().</span><span class="s1">call</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">return await </span><span class="s1">out </span><span class="s3">if </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">iscoroutine</span><span class="s4">(</span><span class="s1">out</span><span class="s4">) </span><span class="s3">else </span><span class="s1">out</span>
+
+    <span class="s3">async def </span><span class="s1">_call</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_before_call</span><span class="s4">(</span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s1">start_time </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">()</span>
+        <span class="s1">output </span><span class="s4">= </span><span class="s3">await </span><span class="s1">self</span><span class="s4">.</span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_after_call</span><span class="s4">(</span>
+            <span class="s1">call_id</span><span class="s4">, </span><span class="s1">args</span><span class="s4">, </span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">shelving</span><span class="s4">, </span><span class="s1">output</span><span class="s4">, </span><span class="s1">start_time</span>
+        <span class="s4">)</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># class `Memory`</span>
+<span class="s2">###############################################################################</span>
+<span class="s3">class </span><span class="s1">Memory</span><span class="s4">(</span><span class="s1">Logger</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; A context object for caching a function's return value each time it 
+        is called with the same input arguments. 
+ 
+        All values are cached on the filesystem, in a deep directory 
+        structure. 
+ 
+        Read more in the :ref:`User Guide &lt;memory&gt;`. 
+ 
+        Parameters 
+        ---------- 
+        location: str, pathlib.Path or None 
+            The path of the base directory to use as a data store 
+            or None. If None is given, no caching is done and 
+            the Memory object is completely transparent. This option 
+            replaces cachedir since version 0.12. 
+ 
+        backend: str, optional 
+            Type of store backend for reading/writing cache files. 
+            Default: 'local'. 
+            The 'local' backend is using regular filesystem operations to 
+            manipulate data (open, mv, etc) in the backend. 
+ 
+        mmap_mode: {None, 'r+', 'r', 'w+', 'c'}, optional 
+            The memmapping mode used when loading from cache 
+            numpy arrays. See numpy.load for the meaning of the 
+            arguments. 
+ 
+        compress: boolean, or integer, optional 
+            Whether to zip the stored data on disk. If an integer is 
+            given, it should be between 1 and 9, and sets the amount 
+            of compression. Note that compressed arrays cannot be 
+            read by memmapping. 
+ 
+        verbose: int, optional 
+            Verbosity flag, controls the debug messages that are issued 
+            as functions are evaluated. 
+ 
+        bytes_limit: int | str, optional 
+            Limit in bytes of the size of the cache. By default, the size of 
+            the cache is unlimited. When reducing the size of the cache, 
+            ``joblib`` keeps the most recently accessed items first. If a 
+            str is passed, it is converted to a number of bytes using units 
+            { K | M | G} for kilo, mega, giga. 
+ 
+            **Note:** You need to call :meth:`joblib.Memory.reduce_size` to 
+            actually reduce the cache size to be less than ``bytes_limit``. 
+ 
+            **Note:** This argument has been deprecated. One should give the 
+            value of ``bytes_limit`` directly in 
+            :meth:`joblib.Memory.reduce_size`. 
+ 
+        backend_options: dict, optional 
+            Contains a dictionary of named parameters used to configure 
+            the store backend. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># ------------------------------------------------------------------------</span>
+    <span class="s2"># Public interface</span>
+    <span class="s2"># ------------------------------------------------------------------------</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">location</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">backend</span><span class="s4">=</span><span class="s5">'local'</span><span class="s4">,</span>
+                 <span class="s1">mmap_mode</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">compress</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">verbose</span><span class="s4">=</span><span class="s6">1</span><span class="s4">, </span><span class="s1">bytes_limit</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+                 <span class="s1">backend_options</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s1">Logger</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose </span><span class="s4">= </span><span class="s1">verbose</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s4">= </span><span class="s1">mmap_mode</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">timestamp </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">bytes_limit </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                <span class="s5">&quot;bytes_limit argument has been deprecated. It will be removed &quot;</span>
+                <span class="s5">&quot;in version 1.5. Please pass its value directly to &quot;</span>
+                <span class="s5">&quot;Memory.reduce_size.&quot;</span><span class="s4">,</span>
+                <span class="s1">category</span><span class="s4">=</span><span class="s1">DeprecationWarning</span>
+            <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">bytes_limit </span><span class="s4">= </span><span class="s1">bytes_limit</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">backend </span><span class="s4">= </span><span class="s1">backend</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">compress </span><span class="s4">= </span><span class="s1">compress</span>
+        <span class="s3">if </span><span class="s1">backend_options </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">backend_options </span><span class="s4">= {}</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">backend_options </span><span class="s4">= </span><span class="s1">backend_options</span>
+
+        <span class="s3">if </span><span class="s1">compress </span><span class="s3">and </span><span class="s1">mmap_mode </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">'Compressed results cannot be memmapped'</span><span class="s4">,</span>
+                          <span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">2</span><span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">location </span><span class="s4">= </span><span class="s1">location</span>
+        <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">location</span><span class="s4">, </span><span class="s1">str</span><span class="s4">):</span>
+            <span class="s1">location </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">location</span><span class="s4">, </span><span class="s5">'joblib'</span><span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s4">= </span><span class="s1">_store_backend_factory</span><span class="s4">(</span>
+            <span class="s1">backend</span><span class="s4">, </span><span class="s1">location</span><span class="s4">, </span><span class="s1">verbose</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose</span><span class="s4">,</span>
+            <span class="s1">backend_options</span><span class="s4">=</span><span class="s1">dict</span><span class="s4">(</span><span class="s1">compress</span><span class="s4">=</span><span class="s1">compress</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s1">mmap_mode</span><span class="s4">,</span>
+                                 <span class="s4">**</span><span class="s1">backend_options</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">cache</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">func</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">ignore</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">verbose</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+              <span class="s1">cache_validation_callback</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; Decorates the given function func to only compute its return 
+            value for input arguments not cached on disk. 
+ 
+            Parameters 
+            ---------- 
+            func: callable, optional 
+                The function to be decorated 
+            ignore: list of strings 
+                A list of arguments name to ignore in the hashing 
+            verbose: integer, optional 
+                The verbosity mode of the function. By default that 
+                of the memory object is used. 
+            mmap_mode: {None, 'r+', 'r', 'w+', 'c'}, optional 
+                The memmapping mode used when loading from cache 
+                numpy arrays. See numpy.load for the meaning of the 
+                arguments. By default that of the memory object is used. 
+            cache_validation_callback: callable, optional 
+                Callable to validate whether or not the cache is valid. When 
+                the cached function is called with arguments for which a cache 
+                exists, this callable is called with the metadata of the cached 
+                result as its sole argument. If it returns True, then the 
+                cached result is returned, else the cache for these arguments 
+                is cleared and recomputed. 
+ 
+            Returns 
+            ------- 
+            decorated_func: MemorizedFunc object 
+                The returned object is a MemorizedFunc object, that is 
+                callable (behaves like a function), but offers extra 
+                methods for cache lookup and management. See the 
+                documentation for :class:`joblib.memory.MemorizedFunc`. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s4">(</span><span class="s1">cache_validation_callback </span><span class="s3">is not None and</span>
+                <span class="s3">not </span><span class="s1">callable</span><span class="s4">(</span><span class="s1">cache_validation_callback</span><span class="s4">)):</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;cache_validation_callback needs to be callable. &quot;</span>
+                <span class="s5">f&quot;Got </span><span class="s3">{</span><span class="s1">cache_validation_callback</span><span class="s3">}</span><span class="s5">.&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">func </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s2"># Partial application, to be able to specify extra keyword</span>
+            <span class="s2"># arguments in decorators</span>
+            <span class="s3">return </span><span class="s1">functools</span><span class="s4">.</span><span class="s1">partial</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">cache</span><span class="s4">, </span><span class="s1">ignore</span><span class="s4">=</span><span class="s1">ignore</span><span class="s4">,</span>
+                <span class="s1">mmap_mode</span><span class="s4">=</span><span class="s1">mmap_mode</span><span class="s4">,</span>
+                <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">,</span>
+                <span class="s1">cache_validation_callback</span><span class="s4">=</span><span class="s1">cache_validation_callback</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">cls </span><span class="s4">= (</span><span class="s1">AsyncNotMemorizedFunc</span>
+                   <span class="s3">if </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">iscoroutinefunction</span><span class="s4">(</span><span class="s1">func</span><span class="s4">)</span>
+                   <span class="s3">else </span><span class="s1">NotMemorizedFunc</span><span class="s4">)</span>
+            <span class="s3">return </span><span class="s1">cls</span><span class="s4">(</span><span class="s1">func</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">verbose </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">verbose </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_verbose</span>
+        <span class="s3">if </span><span class="s1">mmap_mode </span><span class="s3">is False</span><span class="s4">:</span>
+            <span class="s1">mmap_mode </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">mmap_mode</span>
+        <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">func</span><span class="s4">, </span><span class="s1">MemorizedFunc</span><span class="s4">):</span>
+            <span class="s1">func </span><span class="s4">= </span><span class="s1">func</span><span class="s4">.</span><span class="s1">func</span>
+        <span class="s1">cls </span><span class="s4">= (</span><span class="s1">AsyncMemorizedFunc</span>
+               <span class="s3">if </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">iscoroutinefunction</span><span class="s4">(</span><span class="s1">func</span><span class="s4">)</span>
+               <span class="s3">else </span><span class="s1">MemorizedFunc</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">cls</span><span class="s4">(</span>
+            <span class="s1">func</span><span class="s4">, </span><span class="s1">location</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">, </span><span class="s1">backend</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">backend</span><span class="s4">,</span>
+            <span class="s1">ignore</span><span class="s4">=</span><span class="s1">ignore</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s1">mmap_mode</span><span class="s4">, </span><span class="s1">compress</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">compress</span><span class="s4">,</span>
+            <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">, </span><span class="s1">timestamp</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">timestamp</span><span class="s4">,</span>
+            <span class="s1">cache_validation_callback</span><span class="s4">=</span><span class="s1">cache_validation_callback</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">clear</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">warn</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; Erase the complete cache directory. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">warn</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">'Flushing completely the cache'</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">clear</span><span class="s4">()</span>
+
+            <span class="s2"># As the cache is completely clear, make sure the _FUNCTION_HASHES</span>
+            <span class="s2"># cache is also reset. Else, for a function that is present in this</span>
+            <span class="s2"># table, results cached after this clear will be have cache miss</span>
+            <span class="s2"># as the function code is not re-written.</span>
+            <span class="s1">_FUNCTION_HASHES</span><span class="s4">.</span><span class="s1">clear</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">reduce_size</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">bytes_limit</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">items_limit</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">age_limit</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Remove cache elements to make the cache fit its limits. 
+ 
+        The limitation can impose that the cache size fits in ``bytes_limit``, 
+        that the number of cache items is no more than ``items_limit``, and 
+        that all files in cache are not older than ``age_limit``. 
+ 
+        Parameters 
+        ---------- 
+        bytes_limit: int | str, optional 
+            Limit in bytes of the size of the cache. By default, the size of 
+            the cache is unlimited. When reducing the size of the cache, 
+            ``joblib`` keeps the most recently accessed items first. If a 
+            str is passed, it is converted to a number of bytes using units 
+            { K | M | G} for kilo, mega, giga. 
+ 
+        items_limit: int, optional 
+            Number of items to limit the cache to.  By default, the number of 
+            items in the cache is unlimited.  When reducing the size of the 
+            cache, ``joblib`` keeps the most recently accessed items first. 
+ 
+        age_limit: datetime.timedelta, optional 
+            Maximum age of items to limit the cache to.  When reducing the size 
+            of the cache, any items last accessed more than the given length of 
+            time ago are deleted. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">bytes_limit </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">bytes_limit </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">bytes_limit</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s2"># No cached results, this function does nothing.</span>
+            <span class="s3">return</span>
+
+        <span class="s3">if </span><span class="s1">bytes_limit </span><span class="s3">is None and </span><span class="s1">items_limit </span><span class="s3">is None and </span><span class="s1">age_limit </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s2"># No limitation to impose, returning</span>
+            <span class="s3">return</span>
+
+        <span class="s2"># Defers the actual limits enforcing to the store backend.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">enforce_store_limits</span><span class="s4">(</span>
+            <span class="s1">bytes_limit</span><span class="s4">, </span><span class="s1">items_limit</span><span class="s4">, </span><span class="s1">age_limit</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">eval</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">func</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; Eval function func with arguments `*args` and `**kwargs`, 
+            in the context of the memory. 
+ 
+            This method works similarly to the builtin `apply`, except 
+            that the function is called only if the cache is not 
+            up to date. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">cache</span><span class="s4">(</span><span class="s1">func</span><span class="s4">)(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s2"># ------------------------------------------------------------------------</span>
+    <span class="s2"># Private `object` interface</span>
+    <span class="s2"># ------------------------------------------------------------------------</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s5">'{class_name}(location={location})'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+            <span class="s1">class_name</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">,</span>
+            <span class="s1">location</span><span class="s4">=(</span><span class="s3">None if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend </span><span class="s3">is None</span>
+                      <span class="s3">else </span><span class="s1">self</span><span class="s4">.</span><span class="s1">store_backend</span><span class="s4">.</span><span class="s1">location</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">__getstate__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; We don't store the timestamp when pickling, to avoid the hash 
+            depending from it. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">state </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">__dict__</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+        <span class="s1">state</span><span class="s4">[</span><span class="s5">'timestamp'</span><span class="s4">] = </span><span class="s3">None</span>
+        <span class="s3">return </span><span class="s1">state</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># cache_validation_callback helpers</span>
+<span class="s2">###############################################################################</span>
+
+<span class="s3">def </span><span class="s1">expires_after</span><span class="s4">(</span><span class="s1">days</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">seconds</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">microseconds</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">milliseconds</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">minutes</span><span class="s4">=</span><span class="s6">0</span><span class="s4">,</span>
+                  <span class="s1">hours</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">weeks</span><span class="s4">=</span><span class="s6">0</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Helper cache_validation_callback to force recompute after a duration. 
+ 
+    Parameters 
+    ---------- 
+    days, seconds, microseconds, milliseconds, minutes, hours, weeks: numbers 
+        argument passed to a timedelta. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">delta </span><span class="s4">= </span><span class="s1">datetime</span><span class="s4">.</span><span class="s1">timedelta</span><span class="s4">(</span>
+        <span class="s1">days</span><span class="s4">=</span><span class="s1">days</span><span class="s4">, </span><span class="s1">seconds</span><span class="s4">=</span><span class="s1">seconds</span><span class="s4">, </span><span class="s1">microseconds</span><span class="s4">=</span><span class="s1">microseconds</span><span class="s4">,</span>
+        <span class="s1">milliseconds</span><span class="s4">=</span><span class="s1">milliseconds</span><span class="s4">, </span><span class="s1">minutes</span><span class="s4">=</span><span class="s1">minutes</span><span class="s4">, </span><span class="s1">hours</span><span class="s4">=</span><span class="s1">hours</span><span class="s4">, </span><span class="s1">weeks</span><span class="s4">=</span><span class="s1">weeks</span>
+    <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">cache_validation_callback</span><span class="s4">(</span><span class="s1">metadata</span><span class="s4">):</span>
+        <span class="s1">computation_age </span><span class="s4">= </span><span class="s1">time</span><span class="s4">.</span><span class="s1">time</span><span class="s4">() - </span><span class="s1">metadata</span><span class="s4">[</span><span class="s5">'time'</span><span class="s4">]</span>
+        <span class="s3">return </span><span class="s1">computation_age </span><span class="s4">&lt; </span><span class="s1">delta</span><span class="s4">.</span><span class="s1">total_seconds</span><span class="s4">()</span>
+
+    <span class="s3">return </span><span class="s1">cache_validation_callback</span>
+</pre>
+</body>
+</html>

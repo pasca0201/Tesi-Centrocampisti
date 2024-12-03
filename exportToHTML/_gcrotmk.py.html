@@ -1,0 +1,524 @@
+<html>
+<head>
+<title>_gcrotmk.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_gcrotmk.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright (C) 2015, Pauli Virtanen &lt;pav@iki.fi&gt;</span>
+<span class="s0"># Distributed under the same license as SciPy.</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">LinAlgError</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s3">(</span><span class="s1">get_blas_funcs</span><span class="s3">, </span><span class="s1">qr</span><span class="s3">, </span><span class="s1">solve</span><span class="s3">, </span><span class="s1">svd</span><span class="s3">, </span><span class="s1">qr_insert</span><span class="s3">, </span><span class="s1">lstsq</span><span class="s3">)</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">iterative </span><span class="s2">import </span><span class="s1">_get_atol_rtol</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">linalg</span><span class="s3">.</span><span class="s1">_isolve</span><span class="s3">.</span><span class="s1">utils </span><span class="s2">import </span><span class="s1">make_system</span>
+
+
+<span class="s1">__all__ </span><span class="s3">= [</span><span class="s4">'gcrotmk'</span><span class="s3">]</span>
+
+
+<span class="s2">def </span><span class="s1">_fgmres</span><span class="s3">(</span><span class="s1">matvec</span><span class="s3">, </span><span class="s1">v0</span><span class="s3">, </span><span class="s1">m</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">lpsolve</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">rpsolve</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">cs</span><span class="s3">=(), </span><span class="s1">outer_v</span><span class="s3">=(),</span>
+            <span class="s1">prepend_outer_v</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    FGMRES Arnoldi process, with optional projection or augmentation 
+ 
+    Parameters 
+    ---------- 
+    matvec : callable 
+        Operation A*x 
+    v0 : ndarray 
+        Initial vector, normalized to nrm2(v0) == 1 
+    m : int 
+        Number of GMRES rounds 
+    atol : float 
+        Absolute tolerance for early exit 
+    lpsolve : callable 
+        Left preconditioner L 
+    rpsolve : callable 
+        Right preconditioner R 
+    cs : list of (ndarray, ndarray) 
+        Columns of matrices C and U in GCROT 
+    outer_v : list of ndarrays 
+        Augmentation vectors in LGMRES 
+    prepend_outer_v : bool, optional 
+        Whether augmentation vectors come before or after 
+        Krylov iterates 
+ 
+    Raises 
+    ------ 
+    LinAlgError 
+        If nans encountered 
+ 
+    Returns 
+    ------- 
+    Q, R : ndarray 
+        QR decomposition of the upper Hessenberg H=QR 
+    B : ndarray 
+        Projections corresponding to matrix C 
+    vs : list of ndarray 
+        Columns of matrix V 
+    zs : list of ndarray 
+        Columns of matrix Z 
+    y : ndarray 
+        Solution to ||H y - e_1||_2 = min! 
+    res : float 
+        The final (preconditioned) residual norm 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">lpsolve </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">def </span><span class="s1">lpsolve</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">x</span>
+    <span class="s2">if </span><span class="s1">rpsolve </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">def </span><span class="s1">rpsolve</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">x</span>
+
+    <span class="s1">axpy</span><span class="s3">, </span><span class="s1">dot</span><span class="s3">, </span><span class="s1">scal</span><span class="s3">, </span><span class="s1">nrm2 </span><span class="s3">= </span><span class="s1">get_blas_funcs</span><span class="s3">([</span><span class="s4">'axpy'</span><span class="s3">, </span><span class="s4">'dot'</span><span class="s3">, </span><span class="s4">'scal'</span><span class="s3">, </span><span class="s4">'nrm2'</span><span class="s3">], (</span><span class="s1">v0</span><span class="s3">,))</span>
+
+    <span class="s1">vs </span><span class="s3">= [</span><span class="s1">v0</span><span class="s3">]</span>
+    <span class="s1">zs </span><span class="s3">= []</span>
+    <span class="s1">y </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s1">res </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+
+    <span class="s1">m </span><span class="s3">= </span><span class="s1">m </span><span class="s3">+ </span><span class="s1">len</span><span class="s3">(</span><span class="s1">outer_v</span><span class="s3">)</span>
+
+    <span class="s0"># Orthogonal projection coefficients</span>
+    <span class="s1">B </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">len</span><span class="s3">(</span><span class="s1">cs</span><span class="s3">), </span><span class="s1">m</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">v0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+
+    <span class="s0"># H is stored in QR factorized form</span>
+    <span class="s1">Q </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">1</span><span class="s3">, </span><span class="s6">1</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">v0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s1">R </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">1</span><span class="s3">, </span><span class="s6">0</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">v0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+
+    <span class="s1">eps </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">v0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">eps</span>
+
+    <span class="s1">breakdown </span><span class="s3">= </span><span class="s2">False</span>
+
+    <span class="s0"># FGMRES Arnoldi process</span>
+    <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">m</span><span class="s3">):</span>
+        <span class="s0"># L A Z = C B + V H</span>
+
+        <span class="s2">if </span><span class="s1">prepend_outer_v </span><span class="s2">and </span><span class="s1">j </span><span class="s3">&lt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">outer_v</span><span class="s3">):</span>
+            <span class="s1">z</span><span class="s3">, </span><span class="s1">w </span><span class="s3">= </span><span class="s1">outer_v</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+        <span class="s2">elif </span><span class="s1">prepend_outer_v </span><span class="s2">and </span><span class="s1">j </span><span class="s3">== </span><span class="s1">len</span><span class="s3">(</span><span class="s1">outer_v</span><span class="s3">):</span>
+            <span class="s1">z </span><span class="s3">= </span><span class="s1">rpsolve</span><span class="s3">(</span><span class="s1">v0</span><span class="s3">)</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">elif not </span><span class="s1">prepend_outer_v </span><span class="s2">and </span><span class="s1">j </span><span class="s3">&gt;= </span><span class="s1">m </span><span class="s3">- </span><span class="s1">len</span><span class="s3">(</span><span class="s1">outer_v</span><span class="s3">):</span>
+            <span class="s1">z</span><span class="s3">, </span><span class="s1">w </span><span class="s3">= </span><span class="s1">outer_v</span><span class="s3">[</span><span class="s1">j </span><span class="s3">- (</span><span class="s1">m </span><span class="s3">- </span><span class="s1">len</span><span class="s3">(</span><span class="s1">outer_v</span><span class="s3">))]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">z </span><span class="s3">= </span><span class="s1">rpsolve</span><span class="s3">(</span><span class="s1">vs</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">])</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s2">None</span>
+
+        <span class="s2">if </span><span class="s1">w </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s1">lpsolve</span><span class="s3">(</span><span class="s1">matvec</span><span class="s3">(</span><span class="s1">z</span><span class="s3">))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0"># w is clobbered below</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s1">w</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+        <span class="s1">w_norm </span><span class="s3">= </span><span class="s1">nrm2</span><span class="s3">(</span><span class="s1">w</span><span class="s3">)</span>
+
+        <span class="s0"># GCROT projection: L A -&gt; (1 - C C^H) L A</span>
+        <span class="s0"># i.e. orthogonalize against C</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">c </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">cs</span><span class="s3">):</span>
+            <span class="s1">alpha </span><span class="s3">= </span><span class="s1">dot</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+            <span class="s1">B</span><span class="s3">[</span><span class="s1">i</span><span class="s3">,</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">alpha</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, </span><span class="s1">c</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">alpha</span><span class="s3">)  </span><span class="s0"># w -= alpha*c</span>
+
+        <span class="s0"># Orthogonalize against V</span>
+        <span class="s1">hcur </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">j</span><span class="s3">+</span><span class="s6">2</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">Q</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">vs</span><span class="s3">):</span>
+            <span class="s1">alpha </span><span class="s3">= </span><span class="s1">dot</span><span class="s3">(</span><span class="s1">v</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+            <span class="s1">hcur</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">alpha</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">v</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, </span><span class="s1">v</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">alpha</span><span class="s3">)  </span><span class="s0"># w -= alpha*v</span>
+        <span class="s1">hcur</span><span class="s3">[</span><span class="s1">i</span><span class="s3">+</span><span class="s6">1</span><span class="s3">] = </span><span class="s1">nrm2</span><span class="s3">(</span><span class="s1">w</span><span class="s3">)</span>
+
+        <span class="s2">with </span><span class="s1">np</span><span class="s3">.</span><span class="s1">errstate</span><span class="s3">(</span><span class="s1">over</span><span class="s3">=</span><span class="s4">'ignore'</span><span class="s3">, </span><span class="s1">divide</span><span class="s3">=</span><span class="s4">'ignore'</span><span class="s3">):</span>
+            <span class="s0"># Careful with denormals</span>
+            <span class="s1">alpha </span><span class="s3">= </span><span class="s6">1</span><span class="s3">/</span><span class="s1">hcur</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">]</span>
+
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">alpha</span><span class="s3">):</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s1">scal</span><span class="s3">(</span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s3">(</span><span class="s1">hcur</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] &gt; </span><span class="s1">eps </span><span class="s3">* </span><span class="s1">w_norm</span><span class="s3">):</span>
+            <span class="s0"># w essentially in the span of previous vectors,</span>
+            <span class="s0"># or we have nans. Bail out after updating the QR</span>
+            <span class="s0"># solution.</span>
+            <span class="s1">breakdown </span><span class="s3">= </span><span class="s2">True</span>
+
+        <span class="s1">vs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">w</span><span class="s3">)</span>
+        <span class="s1">zs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">z</span><span class="s3">)</span>
+
+        <span class="s0"># Arnoldi LSQ problem</span>
+
+        <span class="s0"># Add new column to H=Q@R, padding other columns with zeros</span>
+        <span class="s1">Q2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">j</span><span class="s3">+</span><span class="s6">2</span><span class="s3">, </span><span class="s1">j</span><span class="s3">+</span><span class="s6">2</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">Q</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s4">'F'</span><span class="s3">)</span>
+        <span class="s1">Q2</span><span class="s3">[:</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">,:</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">] = </span><span class="s1">Q</span>
+        <span class="s1">Q2</span><span class="s3">[</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">,</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">] = </span><span class="s6">1</span>
+
+        <span class="s1">R2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">j</span><span class="s3">+</span><span class="s6">2</span><span class="s3">, </span><span class="s1">j</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">R</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s4">'F'</span><span class="s3">)</span>
+        <span class="s1">R2</span><span class="s3">[:</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">,:] = </span><span class="s1">R</span>
+
+        <span class="s1">Q</span><span class="s3">, </span><span class="s1">R </span><span class="s3">= </span><span class="s1">qr_insert</span><span class="s3">(</span><span class="s1">Q2</span><span class="s3">, </span><span class="s1">R2</span><span class="s3">, </span><span class="s1">hcur</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">which</span><span class="s3">=</span><span class="s4">'col'</span><span class="s3">,</span>
+                         <span class="s1">overwrite_qru</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">check_finite</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+
+        <span class="s0"># Transformed least squares problem</span>
+        <span class="s0"># || Q R y - inner_res_0 * e_1 ||_2 = min!</span>
+        <span class="s0"># Since R = [R'; 0], solution is y = inner_res_0 (R')^{-1} (Q^H)[:j,0]</span>
+
+        <span class="s0"># Residual is immediately known</span>
+        <span class="s1">res </span><span class="s3">= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">Q</span><span class="s3">[</span><span class="s6">0</span><span class="s3">,-</span><span class="s6">1</span><span class="s3">])</span>
+
+        <span class="s0"># Check for termination</span>
+        <span class="s2">if </span><span class="s1">res </span><span class="s3">&lt; </span><span class="s1">atol </span><span class="s2">or </span><span class="s1">breakdown</span><span class="s3">:</span>
+            <span class="s2">break</span>
+
+    <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">R</span><span class="s3">[</span><span class="s1">j</span><span class="s3">,</span><span class="s1">j</span><span class="s3">]):</span>
+        <span class="s0"># nans encountered, bail out</span>
+        <span class="s2">raise </span><span class="s1">LinAlgError</span><span class="s3">()</span>
+
+    <span class="s0"># -- Get the LSQ problem solution</span>
+
+    <span class="s0"># The problem is triangular, but the condition number may be</span>
+    <span class="s0"># bad (or in case of breakdown the last diagonal entry may be</span>
+    <span class="s0"># zero), so use lstsq instead of trtrs.</span>
+    <span class="s1">y</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, = </span><span class="s1">lstsq</span><span class="s3">(</span><span class="s1">R</span><span class="s3">[:</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">,:</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">], </span><span class="s1">Q</span><span class="s3">[</span><span class="s6">0</span><span class="s3">,:</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">].</span><span class="s1">conj</span><span class="s3">())</span>
+
+    <span class="s1">B </span><span class="s3">= </span><span class="s1">B</span><span class="s3">[:,:</span><span class="s1">j</span><span class="s3">+</span><span class="s6">1</span><span class="s3">]</span>
+
+    <span class="s2">return </span><span class="s1">Q</span><span class="s3">, </span><span class="s1">R</span><span class="s3">, </span><span class="s1">B</span><span class="s3">, </span><span class="s1">vs</span><span class="s3">, </span><span class="s1">zs</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">res</span>
+
+
+<span class="s2">def </span><span class="s1">gcrotmk</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, *, </span><span class="s1">rtol</span><span class="s3">=</span><span class="s6">1e-5</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">=</span><span class="s6">0.</span><span class="s3">, </span><span class="s1">maxiter</span><span class="s3">=</span><span class="s6">1000</span><span class="s3">, </span><span class="s1">M</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">m</span><span class="s3">=</span><span class="s6">20</span><span class="s3">, </span><span class="s1">k</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">CU</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">discard_C</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">truncate</span><span class="s3">=</span><span class="s4">'oldest'</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Solve a matrix equation using flexible GCROT(m,k) algorithm. 
+ 
+    Parameters 
+    ---------- 
+    A : {sparse matrix, ndarray, LinearOperator} 
+        The real or complex N-by-N matrix of the linear system. 
+        Alternatively, ``A`` can be a linear operator which can 
+        produce ``Ax`` using, e.g., 
+        ``scipy.sparse.linalg.LinearOperator``. 
+    b : ndarray 
+        Right hand side of the linear system. Has shape (N,) or (N,1). 
+    x0 : ndarray 
+        Starting guess for the solution. 
+    rtol, atol : float, optional 
+        Parameters for the convergence test. For convergence, 
+        ``norm(b - A @ x) &lt;= max(rtol*norm(b), atol)`` should be satisfied. 
+        The default is ``rtol=1e-5``, the default for ``atol`` is ``0.0``. 
+    maxiter : int, optional 
+        Maximum number of iterations.  Iteration will stop after maxiter 
+        steps even if the specified tolerance has not been achieved. 
+    M : {sparse matrix, ndarray, LinearOperator}, optional 
+        Preconditioner for A.  The preconditioner should approximate the 
+        inverse of A. gcrotmk is a 'flexible' algorithm and the preconditioner 
+        can vary from iteration to iteration. Effective preconditioning 
+        dramatically improves the rate of convergence, which implies that 
+        fewer iterations are needed to reach a given error tolerance. 
+    callback : function, optional 
+        User-supplied function to call after each iteration.  It is called 
+        as callback(xk), where xk is the current solution vector. 
+    m : int, optional 
+        Number of inner FGMRES iterations per each outer iteration. 
+        Default: 20 
+    k : int, optional 
+        Number of vectors to carry between inner FGMRES iterations. 
+        According to [2]_, good values are around m. 
+        Default: m 
+    CU : list of tuples, optional 
+        List of tuples ``(c, u)`` which contain the columns of the matrices 
+        C and U in the GCROT(m,k) algorithm. For details, see [2]_. 
+        The list given and vectors contained in it are modified in-place. 
+        If not given, start from empty matrices. The ``c`` elements in the 
+        tuples can be ``None``, in which case the vectors are recomputed 
+        via ``c = A u`` on start and orthogonalized as described in [3]_. 
+    discard_C : bool, optional 
+        Discard the C-vectors at the end. Useful if recycling Krylov subspaces 
+        for different linear systems. 
+    truncate : {'oldest', 'smallest'}, optional 
+        Truncation scheme to use. Drop: oldest vectors, or vectors with 
+        smallest singular values using the scheme discussed in [1,2]. 
+        See [2]_ for detailed comparison. 
+        Default: 'oldest' 
+ 
+    Returns 
+    ------- 
+    x : ndarray 
+        The solution found. 
+    info : int 
+        Provides convergence information: 
+ 
+        * 0  : successful exit 
+        * &gt;0 : convergence to tolerance not achieved, number of iterations 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; from scipy.sparse.linalg import gcrotmk 
+    &gt;&gt;&gt; R = np.random.randn(5, 5) 
+    &gt;&gt;&gt; A = csc_matrix(R) 
+    &gt;&gt;&gt; b = np.random.randn(5) 
+    &gt;&gt;&gt; x, exit_code = gcrotmk(A, b, atol=1e-5) 
+    &gt;&gt;&gt; print(exit_code) 
+    0 
+    &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+    True 
+ 
+    References 
+    ---------- 
+    .. [1] E. de Sturler, ''Truncation strategies for optimal Krylov subspace 
+           methods'', SIAM J. Numer. Anal. 36, 864 (1999). 
+    .. [2] J.E. Hicken and D.W. Zingg, ''A simplified and flexible variant 
+           of GCROT for solving nonsymmetric linear systems'', 
+           SIAM J. Sci. Comput. 32, 172 (2010). 
+    .. [3] M.L. Parks, E. de Sturler, G. Mackey, D.D. Johnson, S. Maiti, 
+           ''Recycling Krylov subspaces for sequences of linear systems'', 
+           SIAM J. Sci. Comput. 28, 1651 (2006). 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">A</span><span class="s3">,</span><span class="s1">M</span><span class="s3">,</span><span class="s1">x</span><span class="s3">,</span><span class="s1">b</span><span class="s3">,</span><span class="s1">postprocess </span><span class="s3">= </span><span class="s1">make_system</span><span class="s3">(</span><span class="s1">A</span><span class="s3">,</span><span class="s1">M</span><span class="s3">,</span><span class="s1">x0</span><span class="s3">,</span><span class="s1">b</span><span class="s3">)</span>
+
+    <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">b</span><span class="s3">).</span><span class="s1">all</span><span class="s3">():</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;RHS must contain only finite numbers&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">truncate </span><span class="s2">not in </span><span class="s3">(</span><span class="s4">'oldest'</span><span class="s3">, </span><span class="s4">'smallest'</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">f&quot;Invalid value for 'truncate': </span><span class="s2">{</span><span class="s1">truncate</span><span class="s2">!r}</span><span class="s4">&quot;</span><span class="s3">)</span>
+
+    <span class="s1">matvec </span><span class="s3">= </span><span class="s1">A</span><span class="s3">.</span><span class="s1">matvec</span>
+    <span class="s1">psolve </span><span class="s3">= </span><span class="s1">M</span><span class="s3">.</span><span class="s1">matvec</span>
+
+    <span class="s2">if </span><span class="s1">CU </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">CU </span><span class="s3">= []</span>
+
+    <span class="s2">if </span><span class="s1">k </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">k </span><span class="s3">= </span><span class="s1">m</span>
+
+    <span class="s1">axpy</span><span class="s3">, </span><span class="s1">dot</span><span class="s3">, </span><span class="s1">scal </span><span class="s3">= </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span>
+
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">r </span><span class="s3">= </span><span class="s1">b</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">r </span><span class="s3">= </span><span class="s1">b </span><span class="s3">- </span><span class="s1">matvec</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+
+    <span class="s1">axpy</span><span class="s3">, </span><span class="s1">dot</span><span class="s3">, </span><span class="s1">scal</span><span class="s3">, </span><span class="s1">nrm2 </span><span class="s3">= </span><span class="s1">get_blas_funcs</span><span class="s3">([</span><span class="s4">'axpy'</span><span class="s3">, </span><span class="s4">'dot'</span><span class="s3">, </span><span class="s4">'scal'</span><span class="s3">, </span><span class="s4">'nrm2'</span><span class="s3">], (</span><span class="s1">x</span><span class="s3">, </span><span class="s1">r</span><span class="s3">))</span>
+
+    <span class="s1">b_norm </span><span class="s3">= </span><span class="s1">nrm2</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)</span>
+
+    <span class="s0"># we call this to get the right atol/rtol and raise errors as necessary</span>
+    <span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol </span><span class="s3">= </span><span class="s1">_get_atol_rtol</span><span class="s3">(</span><span class="s4">'gcrotmk'</span><span class="s3">, </span><span class="s1">b_norm</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">b_norm </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">b</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">postprocess</span><span class="s3">(</span><span class="s1">x</span><span class="s3">), </span><span class="s6">0</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">discard_C</span><span class="s3">:</span>
+        <span class="s1">CU</span><span class="s3">[:] = [(</span><span class="s2">None</span><span class="s3">, </span><span class="s1">u</span><span class="s3">) </span><span class="s2">for </span><span class="s1">c</span><span class="s3">, </span><span class="s1">u </span><span class="s2">in </span><span class="s1">CU</span><span class="s3">]</span>
+
+    <span class="s0"># Reorthogonalize old vectors</span>
+    <span class="s2">if </span><span class="s1">CU</span><span class="s3">:</span>
+        <span class="s0"># Sort already existing vectors to the front</span>
+        <span class="s1">CU</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">(</span><span class="s1">key</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">cu</span><span class="s3">: </span><span class="s1">cu</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] </span><span class="s2">is not None</span><span class="s3">)</span>
+
+        <span class="s0"># Fill-in missing ones</span>
+        <span class="s1">C </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">A</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">len</span><span class="s3">(</span><span class="s1">CU</span><span class="s3">)), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">r</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s4">'F'</span><span class="s3">)</span>
+        <span class="s1">us </span><span class="s3">= []</span>
+        <span class="s1">j </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s2">while </span><span class="s1">CU</span><span class="s3">:</span>
+            <span class="s0"># More memory-efficient: throw away old vectors as we go</span>
+            <span class="s1">c</span><span class="s3">, </span><span class="s1">u </span><span class="s3">= </span><span class="s1">CU</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">c </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">c </span><span class="s3">= </span><span class="s1">matvec</span><span class="s3">(</span><span class="s1">u</span><span class="s3">)</span>
+            <span class="s1">C</span><span class="s3">[:,</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">c</span>
+            <span class="s1">j </span><span class="s3">+= </span><span class="s6">1</span>
+            <span class="s1">us</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">u</span><span class="s3">)</span>
+
+        <span class="s0"># Orthogonalize</span>
+        <span class="s1">Q</span><span class="s3">, </span><span class="s1">R</span><span class="s3">, </span><span class="s1">P </span><span class="s3">= </span><span class="s1">qr</span><span class="s3">(</span><span class="s1">C</span><span class="s3">, </span><span class="s1">overwrite_a</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'economic'</span><span class="s3">, </span><span class="s1">pivoting</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">del </span><span class="s1">C</span>
+
+        <span class="s0"># C := Q</span>
+        <span class="s1">cs </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">Q</span><span class="s3">.</span><span class="s1">T</span><span class="s3">)</span>
+
+        <span class="s0"># U := U P R^-1,  back-substitution</span>
+        <span class="s1">new_us </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">cs</span><span class="s3">)):</span>
+            <span class="s1">u </span><span class="s3">= </span><span class="s1">us</span><span class="s3">[</span><span class="s1">P</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]]</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">j</span><span class="s3">):</span>
+                <span class="s1">u </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">us</span><span class="s3">[</span><span class="s1">P</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]], </span><span class="s1">u</span><span class="s3">, </span><span class="s1">u</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">R</span><span class="s3">[</span><span class="s1">i</span><span class="s3">,</span><span class="s1">j</span><span class="s3">])</span>
+            <span class="s2">if </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">R</span><span class="s3">[</span><span class="s1">j</span><span class="s3">,</span><span class="s1">j</span><span class="s3">]) &lt; </span><span class="s6">1e-12 </span><span class="s3">* </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">R</span><span class="s3">[</span><span class="s6">0</span><span class="s3">,</span><span class="s6">0</span><span class="s3">]):</span>
+                <span class="s0"># discard rest of the vectors</span>
+                <span class="s2">break</span>
+            <span class="s1">u </span><span class="s3">= </span><span class="s1">scal</span><span class="s3">(</span><span class="s6">1.0</span><span class="s3">/</span><span class="s1">R</span><span class="s3">[</span><span class="s1">j</span><span class="s3">,</span><span class="s1">j</span><span class="s3">], </span><span class="s1">u</span><span class="s3">)</span>
+            <span class="s1">new_us</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">u</span><span class="s3">)</span>
+
+        <span class="s0"># Form the new CU lists</span>
+        <span class="s1">CU</span><span class="s3">[:] = </span><span class="s1">list</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">cs</span><span class="s3">, </span><span class="s1">new_us</span><span class="s3">))[::-</span><span class="s6">1</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">CU</span><span class="s3">:</span>
+        <span class="s1">axpy</span><span class="s3">, </span><span class="s1">dot </span><span class="s3">= </span><span class="s1">get_blas_funcs</span><span class="s3">([</span><span class="s4">'axpy'</span><span class="s3">, </span><span class="s4">'dot'</span><span class="s3">], (</span><span class="s1">r</span><span class="s3">,))</span>
+
+        <span class="s0"># Solve first the projection operation with respect to the CU</span>
+        <span class="s0"># vectors. This corresponds to modifying the initial guess to</span>
+        <span class="s0"># be</span>
+        <span class="s0">#</span>
+        <span class="s0">#     x' = x + U y</span>
+        <span class="s0">#     y = argmin_y || b - A (x + U y) ||^2</span>
+        <span class="s0">#</span>
+        <span class="s0"># The solution is y = C^H (b - A x)</span>
+        <span class="s2">for </span><span class="s1">c</span><span class="s3">, </span><span class="s1">u </span><span class="s2">in </span><span class="s1">CU</span><span class="s3">:</span>
+            <span class="s1">yc </span><span class="s3">= </span><span class="s1">dot</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">r</span><span class="s3">)</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">u</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">yc</span><span class="s3">)</span>
+            <span class="s1">r </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">r</span><span class="s3">, </span><span class="s1">r</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">yc</span><span class="s3">)</span>
+
+    <span class="s0"># GCROT main iteration</span>
+    <span class="s2">for </span><span class="s1">j_outer </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">maxiter</span><span class="s3">):</span>
+        <span class="s0"># -- callback</span>
+        <span class="s2">if </span><span class="s1">callback </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">callback</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+
+        <span class="s1">beta </span><span class="s3">= </span><span class="s1">nrm2</span><span class="s3">(</span><span class="s1">r</span><span class="s3">)</span>
+
+        <span class="s0"># -- check stopping condition</span>
+        <span class="s1">beta_tol </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol </span><span class="s3">* </span><span class="s1">b_norm</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">beta </span><span class="s3">&lt;= </span><span class="s1">beta_tol </span><span class="s2">and </span><span class="s3">(</span><span class="s1">j_outer </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">or </span><span class="s1">CU</span><span class="s3">):</span>
+            <span class="s0"># recompute residual to avoid rounding error</span>
+            <span class="s1">r </span><span class="s3">= </span><span class="s1">b </span><span class="s3">- </span><span class="s1">matvec</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+            <span class="s1">beta </span><span class="s3">= </span><span class="s1">nrm2</span><span class="s3">(</span><span class="s1">r</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">beta </span><span class="s3">&lt;= </span><span class="s1">beta_tol</span><span class="s3">:</span>
+            <span class="s1">j_outer </span><span class="s3">= -</span><span class="s6">1</span>
+            <span class="s2">break</span>
+
+        <span class="s1">ml </span><span class="s3">= </span><span class="s1">m </span><span class="s3">+ </span><span class="s1">max</span><span class="s3">(</span><span class="s1">k </span><span class="s3">- </span><span class="s1">len</span><span class="s3">(</span><span class="s1">CU</span><span class="s3">), </span><span class="s6">0</span><span class="s3">)</span>
+
+        <span class="s1">cs </span><span class="s3">= [</span><span class="s1">c </span><span class="s2">for </span><span class="s1">c</span><span class="s3">, </span><span class="s1">u </span><span class="s2">in </span><span class="s1">CU</span><span class="s3">]</span>
+
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">Q</span><span class="s3">, </span><span class="s1">R</span><span class="s3">, </span><span class="s1">B</span><span class="s3">, </span><span class="s1">vs</span><span class="s3">, </span><span class="s1">zs</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">pres </span><span class="s3">= </span><span class="s1">_fgmres</span><span class="s3">(</span><span class="s1">matvec</span><span class="s3">,</span>
+                                               <span class="s1">r</span><span class="s3">/</span><span class="s1">beta</span><span class="s3">,</span>
+                                               <span class="s1">ml</span><span class="s3">,</span>
+                                               <span class="s1">rpsolve</span><span class="s3">=</span><span class="s1">psolve</span><span class="s3">,</span>
+                                               <span class="s1">atol</span><span class="s3">=</span><span class="s1">max</span><span class="s3">(</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">*</span><span class="s1">b_norm</span><span class="s3">)/</span><span class="s1">beta</span><span class="s3">,</span>
+                                               <span class="s1">cs</span><span class="s3">=</span><span class="s1">cs</span><span class="s3">)</span>
+            <span class="s1">y </span><span class="s3">*= </span><span class="s1">beta</span>
+        <span class="s2">except </span><span class="s1">LinAlgError</span><span class="s3">:</span>
+            <span class="s0"># Floating point over/underflow, non-finite result from</span>
+            <span class="s0"># matmul etc. -- report failure.</span>
+            <span class="s2">break</span>
+
+        <span class="s0">#</span>
+        <span class="s0"># At this point,</span>
+        <span class="s0">#</span>
+        <span class="s0">#     [A U, A Z] = [C, V] G;   G =  [ I  B ]</span>
+        <span class="s0">#                                   [ 0  H ]</span>
+        <span class="s0">#</span>
+        <span class="s0"># where [C, V] has orthonormal columns, and r = beta v_0. Moreover,</span>
+        <span class="s0">#</span>
+        <span class="s0">#     || b - A (x + Z y + U q) ||_2 = || r - C B y - V H y - C q ||_2 = min!</span>
+        <span class="s0">#</span>
+        <span class="s0"># from which y = argmin_y || beta e_1 - H y ||_2, and q = -B y</span>
+        <span class="s0">#</span>
+
+        <span class="s0">#</span>
+        <span class="s0"># GCROT(m,k) update</span>
+        <span class="s0">#</span>
+
+        <span class="s0"># Define new outer vectors</span>
+
+        <span class="s0"># ux := (Z - U B) y</span>
+        <span class="s1">ux </span><span class="s3">= </span><span class="s1">zs</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]*</span><span class="s1">y</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">for </span><span class="s1">z</span><span class="s3">, </span><span class="s1">yc </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">zs</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:], </span><span class="s1">y</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]):</span>
+            <span class="s1">ux </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">z</span><span class="s3">, </span><span class="s1">ux</span><span class="s3">, </span><span class="s1">ux</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">yc</span><span class="s3">)  </span><span class="s0"># ux += z*yc</span>
+        <span class="s1">by </span><span class="s3">= </span><span class="s1">B</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">cu</span><span class="s3">, </span><span class="s1">byc </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">CU</span><span class="s3">, </span><span class="s1">by</span><span class="s3">):</span>
+            <span class="s1">c</span><span class="s3">, </span><span class="s1">u </span><span class="s3">= </span><span class="s1">cu</span>
+            <span class="s1">ux </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">u</span><span class="s3">, </span><span class="s1">ux</span><span class="s3">, </span><span class="s1">ux</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">byc</span><span class="s3">)  </span><span class="s0"># ux -= u*byc</span>
+
+        <span class="s0"># cx := V H y</span>
+        <span class="s1">hy </span><span class="s3">= </span><span class="s1">Q</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">R</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">y</span><span class="s3">))</span>
+        <span class="s1">cx </span><span class="s3">= </span><span class="s1">vs</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] * </span><span class="s1">hy</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">for </span><span class="s1">v</span><span class="s3">, </span><span class="s1">hyc </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">vs</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:], </span><span class="s1">hy</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]):</span>
+            <span class="s1">cx </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">v</span><span class="s3">, </span><span class="s1">cx</span><span class="s3">, </span><span class="s1">cx</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">hyc</span><span class="s3">)  </span><span class="s0"># cx += v*hyc</span>
+
+        <span class="s0"># Normalize cx, maintaining cx = A ux</span>
+        <span class="s0"># This new cx is orthogonal to the previous C, by construction</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">alpha </span><span class="s3">= </span><span class="s6">1</span><span class="s3">/</span><span class="s1">nrm2</span><span class="s3">(</span><span class="s1">cx</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">alpha</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">FloatingPointError</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s3">(</span><span class="s1">FloatingPointError</span><span class="s3">, </span><span class="s1">ZeroDivisionError</span><span class="s3">):</span>
+            <span class="s0"># Cannot update, so skip it</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">cx </span><span class="s3">= </span><span class="s1">scal</span><span class="s3">(</span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">cx</span><span class="s3">)</span>
+        <span class="s1">ux </span><span class="s3">= </span><span class="s1">scal</span><span class="s3">(</span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">ux</span><span class="s3">)</span>
+
+        <span class="s0"># Update residual and solution</span>
+        <span class="s1">gamma </span><span class="s3">= </span><span class="s1">dot</span><span class="s3">(</span><span class="s1">cx</span><span class="s3">, </span><span class="s1">r</span><span class="s3">)</span>
+        <span class="s1">r </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">cx</span><span class="s3">, </span><span class="s1">r</span><span class="s3">, </span><span class="s1">r</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">gamma</span><span class="s3">)  </span><span class="s0"># r -= gamma*cx</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">ux</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">gamma</span><span class="s3">)  </span><span class="s0"># x += gamma*ux</span>
+
+        <span class="s0"># Truncate CU</span>
+        <span class="s2">if </span><span class="s1">truncate </span><span class="s3">== </span><span class="s4">'oldest'</span><span class="s3">:</span>
+            <span class="s2">while </span><span class="s1">len</span><span class="s3">(</span><span class="s1">CU</span><span class="s3">) &gt;= </span><span class="s1">k </span><span class="s2">and </span><span class="s1">CU</span><span class="s3">:</span>
+                <span class="s2">del </span><span class="s1">CU</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">elif </span><span class="s1">truncate </span><span class="s3">== </span><span class="s4">'smallest'</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">CU</span><span class="s3">) &gt;= </span><span class="s1">k </span><span class="s2">and </span><span class="s1">CU</span><span class="s3">:</span>
+                <span class="s0"># cf. [1,2]</span>
+                <span class="s1">D </span><span class="s3">= </span><span class="s1">solve</span><span class="s3">(</span><span class="s1">R</span><span class="s3">[:-</span><span class="s6">1</span><span class="s3">,:].</span><span class="s1">T</span><span class="s3">, </span><span class="s1">B</span><span class="s3">.</span><span class="s1">T</span><span class="s3">).</span><span class="s1">T</span>
+                <span class="s1">W</span><span class="s3">, </span><span class="s1">sigma</span><span class="s3">, </span><span class="s1">V </span><span class="s3">= </span><span class="s1">svd</span><span class="s3">(</span><span class="s1">D</span><span class="s3">)</span>
+
+                <span class="s0"># C := C W[:,:k-1],  U := U W[:,:k-1]</span>
+                <span class="s1">new_CU </span><span class="s3">= []</span>
+                <span class="s2">for </span><span class="s1">j</span><span class="s3">, </span><span class="s1">w </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">W</span><span class="s3">[:,:</span><span class="s1">k</span><span class="s3">-</span><span class="s6">1</span><span class="s3">].</span><span class="s1">T</span><span class="s3">):</span>
+                    <span class="s1">c</span><span class="s3">, </span><span class="s1">u </span><span class="s3">= </span><span class="s1">CU</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                    <span class="s1">c </span><span class="s3">= </span><span class="s1">c </span><span class="s3">* </span><span class="s1">w</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                    <span class="s1">u </span><span class="s3">= </span><span class="s1">u </span><span class="s3">* </span><span class="s1">w</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                    <span class="s2">for </span><span class="s1">cup</span><span class="s3">, </span><span class="s1">wp </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">CU</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:], </span><span class="s1">w</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]):</span>
+                        <span class="s1">cp</span><span class="s3">, </span><span class="s1">up </span><span class="s3">= </span><span class="s1">cup</span>
+                        <span class="s1">c </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">cp</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">c</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">wp</span><span class="s3">)</span>
+                        <span class="s1">u </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">up</span><span class="s3">, </span><span class="s1">u</span><span class="s3">, </span><span class="s1">u</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">wp</span><span class="s3">)</span>
+
+                    <span class="s0"># Reorthogonalize at the same time; not necessary</span>
+                    <span class="s0"># in exact arithmetic, but floating point error</span>
+                    <span class="s0"># tends to accumulate here</span>
+                    <span class="s2">for </span><span class="s1">cp</span><span class="s3">, </span><span class="s1">up </span><span class="s2">in </span><span class="s1">new_CU</span><span class="s3">:</span>
+                        <span class="s1">alpha </span><span class="s3">= </span><span class="s1">dot</span><span class="s3">(</span><span class="s1">cp</span><span class="s3">, </span><span class="s1">c</span><span class="s3">)</span>
+                        <span class="s1">c </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">cp</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">c</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">alpha</span><span class="s3">)</span>
+                        <span class="s1">u </span><span class="s3">= </span><span class="s1">axpy</span><span class="s3">(</span><span class="s1">up</span><span class="s3">, </span><span class="s1">u</span><span class="s3">, </span><span class="s1">u</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], -</span><span class="s1">alpha</span><span class="s3">)</span>
+                    <span class="s1">alpha </span><span class="s3">= </span><span class="s1">nrm2</span><span class="s3">(</span><span class="s1">c</span><span class="s3">)</span>
+                    <span class="s1">c </span><span class="s3">= </span><span class="s1">scal</span><span class="s3">(</span><span class="s6">1.0</span><span class="s3">/</span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">c</span><span class="s3">)</span>
+                    <span class="s1">u </span><span class="s3">= </span><span class="s1">scal</span><span class="s3">(</span><span class="s6">1.0</span><span class="s3">/</span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">u</span><span class="s3">)</span>
+
+                    <span class="s1">new_CU</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">c</span><span class="s3">, </span><span class="s1">u</span><span class="s3">))</span>
+                <span class="s1">CU</span><span class="s3">[:] = </span><span class="s1">new_CU</span>
+
+        <span class="s0"># Add new vector to CU</span>
+        <span class="s1">CU</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">cx</span><span class="s3">, </span><span class="s1">ux</span><span class="s3">))</span>
+
+    <span class="s0"># Include the solution vector to the span</span>
+    <span class="s1">CU</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s2">None</span><span class="s3">, </span><span class="s1">x</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()))</span>
+    <span class="s2">if </span><span class="s1">discard_C</span><span class="s3">:</span>
+        <span class="s1">CU</span><span class="s3">[:] = [(</span><span class="s2">None</span><span class="s3">, </span><span class="s1">uz</span><span class="s3">) </span><span class="s2">for </span><span class="s1">cz</span><span class="s3">, </span><span class="s1">uz </span><span class="s2">in </span><span class="s1">CU</span><span class="s3">]</span>
+
+    <span class="s2">return </span><span class="s1">postprocess</span><span class="s3">(</span><span class="s1">x</span><span class="s3">), </span><span class="s1">j_outer </span><span class="s3">+ </span><span class="s6">1</span>
+</pre>
+</body>
+</html>

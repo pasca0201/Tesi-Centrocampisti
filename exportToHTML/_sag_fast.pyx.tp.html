@@ -1,0 +1,859 @@
+<html>
+<head>
+<title>_sag_fast.pyx.tp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_sag_fast.pyx.tp</font>
+</center></td></tr></table>
+<pre><span class="s0">{{py:</span>
+
+<span class="s0">&quot;&quot;&quot;</span>
+
+<span class="s0">Template file for easily generate fused types consistent code using Tempita</span>
+<span class="s0">(https://github.com/cython/cython/blob/master/Cython/Tempita/_tempita.py).</span>
+
+<span class="s0">Generated file: sag_fast.pyx</span>
+
+<span class="s0">Each class is duplicated for all dtypes (float and double). The keywords</span>
+<span class="s0">between double braces are substituted in setup.py.</span>
+
+<span class="s0">Authors: Danny Sullivan &lt;dbsullivan23@gmail.com&gt;</span>
+         <span class="s0">Tom Dupre la Tour &lt;tom.dupre-la-tour@m4x.org&gt;</span>
+         <span class="s0">Arthur Mensch &lt;arthur.mensch@m4x.org</span>
+         <span class="s0">Arthur Imbert &lt;arthurimbert05@gmail.com&gt;</span>
+         <span class="s0">Joan Massich &lt;mailsik@gmail.com&gt;</span>
+
+<span class="s0">License: BSD 3 clause</span>
+<span class="s0">&quot;&quot;&quot;</span>
+
+<span class="s0"># name_suffix, c_type, np_type</span>
+<span class="s0">dtypes = [('64', 'double', 'np.float64'),</span>
+          <span class="s0">('32', 'float', 'np.float32')]</span>
+
+<span class="s0">}}</span>
+<span class="s0">&quot;&quot;&quot;SAG and SAGA implementation&quot;&quot;&quot;</span>
+
+<span class="s0">import numpy as np</span>
+<span class="s0">from libc.math cimport exp, fabs, isfinite, log</span>
+<span class="s0">from libc.time cimport time, time_t</span>
+
+<span class="s0">from ._sgd_fast cimport LossFunction</span>
+<span class="s0">from ._sgd_fast cimport Log, SquaredLoss</span>
+
+<span class="s0">from ..utils._seq_dataset cimport SequentialDataset32, SequentialDataset64</span>
+
+<span class="s0">from libc.stdio cimport printf</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef inline {{c_type}} fmax{{name_suffix}}({{c_type}} x, {{c_type}} y) noexcept nogil:</span>
+    <span class="s0">if x &gt; y:</span>
+        <span class="s0">return x</span>
+    <span class="s0">return y</span>
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef {{c_type}} _logsumexp{{name_suffix}}({{c_type}}* arr, int n_classes) noexcept nogil:</span>
+    <span class="s0">&quot;&quot;&quot;Computes the sum of arr assuming arr is in the log domain.</span>
+
+    <span class="s0">Returns log(sum(exp(arr))) while minimizing the possibility of</span>
+    <span class="s0">over/underflow.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0"># Use the max to normalize, as with the log this is what accumulates</span>
+    <span class="s0"># the less errors</span>
+    <span class="s0">cdef {{c_type}} vmax = arr[0]</span>
+    <span class="s0">cdef {{c_type}} out = 0.0</span>
+    <span class="s0">cdef int i</span>
+
+    <span class="s0">for i in range(1, n_classes):</span>
+        <span class="s0">if vmax &lt; arr[i]:</span>
+            <span class="s0">vmax = arr[i]</span>
+
+    <span class="s0">for i in range(n_classes):</span>
+        <span class="s0">out += exp(arr[i] - vmax)</span>
+
+    <span class="s0">return log(out) + vmax</span>
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef class MultinomialLogLoss{{name_suffix}}:</span>
+    <span class="s0">cdef {{c_type}} _loss(self, {{c_type}} y, {{c_type}}* prediction, int n_classes,</span>
+                      <span class="s0">{{c_type}} sample_weight) noexcept nogil:</span>
+        <span class="s0">r&quot;&quot;&quot;Multinomial Logistic regression loss.</span>
+
+        <span class="s0">The multinomial logistic loss for one sample is:</span>
+        <span class="s0">loss = - sw \sum_c \delta_{y,c} (prediction[c] - logsumexp(prediction))</span>
+             <span class="s0">= sw (logsumexp(prediction) - prediction[y])</span>
+
+        <span class="s0">where:</span>
+            <span class="s0">prediction = dot(x_sample, weights) + intercept</span>
+            <span class="s0">\delta_{y,c} = 1 if (y == c) else 0</span>
+            <span class="s0">sw = sample_weight</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">y : {{c_type}}, between 0 and n_classes - 1</span>
+            <span class="s0">Indice of the correct class for current sample (i.e. label encoded).</span>
+
+        <span class="s0">prediction : pointer to a np.ndarray[{{c_type}}] of shape (n_classes,)</span>
+            <span class="s0">Prediction of the multinomial classifier, for current sample.</span>
+
+        <span class="s0">n_classes : integer</span>
+            <span class="s0">Total number of classes.</span>
+
+        <span class="s0">sample_weight : {{c_type}}</span>
+            <span class="s0">Weight of current sample.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">loss : {{c_type}}</span>
+            <span class="s0">Multinomial loss for current sample.</span>
+
+        <span class="s0">Reference</span>
+        <span class="s0">---------</span>
+        <span class="s0">Bishop, C. M. (2006). Pattern recognition and machine learning.</span>
+        <span class="s0">Springer. (Chapter 4.3.4)</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef {{c_type}} logsumexp_prediction = _logsumexp{{name_suffix}}(prediction, n_classes)</span>
+        <span class="s0">cdef {{c_type}} loss</span>
+
+        <span class="s0"># y is the indice of the correct class of current sample.</span>
+        <span class="s0">loss = (logsumexp_prediction - prediction[int(y)]) * sample_weight</span>
+        <span class="s0">return loss</span>
+
+    <span class="s0">cdef void dloss(self, {{c_type}} y, {{c_type}}* prediction, int n_classes,</span>
+                     <span class="s0">{{c_type}} sample_weight, {{c_type}}* gradient_ptr) noexcept nogil:</span>
+        <span class="s0">r&quot;&quot;&quot;Multinomial Logistic regression gradient of the loss.</span>
+
+        <span class="s0">The gradient of the multinomial logistic loss with respect to a class c,</span>
+        <span class="s0">and for one sample is:</span>
+        <span class="s0">grad_c = - sw * (p[c] - \delta_{y,c})</span>
+
+        <span class="s0">where:</span>
+            <span class="s0">p[c] = exp(logsumexp(prediction) - prediction[c])</span>
+            <span class="s0">prediction = dot(sample, weights) + intercept</span>
+            <span class="s0">\delta_{y,c} = 1 if (y == c) else 0</span>
+            <span class="s0">sw = sample_weight</span>
+
+        <span class="s0">Note that to obtain the true gradient, this value has to be multiplied</span>
+        <span class="s0">by the sample vector x.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">prediction : pointer to a np.ndarray[{{c_type}}] of shape (n_classes,)</span>
+            <span class="s0">Prediction of the multinomial classifier, for current sample.</span>
+
+        <span class="s0">y : {{c_type}}, between 0 and n_classes - 1</span>
+            <span class="s0">Indice of the correct class for current sample (i.e. label encoded)</span>
+
+        <span class="s0">n_classes : integer</span>
+            <span class="s0">Total number of classes.</span>
+
+        <span class="s0">sample_weight : {{c_type}}</span>
+            <span class="s0">Weight of current sample.</span>
+
+        <span class="s0">gradient_ptr : pointer to a np.ndarray[{{c_type}}] of shape (n_classes,)</span>
+            <span class="s0">Gradient vector to be filled.</span>
+
+        <span class="s0">Reference</span>
+        <span class="s0">---------</span>
+        <span class="s0">Bishop, C. M. (2006). Pattern recognition and machine learning.</span>
+        <span class="s0">Springer. (Chapter 4.3.4)</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef {{c_type}} logsumexp_prediction = _logsumexp{{name_suffix}}(prediction, n_classes)</span>
+        <span class="s0">cdef int class_ind</span>
+
+        <span class="s0">for class_ind in range(n_classes):</span>
+            <span class="s0">gradient_ptr[class_ind] = exp(prediction[class_ind] -</span>
+                                          <span class="s0">logsumexp_prediction)</span>
+
+            <span class="s0"># y is the indice of the correct class of current sample.</span>
+            <span class="s0">if class_ind == y:</span>
+                <span class="s0">gradient_ptr[class_ind] -= 1.0</span>
+
+            <span class="s0">gradient_ptr[class_ind] *= sample_weight</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return MultinomialLogLoss{{name_suffix}}, ()</span>
+
+<span class="s0">{{endfor}}</span>
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef inline {{c_type}} _soft_thresholding{{name_suffix}}({{c_type}} x, {{c_type}} shrinkage) noexcept nogil:</span>
+    <span class="s0">return fmax{{name_suffix}}(x - shrinkage, 0) - fmax{{name_suffix}}(- x - shrinkage, 0)</span>
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">def sag{{name_suffix}}(</span>
+    <span class="s0">SequentialDataset{{name_suffix}} dataset,</span>
+    <span class="s0">{{c_type}}[:, ::1] weights_array,</span>
+    <span class="s0">{{c_type}}[::1] intercept_array,</span>
+    <span class="s0">int n_samples,</span>
+    <span class="s0">int n_features,</span>
+    <span class="s0">int n_classes,</span>
+    <span class="s0">double tol,</span>
+    <span class="s0">int max_iter,</span>
+    <span class="s0">str loss_function,</span>
+    <span class="s0">double step_size,</span>
+    <span class="s0">double alpha,</span>
+    <span class="s0">double beta,</span>
+    <span class="s0">{{c_type}}[:, ::1] sum_gradient_init,</span>
+    <span class="s0">{{c_type}}[:, ::1] gradient_memory_init,</span>
+    <span class="s0">bint[::1] seen_init,</span>
+    <span class="s0">int num_seen,</span>
+    <span class="s0">bint fit_intercept,</span>
+    <span class="s0">{{c_type}}[::1] intercept_sum_gradient_init,</span>
+    <span class="s0">double intercept_decay,</span>
+    <span class="s0">bint saga,</span>
+    <span class="s0">bint verbose</span>
+<span class="s0">):</span>
+    <span class="s0">&quot;&quot;&quot;Stochastic Average Gradient (SAG) and SAGA solvers.</span>
+
+    <span class="s0">Used in Ridge and LogisticRegression.</span>
+
+    <span class="s0">Some implementation details:</span>
+
+    <span class="s0">- Just-in-time (JIT) update: In SAG(A), the average-gradient update is</span>
+    <span class="s0">collinear with the drawn sample X_i. Therefore, if the data is sparse, the</span>
+    <span class="s0">random sample X_i will change the average gradient only on features j where</span>
+    <span class="s0">X_ij != 0. In some cases, the average gradient on feature j might change</span>
+    <span class="s0">only after k random samples with no change. In these cases, instead of</span>
+    <span class="s0">applying k times the same gradient step on feature j, we apply the gradient</span>
+    <span class="s0">step only once, scaled by k. This is called the &quot;just-in-time update&quot;, and</span>
+    <span class="s0">it is performed in `lagged_update{{name_suffix}}`. This function also</span>
+    <span class="s0">applies the proximal operator after the gradient step (if L1 regularization</span>
+    <span class="s0">is used in SAGA).</span>
+
+    <span class="s0">- Weight scale: In SAG(A), the weights are scaled down at each iteration</span>
+    <span class="s0">due to the L2 regularization. To avoid updating all the weights at each</span>
+    <span class="s0">iteration, the weight scale is factored out in a separate variable `wscale`</span>
+    <span class="s0">which is only used in the JIT update. When this variable is too small, it</span>
+    <span class="s0">is reset for numerical stability using the function</span>
+    <span class="s0">`scale_weights{{name_suffix}}`. This reset requires applying all remaining</span>
+    <span class="s0">JIT updates. This reset is also performed every `n_samples` iterations</span>
+    <span class="s0">before each convergence check, so when the algorithm stops, we are sure</span>
+    <span class="s0">that there is no remaining JIT updates.</span>
+
+    <span class="s0">Reference</span>
+    <span class="s0">---------</span>
+    <span class="s0">Schmidt, M., Roux, N. L., &amp; Bach, F. (2013).</span>
+    <span class="s0">Minimizing finite sums with the stochastic average gradient</span>
+    <span class="s0">https://hal.inria.fr/hal-00860051/document</span>
+    <span class="s0">(section 4.3)</span>
+
+    <span class="s0">:arxiv:`Defazio, A., Bach F. &amp; Lacoste-Julien S. (2014).</span>
+    <span class="s0">&quot;SAGA: A Fast Incremental Gradient Method With Support</span>
+    <span class="s0">for Non-Strongly Convex Composite Objectives&quot; &lt;1407.0202&gt;`</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0"># the data pointer for x, the current sample</span>
+    <span class="s0">cdef {{c_type}} *x_data_ptr = NULL</span>
+    <span class="s0"># the index pointer for the column of the data</span>
+    <span class="s0">cdef int *x_ind_ptr = NULL</span>
+    <span class="s0"># the number of non-zero features for current sample</span>
+    <span class="s0">cdef int xnnz = -1</span>
+    <span class="s0"># the label value for current sample</span>
+    <span class="s0"># the label value for current sample</span>
+    <span class="s0">cdef {{c_type}} y</span>
+    <span class="s0"># the sample weight</span>
+    <span class="s0">cdef {{c_type}} sample_weight</span>
+
+    <span class="s0"># helper variable for indexes</span>
+    <span class="s0">cdef int f_idx, s_idx, feature_ind, class_ind, j</span>
+    <span class="s0"># the number of pass through all samples</span>
+    <span class="s0">cdef int n_iter = 0</span>
+    <span class="s0"># helper to track iterations through samples</span>
+    <span class="s0">cdef int sample_itr</span>
+    <span class="s0"># the index (row number) of the current sample</span>
+    <span class="s0">cdef int sample_ind</span>
+
+    <span class="s0"># the maximum change in weights, used to compute stopping criteria</span>
+    <span class="s0">cdef {{c_type}} max_change</span>
+    <span class="s0"># a holder variable for the max weight, used to compute stopping criteria</span>
+    <span class="s0">cdef {{c_type}} max_weight</span>
+
+    <span class="s0"># the start time of the fit</span>
+    <span class="s0">cdef time_t start_time</span>
+    <span class="s0"># the end time of the fit</span>
+    <span class="s0">cdef time_t end_time</span>
+
+    <span class="s0"># precomputation since the step size does not change in this implementation</span>
+    <span class="s0">cdef {{c_type}} wscale_update = 1.0 - step_size * alpha</span>
+
+    <span class="s0"># helper for cumulative sum</span>
+    <span class="s0">cdef {{c_type}} cum_sum</span>
+
+    <span class="s0"># the pointer to the coef_ or weights</span>
+    <span class="s0">cdef {{c_type}}* weights = &amp;weights_array[0, 0]</span>
+
+    <span class="s0"># the sum of gradients for each feature</span>
+    <span class="s0">cdef {{c_type}}* sum_gradient = &amp;sum_gradient_init[0, 0]</span>
+
+    <span class="s0"># the previously seen gradient for each sample</span>
+    <span class="s0">cdef {{c_type}}* gradient_memory = &amp;gradient_memory_init[0, 0]</span>
+
+    <span class="s0"># the cumulative sums needed for JIT params</span>
+    <span class="s0">cdef {{c_type}}[::1] cumulative_sums = np.empty(n_samples, dtype={{np_type}}, order=&quot;c&quot;)</span>
+
+    <span class="s0"># the index for the last time this feature was updated</span>
+    <span class="s0">cdef int[::1] feature_hist = np.zeros(n_features, dtype=np.int32, order=&quot;c&quot;)</span>
+
+    <span class="s0"># the previous weights to use to compute stopping criteria</span>
+    <span class="s0">cdef {{c_type}}[:, ::1] previous_weights_array = np.zeros((n_features, n_classes), dtype={{np_type}}, order=&quot;c&quot;)</span>
+    <span class="s0">cdef {{c_type}}* previous_weights = &amp;previous_weights_array[0, 0]</span>
+
+    <span class="s0">cdef {{c_type}}[::1] prediction = np.zeros(n_classes, dtype={{np_type}}, order=&quot;c&quot;)</span>
+
+    <span class="s0">cdef {{c_type}}[::1] gradient = np.zeros(n_classes, dtype={{np_type}}, order=&quot;c&quot;)</span>
+
+    <span class="s0"># Intermediate variable that need declaration since cython cannot infer when templating</span>
+    <span class="s0">cdef {{c_type}} val</span>
+
+    <span class="s0"># Bias correction term in saga</span>
+    <span class="s0">cdef {{c_type}} gradient_correction</span>
+
+    <span class="s0"># the scalar used for multiplying z</span>
+    <span class="s0">cdef {{c_type}} wscale = 1.0</span>
+
+    <span class="s0"># return value (-1 if an error occurred, 0 otherwise)</span>
+    <span class="s0">cdef int status = 0</span>
+
+    <span class="s0"># the cumulative sums for each iteration for the sparse implementation</span>
+    <span class="s0">cumulative_sums[0] = 0.0</span>
+
+    <span class="s0"># the multipliative scale needed for JIT params</span>
+    <span class="s0">cdef {{c_type}}[::1] cumulative_sums_prox</span>
+    <span class="s0">cdef {{c_type}}* cumulative_sums_prox_ptr</span>
+
+    <span class="s0">cdef bint prox = beta &gt; 0 and saga</span>
+
+    <span class="s0"># Loss function to optimize</span>
+    <span class="s0">cdef LossFunction loss</span>
+    <span class="s0"># Whether the loss function is multinomial</span>
+    <span class="s0">cdef bint multinomial = False</span>
+    <span class="s0"># Multinomial loss function</span>
+    <span class="s0">cdef MultinomialLogLoss{{name_suffix}} multiloss</span>
+
+    <span class="s0">if loss_function == &quot;multinomial&quot;:</span>
+        <span class="s0">multinomial = True</span>
+        <span class="s0">multiloss = MultinomialLogLoss{{name_suffix}}()</span>
+    <span class="s0">elif loss_function == &quot;log&quot;:</span>
+        <span class="s0">loss = Log()</span>
+    <span class="s0">elif loss_function == &quot;squared&quot;:</span>
+        <span class="s0">loss = SquaredLoss()</span>
+    <span class="s0">else:</span>
+        <span class="s0">raise ValueError(&quot;Invalid loss parameter: got %s instead of &quot;</span>
+                         <span class="s0">&quot;one of ('log', 'squared', 'multinomial')&quot;</span>
+                         <span class="s0">% loss_function)</span>
+
+    <span class="s0">if prox:</span>
+        <span class="s0">cumulative_sums_prox = np.empty(n_samples, dtype={{np_type}}, order=&quot;c&quot;)</span>
+        <span class="s0">cumulative_sums_prox_ptr = &amp;cumulative_sums_prox[0]</span>
+    <span class="s0">else:</span>
+        <span class="s0">cumulative_sums_prox = None</span>
+        <span class="s0">cumulative_sums_prox_ptr = NULL</span>
+
+    <span class="s0">with nogil:</span>
+        <span class="s0">start_time = time(NULL)</span>
+        <span class="s0">for n_iter in range(max_iter):</span>
+            <span class="s0">for sample_itr in range(n_samples):</span>
+                <span class="s0"># extract a random sample</span>
+                <span class="s0">sample_ind = dataset.random(&amp;x_data_ptr, &amp;x_ind_ptr, &amp;xnnz, &amp;y, &amp;sample_weight)</span>
+
+                <span class="s0"># cached index for gradient_memory</span>
+                <span class="s0">s_idx = sample_ind * n_classes</span>
+
+                <span class="s0"># update the number of samples seen and the seen array</span>
+                <span class="s0">if seen_init[sample_ind] == 0:</span>
+                    <span class="s0">num_seen += 1</span>
+                    <span class="s0">seen_init[sample_ind] = 1</span>
+
+                <span class="s0"># make the weight updates (just-in-time gradient step, and prox operator)</span>
+                <span class="s0">if sample_itr &gt; 0:</span>
+                   <span class="s0">status = lagged_update{{name_suffix}}(</span>
+                       <span class="s0">weights=weights,</span>
+                       <span class="s0">wscale=wscale,</span>
+                       <span class="s0">xnnz=xnnz,</span>
+                       <span class="s0">n_samples=n_samples,</span>
+                       <span class="s0">n_classes=n_classes,</span>
+                       <span class="s0">sample_itr=sample_itr,</span>
+                       <span class="s0">cumulative_sums=&amp;cumulative_sums[0],</span>
+                       <span class="s0">cumulative_sums_prox=cumulative_sums_prox_ptr,</span>
+                       <span class="s0">feature_hist=&amp;feature_hist[0],</span>
+                       <span class="s0">prox=prox,</span>
+                       <span class="s0">sum_gradient=sum_gradient,</span>
+                       <span class="s0">x_ind_ptr=x_ind_ptr,</span>
+                       <span class="s0">reset=False,</span>
+                       <span class="s0">n_iter=n_iter</span>
+                   <span class="s0">)</span>
+                   <span class="s0">if status == -1:</span>
+                       <span class="s0">break</span>
+
+                <span class="s0"># find the current prediction</span>
+                <span class="s0">predict_sample{{name_suffix}}(</span>
+                    <span class="s0">x_data_ptr=x_data_ptr,</span>
+                    <span class="s0">x_ind_ptr=x_ind_ptr,</span>
+                    <span class="s0">xnnz=xnnz,</span>
+                    <span class="s0">w_data_ptr=weights,</span>
+                    <span class="s0">wscale=wscale,</span>
+                    <span class="s0">intercept=&amp;intercept_array[0],</span>
+                    <span class="s0">prediction=&amp;prediction[0],</span>
+                    <span class="s0">n_classes=n_classes</span>
+                <span class="s0">)</span>
+
+                <span class="s0"># compute the gradient for this sample, given the prediction</span>
+                <span class="s0">if multinomial:</span>
+                    <span class="s0">multiloss.dloss(y, &amp;prediction[0], n_classes, sample_weight, &amp;gradient[0])</span>
+                <span class="s0">else:</span>
+                    <span class="s0">gradient[0] = loss.dloss(y, prediction[0]) * sample_weight</span>
+
+                <span class="s0"># L2 regularization by simply rescaling the weights</span>
+                <span class="s0">wscale *= wscale_update</span>
+
+                <span class="s0"># make the updates to the sum of gradients</span>
+                <span class="s0">for j in range(xnnz):</span>
+                    <span class="s0">feature_ind = x_ind_ptr[j]</span>
+                    <span class="s0">val = x_data_ptr[j]</span>
+                    <span class="s0">f_idx = feature_ind * n_classes</span>
+                    <span class="s0">for class_ind in range(n_classes):</span>
+                        <span class="s0">gradient_correction = \</span>
+                            <span class="s0">val * (gradient[class_ind] -</span>
+                                   <span class="s0">gradient_memory[s_idx + class_ind])</span>
+                        <span class="s0">if saga:</span>
+                            <span class="s0"># Note that this is not the main gradient step,</span>
+                            <span class="s0"># which is performed just-in-time in lagged_update.</span>
+                            <span class="s0"># This part is done outside the JIT update</span>
+                            <span class="s0"># as it does not depend on the average gradient.</span>
+                            <span class="s0"># The prox operator is applied after the JIT update</span>
+                            <span class="s0">weights[f_idx + class_ind] -= \</span>
+                                <span class="s0">(gradient_correction * step_size</span>
+                                 <span class="s0">* (1 - 1. / num_seen) / wscale)</span>
+                        <span class="s0">sum_gradient[f_idx + class_ind] += gradient_correction</span>
+
+                <span class="s0"># fit the intercept</span>
+                <span class="s0">if fit_intercept:</span>
+                    <span class="s0">for class_ind in range(n_classes):</span>
+                        <span class="s0">gradient_correction = (gradient[class_ind] -</span>
+                                               <span class="s0">gradient_memory[s_idx + class_ind])</span>
+                        <span class="s0">intercept_sum_gradient_init[class_ind] += gradient_correction</span>
+                        <span class="s0">gradient_correction *= step_size * (1. - 1. / num_seen)</span>
+                        <span class="s0">if saga:</span>
+                            <span class="s0">intercept_array[class_ind] -= \</span>
+                                <span class="s0">(step_size * intercept_sum_gradient_init[class_ind] /</span>
+                                 <span class="s0">num_seen * intercept_decay) + gradient_correction</span>
+                        <span class="s0">else:</span>
+                            <span class="s0">intercept_array[class_ind] -= \</span>
+                                <span class="s0">(step_size * intercept_sum_gradient_init[class_ind] /</span>
+                                 <span class="s0">num_seen * intercept_decay)</span>
+
+                        <span class="s0"># check to see that the intercept is not inf or NaN</span>
+                        <span class="s0">if not isfinite(intercept_array[class_ind]):</span>
+                            <span class="s0">status = -1</span>
+                            <span class="s0">break</span>
+                    <span class="s0"># Break from the n_samples outer loop if an error happened</span>
+                    <span class="s0"># in the fit_intercept n_classes inner loop</span>
+                    <span class="s0">if status == -1:</span>
+                        <span class="s0">break</span>
+
+                <span class="s0"># update the gradient memory for this sample</span>
+                <span class="s0">for class_ind in range(n_classes):</span>
+                    <span class="s0">gradient_memory[s_idx + class_ind] = gradient[class_ind]</span>
+
+                <span class="s0">if sample_itr == 0:</span>
+                    <span class="s0">cumulative_sums[0] = step_size / (wscale * num_seen)</span>
+                    <span class="s0">if prox:</span>
+                        <span class="s0">cumulative_sums_prox[0] = step_size * beta / wscale</span>
+                <span class="s0">else:</span>
+                    <span class="s0">cumulative_sums[sample_itr] = \</span>
+                        <span class="s0">(cumulative_sums[sample_itr - 1] +</span>
+                         <span class="s0">step_size / (wscale * num_seen))</span>
+                    <span class="s0">if prox:</span>
+                        <span class="s0">cumulative_sums_prox[sample_itr] = \</span>
+                        <span class="s0">(cumulative_sums_prox[sample_itr - 1] +</span>
+                             <span class="s0">step_size * beta / wscale)</span>
+                <span class="s0"># If wscale gets too small, we need to reset the scale.</span>
+                <span class="s0"># This also resets the just-in-time update system.</span>
+                <span class="s0">if wscale &lt; 1e-9:</span>
+                    <span class="s0">if verbose:</span>
+                        <span class="s0">with gil:</span>
+                            <span class="s0">print(&quot;rescaling...&quot;)</span>
+                    <span class="s0">status = scale_weights{{name_suffix}}(</span>
+                        <span class="s0">weights=weights,</span>
+                        <span class="s0">wscale=&amp;wscale,</span>
+                        <span class="s0">n_features=n_features,</span>
+                        <span class="s0">n_samples=n_samples,</span>
+                        <span class="s0">n_classes=n_classes,</span>
+                        <span class="s0">sample_itr=sample_itr,</span>
+                        <span class="s0">cumulative_sums=&amp;cumulative_sums[0],</span>
+                        <span class="s0">cumulative_sums_prox=cumulative_sums_prox_ptr,</span>
+                        <span class="s0">feature_hist=&amp;feature_hist[0],</span>
+                        <span class="s0">prox=prox,</span>
+                        <span class="s0">sum_gradient=sum_gradient,</span>
+                        <span class="s0">n_iter=n_iter</span>
+                    <span class="s0">)</span>
+                    <span class="s0">if status == -1:</span>
+                        <span class="s0">break</span>
+
+            <span class="s0"># Break from the n_iter outer loop if an error happened in the</span>
+            <span class="s0"># n_samples inner loop</span>
+            <span class="s0">if status == -1:</span>
+                <span class="s0">break</span>
+
+            <span class="s0"># We scale the weights every n_samples iterations and reset the</span>
+            <span class="s0"># just-in-time update system for numerical stability.</span>
+            <span class="s0"># Because this reset is done before every convergence check, we are</span>
+            <span class="s0"># sure there is no remaining lagged update when the algorithm stops.</span>
+            <span class="s0">status = scale_weights{{name_suffix}}(</span>
+                <span class="s0">weights=weights,</span>
+                <span class="s0">wscale=&amp;wscale,</span>
+                <span class="s0">n_features=n_features,</span>
+                <span class="s0">n_samples=n_samples,</span>
+                <span class="s0">n_classes=n_classes,</span>
+                <span class="s0">sample_itr=n_samples - 1,</span>
+                <span class="s0">cumulative_sums=&amp;cumulative_sums[0],</span>
+                <span class="s0">cumulative_sums_prox=cumulative_sums_prox_ptr,</span>
+                <span class="s0">feature_hist=&amp;feature_hist[0],</span>
+                <span class="s0">prox=prox,</span>
+                <span class="s0">sum_gradient=sum_gradient,</span>
+                <span class="s0">n_iter=n_iter</span>
+            <span class="s0">)</span>
+            <span class="s0">if status == -1:</span>
+                <span class="s0">break</span>
+
+            <span class="s0"># check if the stopping criteria is reached</span>
+            <span class="s0">max_change = 0.0</span>
+            <span class="s0">max_weight = 0.0</span>
+            <span class="s0">for idx in range(n_features * n_classes):</span>
+                <span class="s0">max_weight = fmax{{name_suffix}}(max_weight, fabs(weights[idx]))</span>
+                <span class="s0">max_change = fmax{{name_suffix}}(max_change, fabs(weights[idx] - previous_weights[idx]))</span>
+                <span class="s0">previous_weights[idx] = weights[idx]</span>
+            <span class="s0">if ((max_weight != 0 and max_change / max_weight &lt;= tol)</span>
+                <span class="s0">or max_weight == 0 and max_change == 0):</span>
+                <span class="s0">if verbose:</span>
+                    <span class="s0">end_time = time(NULL)</span>
+                    <span class="s0">with gil:</span>
+                        <span class="s0">print(&quot;convergence after %d epochs took %d seconds&quot; %</span>
+                              <span class="s0">(n_iter + 1, end_time - start_time))</span>
+                <span class="s0">break</span>
+            <span class="s0">elif verbose:</span>
+                <span class="s0">printf('Epoch %d, change: %.8f\n', n_iter + 1,</span>
+                                                  <span class="s0">max_change / max_weight)</span>
+    <span class="s0">n_iter += 1</span>
+    <span class="s0"># We do the error treatment here based on error code in status to avoid</span>
+    <span class="s0"># re-acquiring the GIL within the cython code, which slows the computation</span>
+    <span class="s0"># when the sag/saga solver is used concurrently in multiple Python threads.</span>
+    <span class="s0">if status == -1:</span>
+        <span class="s0">raise ValueError((&quot;Floating-point under-/overflow occurred at epoch&quot;</span>
+                          <span class="s0">&quot; #%d. Scaling input data with StandardScaler or&quot;</span>
+                          <span class="s0">&quot; MinMaxScaler might help.&quot;) % n_iter)</span>
+
+    <span class="s0">if verbose and n_iter &gt;= max_iter:</span>
+        <span class="s0">end_time = time(NULL)</span>
+        <span class="s0">print((&quot;max_iter reached after %d seconds&quot;) %</span>
+              <span class="s0">(end_time - start_time))</span>
+
+    <span class="s0">return num_seen, n_iter</span>
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef int scale_weights{{name_suffix}}(</span>
+    <span class="s0">{{c_type}}* weights,</span>
+    <span class="s0">{{c_type}}* wscale,</span>
+    <span class="s0">int n_features,</span>
+    <span class="s0">int n_samples,</span>
+    <span class="s0">int n_classes,</span>
+    <span class="s0">int sample_itr,</span>
+    <span class="s0">{{c_type}}* cumulative_sums,</span>
+    <span class="s0">{{c_type}}* cumulative_sums_prox,</span>
+    <span class="s0">int* feature_hist,</span>
+    <span class="s0">bint prox,</span>
+    <span class="s0">{{c_type}}* sum_gradient,</span>
+    <span class="s0">int n_iter</span>
+<span class="s0">) noexcept nogil:</span>
+    <span class="s0">&quot;&quot;&quot;Scale the weights and reset wscale to 1.0 for numerical stability, and</span>
+    <span class="s0">reset the just-in-time (JIT) update system.</span>
+
+    <span class="s0">See `sag{{name_suffix}}`'s docstring about the JIT update system.</span>
+
+    <span class="s0">wscale = (1 - step_size * alpha) ** (n_iter * n_samples + sample_itr)</span>
+    <span class="s0">can become very small, so we reset it every n_samples iterations to 1.0 for</span>
+    <span class="s0">numerical stability. To be able to scale, we first need to update every</span>
+    <span class="s0">coefficients and reset the just-in-time update system.</span>
+    <span class="s0">This also limits the size of `cumulative_sums`.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef int status</span>
+    <span class="s0">status = lagged_update{{name_suffix}}(</span>
+        <span class="s0">weights,</span>
+        <span class="s0">wscale[0],</span>
+        <span class="s0">n_features,</span>
+        <span class="s0">n_samples,</span>
+        <span class="s0">n_classes,</span>
+        <span class="s0">sample_itr + 1,</span>
+        <span class="s0">cumulative_sums,</span>
+        <span class="s0">cumulative_sums_prox,</span>
+        <span class="s0">feature_hist,</span>
+        <span class="s0">prox,</span>
+        <span class="s0">sum_gradient,</span>
+        <span class="s0">NULL,</span>
+        <span class="s0">True,</span>
+        <span class="s0">n_iter</span>
+    <span class="s0">)</span>
+    <span class="s0"># if lagged update succeeded, reset wscale to 1.0</span>
+    <span class="s0">if status == 0:</span>
+        <span class="s0">wscale[0] = 1.0</span>
+    <span class="s0">return status</span>
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef int lagged_update{{name_suffix}}(</span>
+    <span class="s0">{{c_type}}* weights,</span>
+    <span class="s0">{{c_type}} wscale,</span>
+    <span class="s0">int xnnz,</span>
+    <span class="s0">int n_samples,</span>
+    <span class="s0">int n_classes,</span>
+    <span class="s0">int sample_itr,</span>
+    <span class="s0">{{c_type}}* cumulative_sums,</span>
+    <span class="s0">{{c_type}}* cumulative_sums_prox,</span>
+    <span class="s0">int* feature_hist,</span>
+    <span class="s0">bint prox,</span>
+    <span class="s0">{{c_type}}* sum_gradient,</span>
+    <span class="s0">int* x_ind_ptr,</span>
+    <span class="s0">bint reset,</span>
+    <span class="s0">int n_iter</span>
+<span class="s0">) noexcept nogil:</span>
+    <span class="s0">&quot;&quot;&quot;Hard perform the JIT updates for non-zero features of present sample.</span>
+
+    <span class="s0">See `sag{{name_suffix}}`'s docstring about the JIT update system.</span>
+
+    <span class="s0">The updates that awaits are kept in memory using cumulative_sums,</span>
+    <span class="s0">cumulative_sums_prox, wscale and feature_hist. See original SAGA paper</span>
+    <span class="s0">(Defazio et al. 2014) for details. If reset=True, we also reset wscale to</span>
+    <span class="s0">1 (this is done at the end of each epoch).</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef int feature_ind, class_ind, idx, f_idx, lagged_ind, last_update_ind</span>
+    <span class="s0">cdef {{c_type}} cum_sum, grad_step, prox_step, cum_sum_prox</span>
+    <span class="s0">for feature_ind in range(xnnz):</span>
+        <span class="s0">if not reset:</span>
+            <span class="s0">feature_ind = x_ind_ptr[feature_ind]</span>
+        <span class="s0">f_idx = feature_ind * n_classes</span>
+
+        <span class="s0">cum_sum = cumulative_sums[sample_itr - 1]</span>
+        <span class="s0">if prox:</span>
+            <span class="s0">cum_sum_prox = cumulative_sums_prox[sample_itr - 1]</span>
+        <span class="s0">if feature_hist[feature_ind] != 0:</span>
+            <span class="s0">cum_sum -= cumulative_sums[feature_hist[feature_ind] - 1]</span>
+            <span class="s0">if prox:</span>
+                <span class="s0">cum_sum_prox -= cumulative_sums_prox[feature_hist[feature_ind] - 1]</span>
+        <span class="s0">if not prox:</span>
+            <span class="s0">for class_ind in range(n_classes):</span>
+                <span class="s0">idx = f_idx + class_ind</span>
+                <span class="s0">weights[idx] -= cum_sum * sum_gradient[idx]</span>
+                <span class="s0">if reset:</span>
+                    <span class="s0">weights[idx] *= wscale</span>
+                    <span class="s0">if not isfinite(weights[idx]):</span>
+                        <span class="s0"># returning here does not require the gil as the return</span>
+                        <span class="s0"># type is a C integer</span>
+                        <span class="s0">return -1</span>
+        <span class="s0">else:</span>
+            <span class="s0">for class_ind in range(n_classes):</span>
+                <span class="s0">idx = f_idx + class_ind</span>
+                <span class="s0">if fabs(sum_gradient[idx] * cum_sum) &lt; cum_sum_prox:</span>
+                    <span class="s0"># In this case, we can perform all the gradient steps and</span>
+                    <span class="s0"># all the proximal steps in this order, which is more</span>
+                    <span class="s0"># efficient than unrolling all the lagged updates.</span>
+                    <span class="s0"># Idea taken from scikit-learn-contrib/lightning.</span>
+                    <span class="s0">weights[idx] -= cum_sum * sum_gradient[idx]</span>
+                    <span class="s0">weights[idx] = _soft_thresholding{{name_suffix}}(weights[idx],</span>
+                                                      <span class="s0">cum_sum_prox)</span>
+                <span class="s0">else:</span>
+                    <span class="s0">last_update_ind = feature_hist[feature_ind]</span>
+                    <span class="s0">if last_update_ind == -1:</span>
+                        <span class="s0">last_update_ind = sample_itr - 1</span>
+                    <span class="s0">for lagged_ind in range(sample_itr - 1,</span>
+                                   <span class="s0">last_update_ind - 1, -1):</span>
+                        <span class="s0">if lagged_ind &gt; 0:</span>
+                            <span class="s0">grad_step = (cumulative_sums[lagged_ind]</span>
+                               <span class="s0">- cumulative_sums[lagged_ind - 1])</span>
+                            <span class="s0">prox_step = (cumulative_sums_prox[lagged_ind]</span>
+                               <span class="s0">- cumulative_sums_prox[lagged_ind - 1])</span>
+                        <span class="s0">else:</span>
+                            <span class="s0">grad_step = cumulative_sums[lagged_ind]</span>
+                            <span class="s0">prox_step = cumulative_sums_prox[lagged_ind]</span>
+                        <span class="s0">weights[idx] -= sum_gradient[idx] * grad_step</span>
+                        <span class="s0">weights[idx] = _soft_thresholding{{name_suffix}}(weights[idx],</span>
+                                                          <span class="s0">prox_step)</span>
+
+                <span class="s0">if reset:</span>
+                    <span class="s0">weights[idx] *= wscale</span>
+                    <span class="s0"># check to see that the weight is not inf or NaN</span>
+                    <span class="s0">if not isfinite(weights[idx]):</span>
+                        <span class="s0">return -1</span>
+        <span class="s0">if reset:</span>
+            <span class="s0">feature_hist[feature_ind] = sample_itr % n_samples</span>
+        <span class="s0">else:</span>
+            <span class="s0">feature_hist[feature_ind] = sample_itr</span>
+
+    <span class="s0">if reset:</span>
+        <span class="s0">cumulative_sums[sample_itr - 1] = 0.0</span>
+        <span class="s0">if prox:</span>
+            <span class="s0">cumulative_sums_prox[sample_itr - 1] = 0.0</span>
+
+    <span class="s0">return 0</span>
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef void predict_sample{{name_suffix}}(</span>
+    <span class="s0">{{c_type}}* x_data_ptr,</span>
+    <span class="s0">int* x_ind_ptr,</span>
+    <span class="s0">int xnnz,</span>
+    <span class="s0">{{c_type}}* w_data_ptr,</span>
+    <span class="s0">{{c_type}} wscale,</span>
+    <span class="s0">{{c_type}}* intercept,</span>
+    <span class="s0">{{c_type}}* prediction,</span>
+    <span class="s0">int n_classes</span>
+<span class="s0">) noexcept nogil:</span>
+    <span class="s0">&quot;&quot;&quot;Compute the prediction given sparse sample x and dense weight w.</span>
+
+    <span class="s0">Parameters</span>
+    <span class="s0">----------</span>
+    <span class="s0">x_data_ptr : pointer</span>
+        <span class="s0">Pointer to the data of the sample x</span>
+
+    <span class="s0">x_ind_ptr : pointer</span>
+        <span class="s0">Pointer to the indices of the sample  x</span>
+
+    <span class="s0">xnnz : int</span>
+        <span class="s0">Number of non-zero element in the sample  x</span>
+
+    <span class="s0">w_data_ptr : pointer</span>
+        <span class="s0">Pointer to the data of the weights w</span>
+
+    <span class="s0">wscale : {{c_type}}</span>
+        <span class="s0">Scale of the weights w</span>
+
+    <span class="s0">intercept : pointer</span>
+        <span class="s0">Pointer to the intercept</span>
+
+    <span class="s0">prediction : pointer</span>
+        <span class="s0">Pointer to store the resulting prediction</span>
+
+    <span class="s0">n_classes : int</span>
+        <span class="s0">Number of classes in multinomial case. Equals 1 in binary case.</span>
+
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef int feature_ind, class_ind, j</span>
+    <span class="s0">cdef {{c_type}} innerprod</span>
+
+    <span class="s0">for class_ind in range(n_classes):</span>
+        <span class="s0">innerprod = 0.0</span>
+        <span class="s0"># Compute the dot product only on non-zero elements of x</span>
+        <span class="s0">for j in range(xnnz):</span>
+            <span class="s0">feature_ind = x_ind_ptr[j]</span>
+            <span class="s0">innerprod += (w_data_ptr[feature_ind * n_classes + class_ind] *</span>
+                          <span class="s0">x_data_ptr[j])</span>
+
+        <span class="s0">prediction[class_ind] = wscale * innerprod + intercept[class_ind]</span>
+
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">def _multinomial_grad_loss_all_samples(</span>
+    <span class="s0">SequentialDataset64 dataset,</span>
+    <span class="s0">double[:, ::1] weights_array,</span>
+    <span class="s0">double[::1] intercept_array,</span>
+    <span class="s0">int n_samples,</span>
+    <span class="s0">int n_features,</span>
+    <span class="s0">int n_classes</span>
+<span class="s0">):</span>
+    <span class="s0">&quot;&quot;&quot;Compute multinomial gradient and loss across all samples.</span>
+
+    <span class="s0">Used for testing purpose only.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef double *x_data_ptr = NULL</span>
+    <span class="s0">cdef int *x_ind_ptr = NULL</span>
+    <span class="s0">cdef int xnnz = -1</span>
+    <span class="s0">cdef double y</span>
+    <span class="s0">cdef double sample_weight</span>
+
+    <span class="s0">cdef double wscale = 1.0</span>
+    <span class="s0">cdef int i, j, class_ind, feature_ind</span>
+    <span class="s0">cdef double val</span>
+    <span class="s0">cdef double sum_loss = 0.0</span>
+
+    <span class="s0">cdef MultinomialLogLoss64 multiloss = MultinomialLogLoss64()</span>
+
+    <span class="s0">cdef double[:, ::1] sum_gradient_array = np.zeros((n_features, n_classes), dtype=np.double, order=&quot;c&quot;)</span>
+    <span class="s0">cdef double* sum_gradient = &amp;sum_gradient_array[0, 0]</span>
+
+    <span class="s0">cdef double[::1] prediction = np.zeros(n_classes, dtype=np.double, order=&quot;c&quot;)</span>
+
+    <span class="s0">cdef double[::1] gradient = np.zeros(n_classes, dtype=np.double, order=&quot;c&quot;)</span>
+
+    <span class="s0">with nogil:</span>
+        <span class="s0">for i in range(n_samples):</span>
+            <span class="s0"># get next sample on the dataset</span>
+            <span class="s0">dataset.next(</span>
+                <span class="s0">&amp;x_data_ptr,</span>
+                <span class="s0">&amp;x_ind_ptr,</span>
+                <span class="s0">&amp;xnnz,</span>
+                <span class="s0">&amp;y,</span>
+                <span class="s0">&amp;sample_weight</span>
+            <span class="s0">)</span>
+
+            <span class="s0"># prediction of the multinomial classifier for the sample</span>
+            <span class="s0">predict_sample64(</span>
+                <span class="s0">x_data_ptr,</span>
+                <span class="s0">x_ind_ptr,</span>
+                <span class="s0">xnnz,</span>
+                <span class="s0">&amp;weights_array[0, 0],</span>
+                <span class="s0">wscale,</span>
+                <span class="s0">&amp;intercept_array[0],</span>
+                <span class="s0">&amp;prediction[0],</span>
+                <span class="s0">n_classes</span>
+            <span class="s0">)</span>
+
+            <span class="s0"># compute the gradient for this sample, given the prediction</span>
+            <span class="s0">multiloss.dloss(y, &amp;prediction[0], n_classes, sample_weight, &amp;gradient[0])</span>
+
+            <span class="s0"># compute the loss for this sample, given the prediction</span>
+            <span class="s0">sum_loss += multiloss._loss(y, &amp;prediction[0], n_classes, sample_weight)</span>
+
+            <span class="s0"># update the sum of the gradient</span>
+            <span class="s0">for j in range(xnnz):</span>
+                <span class="s0">feature_ind = x_ind_ptr[j]</span>
+                <span class="s0">val = x_data_ptr[j]</span>
+                <span class="s0">for class_ind in range(n_classes):</span>
+                    <span class="s0">sum_gradient[feature_ind * n_classes + class_ind] += gradient[class_ind] * val</span>
+
+    <span class="s0">return sum_loss, sum_gradient_array</span>
+</pre>
+</body>
+</html>

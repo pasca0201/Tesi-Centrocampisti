@@ -1,0 +1,317 @@
+<html>
+<head>
+<title>_barnes_hut_tsne.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_barnes_hut_tsne.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0"># Author: Christopher Moody &lt;chrisemoody@gmail.com&gt;</span>
+<span class="s0"># Author: Nick Travers &lt;nickt@squareup.com&gt;</span>
+<span class="s0"># Implementation by Chris Moody &amp; Nick Travers</span>
+<span class="s0"># See http://homepage.tudelft.nl/19j49/t-SNE.html for reference</span>
+<span class="s0"># implementations and papers describing the technique</span>
+
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">cimport </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">cnp</span>
+<span class="s2">from </span><span class="s1">libc</span><span class="s3">.</span><span class="s1">stdio </span><span class="s2">cimport </span><span class="s1">printf</span>
+<span class="s2">from </span><span class="s1">libc</span><span class="s3">.</span><span class="s1">math </span><span class="s2">cimport </span><span class="s1">log</span>
+<span class="s2">from </span><span class="s1">libc</span><span class="s3">.</span><span class="s1">stdlib </span><span class="s2">cimport </span><span class="s1">malloc</span><span class="s3">, </span><span class="s1">free</span>
+<span class="s2">from </span><span class="s1">libc</span><span class="s3">.</span><span class="s1">time </span><span class="s2">cimport </span><span class="s1">clock</span><span class="s3">, </span><span class="s1">clock_t</span>
+<span class="s2">from </span><span class="s1">cython</span><span class="s3">.</span><span class="s1">parallel </span><span class="s2">cimport </span><span class="s1">prange</span><span class="s3">, </span><span class="s1">parallel</span>
+
+<span class="s2">from </span><span class="s3">..</span><span class="s1">neighbors</span><span class="s3">.</span><span class="s1">_quad_tree </span><span class="s2">cimport </span><span class="s1">_QuadTree</span>
+
+<span class="s1">cnp</span><span class="s3">.</span><span class="s1">import_array</span><span class="s3">()</span>
+
+
+<span class="s2">cdef </span><span class="s1">char</span><span class="s3">* </span><span class="s1">EMPTY_STRING </span><span class="s3">= </span><span class="s4">&quot;&quot;</span>
+
+<span class="s0"># Smallest strictly positive value that can be represented by floating</span>
+<span class="s0"># point numbers for different precision levels. This is useful to avoid</span>
+<span class="s0"># taking the log of zero when computing the KL divergence.</span>
+<span class="s2">cdef </span><span class="s1">float FLOAT32_TINY </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">).</span><span class="s1">tiny</span>
+
+<span class="s0"># Useful to void division by zero or divergence to +inf.</span>
+<span class="s2">cdef </span><span class="s1">float FLOAT64_EPS </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">).</span><span class="s1">eps</span>
+
+<span class="s0"># This is effectively an ifdef statement in Cython</span>
+<span class="s0"># It allows us to write printf debugging lines</span>
+<span class="s0"># and remove them at compile time</span>
+<span class="s2">cdef </span><span class="s1">enum</span><span class="s3">:</span>
+    <span class="s1">DEBUGFLAG </span><span class="s3">= </span><span class="s5">0</span>
+
+<span class="s2">cdef </span><span class="s1">float compute_gradient</span><span class="s3">(</span><span class="s1">float</span><span class="s3">[:] </span><span class="s1">val_P</span><span class="s3">,</span>
+                            <span class="s1">float</span><span class="s3">[:, :] </span><span class="s1">pos_reference</span><span class="s3">,</span>
+                            <span class="s1">cnp</span><span class="s3">.</span><span class="s1">int64_t</span><span class="s3">[:] </span><span class="s1">neighbors</span><span class="s3">,</span>
+                            <span class="s1">cnp</span><span class="s3">.</span><span class="s1">int64_t</span><span class="s3">[:] </span><span class="s1">indptr</span><span class="s3">,</span>
+                            <span class="s1">float</span><span class="s3">[:, :] </span><span class="s1">tot_force</span><span class="s3">,</span>
+                            <span class="s1">_QuadTree qt</span><span class="s3">,</span>
+                            <span class="s1">float theta</span><span class="s3">,</span>
+                            <span class="s1">int dof</span><span class="s3">,</span>
+                            <span class="s1">long start</span><span class="s3">,</span>
+                            <span class="s1">bint compute_error</span><span class="s3">,</span>
+                            <span class="s1">int num_threads</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s0"># Having created the tree, calculate the gradient</span>
+    <span class="s0"># in two components, the positive and negative forces</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">long i</span><span class="s3">, </span><span class="s1">coord</span>
+        <span class="s1">int ax</span>
+        <span class="s1">long n_samples </span><span class="s3">= </span><span class="s1">pos_reference</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">int n_dimensions </span><span class="s3">= </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">n_dimensions</span>
+        <span class="s1">clock_t t1 </span><span class="s3">= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">t2 </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">double sQ</span>
+        <span class="s1">float error</span>
+        <span class="s1">int take_timing </span><span class="s3">= </span><span class="s5">1 </span><span class="s2">if </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">15 </span><span class="s2">else </span><span class="s5">0</span>
+
+    <span class="s2">if </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">11</span><span class="s3">:</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Allocating %li elements in force arrays</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">,</span>
+               <span class="s1">n_samples </span><span class="s3">* </span><span class="s1">n_dimensions </span><span class="s3">* </span><span class="s5">2</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">float</span><span class="s3">* </span><span class="s1">neg_f </span><span class="s3">= &lt;</span><span class="s1">float</span><span class="s3">*&gt; </span><span class="s1">malloc</span><span class="s3">(</span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s1">n_samples </span><span class="s3">* </span><span class="s1">n_dimensions</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">float</span><span class="s3">* </span><span class="s1">pos_f </span><span class="s3">= &lt;</span><span class="s1">float</span><span class="s3">*&gt; </span><span class="s1">malloc</span><span class="s3">(</span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s1">n_samples </span><span class="s3">* </span><span class="s1">n_dimensions</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+        <span class="s1">t1 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+    <span class="s1">sQ </span><span class="s3">= </span><span class="s1">compute_gradient_negative</span><span class="s3">(</span><span class="s1">pos_reference</span><span class="s3">, </span><span class="s1">neg_f</span><span class="s3">, </span><span class="s1">qt</span><span class="s3">, </span><span class="s1">dof</span><span class="s3">, </span><span class="s1">theta</span><span class="s3">, </span><span class="s1">start</span><span class="s3">,</span>
+                                   <span class="s1">num_threads</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+        <span class="s1">t2 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Computing negative gradient: %e ticks</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">, ((</span><span class="s1">float</span><span class="s3">) (</span><span class="s1">t2 </span><span class="s3">- </span><span class="s1">t1</span><span class="s3">)))</span>
+
+    <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+        <span class="s1">t1 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+    <span class="s1">error </span><span class="s3">= </span><span class="s1">compute_gradient_positive</span><span class="s3">(</span><span class="s1">val_P</span><span class="s3">, </span><span class="s1">pos_reference</span><span class="s3">, </span><span class="s1">neighbors</span><span class="s3">, </span><span class="s1">indptr</span><span class="s3">,</span>
+                                      <span class="s1">pos_f</span><span class="s3">, </span><span class="s1">n_dimensions</span><span class="s3">, </span><span class="s1">dof</span><span class="s3">, </span><span class="s1">sQ</span><span class="s3">, </span><span class="s1">start</span><span class="s3">,</span>
+                                      <span class="s1">qt</span><span class="s3">.</span><span class="s1">verbose</span><span class="s3">, </span><span class="s1">compute_error</span><span class="s3">, </span><span class="s1">num_threads</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+        <span class="s1">t2 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Computing positive gradient: %e ticks</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">,</span>
+               <span class="s3">((</span><span class="s1">float</span><span class="s3">) (</span><span class="s1">t2 </span><span class="s3">- </span><span class="s1">t1</span><span class="s3">)))</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">prange</span><span class="s3">(</span><span class="s1">start</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">nogil</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">num_threads</span><span class="s3">=</span><span class="s1">num_threads</span><span class="s3">,</span>
+                    <span class="s1">schedule</span><span class="s3">=</span><span class="s4">'static'</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dimensions</span><span class="s3">):</span>
+            <span class="s1">coord </span><span class="s3">= </span><span class="s1">i </span><span class="s3">* </span><span class="s1">n_dimensions </span><span class="s3">+ </span><span class="s1">ax</span>
+            <span class="s1">tot_force</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s1">ax</span><span class="s3">] = </span><span class="s1">pos_f</span><span class="s3">[</span><span class="s1">coord</span><span class="s3">] - (</span><span class="s1">neg_f</span><span class="s3">[</span><span class="s1">coord</span><span class="s3">] / </span><span class="s1">sQ</span><span class="s3">)</span>
+
+    <span class="s1">free</span><span class="s3">(</span><span class="s1">neg_f</span><span class="s3">)</span>
+    <span class="s1">free</span><span class="s3">(</span><span class="s1">pos_f</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">error</span>
+
+
+<span class="s2">cdef </span><span class="s1">float compute_gradient_positive</span><span class="s3">(</span><span class="s1">float</span><span class="s3">[:] </span><span class="s1">val_P</span><span class="s3">,</span>
+                                     <span class="s1">float</span><span class="s3">[:, :] </span><span class="s1">pos_reference</span><span class="s3">,</span>
+                                     <span class="s1">cnp</span><span class="s3">.</span><span class="s1">int64_t</span><span class="s3">[:] </span><span class="s1">neighbors</span><span class="s3">,</span>
+                                     <span class="s1">cnp</span><span class="s3">.</span><span class="s1">int64_t</span><span class="s3">[:] </span><span class="s1">indptr</span><span class="s3">,</span>
+                                     <span class="s1">float</span><span class="s3">* </span><span class="s1">pos_f</span><span class="s3">,</span>
+                                     <span class="s1">int n_dimensions</span><span class="s3">,</span>
+                                     <span class="s1">int dof</span><span class="s3">,</span>
+                                     <span class="s1">double sum_Q</span><span class="s3">,</span>
+                                     <span class="s1">cnp</span><span class="s3">.</span><span class="s1">int64_t start</span><span class="s3">,</span>
+                                     <span class="s1">int verbose</span><span class="s3">,</span>
+                                     <span class="s1">bint compute_error</span><span class="s3">,</span>
+                                     <span class="s1">int num_threads</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s0"># Sum over the following expression for i not equal to j</span>
+    <span class="s0"># grad_i = p_ij (1 + ||y_i - y_j||^2)^-1 (y_i - y_j)</span>
+    <span class="s0"># This is equivalent to compute_edge_forces in the authors' code</span>
+    <span class="s0"># It just goes over the nearest neighbors instead of all the data points</span>
+    <span class="s0"># (unlike the non-nearest neighbors version of `compute_gradient_positive')</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">int ax</span>
+        <span class="s1">long i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">k</span>
+        <span class="s1">long n_samples </span><span class="s3">= </span><span class="s1">indptr</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] - </span><span class="s5">1</span>
+        <span class="s1">float C </span><span class="s3">= </span><span class="s5">0.0</span>
+        <span class="s1">float dij</span><span class="s3">, </span><span class="s1">qij</span><span class="s3">, </span><span class="s1">pij</span>
+        <span class="s1">float exponent </span><span class="s3">= (</span><span class="s1">dof </span><span class="s3">+ </span><span class="s5">1.0</span><span class="s3">) / </span><span class="s5">2.0</span>
+        <span class="s1">float float_dof </span><span class="s3">= (</span><span class="s1">float</span><span class="s3">) (</span><span class="s1">dof</span><span class="s3">)</span>
+        <span class="s1">float</span><span class="s3">* </span><span class="s1">buff</span>
+        <span class="s1">clock_t t1 </span><span class="s3">= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">t2 </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">float dt</span>
+
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s1">t1 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+
+    <span class="s2">with </span><span class="s1">nogil</span><span class="s3">, </span><span class="s1">parallel</span><span class="s3">(</span><span class="s1">num_threads</span><span class="s3">=</span><span class="s1">num_threads</span><span class="s3">):</span>
+        <span class="s0"># Define private buffer variables</span>
+        <span class="s1">buff </span><span class="s3">= &lt;</span><span class="s1">float </span><span class="s3">*&gt; </span><span class="s1">malloc</span><span class="s3">(</span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s1">n_dimensions</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">prange</span><span class="s3">(</span><span class="s1">start</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">schedule</span><span class="s3">=</span><span class="s4">'static'</span><span class="s3">):</span>
+            <span class="s0"># Init the gradient vector</span>
+            <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dimensions</span><span class="s3">):</span>
+                <span class="s1">pos_f</span><span class="s3">[</span><span class="s1">i </span><span class="s3">* </span><span class="s1">n_dimensions </span><span class="s3">+ </span><span class="s1">ax</span><span class="s3">] = </span><span class="s5">0.0</span>
+            <span class="s0"># Compute the positive interaction for the nearest neighbors</span>
+            <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">indptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">], </span><span class="s1">indptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">+</span><span class="s5">1</span><span class="s3">]):</span>
+                <span class="s1">j </span><span class="s3">= </span><span class="s1">neighbors</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+                <span class="s1">dij </span><span class="s3">= </span><span class="s5">0.0</span>
+                <span class="s1">pij </span><span class="s3">= </span><span class="s1">val_P</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+                <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dimensions</span><span class="s3">):</span>
+                    <span class="s1">buff</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">] = </span><span class="s1">pos_reference</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s1">ax</span><span class="s3">] - </span><span class="s1">pos_reference</span><span class="s3">[</span><span class="s1">j</span><span class="s3">, </span><span class="s1">ax</span><span class="s3">]</span>
+                    <span class="s1">dij </span><span class="s3">+= </span><span class="s1">buff</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">] * </span><span class="s1">buff</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">]</span>
+                <span class="s1">qij </span><span class="s3">= </span><span class="s1">float_dof </span><span class="s3">/ (</span><span class="s1">float_dof </span><span class="s3">+ </span><span class="s1">dij</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">dof </span><span class="s3">!= </span><span class="s5">1</span><span class="s3">:  </span><span class="s0"># i.e. exponent != 1</span>
+                    <span class="s1">qij </span><span class="s3">= </span><span class="s1">qij </span><span class="s3">** </span><span class="s1">exponent</span>
+                <span class="s1">dij </span><span class="s3">= </span><span class="s1">pij </span><span class="s3">* </span><span class="s1">qij</span>
+
+                <span class="s0"># only compute the error when needed</span>
+                <span class="s2">if </span><span class="s1">compute_error</span><span class="s3">:</span>
+                    <span class="s1">qij </span><span class="s3">= </span><span class="s1">qij </span><span class="s3">/ </span><span class="s1">sum_Q</span>
+                    <span class="s1">C </span><span class="s3">+= </span><span class="s1">pij </span><span class="s3">* </span><span class="s1">log</span><span class="s3">(</span><span class="s1">max</span><span class="s3">(</span><span class="s1">pij</span><span class="s3">, </span><span class="s1">FLOAT32_TINY</span><span class="s3">) / </span><span class="s1">max</span><span class="s3">(</span><span class="s1">qij</span><span class="s3">, </span><span class="s1">FLOAT32_TINY</span><span class="s3">))</span>
+                <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dimensions</span><span class="s3">):</span>
+                    <span class="s1">pos_f</span><span class="s3">[</span><span class="s1">i </span><span class="s3">* </span><span class="s1">n_dimensions </span><span class="s3">+ </span><span class="s1">ax</span><span class="s3">] += </span><span class="s1">dij </span><span class="s3">* </span><span class="s1">buff</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">]</span>
+
+        <span class="s1">free</span><span class="s3">(</span><span class="s1">buff</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s1">t2 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+        <span class="s1">dt </span><span class="s3">= ((</span><span class="s1">float</span><span class="s3">) (</span><span class="s1">t2 </span><span class="s3">- </span><span class="s1">t1</span><span class="s3">))</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Computed error=%1.4f in %1.1e ticks</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">, </span><span class="s1">C</span><span class="s3">, </span><span class="s1">dt</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">C</span>
+
+
+<span class="s2">cdef </span><span class="s1">double compute_gradient_negative</span><span class="s3">(</span><span class="s1">float</span><span class="s3">[:, :] </span><span class="s1">pos_reference</span><span class="s3">,</span>
+                                      <span class="s1">float</span><span class="s3">* </span><span class="s1">neg_f</span><span class="s3">,</span>
+                                      <span class="s1">_QuadTree qt</span><span class="s3">,</span>
+                                      <span class="s1">int dof</span><span class="s3">,</span>
+                                      <span class="s1">float theta</span><span class="s3">,</span>
+                                      <span class="s1">long start</span><span class="s3">,</span>
+                                      <span class="s1">int num_threads</span><span class="s3">) </span><span class="s1">noexcept nogil</span><span class="s3">:</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">int ax</span>
+        <span class="s1">int n_dimensions </span><span class="s3">= </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">n_dimensions</span>
+        <span class="s1">int offset </span><span class="s3">= </span><span class="s1">n_dimensions </span><span class="s3">+ </span><span class="s5">2</span>
+        <span class="s1">long i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">idx</span>
+        <span class="s1">long n_samples </span><span class="s3">= </span><span class="s1">pos_reference</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">long n </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s3">- </span><span class="s1">start</span>
+        <span class="s1">long dta </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">long dtb </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">float size</span><span class="s3">, </span><span class="s1">dist2s</span><span class="s3">, </span><span class="s1">mult</span>
+        <span class="s1">float exponent </span><span class="s3">= (</span><span class="s1">dof </span><span class="s3">+ </span><span class="s5">1.0</span><span class="s3">) / </span><span class="s5">2.0</span>
+        <span class="s1">float float_dof </span><span class="s3">= (</span><span class="s1">float</span><span class="s3">) (</span><span class="s1">dof</span><span class="s3">)</span>
+        <span class="s1">double qijZ</span><span class="s3">, </span><span class="s1">sum_Q </span><span class="s3">= </span><span class="s5">0.0</span>
+        <span class="s1">float</span><span class="s3">* </span><span class="s1">force</span>
+        <span class="s1">float</span><span class="s3">* </span><span class="s1">neg_force</span>
+        <span class="s1">float</span><span class="s3">* </span><span class="s1">pos</span>
+        <span class="s1">clock_t t1 </span><span class="s3">= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">t2 </span><span class="s3">= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">t3 </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">int take_timing </span><span class="s3">= </span><span class="s5">1 </span><span class="s2">if </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">20 </span><span class="s2">else </span><span class="s5">0</span>
+
+    <span class="s2">with </span><span class="s1">nogil</span><span class="s3">, </span><span class="s1">parallel</span><span class="s3">(</span><span class="s1">num_threads</span><span class="s3">=</span><span class="s1">num_threads</span><span class="s3">):</span>
+        <span class="s0"># Define thread-local buffers</span>
+        <span class="s1">summary </span><span class="s3">= &lt;</span><span class="s1">float</span><span class="s3">*&gt; </span><span class="s1">malloc</span><span class="s3">(</span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s1">n </span><span class="s3">* </span><span class="s1">offset</span><span class="s3">)</span>
+        <span class="s1">pos </span><span class="s3">= &lt;</span><span class="s1">float </span><span class="s3">*&gt; </span><span class="s1">malloc</span><span class="s3">(</span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s1">n_dimensions</span><span class="s3">)</span>
+        <span class="s1">force </span><span class="s3">= &lt;</span><span class="s1">float </span><span class="s3">*&gt; </span><span class="s1">malloc</span><span class="s3">(</span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s1">n_dimensions</span><span class="s3">)</span>
+        <span class="s1">neg_force </span><span class="s3">= &lt;</span><span class="s1">float </span><span class="s3">*&gt; </span><span class="s1">malloc</span><span class="s3">(</span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s1">n_dimensions</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">prange</span><span class="s3">(</span><span class="s1">start</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">schedule</span><span class="s3">=</span><span class="s4">'static'</span><span class="s3">):</span>
+            <span class="s0"># Clear the arrays</span>
+            <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dimensions</span><span class="s3">):</span>
+                <span class="s1">force</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">] = </span><span class="s5">0.0</span>
+                <span class="s1">neg_force</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">] = </span><span class="s5">0.0</span>
+                <span class="s1">pos</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">] = </span><span class="s1">pos_reference</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s1">ax</span><span class="s3">]</span>
+
+            <span class="s0"># Find which nodes are summarizing and collect their centers of mass</span>
+            <span class="s0"># deltas, and sizes, into vectorized arrays</span>
+            <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+                <span class="s1">t1 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+            <span class="s1">idx </span><span class="s3">= </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">summarize</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">summary</span><span class="s3">, </span><span class="s1">theta</span><span class="s3">*</span><span class="s1">theta</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+                <span class="s1">t2 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+            <span class="s0"># Compute the t-SNE negative force</span>
+            <span class="s0"># for the digits dataset, walking the tree</span>
+            <span class="s0"># is about 10-15x more expensive than the</span>
+            <span class="s0"># following for loop</span>
+            <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">idx </span><span class="s3">// </span><span class="s1">offset</span><span class="s3">):</span>
+
+                <span class="s1">dist2s </span><span class="s3">= </span><span class="s1">summary</span><span class="s3">[</span><span class="s1">j </span><span class="s3">* </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">n_dimensions</span><span class="s3">]</span>
+                <span class="s1">size </span><span class="s3">= </span><span class="s1">summary</span><span class="s3">[</span><span class="s1">j </span><span class="s3">* </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">n_dimensions </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">]</span>
+                <span class="s1">qijZ </span><span class="s3">= </span><span class="s1">float_dof </span><span class="s3">/ (</span><span class="s1">float_dof </span><span class="s3">+ </span><span class="s1">dist2s</span><span class="s3">)  </span><span class="s0"># 1/(1+dist)</span>
+                <span class="s2">if </span><span class="s1">dof </span><span class="s3">!= </span><span class="s5">1</span><span class="s3">:  </span><span class="s0"># i.e. exponent != 1</span>
+                    <span class="s1">qijZ </span><span class="s3">= </span><span class="s1">qijZ </span><span class="s3">** </span><span class="s1">exponent</span>
+
+                <span class="s1">sum_Q </span><span class="s3">+= </span><span class="s1">size </span><span class="s3">* </span><span class="s1">qijZ   </span><span class="s0"># size of the node * q</span>
+                <span class="s1">mult </span><span class="s3">= </span><span class="s1">size </span><span class="s3">* </span><span class="s1">qijZ </span><span class="s3">* </span><span class="s1">qijZ</span>
+                <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dimensions</span><span class="s3">):</span>
+                    <span class="s1">neg_force</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">] += </span><span class="s1">mult </span><span class="s3">* </span><span class="s1">summary</span><span class="s3">[</span><span class="s1">j </span><span class="s3">* </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">ax</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+                <span class="s1">t3 </span><span class="s3">= </span><span class="s1">clock</span><span class="s3">()</span>
+            <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dimensions</span><span class="s3">):</span>
+                <span class="s1">neg_f</span><span class="s3">[</span><span class="s1">i </span><span class="s3">* </span><span class="s1">n_dimensions </span><span class="s3">+ </span><span class="s1">ax</span><span class="s3">] = </span><span class="s1">neg_force</span><span class="s3">[</span><span class="s1">ax</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+                <span class="s1">dta </span><span class="s3">+= </span><span class="s1">t2 </span><span class="s3">- </span><span class="s1">t1</span>
+                <span class="s1">dtb </span><span class="s3">+= </span><span class="s1">t3 </span><span class="s3">- </span><span class="s1">t2</span>
+        <span class="s1">free</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">)</span>
+        <span class="s1">free</span><span class="s3">(</span><span class="s1">force</span><span class="s3">)</span>
+        <span class="s1">free</span><span class="s3">(</span><span class="s1">neg_force</span><span class="s3">)</span>
+        <span class="s1">free</span><span class="s3">(</span><span class="s1">summary</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">take_timing</span><span class="s3">:</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Tree: %li clock ticks | &quot;</span><span class="s3">, </span><span class="s1">dta</span><span class="s3">)</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;Force computation: %li clock ticks</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">, </span><span class="s1">dtb</span><span class="s3">)</span>
+
+    <span class="s0"># Put sum_Q to machine EPSILON to avoid divisions by 0</span>
+    <span class="s1">sum_Q </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">sum_Q</span><span class="s3">, </span><span class="s1">FLOAT64_EPS</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">sum_Q</span>
+
+
+<span class="s2">def </span><span class="s1">gradient</span><span class="s3">(</span><span class="s1">float</span><span class="s3">[:] </span><span class="s1">val_P</span><span class="s3">,</span>
+             <span class="s1">float</span><span class="s3">[:, :] </span><span class="s1">pos_output</span><span class="s3">,</span>
+             <span class="s1">cnp</span><span class="s3">.</span><span class="s1">int64_t</span><span class="s3">[:] </span><span class="s1">neighbors</span><span class="s3">,</span>
+             <span class="s1">cnp</span><span class="s3">.</span><span class="s1">int64_t</span><span class="s3">[:] </span><span class="s1">indptr</span><span class="s3">,</span>
+             <span class="s1">float</span><span class="s3">[:, :] </span><span class="s1">forces</span><span class="s3">,</span>
+             <span class="s1">float theta</span><span class="s3">,</span>
+             <span class="s1">int n_dimensions</span><span class="s3">,</span>
+             <span class="s1">int verbose</span><span class="s3">,</span>
+             <span class="s1">int dof</span><span class="s3">=</span><span class="s5">1</span><span class="s3">,</span>
+             <span class="s1">long skip_num_points</span><span class="s3">=</span><span class="s5">0</span><span class="s3">,</span>
+             <span class="s1">bint compute_error</span><span class="s3">=</span><span class="s5">1</span><span class="s3">,</span>
+             <span class="s1">int num_threads</span><span class="s3">=</span><span class="s5">1</span><span class="s3">):</span>
+    <span class="s0"># This function is designed to be called from external Python</span>
+    <span class="s0"># it passes the 'forces' array by reference and fills that's array</span>
+    <span class="s0"># up in-place</span>
+    <span class="s2">cdef </span><span class="s1">float C</span>
+    <span class="s2">cdef </span><span class="s1">int n</span>
+    <span class="s1">n </span><span class="s3">= </span><span class="s1">pos_output</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">val_P</span><span class="s3">.</span><span class="s1">itemsize </span><span class="s3">== </span><span class="s5">4</span>
+    <span class="s2">assert </span><span class="s1">pos_output</span><span class="s3">.</span><span class="s1">itemsize </span><span class="s3">== </span><span class="s5">4</span>
+    <span class="s2">assert </span><span class="s1">forces</span><span class="s3">.</span><span class="s1">itemsize </span><span class="s3">== </span><span class="s5">4</span>
+    <span class="s1">m </span><span class="s3">= </span><span class="s4">&quot;Forces array and pos_output shapes are incompatible&quot;</span>
+    <span class="s2">assert </span><span class="s1">n </span><span class="s3">== </span><span class="s1">forces</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">], </span><span class="s1">m</span>
+    <span class="s1">m </span><span class="s3">= </span><span class="s4">&quot;Pij and pos_output shapes are incompatible&quot;</span>
+    <span class="s2">assert </span><span class="s1">n </span><span class="s3">== </span><span class="s1">indptr</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] - </span><span class="s5">1</span><span class="s3">, </span><span class="s1">m</span>
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Initializing tree of n_dimensions %i</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">, </span><span class="s1">n_dimensions</span><span class="s3">)</span>
+    <span class="s2">cdef </span><span class="s1">_QuadTree qt </span><span class="s3">= </span><span class="s1">_QuadTree</span><span class="s3">(</span><span class="s1">pos_output</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">1</span><span class="s3">], </span><span class="s1">verbose</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Inserting %li points</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">, </span><span class="s1">pos_output</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+    <span class="s1">qt</span><span class="s3">.</span><span class="s1">build_tree</span><span class="s3">(</span><span class="s1">pos_output</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s0"># XXX: format hack to workaround lack of `const char *` type</span>
+        <span class="s0"># in the generated C code that triggers error with gcc 4.9</span>
+        <span class="s0"># and -Werror=format-security</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Computing gradient</span><span class="s2">\n</span><span class="s4">%s&quot;</span><span class="s3">, </span><span class="s1">EMPTY_STRING</span><span class="s3">)</span>
+
+    <span class="s1">C </span><span class="s3">= </span><span class="s1">compute_gradient</span><span class="s3">(</span><span class="s1">val_P</span><span class="s3">, </span><span class="s1">pos_output</span><span class="s3">, </span><span class="s1">neighbors</span><span class="s3">, </span><span class="s1">indptr</span><span class="s3">, </span><span class="s1">forces</span><span class="s3">,</span>
+                         <span class="s1">qt</span><span class="s3">, </span><span class="s1">theta</span><span class="s3">, </span><span class="s1">dof</span><span class="s3">, </span><span class="s1">skip_num_points</span><span class="s3">, </span><span class="s1">compute_error</span><span class="s3">,</span>
+                         <span class="s1">num_threads</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">&gt; </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s0"># XXX: format hack to workaround lack of `const char *` type</span>
+        <span class="s0"># in the generated C code</span>
+        <span class="s0"># and -Werror=format-security</span>
+        <span class="s1">printf</span><span class="s3">(</span><span class="s4">&quot;[t-SNE] Checking tree consistency</span><span class="s2">\n</span><span class="s4">%s&quot;</span><span class="s3">, </span><span class="s1">EMPTY_STRING</span><span class="s3">)</span>
+    <span class="s1">m </span><span class="s3">= </span><span class="s4">&quot;Tree consistency failed: unexpected number of points on the tree&quot;</span>
+    <span class="s2">assert </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">cells</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">cumulative_size </span><span class="s3">== </span><span class="s1">qt</span><span class="s3">.</span><span class="s1">n_points</span><span class="s3">, </span><span class="s1">m</span>
+    <span class="s2">if not </span><span class="s1">compute_error</span><span class="s3">:</span>
+        <span class="s1">C </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+    <span class="s2">return </span><span class="s1">C</span>
+</pre>
+</body>
+</html>

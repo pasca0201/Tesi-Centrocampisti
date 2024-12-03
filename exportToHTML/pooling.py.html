@@ -1,0 +1,722 @@
+<html>
+<head>
+<title>pooling.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+pooling.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright (c) 2013, 2024, Oracle and/or its affiliates.</span>
+<span class="s0">#</span>
+<span class="s0"># This program is free software; you can redistribute it and/or modify</span>
+<span class="s0"># it under the terms of the GNU General Public License, version 2.0, as</span>
+<span class="s0"># published by the Free Software Foundation.</span>
+<span class="s0">#</span>
+<span class="s0"># This program is designed to work with certain software (including</span>
+<span class="s0"># but not limited to OpenSSL) that is licensed under separate terms,</span>
+<span class="s0"># as designated in a particular file or component or in included license</span>
+<span class="s0"># documentation. The authors of MySQL hereby grant you an</span>
+<span class="s0"># additional permission to link the program and your derivative works</span>
+<span class="s0"># with the separately licensed software that they have either included with</span>
+<span class="s0"># the program or referenced in the documentation.</span>
+<span class="s0">#</span>
+<span class="s0"># Without limiting anything contained in the foregoing, this file,</span>
+<span class="s0"># which is part of MySQL Connector/Python, is also subject to the</span>
+<span class="s0"># Universal FOSS Exception, version 1.0, a copy of which can be found at</span>
+<span class="s0"># http://oss.oracle.com/licenses/universal-foss-exception.</span>
+<span class="s0">#</span>
+<span class="s0"># This program is distributed in the hope that it will be useful, but</span>
+<span class="s0"># WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="s0"># MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.</span>
+<span class="s0"># See the GNU General Public License, version 2.0, for more details.</span>
+<span class="s0">#</span>
+<span class="s0"># You should have received a copy of the GNU General Public License</span>
+<span class="s0"># along with this program; if not, write to the Free Software Foundation, Inc.,</span>
+<span class="s0"># 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA</span>
+
+<span class="s2">&quot;&quot;&quot;Implementing pooling of connections to MySQL servers.&quot;&quot;&quot;</span>
+<span class="s3">from </span><span class="s1">__future__ </span><span class="s3">import </span><span class="s1">annotations</span>
+
+<span class="s3">import </span><span class="s1">queue</span>
+<span class="s3">import </span><span class="s1">random</span>
+<span class="s3">import </span><span class="s1">re</span>
+<span class="s3">import </span><span class="s1">threading</span>
+
+<span class="s3">from </span><span class="s1">types </span><span class="s3">import </span><span class="s1">TracebackType</span>
+<span class="s3">from </span><span class="s1">typing </span><span class="s3">import </span><span class="s1">TYPE_CHECKING</span><span class="s4">, </span><span class="s1">Any</span><span class="s4">, </span><span class="s1">Dict</span><span class="s4">, </span><span class="s1">NoReturn</span><span class="s4">, </span><span class="s1">Optional</span><span class="s4">, </span><span class="s1">Tuple</span><span class="s4">, </span><span class="s1">Type</span><span class="s4">, </span><span class="s1">Union</span>
+<span class="s3">from </span><span class="s1">uuid </span><span class="s3">import </span><span class="s1">uuid4</span>
+
+<span class="s3">try</span><span class="s4">:</span>
+    <span class="s3">import </span><span class="s1">dns</span><span class="s4">.</span><span class="s1">exception</span>
+    <span class="s3">import </span><span class="s1">dns</span><span class="s4">.</span><span class="s1">resolver</span>
+<span class="s3">except </span><span class="s1">ImportError</span><span class="s4">:</span>
+    <span class="s1">HAVE_DNSPYTHON </span><span class="s4">= </span><span class="s3">False</span>
+<span class="s3">else</span><span class="s4">:</span>
+    <span class="s1">HAVE_DNSPYTHON </span><span class="s4">= </span><span class="s3">True</span>
+
+<span class="s3">try</span><span class="s4">:</span>
+    <span class="s3">from </span><span class="s4">.</span><span class="s1">connection_cext </span><span class="s3">import </span><span class="s1">CMySQLConnection</span>
+<span class="s3">except </span><span class="s1">ImportError</span><span class="s4">:</span>
+    <span class="s1">CMySQLConnection </span><span class="s4">= </span><span class="s3">None  </span><span class="s0"># type: ignore[misc]</span>
+
+<span class="s3">from </span><span class="s4">.</span><span class="s1">connection </span><span class="s3">import </span><span class="s1">MySQLConnection</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">constants </span><span class="s3">import </span><span class="s1">CNX_POOL_ARGS</span><span class="s4">, </span><span class="s1">DEFAULT_CONFIGURATION</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">errors </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">Error</span><span class="s4">,</span>
+    <span class="s1">InterfaceError</span><span class="s4">,</span>
+    <span class="s1">NotSupportedError</span><span class="s4">,</span>
+    <span class="s1">PoolError</span><span class="s4">,</span>
+    <span class="s1">ProgrammingError</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">optionfiles </span><span class="s3">import </span><span class="s1">read_option_files</span>
+
+<span class="s3">if </span><span class="s1">TYPE_CHECKING</span><span class="s4">:</span>
+    <span class="s3">from </span><span class="s4">.</span><span class="s1">abstracts </span><span class="s3">import </span><span class="s1">MySQLConnectionAbstract</span>
+
+<span class="s1">CONNECTION_POOL_LOCK </span><span class="s4">= </span><span class="s1">threading</span><span class="s4">.</span><span class="s1">RLock</span><span class="s4">()</span>
+<span class="s1">CNX_POOL_MAXSIZE </span><span class="s4">= </span><span class="s5">32</span>
+<span class="s1">CNX_POOL_MAXNAMESIZE </span><span class="s4">= </span><span class="s5">64</span>
+<span class="s1">CNX_POOL_NAMEREGEX </span><span class="s4">= </span><span class="s1">re</span><span class="s4">.</span><span class="s1">compile</span><span class="s4">(</span><span class="s6">r&quot;[^a-zA-Z0-9._:\-*$#]&quot;</span><span class="s4">)</span>
+<span class="s1">ERROR_NO_CEXT </span><span class="s4">= </span><span class="s6">&quot;MySQL Connector/Python C Extension not available&quot;</span>
+<span class="s1">MYSQL_CNX_CLASS</span><span class="s4">: </span><span class="s1">Union</span><span class="s4">[</span><span class="s1">type</span><span class="s4">, </span><span class="s1">Tuple</span><span class="s4">[</span><span class="s1">type</span><span class="s4">, ...]] = (</span>
+    <span class="s1">MySQLConnection </span><span class="s3">if </span><span class="s1">CMySQLConnection </span><span class="s3">is None else </span><span class="s4">(</span><span class="s1">MySQLConnection</span><span class="s4">, </span><span class="s1">CMySQLConnection</span><span class="s4">)</span>
+<span class="s4">)</span>
+
+<span class="s1">_CONNECTION_POOLS</span><span class="s4">: </span><span class="s1">Dict</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">MySQLConnectionPool</span><span class="s4">] = {}</span>
+
+
+<span class="s3">def </span><span class="s1">_get_pooled_connection</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; PooledMySQLConnection</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Return a pooled MySQL connection.&quot;&quot;&quot;</span>
+    <span class="s0"># If no pool name specified, generate one</span>
+    <span class="s1">pool_name </span><span class="s4">= (</span>
+        <span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;pool_name&quot;</span><span class="s4">] </span><span class="s3">if </span><span class="s6">&quot;pool_name&quot; </span><span class="s3">in </span><span class="s1">kwargs </span><span class="s3">else </span><span class="s1">generate_pool_name</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+    <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">kwargs</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s6">&quot;use_pure&quot;</span><span class="s4">) </span><span class="s3">is False and </span><span class="s1">CMySQLConnection </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ImportError</span><span class="s4">(</span><span class="s1">ERROR_NO_CEXT</span><span class="s4">)</span>
+
+    <span class="s0"># Setup the pool, ensuring only 1 thread can update at a time</span>
+    <span class="s3">with </span><span class="s1">CONNECTION_POOL_LOCK</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">pool_name </span><span class="s3">not in </span><span class="s1">_CONNECTION_POOLS</span><span class="s4">:</span>
+            <span class="s1">_CONNECTION_POOLS</span><span class="s4">[</span><span class="s1">pool_name</span><span class="s4">] = </span><span class="s1">MySQLConnectionPool</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">_CONNECTION_POOLS</span><span class="s4">[</span><span class="s1">pool_name</span><span class="s4">], </span><span class="s1">MySQLConnectionPool</span><span class="s4">):</span>
+            <span class="s0"># pool_size must be the same</span>
+            <span class="s1">check_size </span><span class="s4">= </span><span class="s1">_CONNECTION_POOLS</span><span class="s4">[</span><span class="s1">pool_name</span><span class="s4">].</span><span class="s1">pool_size</span>
+            <span class="s3">if </span><span class="s6">&quot;pool_size&quot; </span><span class="s3">in </span><span class="s1">kwargs </span><span class="s3">and </span><span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;pool_size&quot;</span><span class="s4">] != </span><span class="s1">check_size</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span><span class="s6">&quot;Size can not be changed for active pools.&quot;</span><span class="s4">)</span>
+
+    <span class="s0"># Return pooled connection</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">_CONNECTION_POOLS</span><span class="s4">[</span><span class="s1">pool_name</span><span class="s4">].</span><span class="s1">get_connection</span><span class="s4">()</span>
+    <span class="s3">except </span><span class="s1">AttributeError</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+            <span class="s6">f&quot;Failed getting connection from pool '</span><span class="s3">{</span><span class="s1">pool_name</span><span class="s3">}</span><span class="s6">'&quot;</span>
+        <span class="s4">) </span><span class="s3">from None</span>
+
+
+<span class="s3">def </span><span class="s1">_get_failover_connection</span><span class="s4">(</span>
+    <span class="s4">**</span><span class="s1">kwargs</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">,</span>
+<span class="s4">) </span><span class="s1">-&gt; Union</span><span class="s4">[</span><span class="s1">PooledMySQLConnection</span><span class="s4">, </span><span class="s1">MySQLConnectionAbstract</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Return a MySQL connection and try to failover if needed. 
+ 
+    An InterfaceError is raise when no MySQL is available. ValueError is 
+    raised when the failover server configuration contains an illegal 
+    connection argument. Supported arguments are user, password, host, port, 
+    unix_socket and database. ValueError is also raised when the failover 
+    argument was not provided. 
+ 
+    Returns MySQLConnection instance. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">config </span><span class="s4">= </span><span class="s1">kwargs</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">failover </span><span class="s4">= </span><span class="s1">config</span><span class="s4">[</span><span class="s6">&quot;failover&quot;</span><span class="s4">]</span>
+    <span class="s3">except </span><span class="s1">KeyError</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s6">&quot;failover argument not provided&quot;</span><span class="s4">) </span><span class="s3">from None</span>
+    <span class="s3">del </span><span class="s1">config</span><span class="s4">[</span><span class="s6">&quot;failover&quot;</span><span class="s4">]</span>
+
+    <span class="s1">support_cnx_args </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span>
+        <span class="s4">[</span>
+            <span class="s6">&quot;user&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;password&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;host&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;port&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;unix_socket&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;database&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;pool_name&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;pool_size&quot;</span><span class="s4">,</span>
+            <span class="s6">&quot;priority&quot;</span><span class="s4">,</span>
+        <span class="s4">]</span>
+    <span class="s4">)</span>
+
+    <span class="s0"># First check if we can add all use the configuration</span>
+    <span class="s1">priority_count </span><span class="s4">= </span><span class="s5">0</span>
+    <span class="s3">for </span><span class="s1">server </span><span class="s3">in </span><span class="s1">failover</span><span class="s4">:</span>
+        <span class="s1">diff </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">server</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()) - </span><span class="s1">support_cnx_args</span>
+        <span class="s3">if </span><span class="s1">diff</span><span class="s4">:</span>
+            <span class="s1">arg </span><span class="s4">= </span><span class="s6">&quot;s&quot; </span><span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">diff</span><span class="s4">) &gt; </span><span class="s5">1 </span><span class="s3">else </span><span class="s6">&quot;&quot;</span>
+            <span class="s1">lst </span><span class="s4">= </span><span class="s6">&quot;, &quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">diff</span><span class="s4">)</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s6">f&quot;Unsupported connection argument </span><span class="s3">{</span><span class="s1">arg</span><span class="s3">} </span><span class="s6">in failover: </span><span class="s3">{</span><span class="s1">lst</span><span class="s3">}</span><span class="s6">&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">server</span><span class="s4">, </span><span class="s6">&quot;priority&quot;</span><span class="s4">):</span>
+            <span class="s1">priority_count </span><span class="s4">+= </span><span class="s5">1</span>
+
+        <span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">] = </span><span class="s1">server</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s6">&quot;priority&quot;</span><span class="s4">, </span><span class="s5">100</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">] &lt; </span><span class="s5">0 </span><span class="s3">or </span><span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">] &gt; </span><span class="s5">100</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+                <span class="s6">&quot;Priority value should be in the range of 0 to 100, &quot;</span>
+                <span class="s6">f&quot;got : </span><span class="s3">{</span><span class="s1">server</span><span class="s4">[</span><span class="s6">'priority'</span><span class="s4">]</span><span class="s3">}</span><span class="s6">&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">], </span><span class="s1">int</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+                <span class="s6">&quot;Priority value should be an integer in the range of 0 to &quot;</span>
+                <span class="s6">f&quot;100, got : </span><span class="s3">{</span><span class="s1">server</span><span class="s4">[</span><span class="s6">'priority'</span><span class="s4">]</span><span class="s3">}</span><span class="s6">&quot;</span>
+            <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s5">0 </span><span class="s4">&lt; </span><span class="s1">priority_count </span><span class="s4">&lt; </span><span class="s1">len</span><span class="s4">(</span><span class="s1">failover</span><span class="s4">):</span>
+        <span class="s3">raise </span><span class="s1">ProgrammingError</span><span class="s4">(</span>
+            <span class="s6">&quot;You must either assign no priority to any &quot;</span>
+            <span class="s6">&quot;of the routers or give a priority for &quot;</span>
+            <span class="s6">&quot;every router&quot;</span>
+        <span class="s4">)</span>
+
+    <span class="s1">server_directory </span><span class="s4">= {}</span>
+    <span class="s1">server_priority_list </span><span class="s4">= []</span>
+    <span class="s3">for </span><span class="s1">server </span><span class="s3">in </span><span class="s1">sorted</span><span class="s4">(</span><span class="s1">failover</span><span class="s4">, </span><span class="s1">key</span><span class="s4">=</span><span class="s3">lambda </span><span class="s1">x</span><span class="s4">: </span><span class="s1">x</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">], </span><span class="s1">reverse</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">] </span><span class="s3">not in </span><span class="s1">server_directory</span><span class="s4">:</span>
+            <span class="s1">server_directory</span><span class="s4">[</span><span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">]] = [</span><span class="s1">server</span><span class="s4">]</span>
+            <span class="s1">server_priority_list</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">])</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">server_directory</span><span class="s4">[</span><span class="s1">server</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">]].</span><span class="s1">append</span><span class="s4">(</span><span class="s1">server</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">priority </span><span class="s3">in </span><span class="s1">server_priority_list</span><span class="s4">:</span>
+        <span class="s1">failover_list </span><span class="s4">= </span><span class="s1">server_directory</span><span class="s4">[</span><span class="s1">priority</span><span class="s4">]</span>
+        <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">len</span><span class="s4">(</span><span class="s1">failover_list</span><span class="s4">)):</span>
+            <span class="s1">last </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">failover_list</span><span class="s4">) - </span><span class="s5">1</span>
+            <span class="s1">index </span><span class="s4">= </span><span class="s1">random</span><span class="s4">.</span><span class="s1">randint</span><span class="s4">(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">last</span><span class="s4">)</span>
+            <span class="s1">server </span><span class="s4">= </span><span class="s1">failover_list</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s1">index</span><span class="s4">)</span>
+            <span class="s1">new_config </span><span class="s4">= </span><span class="s1">config</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+            <span class="s1">new_config</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">server</span><span class="s4">)</span>
+            <span class="s1">new_config</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s6">&quot;priority&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s3">return </span><span class="s1">connect</span><span class="s4">(**</span><span class="s1">new_config</span><span class="s4">)</span>
+            <span class="s3">except </span><span class="s1">Error</span><span class="s4">:</span>
+                <span class="s0"># If we failed to connect, we try the next server</span>
+                <span class="s3">pass</span>
+
+    <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span><span class="s6">&quot;Unable to connect to any of the target hosts&quot;</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">connect</span><span class="s4">(</span>
+    <span class="s4">*</span><span class="s1">args</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">: </span><span class="s1">Any</span>
+<span class="s4">) </span><span class="s1">-&gt; Union</span><span class="s4">[</span><span class="s1">PooledMySQLConnection</span><span class="s4">, </span><span class="s1">MySQLConnectionAbstract</span><span class="s4">]:</span>
+    <span class="s2">&quot;&quot;&quot;Creates or gets a MySQL connection object. 
+ 
+    In its simpliest form, `connect()` will open a connection to a 
+    MySQL server and return a `MySQLConnectionAbstract` subclass 
+    object such as `MySQLConnection` or `CMySQLConnection`. 
+ 
+    When any connection pooling arguments are given, for example `pool_name` 
+    or `pool_size`, a pool is created or a previously one is used to return 
+    a `PooledMySQLConnection`. 
+ 
+    Args: 
+        *args: N/A. 
+        **kwargs: For a complete list of possible arguments, see [1]. If no arguments 
+                  are given, it uses the already configured or default values. 
+ 
+    Returns: 
+        A `MySQLConnectionAbstract` subclass instance (such as `MySQLConnection` or 
+        `CMySQLConnection`) or a `PooledMySQLConnection` instance. 
+ 
+    Examples: 
+        A connection with the MySQL server can be established using either the 
+        `mysql.connector.connect()` method or a `MySQLConnectionAbstract` subclass: 
+        ``` 
+        &gt;&gt;&gt; from mysql.connector import MySQLConnection, HAVE_CEXT 
+        &gt;&gt;&gt; 
+        &gt;&gt;&gt; cnx1 = mysql.connector.connect(user='joe', database='test') 
+        &gt;&gt;&gt; cnx2 = MySQLConnection(user='joe', database='test') 
+        &gt;&gt;&gt; 
+        &gt;&gt;&gt; cnx3 = None 
+        &gt;&gt;&gt; if HAVE_CEXT: 
+        &gt;&gt;&gt;     from mysql.connector import CMySQLConnection 
+        &gt;&gt;&gt;     cnx3 = CMySQLConnection(user='joe', database='test') 
+        ``` 
+ 
+    References: 
+        [1]: https://dev.mysql.com/doc/connector-python/en/connector-python-connectargs.html 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># DNS SRV</span>
+    <span class="s1">dns_srv </span><span class="s4">= </span><span class="s1">kwargs</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s6">&quot;dns_srv&quot;</span><span class="s4">) </span><span class="s3">if </span><span class="s6">&quot;dns_srv&quot; </span><span class="s3">in </span><span class="s1">kwargs </span><span class="s3">else False</span>
+
+    <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">dns_srv</span><span class="s4">, </span><span class="s1">bool</span><span class="s4">):</span>
+        <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span><span class="s6">&quot;The value of 'dns-srv' must be a boolean&quot;</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">dns_srv</span><span class="s4">:</span>
+        <span class="s3">if not </span><span class="s1">HAVE_DNSPYTHON</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+                <span class="s6">&quot;MySQL host configuration requested DNS &quot;</span>
+                <span class="s6">&quot;SRV. This requires the Python dnspython &quot;</span>
+                <span class="s6">&quot;module. Please refer to documentation&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s6">&quot;unix_socket&quot; </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+                <span class="s6">&quot;Using Unix domain sockets with DNS SRV lookup is not allowed&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s6">&quot;port&quot; </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+                <span class="s6">&quot;Specifying a port number with DNS SRV lookup is not allowed&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s6">&quot;failover&quot; </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+                <span class="s6">&quot;Specifying multiple hostnames with DNS SRV look up is not allowed&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s6">&quot;host&quot; </span><span class="s3">not in </span><span class="s1">kwargs</span><span class="s4">:</span>
+            <span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;host&quot;</span><span class="s4">] = </span><span class="s1">DEFAULT_CONFIGURATION</span><span class="s4">[</span><span class="s6">&quot;host&quot;</span><span class="s4">]</span>
+
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">srv_records </span><span class="s4">= </span><span class="s1">dns</span><span class="s4">.</span><span class="s1">resolver</span><span class="s4">.</span><span class="s1">query</span><span class="s4">(</span><span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;host&quot;</span><span class="s4">], </span><span class="s6">&quot;SRV&quot;</span><span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">dns</span><span class="s4">.</span><span class="s1">exception</span><span class="s4">.</span><span class="s1">DNSException</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">InterfaceError</span><span class="s4">(</span>
+                <span class="s6">f&quot;Unable to locate any hosts for '</span><span class="s3">{</span><span class="s1">kwargs</span><span class="s4">[</span><span class="s6">'host'</span><span class="s4">]</span><span class="s3">}</span><span class="s6">'&quot;</span>
+            <span class="s4">) </span><span class="s3">from None</span>
+
+        <span class="s1">failover </span><span class="s4">= []</span>
+        <span class="s3">for </span><span class="s1">srv </span><span class="s3">in </span><span class="s1">srv_records</span><span class="s4">:</span>
+            <span class="s1">failover</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span>
+                <span class="s4">{</span>
+                    <span class="s6">&quot;host&quot;</span><span class="s4">: </span><span class="s1">srv</span><span class="s4">.</span><span class="s1">target</span><span class="s4">.</span><span class="s1">to_text</span><span class="s4">(</span><span class="s1">omit_final_dot</span><span class="s4">=</span><span class="s3">True</span><span class="s4">),</span>
+                    <span class="s6">&quot;port&quot;</span><span class="s4">: </span><span class="s1">srv</span><span class="s4">.</span><span class="s1">port</span><span class="s4">,</span>
+                    <span class="s6">&quot;priority&quot;</span><span class="s4">: </span><span class="s1">srv</span><span class="s4">.</span><span class="s1">priority</span><span class="s4">,</span>
+                    <span class="s6">&quot;weight&quot;</span><span class="s4">: </span><span class="s1">srv</span><span class="s4">.</span><span class="s1">weight</span><span class="s4">,</span>
+                <span class="s4">}</span>
+            <span class="s4">)</span>
+
+        <span class="s1">failover</span><span class="s4">.</span><span class="s1">sort</span><span class="s4">(</span><span class="s1">key</span><span class="s4">=</span><span class="s3">lambda </span><span class="s1">x</span><span class="s4">: (</span><span class="s1">x</span><span class="s4">[</span><span class="s6">&quot;priority&quot;</span><span class="s4">], -</span><span class="s1">x</span><span class="s4">[</span><span class="s6">&quot;weight&quot;</span><span class="s4">]))</span>
+        <span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;failover&quot;</span><span class="s4">] = [</span>
+            <span class="s4">{</span><span class="s6">&quot;host&quot;</span><span class="s4">: </span><span class="s1">srv</span><span class="s4">[</span><span class="s6">&quot;host&quot;</span><span class="s4">], </span><span class="s6">&quot;port&quot;</span><span class="s4">: </span><span class="s1">srv</span><span class="s4">[</span><span class="s6">&quot;port&quot;</span><span class="s4">]} </span><span class="s3">for </span><span class="s1">srv </span><span class="s3">in </span><span class="s1">failover</span>
+        <span class="s4">]</span>
+
+    <span class="s0"># Option files</span>
+    <span class="s3">if </span><span class="s6">&quot;read_default_file&quot; </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">:</span>
+        <span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;option_files&quot;</span><span class="s4">] = </span><span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;read_default_file&quot;</span><span class="s4">]</span>
+        <span class="s1">kwargs</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s6">&quot;read_default_file&quot;</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s6">&quot;option_files&quot; </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">:</span>
+        <span class="s1">new_config </span><span class="s4">= </span><span class="s1">read_option_files</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">connect</span><span class="s4">(**</span><span class="s1">new_config</span><span class="s4">)</span>
+
+    <span class="s0"># Failover</span>
+    <span class="s3">if </span><span class="s6">&quot;failover&quot; </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">_get_failover_connection</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s0"># Pooled connections</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">any</span><span class="s4">(</span><span class="s1">key </span><span class="s3">in </span><span class="s1">kwargs </span><span class="s3">for </span><span class="s1">key </span><span class="s3">in </span><span class="s1">CNX_POOL_ARGS</span><span class="s4">):</span>
+            <span class="s3">return </span><span class="s1">_get_pooled_connection</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">NameError</span><span class="s4">:</span>
+        <span class="s0"># No pooling</span>
+        <span class="s3">pass</span>
+
+    <span class="s0"># Use C Extension by default</span>
+    <span class="s1">use_pure </span><span class="s4">= </span><span class="s1">kwargs</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s6">&quot;use_pure&quot;</span><span class="s4">, </span><span class="s3">False</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s6">&quot;use_pure&quot; </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">:</span>
+        <span class="s3">del </span><span class="s1">kwargs</span><span class="s4">[</span><span class="s6">&quot;use_pure&quot;</span><span class="s4">]  </span><span class="s0"># Remove 'use_pure' from kwargs</span>
+        <span class="s3">if not </span><span class="s1">use_pure </span><span class="s3">and </span><span class="s1">CMySQLConnection </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ImportError</span><span class="s4">(</span><span class="s1">ERROR_NO_CEXT</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">CMySQLConnection </span><span class="s3">and not </span><span class="s1">use_pure</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">CMySQLConnection</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">MySQLConnection</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">generate_pool_name</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Generate a pool name 
+ 
+    This function takes keyword arguments, usually the connection 
+    arguments for MySQLConnection, and tries to generate a name for 
+    a pool. 
+ 
+    Raises PoolError when no name can be generated. 
+ 
+    Returns a string. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">parts </span><span class="s4">= []</span>
+    <span class="s3">for </span><span class="s1">key </span><span class="s3">in </span><span class="s4">(</span><span class="s6">&quot;host&quot;</span><span class="s4">, </span><span class="s6">&quot;port&quot;</span><span class="s4">, </span><span class="s6">&quot;user&quot;</span><span class="s4">, </span><span class="s6">&quot;database&quot;</span><span class="s4">):</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">parts</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">str</span><span class="s4">(</span><span class="s1">kwargs</span><span class="s4">[</span><span class="s1">key</span><span class="s4">]))</span>
+        <span class="s3">except </span><span class="s1">KeyError</span><span class="s4">:</span>
+            <span class="s3">pass</span>
+
+    <span class="s3">if not </span><span class="s1">parts</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span><span class="s6">&quot;Failed generating pool name; specify pool_name&quot;</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s6">&quot;_&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">parts</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">PooledMySQLConnection</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Class holding a MySQL Connection in a pool 
+ 
+    PooledMySQLConnection is used by MySQLConnectionPool to return an 
+    instance holding a MySQL connection. It works like a MySQLConnection 
+    except for methods like close() and config(). 
+ 
+    The close()-method will add the connection back to the pool rather 
+    than disconnecting from the MySQL server. 
+ 
+    Configuring the connection have to be done through the MySQLConnectionPool 
+    method set_config(). Using config() on pooled connection will raise a 
+    PoolError. 
+ 
+    Attributes: 
+        pool_name (str): Returns the name of the connection pool to which the 
+                         connection belongs. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">pool</span><span class="s4">: </span><span class="s1">MySQLConnectionPool</span><span class="s4">, </span><span class="s1">cnx</span><span class="s4">: </span><span class="s1">MySQLConnectionAbstract</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Constructor. 
+ 
+        Args: 
+            pool: A `MySQLConnectionPool` instance. 
+            cnx: A `MySQLConnectionAbstract` subclass instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">pool</span><span class="s4">, </span><span class="s1">MySQLConnectionPool</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span><span class="s6">&quot;pool should be a MySQLConnectionPool&quot;</span><span class="s4">)</span>
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">cnx</span><span class="s4">, </span><span class="s1">MYSQL_CNX_CLASS</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span><span class="s6">&quot;cnx should be a MySQLConnection&quot;</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_pool</span><span class="s4">: </span><span class="s1">MySQLConnectionPool </span><span class="s4">= </span><span class="s1">pool</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx</span><span class="s4">: </span><span class="s1">MySQLConnectionAbstract </span><span class="s4">= </span><span class="s1">cnx</span>
+
+    <span class="s3">def </span><span class="s1">__enter__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; PooledMySQLConnection</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">__exit__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">exc_type</span><span class="s4">: </span><span class="s1">Type</span><span class="s4">[</span><span class="s1">BaseException</span><span class="s4">],</span>
+        <span class="s1">exc_value</span><span class="s4">: </span><span class="s1">BaseException</span><span class="s4">,</span>
+        <span class="s1">traceback</span><span class="s4">: </span><span class="s1">TracebackType</span><span class="s4">,</span>
+    <span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">close</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">__getattr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">attr</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; Any</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Calls attributes of the MySQLConnection instance&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx</span><span class="s4">, </span><span class="s1">attr</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">close</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Do not close, but adds connection back to pool. 
+ 
+        For a pooled connection, close() does not actually close it but returns it 
+        to the pool and makes it available for subsequent connection requests. If the 
+        pool configuration parameters are changed, a returned connection is closed 
+        and reopened with the new configuration before being returned from the pool 
+        again in response to a connection request. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">cnx </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_pool</span><span class="s4">.</span><span class="s1">reset_session</span><span class="s4">:</span>
+                <span class="s1">cnx</span><span class="s4">.</span><span class="s1">reset_session</span><span class="s4">()</span>
+        <span class="s3">finally</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_pool</span><span class="s4">.</span><span class="s1">add_connection</span><span class="s4">(</span><span class="s1">cnx</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s4">@</span><span class="s1">staticmethod</span>
+    <span class="s3">def </span><span class="s1">config</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; NoReturn</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Configuration is done through the pool. 
+ 
+        For pooled connections, the `config()` method raises a `PoolError` 
+        exception. Configuration for pooled connections should be done 
+        using the pool object. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span>
+            <span class="s6">&quot;Configuration for pooled connections should be done through the &quot;</span>
+            <span class="s6">&quot;pool itself&quot;</span>
+        <span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">pool_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Returns the name of the connection pool to which the connection belongs.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_pool</span><span class="s4">.</span><span class="s1">pool_name</span>
+
+
+<span class="s3">class </span><span class="s1">MySQLConnectionPool</span><span class="s4">:</span>
+    <span class="s2">&quot;&quot;&quot;Class defining a pool of MySQL connections&quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">pool_size</span><span class="s4">: </span><span class="s1">int </span><span class="s4">= </span><span class="s5">5</span><span class="s4">,</span>
+        <span class="s1">pool_name</span><span class="s4">: </span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">] = </span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">pool_reset_session</span><span class="s4">: </span><span class="s1">bool </span><span class="s4">= </span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s4">**</span><span class="s1">kwargs</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">,</span>
+    <span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Constructor. 
+ 
+        Initialize a MySQL connection pool with a maximum number of 
+        connections set to `pool_size`. The rest of the keywords 
+        arguments, kwargs, are configuration arguments for MySQLConnection 
+        instances. 
+ 
+        Args: 
+            pool_name: The pool name. If this argument is not given, Connector/Python 
+                       automatically generates the name, composed from whichever of 
+                       the host, port, user, and database connection arguments are 
+                       given in kwargs, in that order. 
+            pool_size:  The pool size. If this argument is not given, the default is 5. 
+            pool_reset_session: Whether to reset session variables when the connection 
+                                is returned to the pool. 
+            **kwargs: Optional additional connection arguments, as described in [1]. 
+ 
+        Examples: 
+            ``` 
+            &gt;&gt;&gt; dbconfig = { 
+            &gt;&gt;&gt;     &quot;database&quot;: &quot;test&quot;, 
+            &gt;&gt;&gt;     &quot;user&quot;:     &quot;joe&quot;, 
+            &gt;&gt;&gt; } 
+            &gt;&gt;&gt; cnxpool = mysql.connector.pooling.MySQLConnectionPool(pool_name = &quot;mypool&quot;, 
+            &gt;&gt;&gt;                                                       pool_size = 3, 
+            &gt;&gt;&gt;                                                       **dbconfig) 
+            ``` 
+ 
+        References: 
+            [1]: https://dev.mysql.com/doc/connector-python/en/connector-python-connectargs.html 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_size</span><span class="s4">: </span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">int</span><span class="s4">] = </span><span class="s3">None</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_name</span><span class="s4">: </span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">str</span><span class="s4">] = </span><span class="s3">None</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_reset_session </span><span class="s4">= </span><span class="s1">pool_reset_session</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_set_pool_size</span><span class="s4">(</span><span class="s1">pool_size</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_set_pool_name</span><span class="s4">(</span><span class="s1">pool_name </span><span class="s3">or </span><span class="s1">generate_pool_name</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">))</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_config</span><span class="s4">: </span><span class="s1">Dict</span><span class="s4">[</span><span class="s1">str</span><span class="s4">, </span><span class="s1">Any</span><span class="s4">] = {}</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_queue</span><span class="s4">: </span><span class="s1">queue</span><span class="s4">.</span><span class="s1">Queue</span><span class="s4">[</span><span class="s1">MySQLConnectionAbstract</span><span class="s4">] = </span><span class="s1">queue</span><span class="s4">.</span><span class="s1">Queue</span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_size</span>
+        <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_config_version </span><span class="s4">= </span><span class="s1">uuid4</span><span class="s4">()</span>
+
+        <span class="s3">if </span><span class="s1">kwargs</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">set_config</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+            <span class="s1">cnt </span><span class="s4">= </span><span class="s5">0</span>
+            <span class="s3">while </span><span class="s1">cnt </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_size</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">add_connection</span><span class="s4">()</span>
+                <span class="s1">cnt </span><span class="s4">+= </span><span class="s5">1</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">pool_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; str</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Returns the name of the connection pool.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_name</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">pool_size</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Returns number of connections managed by the pool.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_size</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">reset_session</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; bool</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Returns whether to reset session.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_reset_session</span>
+
+    <span class="s3">def </span><span class="s1">set_config</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">: </span><span class="s1">Any</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Set the connection configuration for `MySQLConnectionAbstract` subclass instances. 
+ 
+        This method sets the configuration used for creating `MySQLConnectionAbstract` 
+        subclass instances such as `MySQLConnection`. See [1] for valid 
+        connection arguments. 
+ 
+        Args: 
+            **kwargs: Connection arguments - for a complete list of possible 
+                      arguments, see [1]. 
+ 
+        Raises: 
+            PoolError: When a connection argument is not valid, missing 
+                       or not supported by `MySQLConnectionAbstract`. 
+ 
+        References: 
+            [1]: https://dev.mysql.com/doc/connector-python/en/connector-python-connectargs.html 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if not </span><span class="s1">kwargs</span><span class="s4">:</span>
+            <span class="s3">return</span>
+
+        <span class="s3">with </span><span class="s1">CONNECTION_POOL_LOCK</span><span class="s4">:</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s1">test_cnx </span><span class="s4">= </span><span class="s1">connect</span><span class="s4">()</span>
+                <span class="s1">test_cnx</span><span class="s4">.</span><span class="s1">config</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_config </span><span class="s4">= </span><span class="s1">kwargs</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_config_version </span><span class="s4">= </span><span class="s1">uuid4</span><span class="s4">()</span>
+            <span class="s3">except </span><span class="s1">AttributeError </span><span class="s3">as </span><span class="s1">err</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span><span class="s6">f&quot;Connection configuration not valid: </span><span class="s3">{</span><span class="s1">err</span><span class="s3">}</span><span class="s6">&quot;</span><span class="s4">) </span><span class="s3">from </span><span class="s1">err</span>
+
+    <span class="s3">def </span><span class="s1">_set_pool_size</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">pool_size</span><span class="s4">: </span><span class="s1">int</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Set the size of the pool 
+ 
+        This method sets the size of the pool but it will not resize the pool. 
+ 
+        Raises an AttributeError when the pool_size is not valid. Invalid size 
+        is 0, negative or higher than pooling.CNX_POOL_MAXSIZE. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">pool_size </span><span class="s4">&lt;= </span><span class="s5">0 </span><span class="s3">or </span><span class="s1">pool_size </span><span class="s4">&gt; </span><span class="s1">CNX_POOL_MAXSIZE</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span>
+                <span class="s6">&quot;Pool size should be higher than 0 and lower or equal to &quot;</span>
+                <span class="s6">f&quot;</span><span class="s3">{</span><span class="s1">CNX_POOL_MAXSIZE</span><span class="s3">}</span><span class="s6">&quot;</span>
+            <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_size </span><span class="s4">= </span><span class="s1">pool_size</span>
+
+    <span class="s3">def </span><span class="s1">_set_pool_name</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">pool_name</span><span class="s4">: </span><span class="s1">str</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">r&quot;&quot;&quot;Set the name of the pool. 
+ 
+        This method checks the validity and sets the name of the pool. 
+ 
+        Raises an AttributeError when pool_name contains illegal characters 
+        ([^a-zA-Z0-9._\-*$#]) or is longer than pooling.CNX_POOL_MAXNAMESIZE. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">CNX_POOL_NAMEREGEX</span><span class="s4">.</span><span class="s1">search</span><span class="s4">(</span><span class="s1">pool_name</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span><span class="s6">f&quot;Pool name '</span><span class="s3">{</span><span class="s1">pool_name</span><span class="s3">}</span><span class="s6">' contains illegal characters&quot;</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">pool_name</span><span class="s4">) &gt; </span><span class="s1">CNX_POOL_MAXNAMESIZE</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span><span class="s6">f&quot;Pool name '</span><span class="s3">{</span><span class="s1">pool_name</span><span class="s3">}</span><span class="s6">' is too long&quot;</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_pool_name </span><span class="s4">= </span><span class="s1">pool_name</span>
+
+    <span class="s3">def </span><span class="s1">_queue_connection</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">cnx</span><span class="s4">: </span><span class="s1">MySQLConnectionAbstract</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Put connection back in the queue 
+ 
+        This method is putting a connection back in the queue. It will not 
+        acquire a lock as the methods using _queue_connection() will have it 
+        set. 
+ 
+        Raises `PoolError` on errors. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">cnx</span><span class="s4">, </span><span class="s1">MYSQL_CNX_CLASS</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span>
+                <span class="s6">&quot;Connection instance not subclass of MySQLConnectionAbstract&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_queue</span><span class="s4">.</span><span class="s1">put</span><span class="s4">(</span><span class="s1">cnx</span><span class="s4">, </span><span class="s1">block</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">queue</span><span class="s4">.</span><span class="s1">Full </span><span class="s3">as </span><span class="s1">err</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span><span class="s6">&quot;Failed adding connection; queue is full&quot;</span><span class="s4">) </span><span class="s3">from </span><span class="s1">err</span>
+
+    <span class="s3">def </span><span class="s1">add_connection</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">cnx</span><span class="s4">: </span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">MySQLConnectionAbstract</span><span class="s4">] = </span><span class="s3">None</span><span class="s4">) </span><span class="s1">-&gt; </span><span class="s3">None</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Adds a connection to the pool. 
+ 
+        This method instantiates a `MySQLConnection` using the configuration 
+        passed when initializing the `MySQLConnectionPool` instance or using 
+        the `set_config()` method. 
+        If cnx is a `MySQLConnection` instance, it will be added to the 
+        queue. 
+ 
+        Args: 
+            cnx: The `MySQLConnectionAbstract` subclass object to be added to 
+                 the pool. If this argument is missing (aka `None`), the pool 
+                 creates a new connection and adds it. 
+ 
+        Raises: 
+            PoolError: When no configuration is set, when no more 
+                       connection can be added (maximum reached) or when the connection 
+                       can not be instantiated. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">with </span><span class="s1">CONNECTION_POOL_LOCK</span><span class="s4">:</span>
+            <span class="s3">if not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_config</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span><span class="s6">&quot;Connection configuration not available&quot;</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_queue</span><span class="s4">.</span><span class="s1">full</span><span class="s4">():</span>
+                <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span><span class="s6">&quot;Failed adding connection; queue is full&quot;</span><span class="s4">)</span>
+
+            <span class="s3">if not </span><span class="s1">cnx</span><span class="s4">:</span>
+                <span class="s1">cnx </span><span class="s4">= </span><span class="s1">connect</span><span class="s4">(**</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_config</span><span class="s4">)  </span><span class="s0"># type: ignore[assignment]</span>
+                <span class="s3">try</span><span class="s4">:</span>
+                    <span class="s3">if </span><span class="s4">(</span>
+                        <span class="s1">self</span><span class="s4">.</span><span class="s1">_reset_session</span>
+                        <span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_config</span><span class="s4">[</span><span class="s6">&quot;compress&quot;</span><span class="s4">]</span>
+                        <span class="s3">and </span><span class="s1">cnx</span><span class="s4">.</span><span class="s1">get_server_version</span><span class="s4">() &lt; (</span><span class="s5">5</span><span class="s4">, </span><span class="s5">7</span><span class="s4">, </span><span class="s5">3</span><span class="s4">)</span>
+                    <span class="s4">):</span>
+                        <span class="s3">raise </span><span class="s1">NotSupportedError</span><span class="s4">(</span>
+                            <span class="s6">&quot;Pool reset session is not supported with &quot;</span>
+                            <span class="s6">&quot;compression for MySQL server version 5.7.2 &quot;</span>
+                            <span class="s6">&quot;or earlier&quot;</span>
+                        <span class="s4">)</span>
+                <span class="s3">except </span><span class="s1">KeyError</span><span class="s4">:</span>
+                    <span class="s3">pass</span>
+
+                <span class="s1">cnx</span><span class="s4">.</span><span class="s1">pool_config_version </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_config_version</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">cnx</span><span class="s4">, </span><span class="s1">MYSQL_CNX_CLASS</span><span class="s4">):</span>
+                    <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span>
+                        <span class="s6">&quot;Connection instance not subclass of MySQLConnectionAbstract&quot;</span>
+                    <span class="s4">)</span>
+
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_queue_connection</span><span class="s4">(</span><span class="s1">cnx</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">get_connection</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; PooledMySQLConnection</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Gets a connection from the pool. 
+ 
+        This method returns an PooledMySQLConnection instance which 
+        has a reference to the pool that created it, and the next available 
+        MySQL connection. 
+ 
+        When the MySQL connection is not connect, a reconnect is attempted. 
+ 
+        Returns: 
+            A `PooledMySQLConnection` instance. 
+ 
+        Raises: 
+            PoolError: On errors. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">with </span><span class="s1">CONNECTION_POOL_LOCK</span><span class="s4">:</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s1">cnx </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_queue</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s1">block</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+            <span class="s3">except </span><span class="s1">queue</span><span class="s4">.</span><span class="s1">Empty </span><span class="s3">as </span><span class="s1">err</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">PoolError</span><span class="s4">(</span><span class="s6">&quot;Failed getting connection; pool exhausted&quot;</span><span class="s4">) </span><span class="s3">from </span><span class="s1">err</span>
+
+            <span class="s3">if </span><span class="s4">(</span>
+                <span class="s3">not </span><span class="s1">cnx</span><span class="s4">.</span><span class="s1">is_connected</span><span class="s4">()</span>
+                <span class="s3">or </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_config_version </span><span class="s4">!= </span><span class="s1">cnx</span><span class="s4">.</span><span class="s1">pool_config_version</span>
+            <span class="s4">):</span>
+                <span class="s1">cnx</span><span class="s4">.</span><span class="s1">config</span><span class="s4">(**</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_config</span><span class="s4">)</span>
+                <span class="s3">try</span><span class="s4">:</span>
+                    <span class="s1">cnx</span><span class="s4">.</span><span class="s1">reconnect</span><span class="s4">()</span>
+                <span class="s3">except </span><span class="s1">InterfaceError</span><span class="s4">:</span>
+                    <span class="s0"># Failed to reconnect, give connection back to pool</span>
+                    <span class="s1">self</span><span class="s4">.</span><span class="s1">_queue_connection</span><span class="s4">(</span><span class="s1">cnx</span><span class="s4">)</span>
+                    <span class="s3">raise</span>
+                <span class="s1">cnx</span><span class="s4">.</span><span class="s1">pool_config_version </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_config_version</span>
+
+            <span class="s3">return </span><span class="s1">PooledMySQLConnection</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">cnx</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_remove_connections</span><span class="s4">(</span><span class="s1">self</span><span class="s4">) </span><span class="s1">-&gt; int</span><span class="s4">:</span>
+        <span class="s2">&quot;&quot;&quot;Close all connections 
+ 
+        This method closes all connections. It returns the number 
+        of connections it closed. 
+ 
+        Used mostly for tests. 
+ 
+        Returns int. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">with </span><span class="s1">CONNECTION_POOL_LOCK</span><span class="s4">:</span>
+            <span class="s1">cnt </span><span class="s4">= </span><span class="s5">0</span>
+            <span class="s1">cnxq </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_cnx_queue</span>
+            <span class="s3">while </span><span class="s1">cnxq</span><span class="s4">.</span><span class="s1">qsize</span><span class="s4">():</span>
+                <span class="s3">try</span><span class="s4">:</span>
+                    <span class="s1">cnx </span><span class="s4">= </span><span class="s1">cnxq</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s1">block</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+                    <span class="s1">cnx</span><span class="s4">.</span><span class="s1">disconnect</span><span class="s4">()</span>
+                    <span class="s1">cnt </span><span class="s4">+= </span><span class="s5">1</span>
+                <span class="s3">except </span><span class="s1">queue</span><span class="s4">.</span><span class="s1">Empty</span><span class="s4">:</span>
+                    <span class="s3">return </span><span class="s1">cnt</span>
+                <span class="s3">except </span><span class="s1">PoolError</span><span class="s4">:</span>
+                    <span class="s3">raise</span>
+                <span class="s3">except </span><span class="s1">Error</span><span class="s4">:</span>
+                    <span class="s0"># Any other error when closing means connection is closed</span>
+                    <span class="s3">pass</span>
+
+            <span class="s3">return </span><span class="s1">cnt</span>
+</pre>
+</body>
+</html>

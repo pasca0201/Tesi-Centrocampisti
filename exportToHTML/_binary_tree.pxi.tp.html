@@ -1,0 +1,2498 @@
+<html>
+<head>
+<title>_binary_tree.pxi.tp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_binary_tree.pxi.tp</font>
+</center></td></tr></table>
+<pre><span class="s0">{{py:</span>
+
+<span class="s0"># Generated file: _binary_tree.pxi</span>
+
+<span class="s0">implementation_specific_values = [</span>
+    <span class="s0"># The values are arranged as follows:</span>
+    <span class="s0">#</span>
+    <span class="s0">#       name_suffix, INPUT_DTYPE_t, INPUT_DTYPE, NPY_TYPE</span>
+    <span class="s0">#</span>
+    <span class="s0">('64', 'float64_t', 'np.float64', 'cnp.NPY_DOUBLE'),</span>
+    <span class="s0">('32', 'float32_t', 'np.float32', 'cnp.NPY_FLOAT')</span>
+<span class="s0">]</span>
+
+<span class="s0"># KD Tree and Ball Tree</span>
+<span class="s0"># =====================</span>
+<span class="s0">#</span>
+<span class="s0">#    Author: Jake Vanderplas &lt;jakevdp@cs.washington.edu&gt;, 2012-2013</span>
+<span class="s0">#            Omar Salman &lt;omar.salman@arbisoft.com&gt;</span>
+<span class="s0">#</span>
+<span class="s0">#    License: BSD</span>
+<span class="s0">#</span>
+<span class="s0"># _binary_tree.pxi is generated and is then literally Cython included in</span>
+<span class="s0"># ball_tree.pyx and kd_tree.pyx. See ball_tree.pyx.tp and kd_tree.pyx.tp.</span>
+
+<span class="s0">}}</span>
+
+
+<span class="s0"># KD Tree and Ball Tree</span>
+<span class="s0"># =====================</span>
+<span class="s0">#</span>
+<span class="s0"># The routines here are the core algorithms of the KDTree and BallTree</span>
+<span class="s0"># structures.  If Cython supported polymorphism, we would be able to</span>
+<span class="s0"># create a subclass and derive KDTree and BallTree from it.  Because</span>
+<span class="s0"># polymorphism is not an option, we use this single BinaryTree class</span>
+<span class="s0"># as a literal include to avoid duplicating the entire file.</span>
+<span class="s0">#</span>
+<span class="s0"># A series of functions are implemented in kd_tree.pyx and ball_tree.pyx</span>
+<span class="s0"># which use the information here to calculate the lower and upper bounds</span>
+<span class="s0"># between a node and a point, and between two nodes.  These functions are</span>
+<span class="s0"># used here, and are all that are needed to differentiate between the two</span>
+<span class="s0"># tree types.</span>
+<span class="s0">#</span>
+<span class="s0"># Description of Binary Tree Algorithms</span>
+<span class="s0"># -------------------------------------</span>
+<span class="s0"># A binary tree can be thought of as a collection of nodes.  The top node</span>
+<span class="s0"># contains all the points.  The next level consists of two nodes with half</span>
+<span class="s0"># the points in each, and this continues recursively.  Each node contains</span>
+<span class="s0"># metadata which allow fast computation of distance bounds: in the case of</span>
+<span class="s0"># a ball tree, the metadata is a center and a radius.  In the case of a</span>
+<span class="s0"># KD tree, the metadata is the minimum and maximum bound along each dimension.</span>
+<span class="s0">#</span>
+<span class="s0"># In a typical KD Tree or Ball Tree implementation, the nodes are implemented</span>
+<span class="s0"># as dynamically allocated structures with pointers linking them.  Here we</span>
+<span class="s0"># take a different approach, storing all relevant data in a set of arrays</span>
+<span class="s0"># so that the entire tree object can be saved in a pickle file. For efficiency,</span>
+<span class="s0"># the data can be stored in such a way that explicit pointers are not</span>
+<span class="s0"># necessary: for node data stored at index i, the two child nodes are at</span>
+<span class="s0"># index (2 * i + 1) and (2 * i + 2); the parent node is (i - 1) // 2</span>
+<span class="s0"># (where // indicates integer division).</span>
+<span class="s0">#</span>
+<span class="s0"># The data arrays used here are as follows:</span>
+<span class="s0">#   data : the [n_samples x n_features] array of data from which the tree</span>
+<span class="s0">#          is built</span>
+<span class="s0">#   idx_array : the length n_samples array used to keep track of the indices</span>
+<span class="s0">#          of data within each node.  Each node has values idx_start and</span>
+<span class="s0">#          idx_end: the points within the node are given by (using numpy</span>
+<span class="s0">#          syntax) data[idx_array[idx_start:idx_end]].</span>
+<span class="s0">#   node_data : the length n_nodes array of structures which store the node</span>
+<span class="s0">#          indices, node radii, and leaf information for each node.</span>
+<span class="s0">#   node_bounds : the [* x n_nodes x n_features] array containing the node</span>
+<span class="s0">#          bound information.  For ball tree, the first dimension is 1, and</span>
+<span class="s0">#          each row contains the centroid of the node.  For kd tree, the first</span>
+<span class="s0">#          dimension is 2 and the rows for each point contain the arrays of</span>
+<span class="s0">#          lower bounds and upper bounds in each direction.</span>
+<span class="s0">#</span>
+<span class="s0"># The lack of dynamic allocation means the number of nodes must be computed</span>
+<span class="s0"># before the building of the tree. This can be done assuming the points are</span>
+<span class="s0"># divided equally between child nodes at each step; although this removes</span>
+<span class="s0"># some flexibility in tree creation, it ensures a balanced tree and ensures</span>
+<span class="s0"># that the number of nodes required can be computed beforehand.  Given a</span>
+<span class="s0"># specified leaf_size (the minimum number of points in any node), it is</span>
+<span class="s0"># possible to show that a balanced tree will have</span>
+<span class="s0">#</span>
+<span class="s0">#     n_levels = 1 + max(0, floor(log2((n_samples - 1) / leaf_size)))</span>
+<span class="s0">#</span>
+<span class="s0"># in order to satisfy</span>
+<span class="s0">#</span>
+<span class="s0">#     leaf_size &lt;= min(n_points) &lt;= 2 * leaf_size</span>
+<span class="s0">#</span>
+<span class="s0"># with the exception of the special case where n_samples &lt; leaf_size.</span>
+<span class="s0"># for a given number of levels, the number of nodes in the tree is given by</span>
+<span class="s0">#</span>
+<span class="s0">#     n_nodes = 2 ** n_levels - 1</span>
+<span class="s0">#</span>
+<span class="s0"># both these results can be straightforwardly shown by induction.  The</span>
+<span class="s0"># following code uses these values in the construction of the tree.</span>
+<span class="s0">#</span>
+<span class="s0"># Distance Metrics</span>
+<span class="s0"># ----------------</span>
+<span class="s0"># For flexibility, the trees can be built using a variety of distance metrics.</span>
+<span class="s0"># The metrics are described in the DistanceMetric class: the standard</span>
+<span class="s0"># Euclidean distance is the default, and is inlined to be faster than other</span>
+<span class="s0"># metrics.  In addition, each metric defines both a distance and a</span>
+<span class="s0"># &quot;reduced distance&quot;, which is often faster to compute, and is therefore</span>
+<span class="s0"># used in the query architecture whenever possible. (For example, in the</span>
+<span class="s0"># case of the standard Euclidean distance, the reduced distance is the</span>
+<span class="s0"># squared-distance).</span>
+<span class="s0">#</span>
+<span class="s0"># Implementation Notes</span>
+<span class="s0"># --------------------</span>
+<span class="s0"># This implementation uses the common object-oriented approach of having an</span>
+<span class="s0"># abstract base class which is extended by the KDTree and BallTree</span>
+<span class="s0"># specializations.</span>
+<span class="s0">#</span>
+<span class="s0"># The BinaryTree &quot;base class&quot; is defined here and then subclassed in the BallTree</span>
+<span class="s0"># and KDTree pyx files. These files include implementations of the</span>
+<span class="s0"># &quot;abstract&quot; methods.</span>
+
+<span class="s0"># Necessary Helper Functions</span>
+<span class="s0"># --------------------------</span>
+<span class="s0"># These are the names and descriptions of the &quot;abstract&quot; functions which are</span>
+<span class="s0"># defined in kd_tree.pyx and ball_tree.pyx:</span>
+
+<span class="s0"># cdef int allocate_data(BinaryTree tree, intp_t n_nodes, intp_t n_features):</span>
+<span class="s0">#     &quot;&quot;&quot;Allocate arrays needed for the KD Tree&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef int init_node(BinaryTree tree, intp_t i_node,</span>
+<span class="s0">#                    intp_t idx_start, intp_t idx_end):</span>
+<span class="s0">#    &quot;&quot;&quot;Initialize the node for the dataset stored in tree.data&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef float64_t min_rdist(BinaryTree tree, intp_t i_node, float64_t* pt):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the minimum reduced-distance between a point and a node&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef float64_t min_dist(BinaryTree tree, intp_t i_node, float64_t* pt):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the minimum distance between a point and a node&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef float64_t max_rdist(BinaryTree tree, intp_t i_node, float64_t* pt):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the maximum reduced-distance between a point and a node&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef float64_t max_dist(BinaryTree tree, intp_t i_node, float64_t* pt):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the maximum distance between a point and a node&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef inline int min_max_dist(BinaryTree tree, intp_t i_node, float64_t* pt,</span>
+<span class="s0">#                              float64_t* min_dist, float64_t* max_dist):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the minimum and maximum distance between a point and a node&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef inline float64_t min_rdist_dual(BinaryTree tree1, intp_t i_node1,</span>
+<span class="s0">#                                    BinaryTree tree2, intp_t i_node2):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the minimum reduced distance between two nodes&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef inline float64_t min_dist_dual(BinaryTree tree1, intp_t i_node1,</span>
+<span class="s0">#                                   BinaryTree tree2, intp_t i_node2):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the minimum distance between two nodes&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef inline float64_t max_rdist_dual(BinaryTree tree1, intp_t i_node1,</span>
+<span class="s0">#                                    BinaryTree tree2, intp_t i_node2):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the maximum reduced distance between two nodes&quot;&quot;&quot;</span>
+
+<span class="s0"># cdef inline float64_t max_dist_dual(BinaryTree tree1, intp_t i_node1,</span>
+<span class="s0">#                                   BinaryTree tree2, intp_t i_node2):</span>
+<span class="s0">#     &quot;&quot;&quot;Compute the maximum distance between two nodes&quot;&quot;&quot;</span>
+
+<span class="s0">cimport numpy as cnp</span>
+<span class="s0">from cython cimport floating</span>
+<span class="s0">from libc.math cimport fabs, sqrt, exp, cos, pow, log, lgamma</span>
+<span class="s0">from libc.math cimport fmin, fmax</span>
+<span class="s0">from libc.stdlib cimport calloc, malloc, free</span>
+<span class="s0">from libc.string cimport memcpy</span>
+
+<span class="s0">import numpy as np</span>
+<span class="s0">import warnings</span>
+
+<span class="s0">from ..metrics._dist_metrics cimport (</span>
+    <span class="s0">DistanceMetric,</span>
+    <span class="s0">DistanceMetric64,</span>
+    <span class="s0">DistanceMetric32,</span>
+    <span class="s0">euclidean_dist64,</span>
+    <span class="s0">euclidean_dist32,</span>
+    <span class="s0">euclidean_rdist64,</span>
+    <span class="s0">euclidean_rdist32,</span>
+    <span class="s0">euclidean_dist_to_rdist64,</span>
+    <span class="s0">euclidean_dist_to_rdist32,</span>
+<span class="s0">)</span>
+
+<span class="s0">from ._partition_nodes cimport partition_node_indices</span>
+
+<span class="s0">from ..utils import check_array</span>
+<span class="s0">from ..utils._typedefs cimport float32_t, float64_t, intp_t</span>
+<span class="s0">from ..utils._heap cimport heap_push</span>
+<span class="s0">from ..utils._sorting cimport simultaneous_sort as _simultaneous_sort</span>
+
+<span class="s0">cnp.import_array()</span>
+
+
+<span class="s0"># TODO: use cnp.PyArray_ENABLEFLAGS when Cython&gt;=3.0 is used.</span>
+<span class="s0">cdef extern from &quot;numpy/arrayobject.h&quot;:</span>
+    <span class="s0">void PyArray_ENABLEFLAGS(cnp.ndarray arr, int flags)</span>
+
+
+<span class="s0"># some handy constants</span>
+<span class="s0">cdef float64_t INF = np.inf</span>
+<span class="s0">cdef float64_t NEG_INF = -np.inf</span>
+<span class="s0">cdef float64_t PI = np.pi</span>
+<span class="s0">cdef float64_t ROOT_2PI = sqrt(2 * PI)</span>
+<span class="s0">cdef float64_t LOG_PI = log(PI)</span>
+<span class="s0">cdef float64_t LOG_2PI = log(2 * PI)</span>
+
+
+<span class="s0"># Some compound datatypes used below:</span>
+<span class="s0">cdef struct NodeHeapData_t:</span>
+    <span class="s0">float64_t val</span>
+    <span class="s0">intp_t i1</span>
+    <span class="s0">intp_t i2</span>
+
+<span class="s0"># build the corresponding numpy dtype for NodeHeapData</span>
+<span class="s0">cdef NodeHeapData_t nhd_tmp</span>
+<span class="s0">NodeHeapData = np.asarray(&lt;NodeHeapData_t[:1]&gt;(&amp;nhd_tmp)).dtype</span>
+
+<span class="s0">cdef struct NodeData_t:</span>
+    <span class="s0">intp_t idx_start</span>
+    <span class="s0">intp_t idx_end</span>
+    <span class="s0">intp_t is_leaf</span>
+    <span class="s0">float64_t radius</span>
+
+<span class="s0"># build the corresponding numpy dtype for NodeData</span>
+<span class="s0">cdef NodeData_t nd_tmp</span>
+<span class="s0">NodeData = np.asarray(&lt;NodeData_t[:1]&gt;(&amp;nd_tmp)).dtype</span>
+
+
+<span class="s0">######################################################################</span>
+<span class="s0"># Define doc strings, substituting the appropriate class name using</span>
+<span class="s0"># the DOC_DICT variable defined in the pyx files.</span>
+<span class="s0">CLASS_DOC = &quot;&quot;&quot;{BinaryTree} for fast generalized N-point problems</span>
+
+<span class="s0">Read more in the :ref:`User Guide &lt;unsupervised_neighbors&gt;`.</span>
+
+<span class="s0">Parameters</span>
+<span class="s0">----------</span>
+<span class="s0">X : array-like of shape (n_samples, n_features)</span>
+    <span class="s0">n_samples is the number of points in the data set, and</span>
+    <span class="s0">n_features is the dimension of the parameter space.</span>
+    <span class="s0">Note: if X is a C-contiguous array of doubles then data will</span>
+    <span class="s0">not be copied. Otherwise, an internal copy will be made.</span>
+
+<span class="s0">leaf_size : positive int, default=40</span>
+    <span class="s0">Number of points at which to switch to brute-force. Changing</span>
+    <span class="s0">leaf_size will not affect the results of a query, but can</span>
+    <span class="s0">significantly impact the speed of a query and the memory required</span>
+    <span class="s0">to store the constructed tree.  The amount of memory needed to</span>
+    <span class="s0">store the tree scales as approximately n_samples / leaf_size.</span>
+    <span class="s0">For a specified ``leaf_size``, a leaf node is guaranteed to</span>
+    <span class="s0">satisfy ``leaf_size &lt;= n_points &lt;= 2 * leaf_size``, except in</span>
+    <span class="s0">the case that ``n_samples &lt; leaf_size``.</span>
+
+<span class="s0">metric : str or DistanceMetric64 object, default='minkowski'</span>
+    <span class="s0">Metric to use for distance computation. Default is &quot;minkowski&quot;, which</span>
+    <span class="s0">results in the standard Euclidean distance when p = 2.</span>
+    <span class="s0">A list of valid metrics for {BinaryTree} is given by the attribute</span>
+    <span class="s0">`valid_metrics`.</span>
+    <span class="s0">See the documentation of `scipy.spatial.distance</span>
+    <span class="s0">&lt;https://docs.scipy.org/doc/scipy/reference/spatial.distance.html&gt;`_ and</span>
+    <span class="s0">the metrics listed in :class:`~sklearn.metrics.pairwise.distance_metrics` for</span>
+    <span class="s0">more information on any distance metric.</span>
+
+<span class="s0">Additional keywords are passed to the distance metric class.</span>
+<span class="s0">Note: Callable functions in the metric parameter are NOT supported for KDTree</span>
+<span class="s0">and Ball Tree. Function call overhead will result in very poor performance.</span>
+
+<span class="s0">Attributes</span>
+<span class="s0">----------</span>
+<span class="s0">data : memory view</span>
+    <span class="s0">The training data</span>
+<span class="s0">valid_metrics: list of str</span>
+    <span class="s0">List of valid distance metrics.</span>
+
+<span class="s0">Examples</span>
+<span class="s0">--------</span>
+<span class="s0">Query for k-nearest neighbors</span>
+
+    <span class="s0">&gt;&gt;&gt; import numpy as np</span>
+    <span class="s0">&gt;&gt;&gt; from sklearn.neighbors import {BinaryTree}</span>
+    <span class="s0">&gt;&gt;&gt; rng = np.random.RandomState(0)</span>
+    <span class="s0">&gt;&gt;&gt; X = rng.random_sample((10, 3))  # 10 points in 3 dimensions</span>
+    <span class="s0">&gt;&gt;&gt; tree = {BinaryTree}(X, leaf_size=2)              # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; dist, ind = tree.query(X[:1], k=3)                # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; print(ind)  # indices of 3 closest neighbors</span>
+    <span class="s0">[0 3 1]</span>
+    <span class="s0">&gt;&gt;&gt; print(dist)  # distances to 3 closest neighbors</span>
+    <span class="s0">[ 0.          0.19662693  0.29473397]</span>
+
+<span class="s0">Pickle and Unpickle a tree.  Note that the state of the tree is saved in the</span>
+<span class="s0">pickle operation: the tree needs not be rebuilt upon unpickling.</span>
+
+    <span class="s0">&gt;&gt;&gt; import numpy as np</span>
+    <span class="s0">&gt;&gt;&gt; import pickle</span>
+    <span class="s0">&gt;&gt;&gt; rng = np.random.RandomState(0)</span>
+    <span class="s0">&gt;&gt;&gt; X = rng.random_sample((10, 3))  # 10 points in 3 dimensions</span>
+    <span class="s0">&gt;&gt;&gt; tree = {BinaryTree}(X, leaf_size=2)        # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; s = pickle.dumps(tree)                     # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; tree_copy = pickle.loads(s)                # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; dist, ind = tree_copy.query(X[:1], k=3)     # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; print(ind)  # indices of 3 closest neighbors</span>
+    <span class="s0">[0 3 1]</span>
+    <span class="s0">&gt;&gt;&gt; print(dist)  # distances to 3 closest neighbors</span>
+    <span class="s0">[ 0.          0.19662693  0.29473397]</span>
+
+<span class="s0">Query for neighbors within a given radius</span>
+
+    <span class="s0">&gt;&gt;&gt; import numpy as np</span>
+    <span class="s0">&gt;&gt;&gt; rng = np.random.RandomState(0)</span>
+    <span class="s0">&gt;&gt;&gt; X = rng.random_sample((10, 3))  # 10 points in 3 dimensions</span>
+    <span class="s0">&gt;&gt;&gt; tree = {BinaryTree}(X, leaf_size=2)     # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; print(tree.query_radius(X[:1], r=0.3, count_only=True))</span>
+    <span class="s0">3</span>
+    <span class="s0">&gt;&gt;&gt; ind = tree.query_radius(X[:1], r=0.3)  # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; print(ind)  # indices of neighbors within distance 0.3</span>
+    <span class="s0">[3 0 1]</span>
+
+
+<span class="s0">Compute a gaussian kernel density estimate:</span>
+
+    <span class="s0">&gt;&gt;&gt; import numpy as np</span>
+    <span class="s0">&gt;&gt;&gt; rng = np.random.RandomState(42)</span>
+    <span class="s0">&gt;&gt;&gt; X = rng.random_sample((100, 3))</span>
+    <span class="s0">&gt;&gt;&gt; tree = {BinaryTree}(X)                # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; tree.kernel_density(X[:3], h=0.1, kernel='gaussian')</span>
+    <span class="s0">array([ 6.94114649,  7.83281226,  7.2071716 ])</span>
+
+<span class="s0">Compute a two-point auto-correlation function</span>
+
+    <span class="s0">&gt;&gt;&gt; import numpy as np</span>
+    <span class="s0">&gt;&gt;&gt; rng = np.random.RandomState(0)</span>
+    <span class="s0">&gt;&gt;&gt; X = rng.random_sample((30, 3))</span>
+    <span class="s0">&gt;&gt;&gt; r = np.linspace(0, 1, 5)</span>
+    <span class="s0">&gt;&gt;&gt; tree = {BinaryTree}(X)                # doctest: +SKIP</span>
+    <span class="s0">&gt;&gt;&gt; tree.two_point_correlation(X, r)</span>
+    <span class="s0">array([ 30,  62, 278, 580, 820])</span>
+
+<span class="s0">&quot;&quot;&quot;</span>
+
+
+<span class="s0">######################################################################</span>
+<span class="s0"># Utility functions</span>
+<span class="s0">cdef float64_t logaddexp(float64_t x1, float64_t x2):</span>
+    <span class="s0">&quot;&quot;&quot;logaddexp(x1, x2) -&gt; log(exp(x1) + exp(x2))&quot;&quot;&quot;</span>
+    <span class="s0">cdef float64_t a = fmax(x1, x2)</span>
+    <span class="s0">if a == NEG_INF:</span>
+        <span class="s0">return NEG_INF</span>
+    <span class="s0">else:</span>
+        <span class="s0">return a + log(exp(x1 - a) + exp(x2 - a))</span>
+
+<span class="s0">cdef float64_t logsubexp(float64_t x1, float64_t x2):</span>
+    <span class="s0">&quot;&quot;&quot;logsubexp(x1, x2) -&gt; log(exp(x1) - exp(x2))&quot;&quot;&quot;</span>
+    <span class="s0">if x1 &lt;= x2:</span>
+        <span class="s0">return NEG_INF</span>
+    <span class="s0">else:</span>
+        <span class="s0">return x1 + log(1 - exp(x2 - x1))</span>
+
+
+<span class="s0">######################################################################</span>
+<span class="s0"># Kernel functions</span>
+<span class="s0">#</span>
+<span class="s0"># Note: Kernels assume dist is non-negative and h is positive</span>
+<span class="s0">#       All kernel functions are normalized such that K(0, h) = 1.</span>
+<span class="s0">#       The fully normalized kernel is:</span>
+<span class="s0">#         K = exp[kernel_norm(h, d, kernel) + compute_kernel(dist, h, kernel)]</span>
+<span class="s0">#       The code only works with non-negative kernels: i.e. K(d, h) &gt;= 0</span>
+<span class="s0">#       for all valid d and h.  Note that for precision, the log of both</span>
+<span class="s0">#       the kernel and kernel norm is returned.</span>
+<span class="s0">cdef enum KernelType:</span>
+    <span class="s0">GAUSSIAN_KERNEL = 1</span>
+    <span class="s0">TOPHAT_KERNEL = 2</span>
+    <span class="s0">EPANECHNIKOV_KERNEL = 3</span>
+    <span class="s0">EXPONENTIAL_KERNEL = 4</span>
+    <span class="s0">LINEAR_KERNEL = 5</span>
+    <span class="s0">COSINE_KERNEL = 6</span>
+
+
+<span class="s0">cdef inline float64_t log_gaussian_kernel(float64_t dist, float64_t h):</span>
+    <span class="s0">&quot;&quot;&quot;log of the gaussian kernel for bandwidth h (unnormalized)&quot;&quot;&quot;</span>
+    <span class="s0">return -0.5 * (dist * dist) / (h * h)</span>
+
+
+<span class="s0">cdef inline float64_t log_tophat_kernel(float64_t dist, float64_t h):</span>
+    <span class="s0">&quot;&quot;&quot;log of the tophat kernel for bandwidth h (unnormalized)&quot;&quot;&quot;</span>
+    <span class="s0">if dist &lt; h:</span>
+        <span class="s0">return 0.0</span>
+    <span class="s0">else:</span>
+        <span class="s0">return NEG_INF</span>
+
+
+<span class="s0">cdef inline float64_t log_epanechnikov_kernel(float64_t dist, float64_t h):</span>
+    <span class="s0">&quot;&quot;&quot;log of the epanechnikov kernel for bandwidth h (unnormalized)&quot;&quot;&quot;</span>
+    <span class="s0">if dist &lt; h:</span>
+        <span class="s0">return log(1.0 - (dist * dist) / (h * h))</span>
+    <span class="s0">else:</span>
+        <span class="s0">return NEG_INF</span>
+
+
+<span class="s0">cdef inline float64_t log_exponential_kernel(float64_t dist, float64_t h):</span>
+    <span class="s0">&quot;&quot;&quot;log of the exponential kernel for bandwidth h (unnormalized)&quot;&quot;&quot;</span>
+    <span class="s0">return -dist / h</span>
+
+
+<span class="s0">cdef inline float64_t log_linear_kernel(float64_t dist, float64_t h):</span>
+    <span class="s0">&quot;&quot;&quot;log of the linear kernel for bandwidth h (unnormalized)&quot;&quot;&quot;</span>
+    <span class="s0">if dist &lt; h:</span>
+        <span class="s0">return log(1 - dist / h)</span>
+    <span class="s0">else:</span>
+        <span class="s0">return NEG_INF</span>
+
+
+<span class="s0">cdef inline float64_t log_cosine_kernel(float64_t dist, float64_t h):</span>
+    <span class="s0">&quot;&quot;&quot;log of the cosine kernel for bandwidth h (unnormalized)&quot;&quot;&quot;</span>
+    <span class="s0">if dist &lt; h:</span>
+        <span class="s0">return log(cos(0.5 * PI * dist / h))</span>
+    <span class="s0">else:</span>
+        <span class="s0">return NEG_INF</span>
+
+
+<span class="s0">cdef inline float64_t compute_log_kernel(float64_t dist, float64_t h,</span>
+                                         <span class="s0">KernelType kernel):</span>
+    <span class="s0">&quot;&quot;&quot;Given a KernelType enumeration, compute the appropriate log-kernel&quot;&quot;&quot;</span>
+    <span class="s0">if kernel == GAUSSIAN_KERNEL:</span>
+        <span class="s0">return log_gaussian_kernel(dist, h)</span>
+    <span class="s0">elif kernel == TOPHAT_KERNEL:</span>
+        <span class="s0">return log_tophat_kernel(dist, h)</span>
+    <span class="s0">elif kernel == EPANECHNIKOV_KERNEL:</span>
+        <span class="s0">return log_epanechnikov_kernel(dist, h)</span>
+    <span class="s0">elif kernel == EXPONENTIAL_KERNEL:</span>
+        <span class="s0">return log_exponential_kernel(dist, h)</span>
+    <span class="s0">elif kernel == LINEAR_KERNEL:</span>
+        <span class="s0">return log_linear_kernel(dist, h)</span>
+    <span class="s0">elif kernel == COSINE_KERNEL:</span>
+        <span class="s0">return log_cosine_kernel(dist, h)</span>
+
+
+<span class="s0"># ------------------------------------------------------------</span>
+<span class="s0"># Kernel norms are defined via the volume element V_n</span>
+<span class="s0"># and surface element S_(n-1) of an n-sphere.</span>
+<span class="s0">cdef float64_t logVn(intp_t n):</span>
+    <span class="s0">&quot;&quot;&quot;V_n = pi^(n/2) / gamma(n/2 - 1)&quot;&quot;&quot;</span>
+    <span class="s0">return 0.5 * n * LOG_PI - lgamma(0.5 * n + 1)</span>
+
+
+<span class="s0">cdef float64_t logSn(intp_t n):</span>
+    <span class="s0">&quot;&quot;&quot;V_(n+1) = int_0^1 S_n r^n dr&quot;&quot;&quot;</span>
+    <span class="s0">return LOG_2PI + logVn(n - 1)</span>
+
+
+<span class="s0">cdef float64_t _log_kernel_norm(float64_t h, intp_t d,</span>
+                                <span class="s0">KernelType kernel) except -1:</span>
+    <span class="s0">&quot;&quot;&quot;Given a KernelType enumeration, compute the kernel normalization.</span>
+
+    <span class="s0">h is the bandwidth, d is the dimension.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef float64_t tmp, factor = 0</span>
+    <span class="s0">cdef intp_t k</span>
+    <span class="s0">if kernel == GAUSSIAN_KERNEL:</span>
+        <span class="s0">factor = 0.5 * d * LOG_2PI</span>
+    <span class="s0">elif kernel == TOPHAT_KERNEL:</span>
+        <span class="s0">factor = logVn(d)</span>
+    <span class="s0">elif kernel == EPANECHNIKOV_KERNEL:</span>
+        <span class="s0">factor = logVn(d) + log(2. / (d + 2.))</span>
+    <span class="s0">elif kernel == EXPONENTIAL_KERNEL:</span>
+        <span class="s0">factor = logSn(d - 1) + lgamma(d)</span>
+    <span class="s0">elif kernel == LINEAR_KERNEL:</span>
+        <span class="s0">factor = logVn(d) - log(d + 1.)</span>
+    <span class="s0">elif kernel == COSINE_KERNEL:</span>
+        <span class="s0"># this is derived from a chain rule integration</span>
+        <span class="s0">factor = 0</span>
+        <span class="s0">tmp = 2. / PI</span>
+        <span class="s0">for k in range(1, d + 1, 2):</span>
+            <span class="s0">factor += tmp</span>
+            <span class="s0">tmp *= -(d - k) * (d - k - 1) * (2. / PI) ** 2</span>
+        <span class="s0">factor = log(factor) + logSn(d - 1)</span>
+    <span class="s0">else:</span>
+        <span class="s0">raise ValueError(&quot;Kernel code not recognized&quot;)</span>
+    <span class="s0">return -factor - d * log(h)</span>
+
+
+<span class="s0">def kernel_norm(h, d, kernel, return_log=False):</span>
+    <span class="s0">&quot;&quot;&quot;Given a string specification of a kernel, compute the normalization.</span>
+
+    <span class="s0">Parameters</span>
+    <span class="s0">----------</span>
+    <span class="s0">h : float</span>
+        <span class="s0">The bandwidth of the kernel.</span>
+    <span class="s0">d : int</span>
+        <span class="s0">The dimension of the space in which the kernel norm is computed.</span>
+    <span class="s0">kernel : str</span>
+        <span class="s0">The kernel identifier.  Must be one of</span>
+        <span class="s0">['gaussian'|'tophat'|'epanechnikov'|</span>
+         <span class="s0">'exponential'|'linear'|'cosine']</span>
+    <span class="s0">return_log : bool, default=False</span>
+        <span class="s0">If True, return the log of the kernel norm.  Otherwise, return the</span>
+        <span class="s0">kernel norm.</span>
+    <span class="s0">Returns</span>
+    <span class="s0">-------</span>
+    <span class="s0">knorm or log_knorm : float</span>
+        <span class="s0">the kernel norm or logarithm of the kernel norm.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">if kernel == 'gaussian':</span>
+        <span class="s0">result = _log_kernel_norm(h, d, GAUSSIAN_KERNEL)</span>
+    <span class="s0">elif kernel == 'tophat':</span>
+        <span class="s0">result = _log_kernel_norm(h, d, TOPHAT_KERNEL)</span>
+    <span class="s0">elif kernel == 'epanechnikov':</span>
+        <span class="s0">result = _log_kernel_norm(h, d, EPANECHNIKOV_KERNEL)</span>
+    <span class="s0">elif kernel == 'exponential':</span>
+        <span class="s0">result = _log_kernel_norm(h, d, EXPONENTIAL_KERNEL)</span>
+    <span class="s0">elif kernel == 'linear':</span>
+        <span class="s0">result = _log_kernel_norm(h, d, LINEAR_KERNEL)</span>
+    <span class="s0">elif kernel == 'cosine':</span>
+        <span class="s0">result = _log_kernel_norm(h, d, COSINE_KERNEL)</span>
+    <span class="s0">else:</span>
+        <span class="s0">raise ValueError('kernel not recognized')</span>
+
+    <span class="s0">if return_log:</span>
+        <span class="s0">return result</span>
+    <span class="s0">else:</span>
+        <span class="s0">return np.exp(result)</span>
+
+<span class="s0">{{for name_suffix, INPUT_DTYPE_t, INPUT_DTYPE, NPY_TYPE in implementation_specific_values}}</span>
+
+<span class="s0">cdef class NeighborsHeap{{name_suffix}}:</span>
+    <span class="s0">&quot;&quot;&quot;A max-heap structure to keep track of distances/indices of neighbors</span>
+
+    <span class="s0">This implements an efficient pre-allocated set of fixed-size heaps</span>
+    <span class="s0">for chasing neighbors, holding both an index and a distance.</span>
+    <span class="s0">When any row of the heap is full, adding an additional point will push</span>
+    <span class="s0">the furthest point off the heap.</span>
+
+    <span class="s0">Parameters</span>
+    <span class="s0">----------</span>
+    <span class="s0">n_pts : int</span>
+        <span class="s0">the number of heaps to use</span>
+    <span class="s0">n_nbrs : int</span>
+        <span class="s0">the size of each heap.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef {{INPUT_DTYPE_t}}[:, ::1] distances</span>
+    <span class="s0">cdef intp_t[:, ::1] indices</span>
+
+    <span class="s0">def __cinit__(self):</span>
+        <span class="s0"># One-element arrays are used as placeholders to prevent</span>
+        <span class="s0"># any problem due to potential access to those attributes</span>
+        <span class="s0"># (e.g. assigning to NULL or a to value in another segment).</span>
+        <span class="s0">self.distances = np.zeros((1, 1), dtype={{INPUT_DTYPE}}, order='C')</span>
+        <span class="s0">self.indices = np.zeros((1, 1), dtype=np.intp, order='C')</span>
+
+    <span class="s0">def __init__(self, n_pts, n_nbrs):</span>
+        <span class="s0">self.distances = np.full(</span>
+            <span class="s0">(n_pts, n_nbrs), np.inf, dtype={{INPUT_DTYPE}}, order='C'</span>
+        <span class="s0">)</span>
+        <span class="s0">self.indices = np.zeros((n_pts, n_nbrs), dtype=np.intp, order='C')</span>
+
+    <span class="s0">def get_arrays(self, sort=True):</span>
+        <span class="s0">&quot;&quot;&quot;Get the arrays of distances and indices within the heap.</span>
+
+        <span class="s0">If sort=True, then simultaneously sort the indices and distances,</span>
+        <span class="s0">so the closer points are listed first.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">if sort:</span>
+            <span class="s0">self._sort()</span>
+        <span class="s0">return self.distances.base, self.indices.base</span>
+
+    <span class="s0">cdef inline float64_t largest(self, intp_t row) except -1 nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Return the largest distance in the given row&quot;&quot;&quot;</span>
+        <span class="s0">return self.distances[row, 0]</span>
+
+    <span class="s0">def push(self, intp_t row, float64_t val, intp_t i_val):</span>
+        <span class="s0">return self._push(row, val, i_val)</span>
+
+    <span class="s0">cdef int _push(self, intp_t row, float64_t val,</span>
+                   <span class="s0">intp_t i_val) except -1 nogil:</span>
+        <span class="s0">&quot;&quot;&quot;push (val, i_val) into the given row&quot;&quot;&quot;</span>
+        <span class="s0">return heap_push(</span>
+            <span class="s0">values=&amp;self.distances[row, 0],</span>
+            <span class="s0">indices=&amp;self.indices[row, 0],</span>
+            <span class="s0">size=self.distances.shape[1],</span>
+            <span class="s0">val=val,</span>
+            <span class="s0">val_idx=i_val,</span>
+        <span class="s0">)</span>
+
+    <span class="s0">cdef int _sort(self) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;simultaneously sort the distances and indices&quot;&quot;&quot;</span>
+        <span class="s0">cdef intp_t row</span>
+        <span class="s0">for row in range(self.distances.shape[0]):</span>
+            <span class="s0">_simultaneous_sort(</span>
+                <span class="s0">dist=&amp;self.distances[row, 0],</span>
+                <span class="s0">idx=&amp;self.indices[row, 0],</span>
+                <span class="s0">size=self.distances.shape[1],</span>
+            <span class="s0">)</span>
+        <span class="s0">return 0</span>
+
+<span class="s0">{{endfor}}</span>
+
+<span class="s0">#------------------------------------------------------------</span>
+<span class="s0"># find_node_split_dim:</span>
+<span class="s0">#  this computes the equivalent of</span>
+<span class="s0">#  j_max = np.argmax(np.max(data, 0) - np.min(data, 0))</span>
+<span class="s0">cdef intp_t find_node_split_dim(const floating* data,</span>
+                                 <span class="s0">const intp_t* node_indices,</span>
+                                 <span class="s0">intp_t n_features,</span>
+                                 <span class="s0">intp_t n_points) except -1:</span>
+    <span class="s0">&quot;&quot;&quot;Find the dimension with the largest spread.</span>
+
+    <span class="s0">Parameters</span>
+    <span class="s0">----------</span>
+    <span class="s0">data : double pointer</span>
+        <span class="s0">Pointer to a 2D array of the training data, of shape [N, n_features].</span>
+        <span class="s0">N must be greater than any of the values in node_indices.</span>
+    <span class="s0">node_indices : int pointer</span>
+        <span class="s0">Pointer to a 1D array of length n_points.  This lists the indices of</span>
+        <span class="s0">each of the points within the current node.</span>
+
+    <span class="s0">Returns</span>
+    <span class="s0">-------</span>
+    <span class="s0">i_max : int</span>
+        <span class="s0">The index of the feature (dimension) within the node that has the</span>
+        <span class="s0">largest spread.</span>
+
+    <span class="s0">Notes</span>
+    <span class="s0">-----</span>
+    <span class="s0">In numpy, this operation is equivalent to</span>
+
+    <span class="s0">def find_node_split_dim(data, node_indices):</span>
+        <span class="s0">return np.argmax(data[node_indices].max(0) - data[node_indices].min(0))</span>
+
+    <span class="s0">The cython version is much more efficient in both computation and memory.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef float64_t min_val, max_val, val, spread, max_spread</span>
+    <span class="s0">cdef intp_t i, j, j_max</span>
+
+    <span class="s0">j_max = 0</span>
+    <span class="s0">max_spread = 0</span>
+
+    <span class="s0">for j in range(n_features):</span>
+        <span class="s0">max_val = data[node_indices[0] * n_features + j]</span>
+        <span class="s0">min_val = max_val</span>
+        <span class="s0">for i in range(1, n_points):</span>
+            <span class="s0">val = data[node_indices[i] * n_features + j]</span>
+            <span class="s0">max_val = fmax(max_val, val)</span>
+            <span class="s0">min_val = fmin(min_val, val)</span>
+        <span class="s0">spread = max_val - min_val</span>
+        <span class="s0">if spread &gt; max_spread:</span>
+            <span class="s0">max_spread = spread</span>
+            <span class="s0">j_max = j</span>
+    <span class="s0">return j_max</span>
+
+
+<span class="s0">######################################################################</span>
+<span class="s0"># NodeHeap : min-heap used to keep track of nodes during</span>
+<span class="s0">#            breadth-first query</span>
+<span class="s0">cdef inline void swap_nodes(NodeHeapData_t* arr, intp_t i1, intp_t i2):</span>
+    <span class="s0">cdef NodeHeapData_t tmp = arr[i1]</span>
+    <span class="s0">arr[i1] = arr[i2]</span>
+    <span class="s0">arr[i2] = tmp</span>
+
+
+<span class="s0">cdef class NodeHeap:</span>
+    <span class="s0">&quot;&quot;&quot;NodeHeap</span>
+
+    <span class="s0">This is a min-heap implementation for keeping track of nodes</span>
+    <span class="s0">during a breadth-first search.  Unlike the NeighborsHeap above,</span>
+    <span class="s0">the NodeHeap does not have a fixed size and must be able to grow</span>
+    <span class="s0">as elements are added.</span>
+
+    <span class="s0">Internally, the data is stored in a simple binary heap which meets</span>
+    <span class="s0">the min heap condition:</span>
+
+        <span class="s0">heap[i].val &lt; min(heap[2 * i + 1].val, heap[2 * i + 2].val)</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef NodeHeapData_t[:] data</span>
+    <span class="s0">cdef intp_t n</span>
+
+    <span class="s0">def __cinit__(self):</span>
+        <span class="s0"># A one-elements array is used as a placeholder to prevent</span>
+        <span class="s0"># any problem due to potential access to this attribute</span>
+        <span class="s0"># (e.g. assigning to NULL or a to value in another segment).</span>
+        <span class="s0">self.data = np.zeros(1, dtype=NodeHeapData, order='C')</span>
+
+    <span class="s0">def __init__(self, size_guess=100):</span>
+        <span class="s0">size_guess = max(size_guess, 1)  # need space for at least one item</span>
+        <span class="s0">self.data = np.zeros(size_guess, dtype=NodeHeapData, order='C')</span>
+        <span class="s0">self.n = size_guess</span>
+        <span class="s0">self.clear()</span>
+
+    <span class="s0">cdef int resize(self, intp_t new_size) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;Resize the heap to be either larger or smaller&quot;&quot;&quot;</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">NodeHeapData_t *data_ptr</span>
+            <span class="s0">NodeHeapData_t *new_data_ptr</span>
+            <span class="s0">intp_t i</span>
+            <span class="s0">intp_t size = self.data.shape[0]</span>
+            <span class="s0">NodeHeapData_t[:] new_data = np.zeros(</span>
+                <span class="s0">new_size,</span>
+                <span class="s0">dtype=NodeHeapData,</span>
+            <span class="s0">)</span>
+
+        <span class="s0">if size &gt; 0 and new_size &gt; 0:</span>
+            <span class="s0">data_ptr = &amp;self.data[0]</span>
+            <span class="s0">new_data_ptr = &amp;new_data[0]</span>
+            <span class="s0">for i in range(min(size, new_size)):</span>
+                <span class="s0">new_data_ptr[i] = data_ptr[i]</span>
+
+        <span class="s0">if new_size &lt; size:</span>
+            <span class="s0">self.n = new_size</span>
+
+        <span class="s0">self.data = new_data</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef int push(self, NodeHeapData_t data) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;Push a new item onto the heap&quot;&quot;&quot;</span>
+        <span class="s0">cdef intp_t i, i_parent</span>
+        <span class="s0">cdef NodeHeapData_t* data_arr</span>
+        <span class="s0">self.n += 1</span>
+        <span class="s0">if self.n &gt; self.data.shape[0]:</span>
+            <span class="s0">self.resize(2 * self.n)</span>
+
+        <span class="s0"># put the new element at the end,</span>
+        <span class="s0"># and then perform swaps until the heap is in order</span>
+        <span class="s0">data_arr = &amp;self.data[0]</span>
+        <span class="s0">i = self.n - 1</span>
+        <span class="s0">data_arr[i] = data</span>
+
+        <span class="s0">while i &gt; 0:</span>
+            <span class="s0">i_parent = (i - 1) // 2</span>
+            <span class="s0">if data_arr[i_parent].val &lt;= data_arr[i].val:</span>
+                <span class="s0">break</span>
+            <span class="s0">else:</span>
+                <span class="s0">swap_nodes(data_arr, i, i_parent)</span>
+                <span class="s0">i = i_parent</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef NodeHeapData_t peek(self):</span>
+        <span class="s0">&quot;&quot;&quot;Peek at the root of the heap, without removing it&quot;&quot;&quot;</span>
+        <span class="s0">return self.data[0]</span>
+
+    <span class="s0">cdef NodeHeapData_t pop(self):</span>
+        <span class="s0">&quot;&quot;&quot;Remove the root of the heap, and update the remaining nodes&quot;&quot;&quot;</span>
+        <span class="s0">if self.n == 0:</span>
+            <span class="s0">raise ValueError('cannot pop on empty heap')</span>
+
+        <span class="s0">cdef intp_t i, i_child1, i_child2, i_swap</span>
+        <span class="s0">cdef NodeHeapData_t* data_arr = &amp;self.data[0]</span>
+        <span class="s0">cdef NodeHeapData_t popped_element = data_arr[0]</span>
+
+        <span class="s0"># pop off the first element, move the last element to the front,</span>
+        <span class="s0"># and then perform swaps until the heap is back in order</span>
+        <span class="s0">data_arr[0] = data_arr[self.n - 1]</span>
+        <span class="s0">self.n -= 1</span>
+
+        <span class="s0">i = 0</span>
+
+        <span class="s0">while (i &lt; self.n):</span>
+            <span class="s0">i_child1 = 2 * i + 1</span>
+            <span class="s0">i_child2 = 2 * i + 2</span>
+            <span class="s0">i_swap = 0</span>
+
+            <span class="s0">if i_child2 &lt; self.n:</span>
+                <span class="s0">if data_arr[i_child1].val &lt;= data_arr[i_child2].val:</span>
+                    <span class="s0">i_swap = i_child1</span>
+                <span class="s0">else:</span>
+                    <span class="s0">i_swap = i_child2</span>
+            <span class="s0">elif i_child1 &lt; self.n:</span>
+                <span class="s0">i_swap = i_child1</span>
+            <span class="s0">else:</span>
+                <span class="s0">break</span>
+
+            <span class="s0">if (i_swap &gt; 0) and (data_arr[i_swap].val &lt;= data_arr[i].val):</span>
+                <span class="s0">swap_nodes(data_arr, i, i_swap)</span>
+                <span class="s0">i = i_swap</span>
+            <span class="s0">else:</span>
+                <span class="s0">break</span>
+
+        <span class="s0">return popped_element</span>
+
+    <span class="s0">cdef void clear(self):</span>
+        <span class="s0">&quot;&quot;&quot;Clear the heap&quot;&quot;&quot;</span>
+        <span class="s0">self.n = 0</span>
+
+
+<span class="s0">######################################################################</span>
+<span class="s0"># newObj function</span>
+<span class="s0">#  this is a helper function for pickling</span>
+<span class="s0">def newObj(obj):</span>
+    <span class="s0">return obj.__new__(obj)</span>
+
+
+<span class="s0">{{for name_suffix, INPUT_DTYPE_t, INPUT_DTYPE, NPY_TYPE in implementation_specific_values}}</span>
+
+<span class="s0">######################################################################</span>
+<span class="s0"># define the reverse mapping of VALID_METRICS{{name_suffix}}</span>
+<span class="s0">from sklearn.metrics._dist_metrics import get_valid_metric_ids</span>
+<span class="s0">VALID_METRIC_IDS{{name_suffix}} = get_valid_metric_ids(VALID_METRICS{{name_suffix}})</span>
+
+
+<span class="s0">######################################################################</span>
+<span class="s0"># Binary Tree class</span>
+<span class="s0">cdef class BinaryTree{{name_suffix}}:</span>
+
+    <span class="s0">cdef readonly const {{INPUT_DTYPE_t}}[:, ::1] data</span>
+    <span class="s0">cdef readonly const {{INPUT_DTYPE_t}}[::1] sample_weight</span>
+    <span class="s0">cdef public float64_t sum_weight</span>
+
+    <span class="s0"># TODO: idx_array and node_bounds must not be const, but this change needs</span>
+    <span class="s0"># to happen in a way which preserves pickling</span>
+    <span class="s0"># See also: https://github.com/cython/cython/issues/5639</span>
+    <span class="s0">cdef public const intp_t[::1] idx_array</span>
+    <span class="s0">cdef public const NodeData_t[::1] node_data</span>
+    <span class="s0">cdef public const {{INPUT_DTYPE_t}}[:, :, ::1] node_bounds</span>
+
+    <span class="s0">cdef intp_t leaf_size</span>
+    <span class="s0">cdef intp_t n_levels</span>
+    <span class="s0">cdef intp_t n_nodes</span>
+
+    <span class="s0">cdef DistanceMetric{{name_suffix}} dist_metric</span>
+    <span class="s0">cdef int euclidean</span>
+
+    <span class="s0"># variables to keep track of building &amp; querying stats</span>
+    <span class="s0">cdef int n_trims</span>
+    <span class="s0">cdef int n_leaves</span>
+    <span class="s0">cdef int n_splits</span>
+    <span class="s0">cdef int n_calls</span>
+
+    <span class="s0">valid_metrics = VALID_METRIC_IDS{{name_suffix}}</span>
+
+    <span class="s0"># Use cinit to initialize all arrays to empty: this will prevent memory</span>
+    <span class="s0"># errors and seg-faults in rare cases where __init__ is not called</span>
+    <span class="s0"># A one-elements array is used as a placeholder to prevent</span>
+    <span class="s0"># any problem due to potential access to this attribute</span>
+    <span class="s0"># (e.g. assigning to NULL or a to value in another segment).</span>
+    <span class="s0">def __cinit__(self):</span>
+        <span class="s0">self.data = np.empty((1, 1), dtype={{INPUT_DTYPE}}, order='C')</span>
+        <span class="s0">self.sample_weight = np.empty(1, dtype={{INPUT_DTYPE}}, order='C')</span>
+        <span class="s0">self.idx_array = np.empty(1, dtype=np.intp, order='C')</span>
+        <span class="s0">self.node_data = np.empty(1, dtype=NodeData, order='C')</span>
+        <span class="s0">self.node_bounds = np.empty((1, 1, 1), dtype={{INPUT_DTYPE}})</span>
+
+        <span class="s0">self.leaf_size = 0</span>
+        <span class="s0">self.n_levels = 0</span>
+        <span class="s0">self.n_nodes = 0</span>
+
+        <span class="s0">self.euclidean = False</span>
+
+        <span class="s0">self.n_trims = 0</span>
+        <span class="s0">self.n_leaves = 0</span>
+        <span class="s0">self.n_splits = 0</span>
+        <span class="s0">self.n_calls = 0</span>
+
+    <span class="s0">def __init__(self, data,</span>
+                 <span class="s0">leaf_size=40, metric='minkowski', sample_weight=None, **kwargs):</span>
+        <span class="s0"># validate data</span>
+        <span class="s0">self.data = check_array(data, dtype={{INPUT_DTYPE}}, order='C')</span>
+        <span class="s0">if self.data.size == 0:</span>
+            <span class="s0">raise ValueError(&quot;X is an empty array&quot;)</span>
+
+        <span class="s0">n_samples = self.data.shape[0]</span>
+        <span class="s0">n_features = self.data.shape[1]</span>
+
+        <span class="s0">if leaf_size &lt; 1:</span>
+            <span class="s0">raise ValueError(&quot;leaf_size must be greater than or equal to 1&quot;)</span>
+        <span class="s0">self.leaf_size = leaf_size</span>
+
+        <span class="s0">self.dist_metric = DistanceMetric.get_metric(metric, dtype={{INPUT_DTYPE}}, **kwargs)</span>
+        <span class="s0">self.euclidean = (self.dist_metric.__class__.__name__</span>
+                          <span class="s0">== 'EuclideanDistance{{name_suffix}}')</span>
+
+        <span class="s0">metric = self.dist_metric.__class__.__name__</span>
+        <span class="s0">if metric not in VALID_METRICS{{name_suffix}}:</span>
+            <span class="s0">raise ValueError('metric {metric} is not valid for '</span>
+                             <span class="s0">'{BinaryTree}'.format(metric=metric,</span>
+                                                   <span class="s0">**DOC_DICT{{name_suffix}}))</span>
+        <span class="s0">self.dist_metric._validate_data(self.data)</span>
+
+        <span class="s0"># determine number of levels in the tree, and from this</span>
+        <span class="s0"># the number of nodes in the tree.  This results in leaf nodes</span>
+        <span class="s0"># with numbers of points between leaf_size and 2 * leaf_size</span>
+        <span class="s0">self.n_levels = int(</span>
+            <span class="s0">np.log2(fmax(1, (n_samples - 1) / self.leaf_size)) + 1)</span>
+        <span class="s0">self.n_nodes = &lt;int&gt; (2 ** self.n_levels) - 1</span>
+
+        <span class="s0"># allocate arrays for storage</span>
+        <span class="s0">self.idx_array = np.arange(n_samples, dtype=np.intp)</span>
+        <span class="s0">self.node_data = np.zeros(self.n_nodes, dtype=NodeData)</span>
+
+        <span class="s0">self._update_sample_weight(n_samples, sample_weight)</span>
+
+        <span class="s0"># Allocate tree-specific data</span>
+        <span class="s0">allocate_data{{name_suffix}}(self, self.n_nodes, n_features)</span>
+        <span class="s0">self._recursive_build(</span>
+            <span class="s0">node_data=self.node_data.base,</span>
+            <span class="s0">i_node=0,</span>
+            <span class="s0">idx_start=0,</span>
+            <span class="s0">idx_end=n_samples</span>
+        <span class="s0">)</span>
+
+    <span class="s0">def _update_sample_weight(self, n_samples, sample_weight):</span>
+        <span class="s0">if sample_weight is not None:</span>
+            <span class="s0">self.sample_weight = np.asarray(</span>
+                <span class="s0">sample_weight, dtype={{INPUT_DTYPE}}, order='C')</span>
+            <span class="s0">self.sum_weight = np.sum(self.sample_weight)</span>
+        <span class="s0">else:</span>
+            <span class="s0">self.sample_weight = None</span>
+            <span class="s0">self.sum_weight = &lt;float64_t&gt; n_samples</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">reduce method used for pickling</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return (newObj, (type(self),), self.__getstate__())</span>
+
+    <span class="s0">def __getstate__(self):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">get state for pickling</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">if self.sample_weight is not None:</span>
+            <span class="s0"># pass the numpy array</span>
+            <span class="s0">sample_weight = self.sample_weight.base</span>
+        <span class="s0">else:</span>
+            <span class="s0"># pass None to avoid confusion with the empty place holder</span>
+            <span class="s0"># of size 1 from __cinit__</span>
+            <span class="s0">sample_weight = None</span>
+        <span class="s0">return (self.data.base,</span>
+                <span class="s0">self.idx_array.base,</span>
+                <span class="s0">self.node_data.base,</span>
+                <span class="s0">self.node_bounds.base,</span>
+                <span class="s0">int(self.leaf_size),</span>
+                <span class="s0">int(self.n_levels),</span>
+                <span class="s0">int(self.n_nodes),</span>
+                <span class="s0">int(self.n_trims),</span>
+                <span class="s0">int(self.n_leaves),</span>
+                <span class="s0">int(self.n_splits),</span>
+                <span class="s0">int(self.n_calls),</span>
+                <span class="s0">self.dist_metric,</span>
+                <span class="s0">sample_weight)</span>
+
+    <span class="s0">def __setstate__(self, state):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">set state for pickling</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">self.data = state[0]</span>
+        <span class="s0">self.idx_array = state[1]</span>
+        <span class="s0">self.node_data = state[2]</span>
+        <span class="s0">self.node_bounds = state[3]</span>
+        <span class="s0">self.leaf_size = state[4]</span>
+        <span class="s0">self.n_levels = state[5]</span>
+        <span class="s0">self.n_nodes = state[6]</span>
+        <span class="s0">self.n_trims = state[7]</span>
+        <span class="s0">self.n_leaves = state[8]</span>
+        <span class="s0">self.n_splits = state[9]</span>
+        <span class="s0">self.n_calls = state[10]</span>
+        <span class="s0">self.dist_metric = state[11]</span>
+        <span class="s0">sample_weight = state[12]</span>
+
+        <span class="s0">self.euclidean = (self.dist_metric.__class__.__name__</span>
+                          <span class="s0">== 'EuclideanDistance64')</span>
+        <span class="s0">n_samples = self.data.shape[0]</span>
+        <span class="s0">self._update_sample_weight(n_samples, sample_weight)</span>
+
+    <span class="s0">def get_tree_stats(self):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">get_tree_stats()</span>
+
+        <span class="s0">Get tree status.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">tree_stats: tuple of int</span>
+            <span class="s0">(number of trims, number of leaves, number of splits)</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return (self.n_trims, self.n_leaves, self.n_splits)</span>
+
+    <span class="s0">def reset_n_calls(self):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">reset_n_calls()</span>
+
+        <span class="s0">Reset number of calls to 0.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">self.n_calls = 0</span>
+
+    <span class="s0">def get_n_calls(self):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">get_n_calls()</span>
+
+        <span class="s0">Get number of calls.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">n_calls: int</span>
+            <span class="s0">number of distance computation calls</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return self.n_calls</span>
+
+    <span class="s0">def get_arrays(self):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">get_arrays()</span>
+
+        <span class="s0">Get data and node arrays.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">arrays: tuple of array</span>
+            <span class="s0">Arrays for storing tree data, index, node data and node bounds.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return (</span>
+            <span class="s0">self.data.base,</span>
+            <span class="s0">self.idx_array.base,</span>
+            <span class="s0">self.node_data.base,</span>
+            <span class="s0">self.node_bounds.base,</span>
+        <span class="s0">)</span>
+
+    <span class="s0">cdef inline float64_t dist(self, const {{INPUT_DTYPE_t}}* x1, const {{INPUT_DTYPE_t}}* x2,</span>
+                             <span class="s0">intp_t size) except -1 nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Compute the distance between arrays x1 and x2&quot;&quot;&quot;</span>
+        <span class="s0">self.n_calls += 1</span>
+        <span class="s0">if self.euclidean:</span>
+            <span class="s0">return euclidean_dist{{name_suffix}}(x1, x2, size)</span>
+        <span class="s0">else:</span>
+            <span class="s0">return self.dist_metric.dist(x1, x2, size)</span>
+
+    <span class="s0">cdef inline float64_t rdist(self, const {{INPUT_DTYPE_t}}* x1, const {{INPUT_DTYPE_t}}* x2,</span>
+                              <span class="s0">intp_t size) except -1 nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Compute the reduced distance between arrays x1 and x2.</span>
+
+        <span class="s0">The reduced distance, defined for some metrics, is a quantity which</span>
+        <span class="s0">is more efficient to compute than the distance, but preserves the</span>
+        <span class="s0">relative rankings of the true distance.  For example, the reduced</span>
+        <span class="s0">distance for the Euclidean metric is the squared-euclidean distance.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">self.n_calls += 1</span>
+        <span class="s0">if self.euclidean:</span>
+            <span class="s0">return euclidean_rdist{{name_suffix}}(x1, x2, size)</span>
+        <span class="s0">else:</span>
+            <span class="s0">return self.dist_metric.rdist(x1, x2, size)</span>
+
+    <span class="s0">cdef int _recursive_build(self, NodeData_t[::1] node_data, intp_t i_node, intp_t idx_start,</span>
+                              <span class="s0">intp_t idx_end) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;Recursively build the tree.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">i_node : int</span>
+            <span class="s0">the node for the current step</span>
+        <span class="s0">idx_start, idx_end : int</span>
+            <span class="s0">the bounding indices in the idx_array which define the points that</span>
+            <span class="s0">belong to this node.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef intp_t imax</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+        <span class="s0">cdef intp_t n_points = idx_end - idx_start</span>
+        <span class="s0">cdef intp_t n_mid = n_points / 2</span>
+        <span class="s0">cdef intp_t* idx_array = &amp;self.idx_array[idx_start]</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data = &amp;self.data[0, 0]</span>
+
+        <span class="s0"># initialize node data</span>
+        <span class="s0">init_node{{name_suffix}}(self, node_data, i_node, idx_start, idx_end)</span>
+
+        <span class="s0">if 2 * i_node + 1 &gt;= self.n_nodes:</span>
+            <span class="s0">node_data[i_node].is_leaf = True</span>
+            <span class="s0">if idx_end - idx_start &gt; 2 * self.leaf_size:</span>
+                <span class="s0"># this shouldn't happen if our memory allocation is correct</span>
+                <span class="s0"># we'll proactively prevent memory errors, but raise a</span>
+                <span class="s0"># warning saying we're doing so.</span>
+                <span class="s0">import warnings</span>
+                <span class="s0">warnings.warn(&quot;Internal: memory layout is flawed: &quot;</span>
+                              <span class="s0">&quot;not enough nodes allocated&quot;)</span>
+
+        <span class="s0">elif idx_end - idx_start &lt; 2:</span>
+            <span class="s0"># again, this shouldn't happen if our memory allocation</span>
+            <span class="s0"># is correct.  Raise a warning.</span>
+            <span class="s0">import warnings</span>
+            <span class="s0">warnings.warn(&quot;Internal: memory layout is flawed: &quot;</span>
+                          <span class="s0">&quot;too many nodes allocated&quot;)</span>
+            <span class="s0">node_data[i_node].is_leaf = True</span>
+
+        <span class="s0">else:</span>
+            <span class="s0"># split node and recursively construct child nodes.</span>
+            <span class="s0">node_data[i_node].is_leaf = False</span>
+            <span class="s0">i_max = find_node_split_dim(data, idx_array,</span>
+                                        <span class="s0">n_features, n_points)</span>
+            <span class="s0">partition_node_indices(data, idx_array, i_max, n_mid,</span>
+                                   <span class="s0">n_features, n_points)</span>
+            <span class="s0">self._recursive_build(node_data, 2 * i_node + 1,</span>
+                                  <span class="s0">idx_start, idx_start + n_mid)</span>
+            <span class="s0">self._recursive_build(node_data, 2 * i_node + 2,</span>
+                                  <span class="s0">idx_start + n_mid, idx_end)</span>
+
+    <span class="s0">def query(self, X, k=1, return_distance=True,</span>
+              <span class="s0">dualtree=False, breadth_first=False,</span>
+              <span class="s0">sort_results=True):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">query(X, k=1, return_distance=True,</span>
+              <span class="s0">dualtree=False, breadth_first=False)</span>
+
+        <span class="s0">query the tree for the k nearest neighbors</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">X : array-like of shape (n_samples, n_features)</span>
+            <span class="s0">An array of points to query</span>
+        <span class="s0">k : int, default=1</span>
+            <span class="s0">The number of nearest neighbors to return</span>
+        <span class="s0">return_distance : bool, default=True</span>
+            <span class="s0">if True, return a tuple (d, i) of distances and indices</span>
+            <span class="s0">if False, return array i</span>
+        <span class="s0">dualtree : bool, default=False</span>
+            <span class="s0">if True, use the dual tree formalism for the query: a tree is</span>
+            <span class="s0">built for the query points, and the pair of trees is used to</span>
+            <span class="s0">efficiently search this space.  This can lead to better</span>
+            <span class="s0">performance as the number of points grows large.</span>
+        <span class="s0">breadth_first : bool, default=False</span>
+            <span class="s0">if True, then query the nodes in a breadth-first manner.</span>
+            <span class="s0">Otherwise, query the nodes in a depth-first manner.</span>
+        <span class="s0">sort_results : bool, default=True</span>
+            <span class="s0">if True, then distances and indices of each point are sorted</span>
+            <span class="s0">on return, so that the first column contains the closest points.</span>
+            <span class="s0">Otherwise, neighbors are returned in an arbitrary order.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">i    : if return_distance == False</span>
+        <span class="s0">(d,i) : if return_distance == True</span>
+
+        <span class="s0">d : ndarray of shape X.shape[:-1] + (k,), dtype=double</span>
+            <span class="s0">Each entry gives the list of distances to the neighbors of the</span>
+            <span class="s0">corresponding point.</span>
+
+        <span class="s0">i : ndarray of shape X.shape[:-1] + (k,), dtype=int</span>
+            <span class="s0">Each entry gives the list of indices of neighbors of the</span>
+            <span class="s0">corresponding point.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0"># XXX: we should allow X to be a pre-built tree.</span>
+        <span class="s0">X = check_array(X, dtype={{INPUT_DTYPE}}, order='C')</span>
+
+        <span class="s0">if X.shape[X.ndim - 1] != self.data.shape[1]:</span>
+            <span class="s0">raise ValueError(&quot;query data dimension must &quot;</span>
+                             <span class="s0">&quot;match training data dimension&quot;)</span>
+
+        <span class="s0">if self.data.shape[0] &lt; k:</span>
+            <span class="s0">raise ValueError(&quot;k must be less than or equal &quot;</span>
+                             <span class="s0">&quot;to the number of training points&quot;)</span>
+
+        <span class="s0"># flatten X, and save original shape information</span>
+        <span class="s0">np_Xarr = X.reshape((-1, self.data.shape[1]))</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}[:, ::1] Xarr = np_Xarr</span>
+        <span class="s0">cdef float64_t reduced_dist_LB</span>
+        <span class="s0">cdef intp_t i</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* pt</span>
+
+        <span class="s0"># initialize heap for neighbors</span>
+        <span class="s0">cdef NeighborsHeap{{name_suffix}} heap = NeighborsHeap{{name_suffix}}(Xarr.shape[0], k)</span>
+
+        <span class="s0"># node heap for breadth-first queries</span>
+        <span class="s0">cdef NodeHeap nodeheap</span>
+        <span class="s0">if breadth_first:</span>
+            <span class="s0">nodeheap = NodeHeap(self.data.shape[0] // self.leaf_size)</span>
+
+        <span class="s0"># bounds is needed for the dual tree algorithm</span>
+        <span class="s0">cdef float64_t[::1] bounds</span>
+
+        <span class="s0">self.n_trims = 0</span>
+        <span class="s0">self.n_leaves = 0</span>
+        <span class="s0">self.n_splits = 0</span>
+
+        <span class="s0">if dualtree:</span>
+            <span class="s0">other = self.__class__(np_Xarr, metric=self.dist_metric,</span>
+                                   <span class="s0">leaf_size=self.leaf_size)</span>
+            <span class="s0">if breadth_first:</span>
+                <span class="s0">self._query_dual_breadthfirst(other, heap, nodeheap)</span>
+            <span class="s0">else:</span>
+                <span class="s0">reduced_dist_LB = min_rdist_dual{{name_suffix}}(self, 0, other, 0)</span>
+                <span class="s0">bounds = np.full(other.node_data.shape[0], np.inf)</span>
+                <span class="s0">self._query_dual_depthfirst(0, other, 0, bounds,</span>
+                                            <span class="s0">heap, reduced_dist_LB)</span>
+
+        <span class="s0">else:</span>
+            <span class="s0">pt = &amp;Xarr[0, 0]</span>
+            <span class="s0">if breadth_first:</span>
+                <span class="s0">for i in range(Xarr.shape[0]):</span>
+                    <span class="s0">self._query_single_breadthfirst(pt, i, heap, nodeheap)</span>
+                    <span class="s0">pt += Xarr.shape[1]</span>
+            <span class="s0">else:</span>
+                <span class="s0">with nogil:</span>
+                    <span class="s0">for i in range(Xarr.shape[0]):</span>
+                        <span class="s0">reduced_dist_LB = min_rdist{{name_suffix}}(self, 0, pt)</span>
+                        <span class="s0">self._query_single_depthfirst(0, pt, i, heap,</span>
+                                                      <span class="s0">reduced_dist_LB)</span>
+                        <span class="s0">pt += Xarr.shape[1]</span>
+
+        <span class="s0">distances, indices = heap.get_arrays(sort=sort_results)</span>
+        <span class="s0">distances = self.dist_metric.rdist_to_dist(distances)</span>
+
+        <span class="s0"># deflatten results</span>
+        <span class="s0">if return_distance:</span>
+            <span class="s0">return (distances.reshape(X.shape[:X.ndim - 1] + (k,)),</span>
+                    <span class="s0">indices.reshape(X.shape[:X.ndim - 1] + (k,)))</span>
+        <span class="s0">else:</span>
+            <span class="s0">return indices.reshape(X.shape[:X.ndim - 1] + (k,))</span>
+
+    <span class="s0">def query_radius(self, X, r, int return_distance=False,</span>
+                     <span class="s0">int count_only=False, int sort_results=False):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">query_radius(X, r, return_distance=False,</span>
+        <span class="s0">count_only=False, sort_results=False)</span>
+
+        <span class="s0">query the tree for neighbors within a radius r</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">X : array-like of shape (n_samples, n_features)</span>
+            <span class="s0">An array of points to query</span>
+        <span class="s0">r : distance within which neighbors are returned</span>
+            <span class="s0">r can be a single value, or an array of values of shape</span>
+            <span class="s0">x.shape[:-1] if different radii are desired for each point.</span>
+        <span class="s0">return_distance : bool, default=False</span>
+            <span class="s0">if True,  return distances to neighbors of each point</span>
+            <span class="s0">if False, return only neighbors</span>
+            <span class="s0">Note that unlike the query() method, setting return_distance=True</span>
+            <span class="s0">here adds to the computation time.  Not all distances need to be</span>
+            <span class="s0">calculated explicitly for return_distance=False.  Results are</span>
+            <span class="s0">not sorted by default: see ``sort_results`` keyword.</span>
+        <span class="s0">count_only : bool, default=False</span>
+            <span class="s0">if True,  return only the count of points within distance r</span>
+            <span class="s0">if False, return the indices of all points within distance r</span>
+            <span class="s0">If return_distance==True, setting count_only=True will</span>
+            <span class="s0">result in an error.</span>
+        <span class="s0">sort_results : bool, default=False</span>
+            <span class="s0">if True, the distances and indices will be sorted before being</span>
+            <span class="s0">returned.  If False, the results will not be sorted.  If</span>
+            <span class="s0">return_distance == False, setting sort_results = True will</span>
+            <span class="s0">result in an error.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">count       : if count_only == True</span>
+        <span class="s0">ind         : if count_only == False and return_distance == False</span>
+        <span class="s0">(ind, dist) : if count_only == False and return_distance == True</span>
+
+        <span class="s0">count : ndarray of shape X.shape[:-1], dtype=int</span>
+            <span class="s0">Each entry gives the number of neighbors within a distance r of the</span>
+            <span class="s0">corresponding point.</span>
+
+        <span class="s0">ind : ndarray of shape X.shape[:-1], dtype=object</span>
+            <span class="s0">Each element is a numpy integer array listing the indices of</span>
+            <span class="s0">neighbors of the corresponding point.  Note that unlike</span>
+            <span class="s0">the results of a k-neighbors query, the returned neighbors</span>
+            <span class="s0">are not sorted by distance by default.</span>
+
+        <span class="s0">dist : ndarray of shape X.shape[:-1], dtype=object</span>
+            <span class="s0">Each element is a numpy double array listing the distances</span>
+            <span class="s0">corresponding to indices in i.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">if count_only and return_distance:</span>
+            <span class="s0">raise ValueError(&quot;count_only and return_distance &quot;</span>
+                             <span class="s0">&quot;cannot both be true&quot;)</span>
+
+        <span class="s0">if sort_results and not return_distance:</span>
+            <span class="s0">raise ValueError(&quot;return_distance must be True &quot;</span>
+                             <span class="s0">&quot;if sort_results is True&quot;)</span>
+
+        <span class="s0">cdef intp_t i, count_i = 0</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+        <span class="s0">cdef {{INPUT_DTYPE_t}}[::1] dist_arr_i</span>
+        <span class="s0">cdef intp_t[::1] idx_arr_i, counts</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* pt</span>
+        <span class="s0">cdef intp_t** indices = NULL</span>
+        <span class="s0">cdef {{INPUT_DTYPE_t}}** distances = NULL</span>
+
+        <span class="s0"># validate X and prepare for query</span>
+        <span class="s0">X = check_array(X, dtype={{INPUT_DTYPE}}, order='C')</span>
+
+        <span class="s0">if X.shape[X.ndim - 1] != self.data.shape[1]:</span>
+            <span class="s0">raise ValueError(&quot;query data dimension must &quot;</span>
+                             <span class="s0">&quot;match training data dimension&quot;)</span>
+
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}[:, ::1] Xarr = X.reshape((-1, self.data.shape[1]))</span>
+
+        <span class="s0"># prepare r for query</span>
+        <span class="s0">r = np.asarray(r, dtype=np.float64, order='C')</span>
+        <span class="s0">r = np.atleast_1d(r)</span>
+        <span class="s0">if r.shape == (1,):</span>
+            <span class="s0">r = np.full(X.shape[:X.ndim - 1], r[0], dtype=np.float64)</span>
+        <span class="s0">else:</span>
+            <span class="s0">if r.shape != X.shape[:X.ndim - 1]:</span>
+                <span class="s0">raise ValueError(&quot;r must be broadcastable to X.shape&quot;)</span>
+
+        <span class="s0">rarr_np = r.reshape(-1)  # store explicitly to keep in scope</span>
+        <span class="s0">cdef float64_t[::1] rarr = rarr_np</span>
+
+        <span class="s0">if not count_only:</span>
+            <span class="s0">indices = &lt;intp_t**&gt;calloc(Xarr.shape[0], sizeof(intp_t*))</span>
+            <span class="s0">if indices == NULL:</span>
+                <span class="s0">raise MemoryError()</span>
+            <span class="s0">if return_distance:</span>
+                <span class="s0">distances = &lt;{{INPUT_DTYPE_t}}**&gt;calloc(Xarr.shape[0], sizeof({{INPUT_DTYPE_t}}*))</span>
+                <span class="s0">if distances == NULL:</span>
+                    <span class="s0">free(indices)</span>
+                    <span class="s0">raise MemoryError()</span>
+
+        <span class="s0">np_idx_arr = np.zeros(self.data.shape[0], dtype=np.intp)</span>
+        <span class="s0">idx_arr_i = np_idx_arr</span>
+
+        <span class="s0">np_dist_arr = np.zeros(self.data.shape[0], dtype={{INPUT_DTYPE}})</span>
+        <span class="s0">dist_arr_i = np_dist_arr</span>
+
+        <span class="s0">counts_arr = np.zeros(Xarr.shape[0], dtype=np.intp)</span>
+        <span class="s0">counts = counts_arr</span>
+
+        <span class="s0">pt = &amp;Xarr[0, 0]</span>
+        <span class="s0">memory_error = False</span>
+        <span class="s0">with nogil:</span>
+            <span class="s0">for i in range(Xarr.shape[0]):</span>
+                <span class="s0">counts[i] = self._query_radius_single(0, pt, rarr[i],</span>
+                                                      <span class="s0">&amp;idx_arr_i[0],</span>
+                                                      <span class="s0">&amp;dist_arr_i[0],</span>
+                                                      <span class="s0">0, count_only,</span>
+                                                      <span class="s0">return_distance)</span>
+                <span class="s0">pt += n_features</span>
+
+                <span class="s0">if count_only:</span>
+                    <span class="s0">continue</span>
+
+                <span class="s0">if sort_results:</span>
+                    <span class="s0">_simultaneous_sort(&amp;dist_arr_i[0], &amp;idx_arr_i[0],</span>
+                                       <span class="s0">counts[i])</span>
+
+                <span class="s0"># equivalent to: indices[i] = np_idx_arr[:counts[i]].copy()</span>
+                <span class="s0">indices[i] = &lt;intp_t*&gt;malloc(counts[i] * sizeof(intp_t))</span>
+                <span class="s0">if indices[i] == NULL:</span>
+                    <span class="s0">memory_error = True</span>
+                    <span class="s0">break</span>
+                <span class="s0">memcpy(indices[i], &amp;idx_arr_i[0], counts[i] * sizeof(intp_t))</span>
+
+                <span class="s0">if return_distance:</span>
+                    <span class="s0"># equivalent to: distances[i] = np_dist_arr[:counts[i]].copy()</span>
+                    <span class="s0">distances[i] = &lt;{{INPUT_DTYPE_t}}*&gt;malloc(counts[i] * sizeof({{INPUT_DTYPE_t}}))</span>
+                    <span class="s0">if distances[i] == NULL:</span>
+                        <span class="s0">memory_error = True</span>
+                        <span class="s0">break</span>
+                    <span class="s0">memcpy(distances[i], &amp;dist_arr_i[0], counts[i] * sizeof({{INPUT_DTYPE_t}}))</span>
+
+        <span class="s0">try:</span>
+            <span class="s0">if memory_error:</span>
+                <span class="s0">raise MemoryError()</span>
+
+            <span class="s0">if count_only:</span>
+                <span class="s0"># deflatten results</span>
+                <span class="s0">return counts_arr.reshape(X.shape[:X.ndim - 1])</span>
+            <span class="s0">elif return_distance:</span>
+                <span class="s0">indices_npy = np.zeros(Xarr.shape[0], dtype='object')</span>
+                <span class="s0">distances_npy = np.zeros(Xarr.shape[0], dtype='object')</span>
+                <span class="s0">for i in range(Xarr.shape[0]):</span>
+                    <span class="s0"># make a new numpy array that wraps the existing data</span>
+                    <span class="s0"># TODO: remove the explicit cast to cnp.intp_t* when cython min version &gt;= 3.0</span>
+                    <span class="s0">indices_npy[i] = cnp.PyArray_SimpleNewFromData(1, &lt;cnp.intp_t*&gt;&amp;counts[i], cnp.NPY_INTP, indices[i])</span>
+                    <span class="s0"># make sure the data will be freed when the numpy array is garbage collected</span>
+                    <span class="s0">PyArray_ENABLEFLAGS(indices_npy[i], cnp.NPY_ARRAY_OWNDATA)</span>
+                    <span class="s0"># make sure the data is not freed twice</span>
+                    <span class="s0">indices[i] = NULL</span>
+
+                    <span class="s0"># make a new numpy array that wraps the existing data</span>
+                    <span class="s0"># TODO: remove the explicit cast to cnp.intp_t* when cython min version &gt;= 3.0</span>
+                    <span class="s0">distances_npy[i] = cnp.PyArray_SimpleNewFromData(1, &lt;cnp.intp_t*&gt;&amp;counts[i], {{NPY_TYPE}}, distances[i])</span>
+                    <span class="s0"># make sure the data will be freed when the numpy array is garbage collected</span>
+                    <span class="s0">PyArray_ENABLEFLAGS(distances_npy[i], cnp.NPY_ARRAY_OWNDATA)</span>
+                    <span class="s0"># make sure the data is not freed twice</span>
+                    <span class="s0">distances[i] = NULL</span>
+
+                <span class="s0"># deflatten results</span>
+                <span class="s0">return (indices_npy.reshape(X.shape[:X.ndim - 1]),</span>
+                        <span class="s0">distances_npy.reshape(X.shape[:X.ndim - 1]))</span>
+            <span class="s0">else:</span>
+                <span class="s0">indices_npy = np.zeros(Xarr.shape[0], dtype='object')</span>
+                <span class="s0">for i in range(Xarr.shape[0]):</span>
+                    <span class="s0"># make a new numpy array that wraps the existing data</span>
+                    <span class="s0"># TODO: remove the explicit cast to cnp.intp_t* when cython min version &gt;= 3.0</span>
+                    <span class="s0">indices_npy[i] = cnp.PyArray_SimpleNewFromData(1, &lt;cnp.intp_t*&gt;&amp;counts[i], cnp.NPY_INTP, indices[i])</span>
+                    <span class="s0"># make sure the data will be freed when the numpy array is garbage collected</span>
+                    <span class="s0">PyArray_ENABLEFLAGS(indices_npy[i], cnp.NPY_ARRAY_OWNDATA)</span>
+                    <span class="s0"># make sure the data is not freed twice</span>
+                    <span class="s0">indices[i] = NULL</span>
+
+                <span class="s0"># deflatten results</span>
+                <span class="s0">return indices_npy.reshape(X.shape[:X.ndim - 1])</span>
+        <span class="s0">except MemoryError:</span>
+            <span class="s0"># free any buffer that is not owned by a numpy array</span>
+            <span class="s0">for i in range(Xarr.shape[0]):</span>
+                <span class="s0">free(indices[i])</span>
+                <span class="s0">if return_distance:</span>
+                    <span class="s0">free(distances[i])</span>
+            <span class="s0">raise</span>
+        <span class="s0">finally:</span>
+            <span class="s0">free(indices)</span>
+            <span class="s0">free(distances)</span>
+
+    <span class="s0">def kernel_density(self, X, h, kernel='gaussian',</span>
+                       <span class="s0">atol=0, rtol=1E-8,</span>
+                       <span class="s0">breadth_first=True, return_log=False):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">kernel_density(X, h, kernel='gaussian', atol=0, rtol=1E-8,</span>
+                       <span class="s0">breadth_first=True, return_log=False)</span>
+
+        <span class="s0">Compute the kernel density estimate at points X with the given kernel,</span>
+        <span class="s0">using the distance metric specified at tree creation.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">X : array-like of shape (n_samples, n_features)</span>
+            <span class="s0">An array of points to query.  Last dimension should match dimension</span>
+            <span class="s0">of training data.</span>
+        <span class="s0">h : float</span>
+            <span class="s0">the bandwidth of the kernel</span>
+        <span class="s0">kernel : str, default=&quot;gaussian&quot;</span>
+            <span class="s0">specify the kernel to use.  Options are</span>
+            <span class="s0">- 'gaussian'</span>
+            <span class="s0">- 'tophat'</span>
+            <span class="s0">- 'epanechnikov'</span>
+            <span class="s0">- 'exponential'</span>
+            <span class="s0">- 'linear'</span>
+            <span class="s0">- 'cosine'</span>
+            <span class="s0">Default is kernel = 'gaussian'</span>
+        <span class="s0">atol : float, default=0</span>
+            <span class="s0">Specify the desired absolute tolerance of the result.</span>
+            <span class="s0">If the true result is `K_true`, then the returned result `K_ret`</span>
+            <span class="s0">satisfies ``abs(K_true - K_ret) &lt; atol + rtol * K_ret``</span>
+            <span class="s0">The default is zero (i.e. machine precision).</span>
+        <span class="s0">rtol : float, default=1e-8</span>
+            <span class="s0">Specify the desired relative tolerance of the result.</span>
+            <span class="s0">If the true result is `K_true`, then the returned result `K_ret`</span>
+            <span class="s0">satisfies ``abs(K_true - K_ret) &lt; atol + rtol * K_ret``</span>
+            <span class="s0">The default is `1e-8` (i.e. machine precision).</span>
+        <span class="s0">breadth_first : bool, default=False</span>
+            <span class="s0">If True, use a breadth-first search.  If False (default) use a</span>
+            <span class="s0">depth-first search.  Breadth-first is generally faster for</span>
+            <span class="s0">compact kernels and/or high tolerances.</span>
+        <span class="s0">return_log : bool, default=False</span>
+            <span class="s0">Return the logarithm of the result.  This can be more accurate</span>
+            <span class="s0">than returning the result itself for narrow kernels.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">density : ndarray of shape X.shape[:-1]</span>
+            <span class="s0">The array of (log)-density evaluations</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef float64_t h_c = h</span>
+        <span class="s0">cdef float64_t log_atol = log(atol)</span>
+        <span class="s0">cdef float64_t log_rtol = log(rtol)</span>
+        <span class="s0">cdef float64_t log_min_bound, log_max_bound, log_bound_spread</span>
+        <span class="s0">cdef float64_t dist_LB = 0, dist_UB = 0</span>
+
+        <span class="s0">cdef intp_t n_samples = self.data.shape[0]</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+        <span class="s0">cdef intp_t i</span>
+        <span class="s0">cdef KernelType kernel_c</span>
+
+        <span class="s0"># validate kernel</span>
+        <span class="s0">if kernel == 'gaussian':</span>
+            <span class="s0">kernel_c = GAUSSIAN_KERNEL</span>
+        <span class="s0">elif kernel == 'tophat':</span>
+            <span class="s0">kernel_c = TOPHAT_KERNEL</span>
+        <span class="s0">elif kernel == 'epanechnikov':</span>
+            <span class="s0">kernel_c = EPANECHNIKOV_KERNEL</span>
+        <span class="s0">elif kernel == 'exponential':</span>
+            <span class="s0">kernel_c = EXPONENTIAL_KERNEL</span>
+        <span class="s0">elif kernel == 'linear':</span>
+            <span class="s0">kernel_c = LINEAR_KERNEL</span>
+        <span class="s0">elif kernel == 'cosine':</span>
+            <span class="s0">kernel_c = COSINE_KERNEL</span>
+        <span class="s0">else:</span>
+            <span class="s0">raise ValueError(&quot;kernel = '%s' not recognized&quot; % kernel)</span>
+
+        <span class="s0">cdef float64_t log_knorm = _log_kernel_norm(h_c, n_features, kernel_c)</span>
+
+        <span class="s0"># validate X and prepare for query</span>
+        <span class="s0">X = check_array(X, dtype={{INPUT_DTYPE}}, order='C')</span>
+
+        <span class="s0">if X.shape[X.ndim - 1] != n_features:</span>
+            <span class="s0">raise ValueError(&quot;query data dimension must &quot;</span>
+                             <span class="s0">&quot;match training data dimension&quot;)</span>
+        <span class="s0">Xarr_np = X.reshape((-1, n_features))</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}[:, ::1] Xarr = Xarr_np</span>
+
+        <span class="s0">log_density_arr = np.zeros(Xarr.shape[0], dtype={{INPUT_DTYPE}})</span>
+        <span class="s0">cdef {{INPUT_DTYPE_t}}[::1] log_density = log_density_arr</span>
+
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* pt = &amp;Xarr[0, 0]</span>
+
+        <span class="s0">cdef NodeHeap nodeheap</span>
+        <span class="s0">if breadth_first:</span>
+            <span class="s0">nodeheap = NodeHeap(self.data.shape[0] // self.leaf_size)</span>
+        <span class="s0">cdef float64_t[::1] node_log_min_bounds</span>
+        <span class="s0">cdef float64_t[::1] node_bound_widths</span>
+        <span class="s0"># TODO: implement dual tree approach.</span>
+        <span class="s0">#       this is difficult because of the need to cache values</span>
+        <span class="s0">#       computed between node pairs.</span>
+        <span class="s0">if breadth_first:</span>
+            <span class="s0">node_log_min_bounds_arr = np.full(self.n_nodes, -np.inf)</span>
+            <span class="s0">node_log_min_bounds = node_log_min_bounds_arr</span>
+            <span class="s0">node_bound_widths_arr = np.zeros(self.n_nodes)</span>
+            <span class="s0">node_bound_widths = node_bound_widths_arr</span>
+            <span class="s0">for i in range(Xarr.shape[0]):</span>
+                <span class="s0">log_density[i] = self._kde_single_breadthfirst(</span>
+                                            <span class="s0">pt, kernel_c, h_c,</span>
+                                            <span class="s0">log_knorm, log_atol, log_rtol,</span>
+                                            <span class="s0">nodeheap,</span>
+                                            <span class="s0">&amp;node_log_min_bounds[0],</span>
+                                            <span class="s0">&amp;node_bound_widths[0])</span>
+                <span class="s0">pt += n_features</span>
+        <span class="s0">else:</span>
+            <span class="s0">for i in range(Xarr.shape[0]):</span>
+                <span class="s0">min_max_dist{{name_suffix}}(self, 0, pt, &amp;dist_LB, &amp;dist_UB)</span>
+                <span class="s0"># compute max &amp; min bounds on density within top node</span>
+                <span class="s0">log_min_bound = (log(self.sum_weight) +</span>
+                                 <span class="s0">compute_log_kernel(dist_UB,</span>
+                                                    <span class="s0">h_c, kernel_c))</span>
+                <span class="s0">log_max_bound = (log(self.sum_weight) +</span>
+                                 <span class="s0">compute_log_kernel(dist_LB,</span>
+                                                    <span class="s0">h_c, kernel_c))</span>
+                <span class="s0">log_bound_spread = logsubexp(log_max_bound, log_min_bound)</span>
+                <span class="s0">self._kde_single_depthfirst(0, pt, kernel_c, h_c,</span>
+                                            <span class="s0">log_knorm, log_atol, log_rtol,</span>
+                                            <span class="s0">log_min_bound,</span>
+                                            <span class="s0">log_bound_spread,</span>
+                                            <span class="s0">&amp;log_min_bound,</span>
+                                            <span class="s0">&amp;log_bound_spread)</span>
+                <span class="s0">log_density[i] = logaddexp(log_min_bound,</span>
+                                           <span class="s0">log_bound_spread - log(2))</span>
+                <span class="s0">pt += n_features</span>
+
+        <span class="s0"># normalize the results</span>
+        <span class="s0">for i in range(log_density.shape[0]):</span>
+            <span class="s0">log_density[i] += log_knorm</span>
+
+        <span class="s0">log_density_arr = log_density_arr.reshape(X.shape[:X.ndim - 1])</span>
+
+        <span class="s0">if return_log:</span>
+            <span class="s0">return log_density_arr</span>
+        <span class="s0">else:</span>
+            <span class="s0">return np.exp(log_density_arr)</span>
+
+    <span class="s0">def two_point_correlation(self, X, r, dualtree=False):</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">two_point_correlation(X, r, dualtree=False)</span>
+
+        <span class="s0">Compute the two-point correlation function</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">X : array-like of shape (n_samples, n_features)</span>
+            <span class="s0">An array of points to query.  Last dimension should match dimension</span>
+            <span class="s0">of training data.</span>
+        <span class="s0">r : array-like</span>
+            <span class="s0">A one-dimensional array of distances</span>
+        <span class="s0">dualtree : bool, default=False</span>
+            <span class="s0">If True, use a dualtree algorithm.  Otherwise, use a single-tree</span>
+            <span class="s0">algorithm.  Dual tree algorithms can have better scaling for</span>
+            <span class="s0">large N.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">counts : ndarray</span>
+            <span class="s0">counts[i] contains the number of pairs of points with distance</span>
+            <span class="s0">less than or equal to r[i]</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+        <span class="s0">cdef intp_t i</span>
+
+        <span class="s0"># validate X and prepare for query</span>
+        <span class="s0">X = check_array(X, dtype={{INPUT_DTYPE}}, order='C')</span>
+
+        <span class="s0">if X.shape[X.ndim - 1] != self.data.shape[1]:</span>
+            <span class="s0">raise ValueError(&quot;query data dimension must &quot;</span>
+                             <span class="s0">&quot;match training data dimension&quot;)</span>
+
+        <span class="s0">np_Xarr = X.reshape((-1, self.data.shape[1]))</span>
+        <span class="s0">cdef {{INPUT_DTYPE_t}}[:, ::1] Xarr = np_Xarr</span>
+
+        <span class="s0"># prepare r for query</span>
+        <span class="s0">r = np.asarray(r, dtype=np.float64, order='C')</span>
+        <span class="s0">r = np.atleast_1d(r)</span>
+        <span class="s0">if r.ndim != 1:</span>
+            <span class="s0">raise ValueError(&quot;r must be a 1-dimensional array&quot;)</span>
+        <span class="s0">i_rsort = np.argsort(r)</span>
+        <span class="s0">rarr_np = r[i_rsort]  # needed to keep memory in scope</span>
+        <span class="s0">cdef float64_t[::1] rarr = rarr_np</span>
+
+        <span class="s0"># create array to hold counts</span>
+        <span class="s0">count = np.zeros(r.shape[0], dtype=np.intp)</span>
+        <span class="s0">cdef intp_t[::1] carr = count</span>
+
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* pt = &amp;Xarr[0, 0]</span>
+
+        <span class="s0">if dualtree:</span>
+            <span class="s0">other = self.__class__(Xarr, metric=self.dist_metric,</span>
+                                   <span class="s0">leaf_size=self.leaf_size)</span>
+            <span class="s0">self._two_point_dual(0, other, 0, &amp;rarr[0], &amp;carr[0],</span>
+                                 <span class="s0">0, rarr.shape[0])</span>
+        <span class="s0">else:</span>
+            <span class="s0">for i in range(Xarr.shape[0]):</span>
+                <span class="s0">self._two_point_single(0, pt, &amp;rarr[0], &amp;carr[0],</span>
+                                       <span class="s0">0, rarr.shape[0])</span>
+                <span class="s0">pt += n_features</span>
+
+        <span class="s0">return count</span>
+
+    <span class="s0">cdef int _query_single_depthfirst(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t i_node,</span>
+        <span class="s0">const {{INPUT_DTYPE_t}}* pt,</span>
+        <span class="s0">intp_t i_pt,</span>
+        <span class="s0">NeighborsHeap{{name_suffix}} heap,</span>
+        <span class="s0">float64_t reduced_dist_LB,</span>
+    <span class="s0">) except -1 nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Recursive Single-tree k-neighbors query, depth-first approach&quot;&quot;&quot;</span>
+        <span class="s0">cdef NodeData_t node_info = self.node_data[i_node]</span>
+
+        <span class="s0">cdef float64_t dist_pt, reduced_dist_LB_1, reduced_dist_LB_2</span>
+        <span class="s0">cdef intp_t i, i1, i2</span>
+
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data = &amp;self.data[0, 0]</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 1: query point is outside node radius:</span>
+        <span class="s0">#         trim it from the query</span>
+        <span class="s0">if reduced_dist_LB &gt; heap.largest(i_pt):</span>
+            <span class="s0">self.n_trims += 1</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 2: this is a leaf node.  Update set of nearby points</span>
+        <span class="s0">elif node_info.is_leaf:</span>
+            <span class="s0">self.n_leaves += 1</span>
+            <span class="s0">for i in range(node_info.idx_start, node_info.idx_end):</span>
+                <span class="s0">dist_pt = self.rdist(pt,</span>
+                                     <span class="s0">&amp;self.data[self.idx_array[i], 0],</span>
+                                     <span class="s0">self.data.shape[1])</span>
+                <span class="s0">heap._push(i_pt, dist_pt, self.idx_array[i])</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 3: Node is not a leaf.  Recursively query subnodes</span>
+        <span class="s0">#         starting with the closest</span>
+        <span class="s0">else:</span>
+            <span class="s0">self.n_splits += 1</span>
+            <span class="s0">i1 = 2 * i_node + 1</span>
+            <span class="s0">i2 = i1 + 1</span>
+            <span class="s0">reduced_dist_LB_1 = min_rdist{{name_suffix}}(self, i1, pt)</span>
+            <span class="s0">reduced_dist_LB_2 = min_rdist{{name_suffix}}(self, i2, pt)</span>
+
+            <span class="s0"># recursively query subnodes</span>
+            <span class="s0">if reduced_dist_LB_1 &lt;= reduced_dist_LB_2:</span>
+                <span class="s0">self._query_single_depthfirst(i1, pt, i_pt, heap,</span>
+                                              <span class="s0">reduced_dist_LB_1)</span>
+                <span class="s0">self._query_single_depthfirst(i2, pt, i_pt, heap,</span>
+                                              <span class="s0">reduced_dist_LB_2)</span>
+            <span class="s0">else:</span>
+                <span class="s0">self._query_single_depthfirst(i2, pt, i_pt, heap,</span>
+                                              <span class="s0">reduced_dist_LB_2)</span>
+                <span class="s0">self._query_single_depthfirst(i1, pt, i_pt, heap,</span>
+                                              <span class="s0">reduced_dist_LB_1)</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef int _query_single_breadthfirst(</span>
+        <span class="s0">self,</span>
+        <span class="s0">const {{INPUT_DTYPE_t}}* pt,</span>
+        <span class="s0">intp_t i_pt,</span>
+        <span class="s0">NeighborsHeap{{name_suffix}} heap,</span>
+        <span class="s0">NodeHeap nodeheap,</span>
+    <span class="s0">) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;Non-recursive single-tree k-neighbors query, breadth-first search&quot;&quot;&quot;</span>
+        <span class="s0">cdef intp_t i, i_node</span>
+        <span class="s0">cdef float64_t dist_pt, reduced_dist_LB</span>
+        <span class="s0">cdef const NodeData_t* node_data = &amp;self.node_data[0]</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data = &amp;self.data[0, 0]</span>
+
+        <span class="s0"># Set up the node heap and push the head node onto it</span>
+        <span class="s0">cdef NodeHeapData_t nodeheap_item</span>
+        <span class="s0">nodeheap_item.val = min_rdist{{name_suffix}}(self, 0, pt)</span>
+        <span class="s0">nodeheap_item.i1 = 0</span>
+        <span class="s0">nodeheap.push(nodeheap_item)</span>
+
+        <span class="s0">while nodeheap.n &gt; 0:</span>
+            <span class="s0">nodeheap_item = nodeheap.pop()</span>
+            <span class="s0">reduced_dist_LB = nodeheap_item.val</span>
+            <span class="s0">i_node = nodeheap_item.i1</span>
+            <span class="s0">node_info = node_data[i_node]</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 1: query point is outside node radius:</span>
+            <span class="s0">#         trim it from the query</span>
+            <span class="s0">if reduced_dist_LB &gt; heap.largest(i_pt):</span>
+                <span class="s0">self.n_trims += 1</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 2: this is a leaf node.  Update set of nearby points</span>
+            <span class="s0">elif node_data[i_node].is_leaf:</span>
+                <span class="s0">self.n_leaves += 1</span>
+                <span class="s0">for i in range(node_data[i_node].idx_start,</span>
+                               <span class="s0">node_data[i_node].idx_end):</span>
+                    <span class="s0">dist_pt = self.rdist(pt,</span>
+                                         <span class="s0">&amp;self.data[self.idx_array[i], 0],</span>
+                                         <span class="s0">self.data.shape[1])</span>
+                    <span class="s0">heap._push(i_pt, dist_pt, self.idx_array[i])</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 3: Node is not a leaf.  Add subnodes to the node heap</span>
+            <span class="s0">else:</span>
+                <span class="s0">self.n_splits += 1</span>
+                <span class="s0">for i in range(2 * i_node + 1, 2 * i_node + 3):</span>
+                    <span class="s0">nodeheap_item.i1 = i</span>
+                    <span class="s0">nodeheap_item.val = min_rdist{{name_suffix}}(self, i, pt)</span>
+                    <span class="s0">nodeheap.push(nodeheap_item)</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef int _query_dual_depthfirst(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t i_node1,</span>
+        <span class="s0">BinaryTree{{name_suffix}} other,</span>
+        <span class="s0">intp_t i_node2,</span>
+        <span class="s0">float64_t[::1] bounds,</span>
+        <span class="s0">NeighborsHeap{{name_suffix}} heap,</span>
+        <span class="s0">float64_t reduced_dist_LB,</span>
+    <span class="s0">) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;Recursive dual-tree k-neighbors query, depth-first&quot;&quot;&quot;</span>
+        <span class="s0"># note that the array `bounds` is maintained such that</span>
+        <span class="s0"># bounds[i] is the largest distance among any of the</span>
+        <span class="s0"># current neighbors in node i of the other tree.</span>
+        <span class="s0">cdef NodeData_t node_info1 = self.node_data[i_node1]</span>
+        <span class="s0">cdef NodeData_t node_info2 = other.node_data[i_node2]</span>
+
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data1 = &amp;self.data[0, 0]</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data2 = &amp;other.data[0, 0]</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+
+        <span class="s0">cdef float64_t bound_max, dist_pt, reduced_dist_LB1, reduced_dist_LB2</span>
+        <span class="s0">cdef intp_t i1, i2, i_pt, i_parent</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 1: nodes are further apart than the current bound:</span>
+        <span class="s0">#         trim both from the query</span>
+        <span class="s0">if reduced_dist_LB &gt; bounds[i_node2]:</span>
+            <span class="s0">pass</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 2: both nodes are leaves:</span>
+        <span class="s0">#         do a brute-force search comparing all pairs</span>
+        <span class="s0">elif node_info1.is_leaf and node_info2.is_leaf:</span>
+            <span class="s0">bounds[i_node2] = 0</span>
+
+            <span class="s0">for i2 in range(node_info2.idx_start, node_info2.idx_end):</span>
+                <span class="s0">i_pt = other.idx_array[i2]</span>
+
+                <span class="s0">if heap.largest(i_pt) &lt;= reduced_dist_LB:</span>
+                    <span class="s0">continue</span>
+
+                <span class="s0">for i1 in range(node_info1.idx_start, node_info1.idx_end):</span>
+                    <span class="s0">dist_pt = self.rdist(</span>
+                        <span class="s0">data1 + n_features * self.idx_array[i1],</span>
+                        <span class="s0">data2 + n_features * i_pt,</span>
+                        <span class="s0">n_features)</span>
+                    <span class="s0">heap._push(i_pt, dist_pt, self.idx_array[i1])</span>
+
+                <span class="s0"># keep track of node bound</span>
+                <span class="s0">bounds[i_node2] = fmax(bounds[i_node2],</span>
+                                       <span class="s0">heap.largest(i_pt))</span>
+
+            <span class="s0"># update bounds up the tree</span>
+            <span class="s0">while i_node2 &gt; 0:</span>
+                <span class="s0">i_parent = (i_node2 - 1) // 2</span>
+                <span class="s0">bound_max = fmax(bounds[2 * i_parent + 1],</span>
+                                 <span class="s0">bounds[2 * i_parent + 2])</span>
+                <span class="s0">if bound_max &lt; bounds[i_parent]:</span>
+                    <span class="s0">bounds[i_parent] = bound_max</span>
+                    <span class="s0">i_node2 = i_parent</span>
+                <span class="s0">else:</span>
+                    <span class="s0">break</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 3a: node 1 is a leaf or is smaller: split node 2 and</span>
+        <span class="s0">#          recursively query, starting with the nearest subnode</span>
+        <span class="s0">elif node_info1.is_leaf or (not node_info2.is_leaf</span>
+                                    <span class="s0">and node_info2.radius &gt; node_info1.radius):</span>
+            <span class="s0">reduced_dist_LB1 = min_rdist_dual{{name_suffix}}(self, i_node1,</span>
+                                              <span class="s0">other, 2 * i_node2 + 1)</span>
+            <span class="s0">reduced_dist_LB2 = min_rdist_dual{{name_suffix}}(self, i_node1,</span>
+                                              <span class="s0">other, 2 * i_node2 + 2)</span>
+
+            <span class="s0">if reduced_dist_LB1 &lt; reduced_dist_LB2:</span>
+                <span class="s0">self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 1,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB1)</span>
+                <span class="s0">self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 2,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB2)</span>
+            <span class="s0">else:</span>
+                <span class="s0">self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 2,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB2)</span>
+                <span class="s0">self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 1,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB1)</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 3b: node 2 is a leaf or is smaller: split node 1 and</span>
+        <span class="s0">#          recursively query, starting with the nearest subnode</span>
+        <span class="s0">else:</span>
+            <span class="s0">reduced_dist_LB1 = min_rdist_dual{{name_suffix}}(self, 2 * i_node1 + 1,</span>
+                                              <span class="s0">other, i_node2)</span>
+            <span class="s0">reduced_dist_LB2 = min_rdist_dual{{name_suffix}}(self, 2 * i_node1 + 2,</span>
+                                              <span class="s0">other, i_node2)</span>
+
+            <span class="s0">if reduced_dist_LB1 &lt; reduced_dist_LB2:</span>
+                <span class="s0">self._query_dual_depthfirst(2 * i_node1 + 1, other, i_node2,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB1)</span>
+                <span class="s0">self._query_dual_depthfirst(2 * i_node1 + 2, other, i_node2,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB2)</span>
+            <span class="s0">else:</span>
+                <span class="s0">self._query_dual_depthfirst(2 * i_node1 + 2, other, i_node2,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB2)</span>
+                <span class="s0">self._query_dual_depthfirst(2 * i_node1 + 1, other, i_node2,</span>
+                                            <span class="s0">bounds, heap, reduced_dist_LB1)</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef int _query_dual_breadthfirst(</span>
+        <span class="s0">self,</span>
+        <span class="s0">BinaryTree{{name_suffix}} other,</span>
+        <span class="s0">NeighborsHeap{{name_suffix}} heap,</span>
+        <span class="s0">NodeHeap nodeheap,</span>
+    <span class="s0">) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;Non-recursive dual-tree k-neighbors query, breadth-first&quot;&quot;&quot;</span>
+        <span class="s0">cdef intp_t i, i1, i2, i_node1, i_node2, i_pt</span>
+        <span class="s0">cdef float64_t dist_pt, reduced_dist_LB</span>
+        <span class="s0">cdef float64_t[::1] bounds = np.full(other.node_data.shape[0], np.inf)</span>
+        <span class="s0">cdef const NodeData_t* node_data1 = &amp;self.node_data[0]</span>
+        <span class="s0">cdef const NodeData_t* node_data2 = &amp;other.node_data[0]</span>
+        <span class="s0">cdef NodeData_t node_info1, node_info2</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data1 = &amp;self.data[0, 0]</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data2 = &amp;other.data[0, 0]</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+
+        <span class="s0"># Set up the node heap and push the head nodes onto it</span>
+        <span class="s0">cdef NodeHeapData_t nodeheap_item</span>
+        <span class="s0">nodeheap_item.val = min_rdist_dual{{name_suffix}}(self, 0, other, 0)</span>
+        <span class="s0">nodeheap_item.i1 = 0</span>
+        <span class="s0">nodeheap_item.i2 = 0</span>
+        <span class="s0">nodeheap.push(nodeheap_item)</span>
+
+        <span class="s0">while nodeheap.n &gt; 0:</span>
+            <span class="s0">nodeheap_item = nodeheap.pop()</span>
+            <span class="s0">reduced_dist_LB = nodeheap_item.val</span>
+            <span class="s0">i_node1 = nodeheap_item.i1</span>
+            <span class="s0">i_node2 = nodeheap_item.i2</span>
+
+            <span class="s0">node_info1 = node_data1[i_node1]</span>
+            <span class="s0">node_info2 = node_data2[i_node2]</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 1: nodes are further apart than the current bound:</span>
+            <span class="s0">#         trim both from the query</span>
+            <span class="s0">if reduced_dist_LB &gt; bounds[i_node2]:</span>
+                <span class="s0">pass</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 2: both nodes are leaves:</span>
+            <span class="s0">#         do a brute-force search comparing all pairs</span>
+            <span class="s0">elif node_info1.is_leaf and node_info2.is_leaf:</span>
+                <span class="s0">bounds[i_node2] = -1</span>
+
+                <span class="s0">for i2 in range(node_info2.idx_start, node_info2.idx_end):</span>
+                    <span class="s0">i_pt = other.idx_array[i2]</span>
+
+                    <span class="s0">if heap.largest(i_pt) &lt;= reduced_dist_LB:</span>
+                        <span class="s0">continue</span>
+
+                    <span class="s0">for i1 in range(node_info1.idx_start, node_info1.idx_end):</span>
+                        <span class="s0">dist_pt = self.rdist(</span>
+                            <span class="s0">data1 + n_features * self.idx_array[i1],</span>
+                            <span class="s0">data2 + n_features * i_pt,</span>
+                            <span class="s0">n_features)</span>
+                        <span class="s0">heap._push(i_pt, dist_pt, self.idx_array[i1])</span>
+
+                    <span class="s0"># keep track of node bound</span>
+                    <span class="s0">bounds[i_node2] = fmax(bounds[i_node2],</span>
+                                           <span class="s0">heap.largest(i_pt))</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 3a: node 1 is a leaf or is smaller: split node 2 and</span>
+            <span class="s0">#          recursively query, starting with the nearest subnode</span>
+            <span class="s0">elif node_info1.is_leaf or (not node_info2.is_leaf</span>
+                                        <span class="s0">and (node_info2.radius</span>
+                                             <span class="s0">&gt; node_info1.radius)):</span>
+                <span class="s0">nodeheap_item.i1 = i_node1</span>
+                <span class="s0">for i2 in range(2 * i_node2 + 1, 2 * i_node2 + 3):</span>
+                    <span class="s0">nodeheap_item.i2 = i2</span>
+                    <span class="s0">nodeheap_item.val = min_rdist_dual{{name_suffix}}(self, i_node1,</span>
+                                                       <span class="s0">other, i2)</span>
+                    <span class="s0">nodeheap.push(nodeheap_item)</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 3b: node 2 is a leaf or is smaller: split node 1 and</span>
+            <span class="s0">#          recursively query, starting with the nearest subnode</span>
+            <span class="s0">else:</span>
+                <span class="s0">nodeheap_item.i2 = i_node2</span>
+                <span class="s0">for i1 in range(2 * i_node1 + 1, 2 * i_node1 + 3):</span>
+                    <span class="s0">nodeheap_item.i1 = i1</span>
+                    <span class="s0">nodeheap_item.val = min_rdist_dual{{name_suffix}}(self, i1,</span>
+                                                       <span class="s0">other, i_node2)</span>
+                    <span class="s0">nodeheap.push(nodeheap_item)</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef intp_t _query_radius_single(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t i_node,</span>
+        <span class="s0">const {{INPUT_DTYPE_t}}* pt,</span>
+        <span class="s0">float64_t r,</span>
+        <span class="s0">intp_t* indices,</span>
+        <span class="s0">{{INPUT_DTYPE_t}}* distances,</span>
+        <span class="s0">intp_t count,</span>
+        <span class="s0">int count_only,</span>
+        <span class="s0">int return_distance,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;recursive single-tree radius query, depth-first&quot;&quot;&quot;</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data = &amp;self.data[0, 0]</span>
+        <span class="s0">cdef intp_t* idx_array = &amp;self.idx_array[0]</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+        <span class="s0">cdef NodeData_t node_info = self.node_data[i_node]</span>
+
+        <span class="s0">cdef intp_t i</span>
+        <span class="s0">cdef float64_t reduced_r</span>
+
+        <span class="s0">cdef float64_t dist_pt, dist_LB = 0, dist_UB = 0</span>
+        <span class="s0">min_max_dist{{name_suffix}}(self, i_node, pt, &amp;dist_LB, &amp;dist_UB)</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 1: all node points are outside distance r.</span>
+        <span class="s0">#         prune this branch.</span>
+        <span class="s0">if dist_LB &gt; r:</span>
+            <span class="s0">pass</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 2: all node points are within distance r</span>
+        <span class="s0">#         add all points to neighbors</span>
+        <span class="s0">elif dist_UB &lt;= r:</span>
+            <span class="s0">if count_only:</span>
+                <span class="s0">count += (node_info.idx_end - node_info.idx_start)</span>
+            <span class="s0">else:</span>
+                <span class="s0">for i in range(node_info.idx_start, node_info.idx_end):</span>
+                    <span class="s0">if (count &lt; 0) or (count &gt;= self.data.shape[0]):</span>
+                        <span class="s0">return -1</span>
+                    <span class="s0">indices[count] = idx_array[i]</span>
+                    <span class="s0">if return_distance:</span>
+                        <span class="s0">distances[count] = self.dist(pt, (data + n_features</span>
+                                                          <span class="s0">* idx_array[i]),</span>
+                                                     <span class="s0">n_features)</span>
+                    <span class="s0">count += 1</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 3: this is a leaf node.  Go through all points to</span>
+        <span class="s0">#         determine if they fall within radius</span>
+        <span class="s0">elif node_info.is_leaf:</span>
+            <span class="s0">reduced_r = self.dist_metric._dist_to_rdist(r)</span>
+
+            <span class="s0">for i in range(node_info.idx_start, node_info.idx_end):</span>
+                <span class="s0">dist_pt = self.rdist(pt, (data + n_features * idx_array[i]),</span>
+                                     <span class="s0">n_features)</span>
+                <span class="s0">if dist_pt &lt;= reduced_r:</span>
+                    <span class="s0">if (count &lt; 0) or (count &gt;= self.data.shape[0]):</span>
+                        <span class="s0">return -1</span>
+                    <span class="s0">if count_only:</span>
+                        <span class="s0">pass</span>
+                    <span class="s0">else:</span>
+                        <span class="s0">indices[count] = idx_array[i]</span>
+                        <span class="s0">if return_distance:</span>
+                            <span class="s0">distances[count] =\</span>
+                                <span class="s0">self.dist_metric._rdist_to_dist(dist_pt)</span>
+                    <span class="s0">count += 1</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 4: Node is not a leaf.  Recursively query subnodes</span>
+        <span class="s0">else:</span>
+            <span class="s0">count = self._query_radius_single(2 * i_node + 1, pt, r,</span>
+                                              <span class="s0">indices, distances, count,</span>
+                                              <span class="s0">count_only, return_distance)</span>
+            <span class="s0">count = self._query_radius_single(2 * i_node + 2, pt, r,</span>
+                                              <span class="s0">indices, distances, count,</span>
+                                              <span class="s0">count_only, return_distance)</span>
+
+        <span class="s0">return count</span>
+
+    <span class="s0">cdef float64_t _kde_single_breadthfirst(</span>
+        <span class="s0">self, const {{INPUT_DTYPE_t}}* pt,</span>
+        <span class="s0">KernelType kernel,</span>
+        <span class="s0">float64_t h,</span>
+        <span class="s0">float64_t log_knorm,</span>
+        <span class="s0">float64_t log_atol,</span>
+        <span class="s0">float64_t log_rtol,</span>
+        <span class="s0">NodeHeap nodeheap,</span>
+        <span class="s0">float64_t* node_log_min_bounds,</span>
+        <span class="s0">float64_t* node_log_bound_spreads,</span>
+    <span class="s0">):</span>
+        <span class="s0">&quot;&quot;&quot;non-recursive single-tree kernel density estimation&quot;&quot;&quot;</span>
+        <span class="s0"># For the given point, node_log_min_bounds and node_log_bound_spreads</span>
+        <span class="s0"># will encode the current bounds on the density between the point</span>
+        <span class="s0"># and the associated node.</span>
+        <span class="s0"># The variables global_log_min_bound and global_log_bound_spread</span>
+        <span class="s0"># keep track of the global bounds on density.  The procedure here is</span>
+        <span class="s0"># to split nodes, updating these bounds, until the bounds are within</span>
+        <span class="s0"># atol &amp; rtol.</span>
+        <span class="s0">cdef intp_t i, i1, i2, i_node</span>
+        <span class="s0">cdef float64_t N1, N2</span>
+        <span class="s0">cdef float64_t global_log_min_bound, global_log_bound_spread</span>
+        <span class="s0">cdef float64_t global_log_max_bound</span>
+
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data = &amp;self.data[0, 0]</span>
+        <span class="s0">cdef bint with_sample_weight = self.sample_weight is not None</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* sample_weight</span>
+        <span class="s0">if with_sample_weight:</span>
+            <span class="s0">sample_weight = &amp;self.sample_weight[0]</span>
+        <span class="s0">cdef intp_t* idx_array = &amp;self.idx_array[0]</span>
+        <span class="s0">cdef const NodeData_t* node_data = &amp;self.node_data[0]</span>
+        <span class="s0">cdef float64_t N</span>
+        <span class="s0">cdef float64_t log_weight</span>
+        <span class="s0">if with_sample_weight:</span>
+            <span class="s0">N = self.sum_weight</span>
+        <span class="s0">else:</span>
+            <span class="s0">N = &lt;float64_t&gt; self.data.shape[0]</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+
+        <span class="s0">cdef NodeData_t node_info</span>
+        <span class="s0">cdef float64_t dist_pt, log_density</span>
+        <span class="s0">cdef float64_t dist_LB_1 = 0, dist_LB_2 = 0</span>
+        <span class="s0">cdef float64_t dist_UB_1 = 0, dist_UB_2 = 0</span>
+
+        <span class="s0">cdef float64_t dist_UB, dist_LB</span>
+
+        <span class="s0"># push the top node to the heap</span>
+        <span class="s0">cdef NodeHeapData_t nodeheap_item</span>
+        <span class="s0">nodeheap_item.val = min_dist{{name_suffix}}(self, 0, pt)</span>
+        <span class="s0">nodeheap_item.i1 = 0</span>
+        <span class="s0">nodeheap.push(nodeheap_item)</span>
+
+        <span class="s0">global_log_min_bound = log(N) + compute_log_kernel(</span>
+            <span class="s0">max_dist{{name_suffix}}(self, 0, pt), h, kernel</span>
+        <span class="s0">)</span>
+        <span class="s0">global_log_max_bound = log(N) + compute_log_kernel(nodeheap_item.val,</span>
+                                                           <span class="s0">h, kernel)</span>
+        <span class="s0">global_log_bound_spread = logsubexp(global_log_max_bound,</span>
+                                            <span class="s0">global_log_min_bound)</span>
+
+        <span class="s0">node_log_min_bounds[0] = global_log_min_bound</span>
+        <span class="s0">node_log_bound_spreads[0] = global_log_bound_spread</span>
+
+        <span class="s0">while nodeheap.n &gt; 0:</span>
+            <span class="s0">nodeheap_item = nodeheap.pop()</span>
+            <span class="s0">i_node = nodeheap_item.i1</span>
+
+            <span class="s0">node_info = node_data[i_node]</span>
+            <span class="s0">if with_sample_weight:</span>
+                <span class="s0">N1 = _total_node_weight(node_data, sample_weight,</span>
+                                        <span class="s0">idx_array, i_node)</span>
+            <span class="s0">else:</span>
+                <span class="s0">N1 = node_info.idx_end - node_info.idx_start</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 1: local bounds are equal to within per-point tolerance.</span>
+            <span class="s0">if (log_knorm + node_log_bound_spreads[i_node] - log(N1) + log(N)</span>
+                <span class="s0">&lt;= logaddexp(log_atol, (log_rtol + log_knorm</span>
+                                        <span class="s0">+ node_log_min_bounds[i_node]))):</span>
+                <span class="s0">pass</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 2: global bounds are within rtol &amp; atol.</span>
+            <span class="s0">elif (log_knorm + global_log_bound_spread</span>
+                  <span class="s0">&lt;= logaddexp(log_atol,</span>
+                               <span class="s0">log_rtol + log_knorm + global_log_min_bound)):</span>
+                <span class="s0">break</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 3: node is a leaf. Count contributions from all points</span>
+            <span class="s0">elif node_info.is_leaf:</span>
+                <span class="s0">global_log_min_bound =\</span>
+                    <span class="s0">logsubexp(global_log_min_bound,</span>
+                              <span class="s0">node_log_min_bounds[i_node])</span>
+                <span class="s0">global_log_bound_spread =\</span>
+                    <span class="s0">logsubexp(global_log_bound_spread,</span>
+                              <span class="s0">node_log_bound_spreads[i_node])</span>
+                <span class="s0">for i in range(node_info.idx_start, node_info.idx_end):</span>
+                    <span class="s0">dist_pt = self.dist(pt, data + n_features * idx_array[i],</span>
+                                        <span class="s0">n_features)</span>
+                    <span class="s0">log_density = compute_log_kernel(dist_pt, h, kernel)</span>
+                    <span class="s0">if with_sample_weight:</span>
+                        <span class="s0">log_weight = np.log(sample_weight[idx_array[i]])</span>
+                    <span class="s0">else:</span>
+                        <span class="s0">log_weight = 0.</span>
+                    <span class="s0">global_log_min_bound = logaddexp(global_log_min_bound,</span>
+                                                     <span class="s0">log_density + log_weight)</span>
+
+            <span class="s0"># ------------------------------------------------------------</span>
+            <span class="s0"># Case 4: split node and query subnodes</span>
+            <span class="s0">else:</span>
+                <span class="s0">i1 = 2 * i_node + 1</span>
+                <span class="s0">i2 = 2 * i_node + 2</span>
+
+                <span class="s0">if with_sample_weight:</span>
+                    <span class="s0">N1 = _total_node_weight(node_data, sample_weight,</span>
+                                            <span class="s0">idx_array, i1)</span>
+                    <span class="s0">N2 = _total_node_weight(node_data, sample_weight,</span>
+                                            <span class="s0">idx_array, i2)</span>
+                <span class="s0">else:</span>
+                    <span class="s0">N1 = node_data[i1].idx_end - node_data[i1].idx_start</span>
+                    <span class="s0">N2 = node_data[i2].idx_end - node_data[i2].idx_start</span>
+
+                <span class="s0">min_max_dist{{name_suffix}}(self, i1, pt, &amp;dist_LB_1, &amp;dist_UB_1)</span>
+                <span class="s0">min_max_dist{{name_suffix}}(self, i2, pt, &amp;dist_LB_2, &amp;dist_UB_2)</span>
+
+                <span class="s0">node_log_min_bounds[i1] = (log(N1) +</span>
+                                           <span class="s0">compute_log_kernel(dist_UB_1,</span>
+                                                              <span class="s0">h, kernel))</span>
+                <span class="s0">node_log_bound_spreads[i1] = (log(N1) +</span>
+                                              <span class="s0">compute_log_kernel(dist_LB_1,</span>
+                                                                 <span class="s0">h, kernel))</span>
+
+                <span class="s0">node_log_min_bounds[i2] = (log(N2) +</span>
+                                           <span class="s0">compute_log_kernel(dist_UB_2,</span>
+                                                              <span class="s0">h, kernel))</span>
+                <span class="s0">node_log_bound_spreads[i2] = (log(N2) +</span>
+                                              <span class="s0">compute_log_kernel(dist_LB_2,</span>
+                                                                 <span class="s0">h, kernel))</span>
+
+                <span class="s0">global_log_min_bound = logsubexp(global_log_min_bound,</span>
+                                                 <span class="s0">node_log_min_bounds[i_node])</span>
+                <span class="s0">global_log_min_bound = logaddexp(global_log_min_bound,</span>
+                                                 <span class="s0">node_log_min_bounds[i1])</span>
+                <span class="s0">global_log_min_bound = logaddexp(global_log_min_bound,</span>
+                                                 <span class="s0">node_log_min_bounds[i2])</span>
+
+                <span class="s0">global_log_bound_spread =\</span>
+                    <span class="s0">logsubexp(global_log_bound_spread,</span>
+                              <span class="s0">node_log_bound_spreads[i_node])</span>
+                <span class="s0">global_log_bound_spread = logaddexp(global_log_bound_spread,</span>
+                                                    <span class="s0">node_log_bound_spreads[i1])</span>
+                <span class="s0">global_log_bound_spread = logaddexp(global_log_bound_spread,</span>
+                                                    <span class="s0">node_log_bound_spreads[i2])</span>
+
+                <span class="s0"># TODO: rank by the spread rather than the distance?</span>
+                <span class="s0">nodeheap_item.val = dist_LB_1</span>
+                <span class="s0">nodeheap_item.i1 = i1</span>
+                <span class="s0">nodeheap.push(nodeheap_item)</span>
+
+                <span class="s0">nodeheap_item.val = dist_LB_2</span>
+                <span class="s0">nodeheap_item.i1 = i2</span>
+                <span class="s0">nodeheap.push(nodeheap_item)</span>
+
+        <span class="s0">nodeheap.clear()</span>
+        <span class="s0">return logaddexp(global_log_min_bound,</span>
+                         <span class="s0">global_log_bound_spread - log(2))</span>
+
+    <span class="s0">cdef int _kde_single_depthfirst(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t i_node,</span>
+        <span class="s0">const {{INPUT_DTYPE_t}}* pt,</span>
+        <span class="s0">KernelType kernel,</span>
+        <span class="s0">float64_t h,</span>
+        <span class="s0">float64_t log_knorm,</span>
+        <span class="s0">float64_t log_atol,</span>
+        <span class="s0">float64_t log_rtol,</span>
+        <span class="s0">float64_t local_log_min_bound,</span>
+        <span class="s0">float64_t local_log_bound_spread,</span>
+        <span class="s0">float64_t* global_log_min_bound,</span>
+        <span class="s0">float64_t* global_log_bound_spread,</span>
+    <span class="s0">) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;recursive single-tree kernel density estimate, depth-first&quot;&quot;&quot;</span>
+        <span class="s0"># For the given point, local_min_bound and local_max_bound give the</span>
+        <span class="s0"># minimum and maximum density for the current node, while</span>
+        <span class="s0"># global_min_bound and global_max_bound give the minimum and maximum</span>
+        <span class="s0"># density over the entire tree.  We recurse down until global_min_bound</span>
+        <span class="s0"># and global_max_bound are within rtol and atol.</span>
+        <span class="s0">cdef intp_t i, i1, i2, iw, start, end</span>
+        <span class="s0">cdef float64_t N1, N2</span>
+
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data = &amp;self.data[0, 0]</span>
+        <span class="s0">cdef const NodeData_t* node_data = &amp;self.node_data[0]</span>
+        <span class="s0">cdef bint with_sample_weight = self.sample_weight is not None</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* sample_weight</span>
+        <span class="s0">cdef float64_t log_weight</span>
+        <span class="s0">if with_sample_weight:</span>
+            <span class="s0">sample_weight = &amp;self.sample_weight[0]</span>
+        <span class="s0">cdef intp_t* idx_array = &amp;self.idx_array[0]</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+
+        <span class="s0">cdef NodeData_t node_info = self.node_data[i_node]</span>
+        <span class="s0">cdef float64_t dist_pt, log_dens_contribution</span>
+
+        <span class="s0">cdef float64_t child1_log_min_bound, child2_log_min_bound</span>
+        <span class="s0">cdef float64_t child1_log_bound_spread, child2_log_bound_spread</span>
+        <span class="s0">cdef float64_t dist_UB = 0, dist_LB = 0</span>
+
+        <span class="s0">if with_sample_weight:</span>
+            <span class="s0">N1 = _total_node_weight(node_data, sample_weight,</span>
+                                    <span class="s0">idx_array, i_node)</span>
+            <span class="s0">N2 = self.sum_weight</span>
+        <span class="s0">else:</span>
+            <span class="s0">N1 = &lt;float64_t&gt;(node_info.idx_end - node_info.idx_start)</span>
+            <span class="s0">N2 = &lt;float64_t&gt;self.data.shape[0]</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 1: local bounds are equal to within errors.  Return</span>
+        <span class="s0">if (</span>
+            <span class="s0">log_knorm + local_log_bound_spread - log(N1) + log(N2)</span>
+            <span class="s0">&lt;= logaddexp(log_atol, (log_rtol + log_knorm + local_log_min_bound))</span>
+        <span class="s0">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 2: global bounds are within rtol &amp; atol. Return</span>
+        <span class="s0">elif (</span>
+            <span class="s0">log_knorm + global_log_bound_spread[0]</span>
+            <span class="s0">&lt;= logaddexp(log_atol, (log_rtol + log_knorm + global_log_min_bound[0]))</span>
+        <span class="s0">):</span>
+            <span class="s0">pass</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 3: node is a leaf. Count contributions from all points</span>
+        <span class="s0">elif node_info.is_leaf:</span>
+            <span class="s0">global_log_min_bound[0] = logsubexp(global_log_min_bound[0],</span>
+                                                <span class="s0">local_log_min_bound)</span>
+            <span class="s0">global_log_bound_spread[0] = logsubexp(global_log_bound_spread[0],</span>
+                                                   <span class="s0">local_log_bound_spread)</span>
+            <span class="s0">for i in range(node_info.idx_start, node_info.idx_end):</span>
+                <span class="s0">dist_pt = self.dist(pt, (data + n_features * idx_array[i]),</span>
+                                    <span class="s0">n_features)</span>
+                <span class="s0">log_dens_contribution = compute_log_kernel(dist_pt, h, kernel)</span>
+                <span class="s0">if with_sample_weight:</span>
+                    <span class="s0">log_weight = np.log(sample_weight[idx_array[i]])</span>
+                <span class="s0">else:</span>
+                    <span class="s0">log_weight = 0.</span>
+                <span class="s0">global_log_min_bound[0] = logaddexp(global_log_min_bound[0],</span>
+                                                    <span class="s0">(log_dens_contribution +</span>
+                                                     <span class="s0">log_weight))</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Case 4: split node and query subnodes</span>
+        <span class="s0">else:</span>
+            <span class="s0">i1 = 2 * i_node + 1</span>
+            <span class="s0">i2 = 2 * i_node + 2</span>
+
+            <span class="s0">if with_sample_weight:</span>
+                <span class="s0">N1 = _total_node_weight(node_data, sample_weight,</span>
+                                        <span class="s0">idx_array, i1)</span>
+                <span class="s0">N2 = _total_node_weight(node_data, sample_weight,</span>
+                                        <span class="s0">idx_array, i2)</span>
+            <span class="s0">else:</span>
+                <span class="s0">N1 = &lt;float64_t&gt;(self.node_data[i1].idx_end - self.node_data[i1].idx_start)</span>
+                <span class="s0">N2 = &lt;float64_t&gt;(self.node_data[i2].idx_end - self.node_data[i2].idx_start)</span>
+
+            <span class="s0">min_max_dist{{name_suffix}}(self, i1, pt, &amp;dist_LB, &amp;dist_UB)</span>
+            <span class="s0">child1_log_min_bound = log(N1) + compute_log_kernel(dist_UB, h,</span>
+                                                                <span class="s0">kernel)</span>
+            <span class="s0">child1_log_bound_spread = logsubexp(log(N1) +</span>
+                                                <span class="s0">compute_log_kernel(dist_LB, h,</span>
+                                                                   <span class="s0">kernel),</span>
+                                                <span class="s0">child1_log_min_bound)</span>
+
+            <span class="s0">min_max_dist{{name_suffix}}(self, i2, pt, &amp;dist_LB, &amp;dist_UB)</span>
+            <span class="s0">child2_log_min_bound = log(N2) + compute_log_kernel(dist_UB, h,</span>
+                                                                <span class="s0">kernel)</span>
+            <span class="s0">child2_log_bound_spread = logsubexp(log(N2) +</span>
+                                                <span class="s0">compute_log_kernel(dist_LB, h,</span>
+                                                                   <span class="s0">kernel),</span>
+                                                <span class="s0">child2_log_min_bound)</span>
+
+            <span class="s0">global_log_min_bound[0] = logsubexp(global_log_min_bound[0],</span>
+                                                <span class="s0">local_log_min_bound)</span>
+            <span class="s0">global_log_min_bound[0] = logaddexp(global_log_min_bound[0],</span>
+                                                <span class="s0">child1_log_min_bound)</span>
+            <span class="s0">global_log_min_bound[0] = logaddexp(global_log_min_bound[0],</span>
+                                                <span class="s0">child2_log_min_bound)</span>
+
+            <span class="s0">global_log_bound_spread[0] = logsubexp(global_log_bound_spread[0],</span>
+                                                   <span class="s0">local_log_bound_spread)</span>
+            <span class="s0">global_log_bound_spread[0] = logaddexp(global_log_bound_spread[0],</span>
+                                                   <span class="s0">child1_log_bound_spread)</span>
+            <span class="s0">global_log_bound_spread[0] = logaddexp(global_log_bound_spread[0],</span>
+                                                   <span class="s0">child2_log_bound_spread)</span>
+
+            <span class="s0">self._kde_single_depthfirst(i1, pt, kernel, h, log_knorm,</span>
+                                        <span class="s0">log_atol, log_rtol,</span>
+                                        <span class="s0">child1_log_min_bound,</span>
+                                        <span class="s0">child1_log_bound_spread,</span>
+                                        <span class="s0">global_log_min_bound,</span>
+                                        <span class="s0">global_log_bound_spread)</span>
+            <span class="s0">self._kde_single_depthfirst(i2, pt, kernel, h, log_knorm,</span>
+                                        <span class="s0">log_atol, log_rtol,</span>
+                                        <span class="s0">child2_log_min_bound,</span>
+                                        <span class="s0">child2_log_bound_spread,</span>
+                                        <span class="s0">global_log_min_bound,</span>
+                                        <span class="s0">global_log_bound_spread)</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef int _two_point_single(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t i_node,</span>
+        <span class="s0">const {{INPUT_DTYPE_t}}* pt,</span>
+        <span class="s0">float64_t* r,</span>
+        <span class="s0">intp_t* count,</span>
+        <span class="s0">intp_t i_min,</span>
+        <span class="s0">intp_t i_max,</span>
+    <span class="s0">) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;recursive single-tree two-point correlation function query&quot;&quot;&quot;</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data = &amp;self.data[0, 0]</span>
+        <span class="s0">cdef intp_t* idx_array = &amp;self.idx_array[0]</span>
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+        <span class="s0">cdef NodeData_t node_info = self.node_data[i_node]</span>
+
+        <span class="s0">cdef intp_t i, j, Npts</span>
+        <span class="s0">cdef float64_t reduced_r</span>
+
+        <span class="s0">cdef float64_t dist_pt, dist_LB = 0, dist_UB = 0</span>
+        <span class="s0">min_max_dist{{name_suffix}}(self, i_node, pt, &amp;dist_LB, &amp;dist_UB)</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Go through bounds and check for cuts</span>
+        <span class="s0">while i_min &lt; i_max:</span>
+            <span class="s0">if dist_LB &gt; r[i_min]:</span>
+                <span class="s0">i_min += 1</span>
+            <span class="s0">else:</span>
+                <span class="s0">break</span>
+
+        <span class="s0">while i_max &gt; i_min:</span>
+            <span class="s0">Npts = (node_info.idx_end - node_info.idx_start)</span>
+            <span class="s0">if dist_UB &lt;= r[i_max - 1]:</span>
+                <span class="s0">count[i_max - 1] += Npts</span>
+                <span class="s0">i_max -= 1</span>
+            <span class="s0">else:</span>
+                <span class="s0">break</span>
+
+        <span class="s0">if i_min &lt; i_max:</span>
+            <span class="s0"># If node is a leaf, go through all points</span>
+            <span class="s0">if node_info.is_leaf:</span>
+                <span class="s0">for i in range(node_info.idx_start, node_info.idx_end):</span>
+                    <span class="s0">dist_pt = self.dist(pt, (data + n_features * idx_array[i]),</span>
+                                        <span class="s0">n_features)</span>
+                    <span class="s0">j = i_max - 1</span>
+                    <span class="s0">while (j &gt;= i_min) and (dist_pt &lt;= r[j]):</span>
+                        <span class="s0">count[j] += 1</span>
+                        <span class="s0">j -= 1</span>
+
+            <span class="s0">else:</span>
+                <span class="s0">self._two_point_single(2 * i_node + 1, pt, r,</span>
+                                       <span class="s0">count, i_min, i_max)</span>
+                <span class="s0">self._two_point_single(2 * i_node + 2, pt, r,</span>
+                                       <span class="s0">count, i_min, i_max)</span>
+        <span class="s0">return 0</span>
+
+    <span class="s0">cdef int _two_point_dual(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t i_node1,</span>
+        <span class="s0">BinaryTree{{name_suffix}} other,</span>
+        <span class="s0">intp_t i_node2,</span>
+        <span class="s0">float64_t* r,</span>
+        <span class="s0">intp_t* count,</span>
+        <span class="s0">intp_t i_min,</span>
+        <span class="s0">intp_t i_max,</span>
+    <span class="s0">) except -1:</span>
+        <span class="s0">&quot;&quot;&quot;recursive dual-tree two-point correlation function query&quot;&quot;&quot;</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data1 = &amp;self.data[0, 0]</span>
+        <span class="s0">cdef const {{INPUT_DTYPE_t}}* data2 = &amp;other.data[0, 0]</span>
+        <span class="s0">cdef intp_t* idx_array1 = &amp;self.idx_array[0]</span>
+        <span class="s0">cdef intp_t* idx_array2 = &amp;other.idx_array[0]</span>
+        <span class="s0">cdef NodeData_t node_info1 = self.node_data[i_node1]</span>
+        <span class="s0">cdef NodeData_t node_info2 = other.node_data[i_node2]</span>
+
+        <span class="s0">cdef intp_t n_features = self.data.shape[1]</span>
+
+        <span class="s0">cdef intp_t i1, i2, j, Npts</span>
+        <span class="s0">cdef float64_t reduced_r</span>
+
+        <span class="s0">cdef float64_t dist_pt, dist_LB = 0, dist_UB = 0</span>
+        <span class="s0">dist_LB = min_dist_dual{{name_suffix}}(self, i_node1, other, i_node2)</span>
+        <span class="s0">dist_UB = max_dist_dual{{name_suffix}}(self, i_node1, other, i_node2)</span>
+
+        <span class="s0"># ------------------------------------------------------------</span>
+        <span class="s0"># Go through bounds and check for cuts</span>
+        <span class="s0">while i_min &lt; i_max:</span>
+            <span class="s0">if dist_LB &gt; r[i_min]:</span>
+                <span class="s0">i_min += 1</span>
+            <span class="s0">else:</span>
+                <span class="s0">break</span>
+
+        <span class="s0">while i_max &gt; i_min:</span>
+            <span class="s0">Npts = ((node_info1.idx_end - node_info1.idx_start)</span>
+                    <span class="s0">* (node_info2.idx_end - node_info2.idx_start))</span>
+            <span class="s0">if dist_UB &lt;= r[i_max - 1]:</span>
+                <span class="s0">count[i_max - 1] += Npts</span>
+                <span class="s0">i_max -= 1</span>
+            <span class="s0">else:</span>
+                <span class="s0">break</span>
+
+        <span class="s0">if i_min &lt; i_max:</span>
+            <span class="s0">if node_info1.is_leaf and node_info2.is_leaf:</span>
+                <span class="s0"># If both nodes are leaves, go through all points</span>
+                <span class="s0">for i1 in range(node_info1.idx_start, node_info1.idx_end):</span>
+                    <span class="s0">for i2 in range(node_info2.idx_start, node_info2.idx_end):</span>
+                        <span class="s0">dist_pt = self.dist((data1 + n_features</span>
+                                             <span class="s0">* idx_array1[i1]),</span>
+                                            <span class="s0">(data2 + n_features</span>
+                                             <span class="s0">* idx_array2[i2]),</span>
+                                            <span class="s0">n_features)</span>
+                        <span class="s0">j = i_max - 1</span>
+                        <span class="s0">while (j &gt;= i_min) and (dist_pt &lt;= r[j]):</span>
+                            <span class="s0">count[j] += 1</span>
+                            <span class="s0">j -= 1</span>
+
+            <span class="s0">elif node_info1.is_leaf:</span>
+                <span class="s0"># If only one is a leaf, split the other</span>
+                <span class="s0">for i2 in range(2 * i_node2 + 1, 2 * i_node2 + 3):</span>
+                    <span class="s0">self._two_point_dual(i_node1, other, i2,</span>
+                                         <span class="s0">r, count, i_min, i_max)</span>
+
+            <span class="s0">elif node_info2.is_leaf:</span>
+                <span class="s0">for i1 in range(2 * i_node1 + 1, 2 * i_node1 + 3):</span>
+                    <span class="s0">self._two_point_dual(i1, other, i_node2,</span>
+                                         <span class="s0">r, count, i_min, i_max)</span>
+
+            <span class="s0">else:</span>
+                <span class="s0"># neither is a leaf: split &amp; query both</span>
+                <span class="s0">for i1 in range(2 * i_node1 + 1, 2 * i_node1 + 3):</span>
+                    <span class="s0">for i2 in range(2 * i_node2 + 1, 2 * i_node2 + 3):</span>
+                        <span class="s0">self._two_point_dual(i1, other, i2,</span>
+                                             <span class="s0">r, count, i_min, i_max)</span>
+        <span class="s0">return 0</span>
+
+<span class="s0">{{endfor}}</span>
+
+<span class="s0">######################################################################</span>
+<span class="s0"># Python functions for benchmarking and testing C implementations</span>
+
+<span class="s0">def simultaneous_sort(float64_t[:, ::1] distances, intp_t[:, ::1] indices):</span>
+    <span class="s0">&quot;&quot;&quot;In-place simultaneous sort the given row of the arrays</span>
+
+    <span class="s0">This python wrapper exists primarily to enable unit testing</span>
+    <span class="s0">of the _simultaneous_sort C routine.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">assert distances.shape[0] == indices.shape[0]</span>
+    <span class="s0">assert distances.shape[1] == indices.shape[1]</span>
+    <span class="s0">cdef intp_t row</span>
+    <span class="s0">for row in range(distances.shape[0]):</span>
+        <span class="s0">_simultaneous_sort(&amp;distances[row, 0],</span>
+                           <span class="s0">&amp;indices[row, 0],</span>
+                           <span class="s0">distances.shape[1])</span>
+
+
+<span class="s0">def nodeheap_sort(float64_t[::1] vals):</span>
+    <span class="s0">&quot;&quot;&quot;In-place reverse sort of vals using NodeHeap&quot;&quot;&quot;</span>
+    <span class="s0">cdef intp_t[::1] indices = np.zeros(vals.shape[0], dtype=np.intp)</span>
+    <span class="s0">cdef float64_t[::1] vals_sorted = np.zeros_like(vals)</span>
+
+    <span class="s0"># use initial size 0 to check corner case</span>
+    <span class="s0">cdef NodeHeap heap = NodeHeap(0)</span>
+    <span class="s0">cdef NodeHeapData_t data</span>
+    <span class="s0">cdef intp_t i</span>
+    <span class="s0">for i in range(vals.shape[0]):</span>
+        <span class="s0">data.val = vals[i]</span>
+        <span class="s0">data.i1 = i</span>
+        <span class="s0">data.i2 = i + 1</span>
+        <span class="s0">heap.push(data)</span>
+
+    <span class="s0">for i in range(vals.shape[0]):</span>
+        <span class="s0">data = heap.pop()</span>
+        <span class="s0">vals_sorted[i] = data.val</span>
+        <span class="s0">indices[i] = data.i1</span>
+
+    <span class="s0">return np.asarray(vals_sorted), np.asarray(indices)</span>
+
+
+<span class="s0">cdef inline float64_t _total_node_weight(</span>
+    <span class="s0">const NodeData_t* node_data,</span>
+    <span class="s0">const floating* sample_weight,</span>
+    <span class="s0">const intp_t* idx_array,</span>
+    <span class="s0">intp_t i_node,</span>
+<span class="s0">):</span>
+    <span class="s0">cdef intp_t i</span>
+    <span class="s0">cdef float64_t N = 0.0</span>
+    <span class="s0">for i in range(node_data[i_node].idx_start, node_data[i_node].idx_end):</span>
+        <span class="s0">N += sample_weight[idx_array[i]]</span>
+    <span class="s0">return N</span>
+</pre>
+</body>
+</html>

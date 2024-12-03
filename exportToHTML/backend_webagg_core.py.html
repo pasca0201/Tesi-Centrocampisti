@@ -1,0 +1,540 @@
+<html>
+<head>
+<title>backend_webagg_core.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_webagg_core.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Displays Agg images in the browser, with interactivity.&quot;&quot;&quot;</span>
+<span class="s2"># The WebAgg backend is divided into two modules:</span>
+<span class="s2">#</span>
+<span class="s2"># - `backend_webagg_core.py` contains code necessary to embed a WebAgg</span>
+<span class="s2">#   plot inside of a web application, and communicate in an abstract</span>
+<span class="s2">#   way over a web socket.</span>
+<span class="s2">#</span>
+<span class="s2"># - `backend_webagg.py` contains a concrete implementation of a basic</span>
+<span class="s2">#   application, implemented with asyncio.</span>
+
+<span class="s3">import </span><span class="s1">asyncio</span>
+<span class="s3">import </span><span class="s1">datetime</span>
+<span class="s3">from </span><span class="s1">io </span><span class="s3">import </span><span class="s1">BytesIO</span><span class="s4">, </span><span class="s1">StringIO</span>
+<span class="s3">import </span><span class="s1">json</span>
+<span class="s3">import </span><span class="s1">logging</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">from </span><span class="s1">pathlib </span><span class="s3">import </span><span class="s1">Path</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">PIL </span><span class="s3">import </span><span class="s1">Image</span>
+
+<span class="s3">from </span><span class="s1">matplotlib </span><span class="s3">import </span><span class="s1">_api</span><span class="s4">, </span><span class="s1">backend_bases</span><span class="s4">, </span><span class="s1">backend_tools</span>
+<span class="s3">from </span><span class="s1">matplotlib</span><span class="s4">.</span><span class="s1">backends </span><span class="s3">import </span><span class="s1">backend_agg</span>
+<span class="s3">from </span><span class="s1">matplotlib</span><span class="s4">.</span><span class="s1">backend_bases </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">_Backend</span><span class="s4">, </span><span class="s1">KeyEvent</span><span class="s4">, </span><span class="s1">LocationEvent</span><span class="s4">, </span><span class="s1">MouseEvent</span><span class="s4">, </span><span class="s1">ResizeEvent</span><span class="s4">)</span>
+
+<span class="s1">_log </span><span class="s4">= </span><span class="s1">logging</span><span class="s4">.</span><span class="s1">getLogger</span><span class="s4">(</span><span class="s1">__name__</span><span class="s4">)</span>
+
+<span class="s1">_SPECIAL_KEYS_LUT </span><span class="s4">= {</span><span class="s5">'Alt'</span><span class="s4">: </span><span class="s5">'alt'</span><span class="s4">,</span>
+                     <span class="s5">'AltGraph'</span><span class="s4">: </span><span class="s5">'alt'</span><span class="s4">,</span>
+                     <span class="s5">'CapsLock'</span><span class="s4">: </span><span class="s5">'caps_lock'</span><span class="s4">,</span>
+                     <span class="s5">'Control'</span><span class="s4">: </span><span class="s5">'control'</span><span class="s4">,</span>
+                     <span class="s5">'Meta'</span><span class="s4">: </span><span class="s5">'meta'</span><span class="s4">,</span>
+                     <span class="s5">'NumLock'</span><span class="s4">: </span><span class="s5">'num_lock'</span><span class="s4">,</span>
+                     <span class="s5">'ScrollLock'</span><span class="s4">: </span><span class="s5">'scroll_lock'</span><span class="s4">,</span>
+                     <span class="s5">'Shift'</span><span class="s4">: </span><span class="s5">'shift'</span><span class="s4">,</span>
+                     <span class="s5">'Super'</span><span class="s4">: </span><span class="s5">'super'</span><span class="s4">,</span>
+                     <span class="s5">'Enter'</span><span class="s4">: </span><span class="s5">'enter'</span><span class="s4">,</span>
+                     <span class="s5">'Tab'</span><span class="s4">: </span><span class="s5">'tab'</span><span class="s4">,</span>
+                     <span class="s5">'ArrowDown'</span><span class="s4">: </span><span class="s5">'down'</span><span class="s4">,</span>
+                     <span class="s5">'ArrowLeft'</span><span class="s4">: </span><span class="s5">'left'</span><span class="s4">,</span>
+                     <span class="s5">'ArrowRight'</span><span class="s4">: </span><span class="s5">'right'</span><span class="s4">,</span>
+                     <span class="s5">'ArrowUp'</span><span class="s4">: </span><span class="s5">'up'</span><span class="s4">,</span>
+                     <span class="s5">'End'</span><span class="s4">: </span><span class="s5">'end'</span><span class="s4">,</span>
+                     <span class="s5">'Home'</span><span class="s4">: </span><span class="s5">'home'</span><span class="s4">,</span>
+                     <span class="s5">'PageDown'</span><span class="s4">: </span><span class="s5">'pagedown'</span><span class="s4">,</span>
+                     <span class="s5">'PageUp'</span><span class="s4">: </span><span class="s5">'pageup'</span><span class="s4">,</span>
+                     <span class="s5">'Backspace'</span><span class="s4">: </span><span class="s5">'backspace'</span><span class="s4">,</span>
+                     <span class="s5">'Delete'</span><span class="s4">: </span><span class="s5">'delete'</span><span class="s4">,</span>
+                     <span class="s5">'Insert'</span><span class="s4">: </span><span class="s5">'insert'</span><span class="s4">,</span>
+                     <span class="s5">'Escape'</span><span class="s4">: </span><span class="s5">'escape'</span><span class="s4">,</span>
+                     <span class="s5">'Pause'</span><span class="s4">: </span><span class="s5">'pause'</span><span class="s4">,</span>
+                     <span class="s5">'Select'</span><span class="s4">: </span><span class="s5">'select'</span><span class="s4">,</span>
+                     <span class="s5">'Dead'</span><span class="s4">: </span><span class="s5">'dead'</span><span class="s4">,</span>
+                     <span class="s5">'F1'</span><span class="s4">: </span><span class="s5">'f1'</span><span class="s4">,</span>
+                     <span class="s5">'F2'</span><span class="s4">: </span><span class="s5">'f2'</span><span class="s4">,</span>
+                     <span class="s5">'F3'</span><span class="s4">: </span><span class="s5">'f3'</span><span class="s4">,</span>
+                     <span class="s5">'F4'</span><span class="s4">: </span><span class="s5">'f4'</span><span class="s4">,</span>
+                     <span class="s5">'F5'</span><span class="s4">: </span><span class="s5">'f5'</span><span class="s4">,</span>
+                     <span class="s5">'F6'</span><span class="s4">: </span><span class="s5">'f6'</span><span class="s4">,</span>
+                     <span class="s5">'F7'</span><span class="s4">: </span><span class="s5">'f7'</span><span class="s4">,</span>
+                     <span class="s5">'F8'</span><span class="s4">: </span><span class="s5">'f8'</span><span class="s4">,</span>
+                     <span class="s5">'F9'</span><span class="s4">: </span><span class="s5">'f9'</span><span class="s4">,</span>
+                     <span class="s5">'F10'</span><span class="s4">: </span><span class="s5">'f10'</span><span class="s4">,</span>
+                     <span class="s5">'F11'</span><span class="s4">: </span><span class="s5">'f11'</span><span class="s4">,</span>
+                     <span class="s5">'F12'</span><span class="s4">: </span><span class="s5">'f12'</span><span class="s4">}</span>
+
+
+<span class="s3">def </span><span class="s1">_handle_key</span><span class="s4">(</span><span class="s1">key</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Handle key values&quot;&quot;&quot;</span>
+    <span class="s1">value </span><span class="s4">= </span><span class="s1">key</span><span class="s4">[</span><span class="s1">key</span><span class="s4">.</span><span class="s1">index</span><span class="s4">(</span><span class="s5">'k'</span><span class="s4">) + </span><span class="s6">1</span><span class="s4">:]</span>
+    <span class="s3">if </span><span class="s5">'shift+' </span><span class="s3">in </span><span class="s1">key</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">value</span><span class="s4">) == </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">key </span><span class="s4">= </span><span class="s1">key</span><span class="s4">.</span><span class="s1">replace</span><span class="s4">(</span><span class="s5">'shift+'</span><span class="s4">, </span><span class="s5">''</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">value </span><span class="s3">in </span><span class="s1">_SPECIAL_KEYS_LUT</span><span class="s4">:</span>
+        <span class="s1">value </span><span class="s4">= </span><span class="s1">_SPECIAL_KEYS_LUT</span><span class="s4">[</span><span class="s1">value</span><span class="s4">]</span>
+    <span class="s1">key </span><span class="s4">= </span><span class="s1">key</span><span class="s4">[:</span><span class="s1">key</span><span class="s4">.</span><span class="s1">index</span><span class="s4">(</span><span class="s5">'k'</span><span class="s4">)] + </span><span class="s1">value</span>
+    <span class="s3">return </span><span class="s1">key</span>
+
+
+<span class="s3">class </span><span class="s1">TimerTornado</span><span class="s4">(</span><span class="s1">backend_bases</span><span class="s4">.</span><span class="s1">TimerBase</span><span class="s4">):</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_timer_start</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">import </span><span class="s1">tornado</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer_stop</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_single</span><span class="s4">:</span>
+            <span class="s1">ioloop </span><span class="s4">= </span><span class="s1">tornado</span><span class="s4">.</span><span class="s1">ioloop</span><span class="s4">.</span><span class="s1">IOLoop</span><span class="s4">.</span><span class="s1">instance</span><span class="s4">()</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer </span><span class="s4">= </span><span class="s1">ioloop</span><span class="s4">.</span><span class="s1">add_timeout</span><span class="s4">(</span>
+                <span class="s1">datetime</span><span class="s4">.</span><span class="s1">timedelta</span><span class="s4">(</span><span class="s1">milliseconds</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">interval</span><span class="s4">),</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_on_timer</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer </span><span class="s4">= </span><span class="s1">tornado</span><span class="s4">.</span><span class="s1">ioloop</span><span class="s4">.</span><span class="s1">PeriodicCallback</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_on_timer</span><span class="s4">,</span>
+                <span class="s1">max</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">interval</span><span class="s4">, </span><span class="s6">1e-6</span><span class="s4">))</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer</span><span class="s4">.</span><span class="s1">start</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">_timer_stop</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">import </span><span class="s1">tornado</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_timer </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">return</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_single</span><span class="s4">:</span>
+            <span class="s1">ioloop </span><span class="s4">= </span><span class="s1">tornado</span><span class="s4">.</span><span class="s1">ioloop</span><span class="s4">.</span><span class="s1">IOLoop</span><span class="s4">.</span><span class="s1">instance</span><span class="s4">()</span>
+            <span class="s1">ioloop</span><span class="s4">.</span><span class="s1">remove_timeout</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_timer</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer</span><span class="s4">.</span><span class="s1">stop</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">_timer_set_interval</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2"># Only stop and restart it if the timer has already been started</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_timer </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer_stop</span><span class="s4">()</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer_start</span><span class="s4">()</span>
+
+
+<span class="s3">class </span><span class="s1">TimerAsyncio</span><span class="s4">(</span><span class="s1">backend_bases</span><span class="s4">.</span><span class="s1">TimerBase</span><span class="s4">):</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_task </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s3">async def </span><span class="s1">_timer_task</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">interval</span><span class="s4">):</span>
+        <span class="s3">while True</span><span class="s4">:</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s3">await </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">sleep</span><span class="s4">(</span><span class="s1">interval</span><span class="s4">)</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_on_timer</span><span class="s4">()</span>
+
+                <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_single</span><span class="s4">:</span>
+                    <span class="s3">break</span>
+            <span class="s3">except </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">CancelledError</span><span class="s4">:</span>
+                <span class="s3">break</span>
+
+    <span class="s3">def </span><span class="s1">_timer_start</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer_stop</span><span class="s4">()</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_task </span><span class="s4">= </span><span class="s1">asyncio</span><span class="s4">.</span><span class="s1">ensure_future</span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer_task</span><span class="s4">(</span><span class="s1">max</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">interval </span><span class="s4">/ </span><span class="s6">1_000.</span><span class="s4">, </span><span class="s6">1e-6</span><span class="s4">))</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_timer_stop</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_task </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_task</span><span class="s4">.</span><span class="s1">cancel</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_task </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">_timer_set_interval</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2"># Only stop and restart it if the timer has already been started</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_task </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer_stop</span><span class="s4">()</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_timer_start</span><span class="s4">()</span>
+
+
+<span class="s3">class </span><span class="s1">FigureCanvasWebAggCore</span><span class="s4">(</span><span class="s1">backend_agg</span><span class="s4">.</span><span class="s1">FigureCanvasAgg</span><span class="s4">):</span>
+    <span class="s1">manager_class </span><span class="s4">= </span><span class="s1">_api</span><span class="s4">.</span><span class="s1">classproperty</span><span class="s4">(</span><span class="s3">lambda </span><span class="s1">cls</span><span class="s4">: </span><span class="s1">FigureManagerWebAgg</span><span class="s4">)</span>
+    <span class="s1">_timer_cls </span><span class="s4">= </span><span class="s1">TimerAsyncio</span>
+    <span class="s2"># Webagg and friends having the right methods, but still</span>
+    <span class="s2"># having bugs in practice.  Do not advertise that it works until</span>
+    <span class="s2"># we can debug this.</span>
+    <span class="s1">supports_blit </span><span class="s4">= </span><span class="s3">False</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s2"># Set to True when the renderer contains data that is newer</span>
+        <span class="s2"># than the PNG buffer.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_png_is_old </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s2"># Set to True by the `refresh` message so that the next frame</span>
+        <span class="s2"># sent to the clients will be a full frame.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_force_full </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s2"># The last buffer, for diff mode.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_last_buff </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">((</span><span class="s6">0</span><span class="s4">, </span><span class="s6">0</span><span class="s4">))</span>
+        <span class="s2"># Store the current image mode so that at any point, clients can</span>
+        <span class="s2"># request the information. This should be changed by calling</span>
+        <span class="s2"># self.set_image_mode(mode) so that the notification can be given</span>
+        <span class="s2"># to the connected clients.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_current_image_mode </span><span class="s4">= </span><span class="s5">'full'</span>
+        <span class="s2"># Track mouse events to fill in the x, y position of key events.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_last_mouse_xy </span><span class="s4">= (</span><span class="s3">None</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">show</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2"># show the figure window</span>
+        <span class="s3">from </span><span class="s1">matplotlib</span><span class="s4">.</span><span class="s1">pyplot </span><span class="s3">import </span><span class="s1">show</span>
+        <span class="s1">show</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">draw</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_png_is_old </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">super</span><span class="s4">().</span><span class="s1">draw</span><span class="s4">()</span>
+        <span class="s3">finally</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">manager</span><span class="s4">.</span><span class="s1">refresh_all</span><span class="s4">()  </span><span class="s2"># Swap the frames.</span>
+
+    <span class="s3">def </span><span class="s1">blit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">bbox</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_png_is_old </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">manager</span><span class="s4">.</span><span class="s1">refresh_all</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">draw_idle</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">&quot;draw&quot;</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">set_cursor</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">cursor</span><span class="s4">):</span>
+        <span class="s2"># docstring inherited</span>
+        <span class="s1">cursor </span><span class="s4">= </span><span class="s1">_api</span><span class="s4">.</span><span class="s1">check_getitem</span><span class="s4">({</span>
+            <span class="s1">backend_tools</span><span class="s4">.</span><span class="s1">Cursors</span><span class="s4">.</span><span class="s1">HAND</span><span class="s4">: </span><span class="s5">'pointer'</span><span class="s4">,</span>
+            <span class="s1">backend_tools</span><span class="s4">.</span><span class="s1">Cursors</span><span class="s4">.</span><span class="s1">POINTER</span><span class="s4">: </span><span class="s5">'default'</span><span class="s4">,</span>
+            <span class="s1">backend_tools</span><span class="s4">.</span><span class="s1">Cursors</span><span class="s4">.</span><span class="s1">SELECT_REGION</span><span class="s4">: </span><span class="s5">'crosshair'</span><span class="s4">,</span>
+            <span class="s1">backend_tools</span><span class="s4">.</span><span class="s1">Cursors</span><span class="s4">.</span><span class="s1">MOVE</span><span class="s4">: </span><span class="s5">'move'</span><span class="s4">,</span>
+            <span class="s1">backend_tools</span><span class="s4">.</span><span class="s1">Cursors</span><span class="s4">.</span><span class="s1">WAIT</span><span class="s4">: </span><span class="s5">'wait'</span><span class="s4">,</span>
+            <span class="s1">backend_tools</span><span class="s4">.</span><span class="s1">Cursors</span><span class="s4">.</span><span class="s1">RESIZE_HORIZONTAL</span><span class="s4">: </span><span class="s5">'ew-resize'</span><span class="s4">,</span>
+            <span class="s1">backend_tools</span><span class="s4">.</span><span class="s1">Cursors</span><span class="s4">.</span><span class="s1">RESIZE_VERTICAL</span><span class="s4">: </span><span class="s5">'ns-resize'</span><span class="s4">,</span>
+        <span class="s4">}, </span><span class="s1">cursor</span><span class="s4">=</span><span class="s1">cursor</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">'cursor'</span><span class="s4">, </span><span class="s1">cursor</span><span class="s4">=</span><span class="s1">cursor</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">set_image_mode</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">mode</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Set the image mode for any subsequent images which will be sent 
+        to the clients. The modes may currently be either 'full' or 'diff'. 
+ 
+        Note: diff images may not contain transparency, therefore upon 
+        draw this mode may be changed if the resulting image has any 
+        transparent component. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_api</span><span class="s4">.</span><span class="s1">check_in_list</span><span class="s4">([</span><span class="s5">'full'</span><span class="s4">, </span><span class="s5">'diff'</span><span class="s4">], </span><span class="s1">mode</span><span class="s4">=</span><span class="s1">mode</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_current_image_mode </span><span class="s4">!= </span><span class="s1">mode</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_current_image_mode </span><span class="s4">= </span><span class="s1">mode</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">handle_send_image_mode</span><span class="s4">(</span><span class="s3">None</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">get_diff_image</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_png_is_old</span><span class="s4">:</span>
+            <span class="s1">renderer </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">get_renderer</span><span class="s4">()</span>
+
+            <span class="s1">pixels </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">renderer</span><span class="s4">.</span><span class="s1">buffer_rgba</span><span class="s4">())</span>
+            <span class="s2"># The buffer is created as type uint32 so that entire</span>
+            <span class="s2"># pixels can be compared in one numpy call, rather than</span>
+            <span class="s2"># needing to compare each plane separately.</span>
+            <span class="s1">buff </span><span class="s4">= </span><span class="s1">pixels</span><span class="s4">.</span><span class="s1">view</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint32</span><span class="s4">).</span><span class="s1">squeeze</span><span class="s4">(</span><span class="s6">2</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_force_full</span>
+                    <span class="s2"># If the buffer has changed size we need to do a full draw.</span>
+                    <span class="s3">or </span><span class="s1">buff</span><span class="s4">.</span><span class="s1">shape </span><span class="s4">!= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_last_buff</span><span class="s4">.</span><span class="s1">shape</span>
+                    <span class="s2"># If any pixels have transparency, we need to force a full</span>
+                    <span class="s2"># draw as we cannot overlay new on top of old.</span>
+                    <span class="s3">or </span><span class="s4">(</span><span class="s1">pixels</span><span class="s4">[:, :, </span><span class="s6">3</span><span class="s4">] != </span><span class="s6">255</span><span class="s4">).</span><span class="s1">any</span><span class="s4">()):</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">set_image_mode</span><span class="s4">(</span><span class="s5">'full'</span><span class="s4">)</span>
+                <span class="s1">output </span><span class="s4">= </span><span class="s1">buff</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">set_image_mode</span><span class="s4">(</span><span class="s5">'diff'</span><span class="s4">)</span>
+                <span class="s1">diff </span><span class="s4">= </span><span class="s1">buff </span><span class="s4">!= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_last_buff</span>
+                <span class="s1">output </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">where</span><span class="s4">(</span><span class="s1">diff</span><span class="s4">, </span><span class="s1">buff</span><span class="s4">, </span><span class="s6">0</span><span class="s4">)</span>
+
+            <span class="s2"># Store the current buffer so we can compute the next diff.</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_last_buff </span><span class="s4">= </span><span class="s1">buff</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_force_full </span><span class="s4">= </span><span class="s3">False</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_png_is_old </span><span class="s4">= </span><span class="s3">False</span>
+
+            <span class="s1">data </span><span class="s4">= </span><span class="s1">output</span><span class="s4">.</span><span class="s1">view</span><span class="s4">(</span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint8</span><span class="s4">).</span><span class="s1">reshape</span><span class="s4">((*</span><span class="s1">output</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">, </span><span class="s6">4</span><span class="s4">))</span>
+            <span class="s3">with </span><span class="s1">BytesIO</span><span class="s4">() </span><span class="s3">as </span><span class="s1">png</span><span class="s4">:</span>
+                <span class="s1">Image</span><span class="s4">.</span><span class="s1">fromarray</span><span class="s4">(</span><span class="s1">data</span><span class="s4">).</span><span class="s1">save</span><span class="s4">(</span><span class="s1">png</span><span class="s4">, </span><span class="s1">format</span><span class="s4">=</span><span class="s5">&quot;png&quot;</span><span class="s4">)</span>
+                <span class="s3">return </span><span class="s1">png</span><span class="s4">.</span><span class="s1">getvalue</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">handle_event</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">e_type </span><span class="s4">= </span><span class="s1">event</span><span class="s4">[</span><span class="s5">'type'</span><span class="s4">]</span>
+        <span class="s1">handler </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s5">f'handle_</span><span class="s3">{</span><span class="s1">e_type</span><span class="s3">}</span><span class="s5">'</span><span class="s4">,</span>
+                          <span class="s1">self</span><span class="s4">.</span><span class="s1">handle_unknown_event</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">handler</span><span class="s4">(</span><span class="s1">event</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">handle_unknown_event</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">_log</span><span class="s4">.</span><span class="s1">warning</span><span class="s4">(</span><span class="s5">'Unhandled message type %s. %s'</span><span class="s4">, </span><span class="s1">event</span><span class="s4">[</span><span class="s5">&quot;type&quot;</span><span class="s4">], </span><span class="s1">event</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">handle_ack</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s2"># Network latency tends to decrease if traffic is flowing</span>
+        <span class="s2"># in both directions.  Therefore, the browser sends back</span>
+        <span class="s2"># an &quot;ack&quot; message after each image frame is received.</span>
+        <span class="s2"># This could also be used as a simple sanity check in the</span>
+        <span class="s2"># future, but for now the performance increase is enough</span>
+        <span class="s2"># to justify it, even if the server does nothing with it.</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">handle_draw</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">draw</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">_handle_mouse</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">x </span><span class="s4">= </span><span class="s1">event</span><span class="s4">[</span><span class="s5">'x'</span><span class="s4">]</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">event</span><span class="s4">[</span><span class="s5">'y'</span><span class="s4">]</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">get_renderer</span><span class="s4">().</span><span class="s1">height </span><span class="s4">- </span><span class="s1">y</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_last_mouse_xy </span><span class="s4">= </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span>
+        <span class="s2"># JavaScript button numbers and Matplotlib button numbers are off by 1.</span>
+        <span class="s1">button </span><span class="s4">= </span><span class="s1">event</span><span class="s4">[</span><span class="s5">'button'</span><span class="s4">] + </span><span class="s6">1</span>
+
+        <span class="s1">e_type </span><span class="s4">= </span><span class="s1">event</span><span class="s4">[</span><span class="s5">'type'</span><span class="s4">]</span>
+        <span class="s1">modifiers </span><span class="s4">= </span><span class="s1">event</span><span class="s4">[</span><span class="s5">'modifiers'</span><span class="s4">]</span>
+        <span class="s1">guiEvent </span><span class="s4">= </span><span class="s1">event</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">'guiEvent'</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">e_type </span><span class="s3">in </span><span class="s4">[</span><span class="s5">'button_press'</span><span class="s4">, </span><span class="s5">'button_release'</span><span class="s4">]:</span>
+            <span class="s1">MouseEvent</span><span class="s4">(</span><span class="s1">e_type </span><span class="s4">+ </span><span class="s5">'_event'</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">button</span><span class="s4">,</span>
+                       <span class="s1">modifiers</span><span class="s4">=</span><span class="s1">modifiers</span><span class="s4">, </span><span class="s1">guiEvent</span><span class="s4">=</span><span class="s1">guiEvent</span><span class="s4">).</span><span class="s1">_process</span><span class="s4">()</span>
+        <span class="s3">elif </span><span class="s1">e_type </span><span class="s4">== </span><span class="s5">'dblclick'</span><span class="s4">:</span>
+            <span class="s1">MouseEvent</span><span class="s4">(</span><span class="s5">'button_press_event'</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">button</span><span class="s4">, </span><span class="s1">dblclick</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+                       <span class="s1">modifiers</span><span class="s4">=</span><span class="s1">modifiers</span><span class="s4">, </span><span class="s1">guiEvent</span><span class="s4">=</span><span class="s1">guiEvent</span><span class="s4">).</span><span class="s1">_process</span><span class="s4">()</span>
+        <span class="s3">elif </span><span class="s1">e_type </span><span class="s4">== </span><span class="s5">'scroll'</span><span class="s4">:</span>
+            <span class="s1">MouseEvent</span><span class="s4">(</span><span class="s5">'scroll_event'</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">step</span><span class="s4">=</span><span class="s1">event</span><span class="s4">[</span><span class="s5">'step'</span><span class="s4">],</span>
+                       <span class="s1">modifiers</span><span class="s4">=</span><span class="s1">modifiers</span><span class="s4">, </span><span class="s1">guiEvent</span><span class="s4">=</span><span class="s1">guiEvent</span><span class="s4">).</span><span class="s1">_process</span><span class="s4">()</span>
+        <span class="s3">elif </span><span class="s1">e_type </span><span class="s4">== </span><span class="s5">'motion_notify'</span><span class="s4">:</span>
+            <span class="s1">MouseEvent</span><span class="s4">(</span><span class="s1">e_type </span><span class="s4">+ </span><span class="s5">'_event'</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">,</span>
+                       <span class="s1">modifiers</span><span class="s4">=</span><span class="s1">modifiers</span><span class="s4">, </span><span class="s1">guiEvent</span><span class="s4">=</span><span class="s1">guiEvent</span><span class="s4">).</span><span class="s1">_process</span><span class="s4">()</span>
+        <span class="s3">elif </span><span class="s1">e_type </span><span class="s3">in </span><span class="s4">[</span><span class="s5">'figure_enter'</span><span class="s4">, </span><span class="s5">'figure_leave'</span><span class="s4">]:</span>
+            <span class="s1">LocationEvent</span><span class="s4">(</span><span class="s1">e_type </span><span class="s4">+ </span><span class="s5">'_event'</span><span class="s4">, </span><span class="s1">self</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">,</span>
+                          <span class="s1">modifiers</span><span class="s4">=</span><span class="s1">modifiers</span><span class="s4">, </span><span class="s1">guiEvent</span><span class="s4">=</span><span class="s1">guiEvent</span><span class="s4">).</span><span class="s1">_process</span><span class="s4">()</span>
+    <span class="s1">handle_button_press </span><span class="s4">= </span><span class="s1">handle_button_release </span><span class="s4">= </span><span class="s1">handle_dblclick </span><span class="s4">= </span><span class="s1">\</span>
+        <span class="s1">handle_figure_enter </span><span class="s4">= </span><span class="s1">handle_figure_leave </span><span class="s4">= </span><span class="s1">handle_motion_notify </span><span class="s4">= </span><span class="s1">\</span>
+        <span class="s1">handle_scroll </span><span class="s4">= </span><span class="s1">_handle_mouse</span>
+
+    <span class="s3">def </span><span class="s1">_handle_key</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">KeyEvent</span><span class="s4">(</span><span class="s1">event</span><span class="s4">[</span><span class="s5">'type'</span><span class="s4">] + </span><span class="s5">'_event'</span><span class="s4">, </span><span class="s1">self</span><span class="s4">,</span>
+                 <span class="s1">_handle_key</span><span class="s4">(</span><span class="s1">event</span><span class="s4">[</span><span class="s5">'key'</span><span class="s4">]), *</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_last_mouse_xy</span><span class="s4">,</span>
+                 <span class="s1">guiEvent</span><span class="s4">=</span><span class="s1">event</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">'guiEvent'</span><span class="s4">)).</span><span class="s1">_process</span><span class="s4">()</span>
+    <span class="s1">handle_key_press </span><span class="s4">= </span><span class="s1">handle_key_release </span><span class="s4">= </span><span class="s1">_handle_key</span>
+
+    <span class="s3">def </span><span class="s1">handle_toolbar_button</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s2"># TODO: Be more suspicious of the input</span>
+        <span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">toolbar</span><span class="s4">, </span><span class="s1">event</span><span class="s4">[</span><span class="s5">'name'</span><span class="s4">])()</span>
+
+    <span class="s3">def </span><span class="s1">handle_refresh</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">figure_label </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">figure</span><span class="s4">.</span><span class="s1">get_label</span><span class="s4">()</span>
+        <span class="s3">if not </span><span class="s1">figure_label</span><span class="s4">:</span>
+            <span class="s1">figure_label </span><span class="s4">= </span><span class="s5">f&quot;Figure </span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">manager</span><span class="s4">.</span><span class="s1">num</span><span class="s3">}</span><span class="s5">&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">'figure_label'</span><span class="s4">, </span><span class="s1">label</span><span class="s4">=</span><span class="s1">figure_label</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_force_full </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">toolbar</span><span class="s4">:</span>
+            <span class="s2"># Normal toolbar init would refresh this, but it happens before the</span>
+            <span class="s2"># browser canvas is set up.</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">toolbar</span><span class="s4">.</span><span class="s1">set_history_buttons</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">draw_idle</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">handle_resize</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">x </span><span class="s4">= </span><span class="s1">int</span><span class="s4">(</span><span class="s1">event</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">'width'</span><span class="s4">, </span><span class="s6">800</span><span class="s4">)) * </span><span class="s1">self</span><span class="s4">.</span><span class="s1">device_pixel_ratio</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">int</span><span class="s4">(</span><span class="s1">event</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">'height'</span><span class="s4">, </span><span class="s6">800</span><span class="s4">)) * </span><span class="s1">self</span><span class="s4">.</span><span class="s1">device_pixel_ratio</span>
+        <span class="s1">fig </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">figure</span>
+        <span class="s2"># An attempt at approximating the figure size in pixels.</span>
+        <span class="s1">fig</span><span class="s4">.</span><span class="s1">set_size_inches</span><span class="s4">(</span><span class="s1">x </span><span class="s4">/ </span><span class="s1">fig</span><span class="s4">.</span><span class="s1">dpi</span><span class="s4">, </span><span class="s1">y </span><span class="s4">/ </span><span class="s1">fig</span><span class="s4">.</span><span class="s1">dpi</span><span class="s4">, </span><span class="s1">forward</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s2"># Acknowledge the resize, and force the viewer to update the</span>
+        <span class="s2"># canvas size to the figure's new size (which is hopefully</span>
+        <span class="s2"># identical or within a pixel or so).</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_png_is_old </span><span class="s4">= </span><span class="s3">True</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">manager</span><span class="s4">.</span><span class="s1">resize</span><span class="s4">(*</span><span class="s1">fig</span><span class="s4">.</span><span class="s1">bbox</span><span class="s4">.</span><span class="s1">size</span><span class="s4">, </span><span class="s1">forward</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s1">ResizeEvent</span><span class="s4">(</span><span class="s5">'resize_event'</span><span class="s4">, </span><span class="s1">self</span><span class="s4">).</span><span class="s1">_process</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">draw_idle</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">handle_send_image_mode</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s2"># The client requests notification of what the current image mode is.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">'image_mode'</span><span class="s4">, </span><span class="s1">mode</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_current_image_mode</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">handle_set_device_pixel_ratio</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_handle_set_device_pixel_ratio</span><span class="s4">(</span><span class="s1">event</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">'device_pixel_ratio'</span><span class="s4">, </span><span class="s6">1</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">handle_set_dpi_ratio</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">):</span>
+        <span class="s2"># This handler is for backwards-compatibility with older ipympl.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_handle_set_device_pixel_ratio</span><span class="s4">(</span><span class="s1">event</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">'dpi_ratio'</span><span class="s4">, </span><span class="s6">1</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">_handle_set_device_pixel_ratio</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">device_pixel_ratio</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_set_device_pixel_ratio</span><span class="s4">(</span><span class="s1">device_pixel_ratio</span><span class="s4">):</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_force_full </span><span class="s4">= </span><span class="s3">True</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">draw_idle</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">send_event</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event_type</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">manager</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">manager</span><span class="s4">.</span><span class="s1">_send_event</span><span class="s4">(</span><span class="s1">event_type</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+
+<span class="s1">_ALLOWED_TOOL_ITEMS </span><span class="s4">= {</span>
+    <span class="s5">'home'</span><span class="s4">,</span>
+    <span class="s5">'back'</span><span class="s4">,</span>
+    <span class="s5">'forward'</span><span class="s4">,</span>
+    <span class="s5">'pan'</span><span class="s4">,</span>
+    <span class="s5">'zoom'</span><span class="s4">,</span>
+    <span class="s5">'download'</span><span class="s4">,</span>
+    <span class="s3">None</span><span class="s4">,</span>
+<span class="s4">}</span>
+
+
+<span class="s3">class </span><span class="s1">NavigationToolbar2WebAgg</span><span class="s4">(</span><span class="s1">backend_bases</span><span class="s4">.</span><span class="s1">NavigationToolbar2</span><span class="s4">):</span>
+
+    <span class="s2"># Use the standard toolbar items + download button</span>
+    <span class="s1">toolitems </span><span class="s4">= [</span>
+        <span class="s4">(</span><span class="s1">text</span><span class="s4">, </span><span class="s1">tooltip_text</span><span class="s4">, </span><span class="s1">image_file</span><span class="s4">, </span><span class="s1">name_of_method</span><span class="s4">)</span>
+        <span class="s3">for </span><span class="s1">text</span><span class="s4">, </span><span class="s1">tooltip_text</span><span class="s4">, </span><span class="s1">image_file</span><span class="s4">, </span><span class="s1">name_of_method</span>
+        <span class="s3">in </span><span class="s4">(*</span><span class="s1">backend_bases</span><span class="s4">.</span><span class="s1">NavigationToolbar2</span><span class="s4">.</span><span class="s1">toolitems</span><span class="s4">,</span>
+            <span class="s4">(</span><span class="s5">'Download'</span><span class="s4">, </span><span class="s5">'Download plot'</span><span class="s4">, </span><span class="s5">'filesave'</span><span class="s4">, </span><span class="s5">'download'</span><span class="s4">))</span>
+        <span class="s3">if </span><span class="s1">name_of_method </span><span class="s3">in </span><span class="s1">_ALLOWED_TOOL_ITEMS</span>
+    <span class="s4">]</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">canvas</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">message </span><span class="s4">= </span><span class="s5">''</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">canvas</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">set_message</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">message</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">message </span><span class="s4">!= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">message</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">&quot;message&quot;</span><span class="s4">, </span><span class="s1">message</span><span class="s4">=</span><span class="s1">message</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">message </span><span class="s4">= </span><span class="s1">message</span>
+
+    <span class="s3">def </span><span class="s1">draw_rubberband</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event</span><span class="s4">, </span><span class="s1">x0</span><span class="s4">, </span><span class="s1">y0</span><span class="s4">, </span><span class="s1">x1</span><span class="s4">, </span><span class="s1">y1</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">&quot;rubberband&quot;</span><span class="s4">, </span><span class="s1">x0</span><span class="s4">=</span><span class="s1">x0</span><span class="s4">, </span><span class="s1">y0</span><span class="s4">=</span><span class="s1">y0</span><span class="s4">, </span><span class="s1">x1</span><span class="s4">=</span><span class="s1">x1</span><span class="s4">, </span><span class="s1">y1</span><span class="s4">=</span><span class="s1">y1</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">remove_rubberband</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">&quot;rubberband&quot;</span><span class="s4">, </span><span class="s1">x0</span><span class="s4">=-</span><span class="s6">1</span><span class="s4">, </span><span class="s1">y0</span><span class="s4">=-</span><span class="s6">1</span><span class="s4">, </span><span class="s1">x1</span><span class="s4">=-</span><span class="s6">1</span><span class="s4">, </span><span class="s1">y1</span><span class="s4">=-</span><span class="s6">1</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">save_figure</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *</span><span class="s1">args</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Save the current figure&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">'save'</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">pan</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">pan</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">'navigate_mode'</span><span class="s4">, </span><span class="s1">mode</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">mode</span><span class="s4">.</span><span class="s1">name</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">zoom</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">zoom</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">'navigate_mode'</span><span class="s4">, </span><span class="s1">mode</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">mode</span><span class="s4">.</span><span class="s1">name</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">set_history_buttons</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">can_backward </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_nav_stack</span><span class="s4">.</span><span class="s1">_pos </span><span class="s4">&gt; </span><span class="s6">0</span>
+        <span class="s1">can_forward </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_nav_stack</span><span class="s4">.</span><span class="s1">_pos </span><span class="s4">&lt; </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_nav_stack</span><span class="s4">) - </span><span class="s6">1</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">send_event</span><span class="s4">(</span><span class="s5">'history_buttons'</span><span class="s4">,</span>
+                               <span class="s1">Back</span><span class="s4">=</span><span class="s1">can_backward</span><span class="s4">, </span><span class="s1">Forward</span><span class="s4">=</span><span class="s1">can_forward</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">FigureManagerWebAgg</span><span class="s4">(</span><span class="s1">backend_bases</span><span class="s4">.</span><span class="s1">FigureManagerBase</span><span class="s4">):</span>
+    <span class="s2"># This must be None to not break ipympl</span>
+    <span class="s1">_toolbar2_class </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s1">ToolbarCls </span><span class="s4">= </span><span class="s1">NavigationToolbar2WebAgg</span>
+    <span class="s1">_window_title </span><span class="s4">= </span><span class="s5">&quot;Matplotlib&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">canvas</span><span class="s4">, </span><span class="s1">num</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">web_sockets </span><span class="s4">= </span><span class="s1">set</span><span class="s4">()</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">canvas</span><span class="s4">, </span><span class="s1">num</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">show</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">resize</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">w</span><span class="s4">, </span><span class="s1">h</span><span class="s4">, </span><span class="s1">forward</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_send_event</span><span class="s4">(</span>
+            <span class="s5">'resize'</span><span class="s4">,</span>
+            <span class="s1">size</span><span class="s4">=(</span><span class="s1">w </span><span class="s4">/ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">device_pixel_ratio</span><span class="s4">,</span>
+                  <span class="s1">h </span><span class="s4">/ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">device_pixel_ratio</span><span class="s4">),</span>
+            <span class="s1">forward</span><span class="s4">=</span><span class="s1">forward</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">set_window_title</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">title</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_send_event</span><span class="s4">(</span><span class="s5">'figure_label'</span><span class="s4">, </span><span class="s1">label</span><span class="s4">=</span><span class="s1">title</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_window_title </span><span class="s4">= </span><span class="s1">title</span>
+
+    <span class="s3">def </span><span class="s1">get_window_title</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_window_title</span>
+
+    <span class="s2"># The following methods are specific to FigureManagerWebAgg</span>
+
+    <span class="s3">def </span><span class="s1">add_web_socket</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">web_socket</span><span class="s4">):</span>
+        <span class="s3">assert </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">web_socket</span><span class="s4">, </span><span class="s5">'send_binary'</span><span class="s4">)</span>
+        <span class="s3">assert </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">web_socket</span><span class="s4">, </span><span class="s5">'send_json'</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">web_sockets</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">web_socket</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">resize</span><span class="s4">(*</span><span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">figure</span><span class="s4">.</span><span class="s1">bbox</span><span class="s4">.</span><span class="s1">size</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_send_event</span><span class="s4">(</span><span class="s5">'refresh'</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">remove_web_socket</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">web_socket</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">web_sockets</span><span class="s4">.</span><span class="s1">remove</span><span class="s4">(</span><span class="s1">web_socket</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">handle_json</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">content</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">handle_event</span><span class="s4">(</span><span class="s1">content</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">refresh_all</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">web_sockets</span><span class="s4">:</span>
+            <span class="s1">diff </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">canvas</span><span class="s4">.</span><span class="s1">get_diff_image</span><span class="s4">()</span>
+            <span class="s3">if </span><span class="s1">diff </span><span class="s3">is not None</span><span class="s4">:</span>
+                <span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">web_sockets</span><span class="s4">:</span>
+                    <span class="s1">s</span><span class="s4">.</span><span class="s1">send_binary</span><span class="s4">(</span><span class="s1">diff</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">get_javascript</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">stream</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">stream </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">output </span><span class="s4">= </span><span class="s1">StringIO</span><span class="s4">()</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">output </span><span class="s4">= </span><span class="s1">stream</span>
+
+        <span class="s1">output</span><span class="s4">.</span><span class="s1">write</span><span class="s4">((</span><span class="s1">Path</span><span class="s4">(</span><span class="s1">__file__</span><span class="s4">).</span><span class="s1">parent </span><span class="s4">/ </span><span class="s5">&quot;web_backend/js/mpl.js&quot;</span><span class="s4">)</span>
+                     <span class="s4">.</span><span class="s1">read_text</span><span class="s4">(</span><span class="s1">encoding</span><span class="s4">=</span><span class="s5">&quot;utf-8&quot;</span><span class="s4">))</span>
+
+        <span class="s1">toolitems </span><span class="s4">= []</span>
+        <span class="s3">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">tooltip</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">method </span><span class="s3">in </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">ToolbarCls</span><span class="s4">.</span><span class="s1">toolitems</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">name </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s1">toolitems</span><span class="s4">.</span><span class="s1">append</span><span class="s4">([</span><span class="s5">''</span><span class="s4">, </span><span class="s5">''</span><span class="s4">, </span><span class="s5">''</span><span class="s4">, </span><span class="s5">''</span><span class="s4">])</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">toolitems</span><span class="s4">.</span><span class="s1">append</span><span class="s4">([</span><span class="s1">name</span><span class="s4">, </span><span class="s1">tooltip</span><span class="s4">, </span><span class="s1">image</span><span class="s4">, </span><span class="s1">method</span><span class="s4">])</span>
+        <span class="s1">output</span><span class="s4">.</span><span class="s1">write</span><span class="s4">(</span><span class="s5">f&quot;mpl.toolbar_items = </span><span class="s3">{</span><span class="s1">json</span><span class="s4">.</span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">toolitems</span><span class="s4">)</span><span class="s3">}</span><span class="s5">;</span><span class="s3">\n\n</span><span class="s5">&quot;</span><span class="s4">)</span>
+
+        <span class="s1">extensions </span><span class="s4">= []</span>
+        <span class="s3">for </span><span class="s1">filetype</span><span class="s4">, </span><span class="s1">ext </span><span class="s3">in </span><span class="s1">sorted</span><span class="s4">(</span><span class="s1">FigureCanvasWebAggCore</span><span class="s4">.</span>
+                                    <span class="s1">get_supported_filetypes_grouped</span><span class="s4">().</span>
+                                    <span class="s1">items</span><span class="s4">()):</span>
+            <span class="s1">extensions</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">ext</span><span class="s4">[</span><span class="s6">0</span><span class="s4">])</span>
+        <span class="s1">output</span><span class="s4">.</span><span class="s1">write</span><span class="s4">(</span><span class="s5">f&quot;mpl.extensions = </span><span class="s3">{</span><span class="s1">json</span><span class="s4">.</span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">extensions</span><span class="s4">)</span><span class="s3">}</span><span class="s5">;</span><span class="s3">\n\n</span><span class="s5">&quot;</span><span class="s4">)</span>
+
+        <span class="s1">output</span><span class="s4">.</span><span class="s1">write</span><span class="s4">(</span><span class="s5">&quot;mpl.default_extension = {};&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+            <span class="s1">json</span><span class="s4">.</span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">FigureCanvasWebAggCore</span><span class="s4">.</span><span class="s1">get_default_filetype</span><span class="s4">())))</span>
+
+        <span class="s3">if </span><span class="s1">stream </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">output</span><span class="s4">.</span><span class="s1">getvalue</span><span class="s4">()</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">get_static_file_path</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">dirname</span><span class="s4">(</span><span class="s1">__file__</span><span class="s4">), </span><span class="s5">'web_backend'</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_send_event</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">event_type</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s1">payload </span><span class="s4">= {</span><span class="s5">'type'</span><span class="s4">: </span><span class="s1">event_type</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">}</span>
+        <span class="s3">for </span><span class="s1">s </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">web_sockets</span><span class="s4">:</span>
+            <span class="s1">s</span><span class="s4">.</span><span class="s1">send_json</span><span class="s4">(</span><span class="s1">payload</span><span class="s4">)</span>
+
+
+<span class="s4">@</span><span class="s1">_Backend</span><span class="s4">.</span><span class="s1">export</span>
+<span class="s3">class </span><span class="s1">_BackendWebAggCoreAgg</span><span class="s4">(</span><span class="s1">_Backend</span><span class="s4">):</span>
+    <span class="s1">FigureCanvas </span><span class="s4">= </span><span class="s1">FigureCanvasWebAggCore</span>
+    <span class="s1">FigureManager </span><span class="s4">= </span><span class="s1">FigureManagerWebAgg</span>
+</pre>
+</body>
+</html>

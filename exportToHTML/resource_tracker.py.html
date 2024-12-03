@@ -1,0 +1,402 @@
+<html>
+<head>
+<title>resource_tracker.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+resource_tracker.py</font>
+</center></td></tr></table>
+<pre><span class="s0">###############################################################################</span>
+<span class="s0"># Server process to keep track of unlinked resources, like folders and</span>
+<span class="s0"># semaphores and clean them.</span>
+<span class="s0">#</span>
+<span class="s0"># author: Thomas Moreau</span>
+<span class="s0">#</span>
+<span class="s0"># adapted from multiprocessing/semaphore_tracker.py  (17/02/2017)</span>
+<span class="s0">#  * include custom spawnv_passfds to start the process</span>
+<span class="s0">#  * add some VERBOSE logging</span>
+<span class="s0">#</span>
+<span class="s0"># TODO: multiprocessing.resource_tracker was contributed to Python 3.8 so</span>
+<span class="s0"># once loky drops support for Python 3.7 it might be possible to stop</span>
+<span class="s0"># maintaining this loky-specific fork. As a consequence, it might also be</span>
+<span class="s0"># possible to stop maintaining the loky.backend.synchronize fork of</span>
+<span class="s0"># multiprocessing.synchronize.</span>
+
+<span class="s0">#</span>
+<span class="s0"># On Unix we run a server process which keeps track of unlinked</span>
+<span class="s0"># resources. The server ignores SIGINT and SIGTERM and reads from a</span>
+<span class="s0"># pipe. The resource_tracker implements a reference counting scheme: each time</span>
+<span class="s0"># a Python process anticipates the shared usage of a resource by another</span>
+<span class="s0"># process, it signals the resource_tracker of this shared usage, and in return,</span>
+<span class="s0"># the resource_tracker increments the resource's reference count by 1.</span>
+<span class="s0"># Similarly, when access to a resource is closed by a Python process, the</span>
+<span class="s0"># process notifies the resource_tracker by asking it to decrement the</span>
+<span class="s0"># resource's reference count by 1.  When the reference count drops to 0, the</span>
+<span class="s0"># resource_tracker attempts to clean up the underlying resource.</span>
+
+<span class="s0"># Finally, every other process connected to the resource tracker has a copy of</span>
+<span class="s0"># the writable end of the pipe used to communicate with it, so the resource</span>
+<span class="s0"># tracker gets EOF when all other processes have exited. Then the</span>
+<span class="s0"># resource_tracker process unlinks any remaining leaked resources (with</span>
+<span class="s0"># reference count above 0)</span>
+
+<span class="s0"># For semaphores, this is important because the system only supports a limited</span>
+<span class="s0"># number of named semaphores, and they will not be automatically removed till</span>
+<span class="s0"># the next reboot.  Without this resource tracker process, &quot;killall python&quot;</span>
+<span class="s0"># would probably leave unlinked semaphores.</span>
+
+<span class="s0"># Note that this behavior differs from CPython's resource_tracker, which only</span>
+<span class="s0"># implements list of shared resources, and not a proper refcounting scheme.</span>
+<span class="s0"># Also, CPython's resource tracker will only attempt to cleanup those shared</span>
+<span class="s0"># resources once all procsses connected to the resouce tracker have exited.</span>
+
+
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">shutil</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">signal</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">from </span><span class="s1">_multiprocessing </span><span class="s2">import </span><span class="s1">sem_unlink</span>
+<span class="s2">from </span><span class="s1">multiprocessing </span><span class="s2">import </span><span class="s1">util</span>
+
+<span class="s2">from </span><span class="s3">. </span><span class="s2">import </span><span class="s1">spawn</span>
+
+<span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform </span><span class="s3">== </span><span class="s4">&quot;win32&quot;</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">_winapi</span>
+    <span class="s2">import </span><span class="s1">msvcrt</span>
+    <span class="s2">from </span><span class="s1">multiprocessing</span><span class="s3">.</span><span class="s1">reduction </span><span class="s2">import </span><span class="s1">duplicate</span>
+
+
+<span class="s1">__all__ </span><span class="s3">= [</span><span class="s4">&quot;ensure_running&quot;</span><span class="s3">, </span><span class="s4">&quot;register&quot;</span><span class="s3">, </span><span class="s4">&quot;unregister&quot;</span><span class="s3">]</span>
+
+<span class="s1">_HAVE_SIGMASK </span><span class="s3">= </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">signal</span><span class="s3">, </span><span class="s4">&quot;pthread_sigmask&quot;</span><span class="s3">)</span>
+<span class="s1">_IGNORED_SIGNALS </span><span class="s3">= (</span><span class="s1">signal</span><span class="s3">.</span><span class="s1">SIGINT</span><span class="s3">, </span><span class="s1">signal</span><span class="s3">.</span><span class="s1">SIGTERM</span><span class="s3">)</span>
+
+<span class="s1">_CLEANUP_FUNCS </span><span class="s3">= {</span><span class="s4">&quot;folder&quot;</span><span class="s3">: </span><span class="s1">shutil</span><span class="s3">.</span><span class="s1">rmtree</span><span class="s3">, </span><span class="s4">&quot;file&quot;</span><span class="s3">: </span><span class="s1">os</span><span class="s3">.</span><span class="s1">unlink</span><span class="s3">}</span>
+
+<span class="s2">if </span><span class="s1">os</span><span class="s3">.</span><span class="s1">name </span><span class="s3">== </span><span class="s4">&quot;posix&quot;</span><span class="s3">:</span>
+    <span class="s1">_CLEANUP_FUNCS</span><span class="s3">[</span><span class="s4">&quot;semlock&quot;</span><span class="s3">] = </span><span class="s1">sem_unlink</span>
+
+
+<span class="s1">VERBOSE </span><span class="s3">= </span><span class="s2">False</span>
+
+
+<span class="s2">class </span><span class="s1">ResourceTracker</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_fd </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pid </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">getfd</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ensure_running</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fd</span>
+
+    <span class="s2">def </span><span class="s1">ensure_running</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Make sure that resource tracker process is running. 
+ 
+        This can be run from any process.  Usually a child process will use 
+        the resource created by its parent.&quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fd </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s0"># resource tracker was launched before, is it still running?</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_check_alive</span><span class="s3">():</span>
+                    <span class="s0"># =&gt; still alive</span>
+                    <span class="s2">return</span>
+                <span class="s0"># =&gt; dead, launch it again</span>
+                <span class="s1">os</span><span class="s3">.</span><span class="s1">close</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fd</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">os</span><span class="s3">.</span><span class="s1">name </span><span class="s3">== </span><span class="s4">&quot;posix&quot;</span><span class="s3">:</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s0"># At this point, the resource_tracker process has been</span>
+                        <span class="s0"># killed or crashed. Let's remove the process entry</span>
+                        <span class="s0"># from the process table to avoid zombie processes.</span>
+                        <span class="s1">os</span><span class="s3">.</span><span class="s1">waitpid</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pid</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+                    <span class="s2">except </span><span class="s1">OSError</span><span class="s3">:</span>
+                        <span class="s0"># The process was terminated or is a child from an</span>
+                        <span class="s0"># ancestor of the current process.</span>
+                        <span class="s2">pass</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_fd </span><span class="s3">= </span><span class="s2">None</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_pid </span><span class="s3">= </span><span class="s2">None</span>
+
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                    <span class="s4">&quot;resource_tracker: process died unexpectedly, &quot;</span>
+                    <span class="s4">&quot;relaunching.  Some folders/sempahores might &quot;</span>
+                    <span class="s4">&quot;leak.&quot;</span>
+                <span class="s3">)</span>
+
+            <span class="s1">fds_to_pass </span><span class="s3">= []</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">fds_to_pass</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stderr</span><span class="s3">.</span><span class="s1">fileno</span><span class="s3">())</span>
+            <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+                <span class="s2">pass</span>
+
+            <span class="s1">r</span><span class="s3">, </span><span class="s1">w </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">pipe</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform </span><span class="s3">== </span><span class="s4">&quot;win32&quot;</span><span class="s3">:</span>
+                <span class="s1">_r </span><span class="s3">= </span><span class="s1">duplicate</span><span class="s3">(</span><span class="s1">msvcrt</span><span class="s3">.</span><span class="s1">get_osfhandle</span><span class="s3">(</span><span class="s1">r</span><span class="s3">), </span><span class="s1">inheritable</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+                <span class="s1">os</span><span class="s3">.</span><span class="s1">close</span><span class="s3">(</span><span class="s1">r</span><span class="s3">)</span>
+                <span class="s1">r </span><span class="s3">= </span><span class="s1">_r</span>
+
+            <span class="s1">cmd </span><span class="s3">= </span><span class="s4">f&quot;from </span><span class="s2">{</span><span class="s1">main</span><span class="s3">.</span><span class="s1">__module__</span><span class="s2">} </span><span class="s4">import main; main(</span><span class="s2">{</span><span class="s1">r</span><span class="s2">}</span><span class="s4">, </span><span class="s2">{</span><span class="s1">VERBOSE</span><span class="s2">}</span><span class="s4">)&quot;</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">fds_to_pass</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">r</span><span class="s3">)</span>
+                <span class="s0"># process will out live us, so no need to wait on pid</span>
+                <span class="s1">exe </span><span class="s3">= </span><span class="s1">spawn</span><span class="s3">.</span><span class="s1">get_executable</span><span class="s3">()</span>
+                <span class="s1">args </span><span class="s3">= [</span><span class="s1">exe</span><span class="s3">, *</span><span class="s1">util</span><span class="s3">.</span><span class="s1">_args_from_interpreter_flags</span><span class="s3">(), </span><span class="s4">&quot;-c&quot;</span><span class="s3">, </span><span class="s1">cmd</span><span class="s3">]</span>
+                <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">f&quot;launching resource tracker: </span><span class="s2">{</span><span class="s1">args</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+                <span class="s0"># bpo-33613: Register a signal mask that will block the</span>
+                <span class="s0"># signals.  This signal mask will be inherited by the child</span>
+                <span class="s0"># that is going to be spawned and will protect the child from a</span>
+                <span class="s0"># race condition that can make the child die before it</span>
+                <span class="s0"># registers signal handlers for SIGINT and SIGTERM. The mask is</span>
+                <span class="s0"># unregistered after spawning the child.</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">_HAVE_SIGMASK</span><span class="s3">:</span>
+                        <span class="s1">signal</span><span class="s3">.</span><span class="s1">pthread_sigmask</span><span class="s3">(</span>
+                            <span class="s1">signal</span><span class="s3">.</span><span class="s1">SIG_BLOCK</span><span class="s3">, </span><span class="s1">_IGNORED_SIGNALS</span>
+                        <span class="s3">)</span>
+                    <span class="s1">pid </span><span class="s3">= </span><span class="s1">spawnv_passfds</span><span class="s3">(</span><span class="s1">exe</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">fds_to_pass</span><span class="s3">)</span>
+                <span class="s2">finally</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">_HAVE_SIGMASK</span><span class="s3">:</span>
+                        <span class="s1">signal</span><span class="s3">.</span><span class="s1">pthread_sigmask</span><span class="s3">(</span>
+                            <span class="s1">signal</span><span class="s3">.</span><span class="s1">SIG_UNBLOCK</span><span class="s3">, </span><span class="s1">_IGNORED_SIGNALS</span>
+                        <span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">BaseException</span><span class="s3">:</span>
+                <span class="s1">os</span><span class="s3">.</span><span class="s1">close</span><span class="s3">(</span><span class="s1">w</span><span class="s3">)</span>
+                <span class="s2">raise</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_fd </span><span class="s3">= </span><span class="s1">w</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_pid </span><span class="s3">= </span><span class="s1">pid</span>
+            <span class="s2">finally</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform </span><span class="s3">== </span><span class="s4">&quot;win32&quot;</span><span class="s3">:</span>
+                    <span class="s1">_winapi</span><span class="s3">.</span><span class="s1">CloseHandle</span><span class="s3">(</span><span class="s1">r</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">os</span><span class="s3">.</span><span class="s1">close</span><span class="s3">(</span><span class="s1">r</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_check_alive</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Check for the existence of the resource tracker process.&quot;&quot;&quot;</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_send</span><span class="s3">(</span><span class="s4">&quot;PROBE&quot;</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">BrokenPipeError</span><span class="s3">:</span>
+            <span class="s2">return False</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">register</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Register a named resource, and increment its refcount.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ensure_running</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_send</span><span class="s3">(</span><span class="s4">&quot;REGISTER&quot;</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">unregister</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Unregister a named resource with resource tracker.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ensure_running</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_send</span><span class="s3">(</span><span class="s4">&quot;UNREGISTER&quot;</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">maybe_unlink</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Decrement the refcount of a resource, and delete it if it hits 0&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ensure_running</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_send</span><span class="s3">(</span><span class="s4">&quot;MAYBE_UNLINK&quot;</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_send</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cmd</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">name</span><span class="s3">) &gt; </span><span class="s6">512</span><span class="s3">:</span>
+            <span class="s0"># posix guarantees that writes to a pipe of less than PIPE_BUF</span>
+            <span class="s0"># bytes are atomic, and that PIPE_BUF &gt;= 512</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;name too long&quot;</span><span class="s3">)</span>
+        <span class="s1">msg </span><span class="s3">= </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">cmd</span><span class="s2">}</span><span class="s4">:</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">:</span><span class="s2">{</span><span class="s1">rtype</span><span class="s2">}\n</span><span class="s4">&quot;</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">&quot;ascii&quot;</span><span class="s3">)</span>
+        <span class="s1">nbytes </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fd</span><span class="s3">, </span><span class="s1">msg</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">nbytes </span><span class="s3">== </span><span class="s1">len</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+
+<span class="s1">_resource_tracker </span><span class="s3">= </span><span class="s1">ResourceTracker</span><span class="s3">()</span>
+<span class="s1">ensure_running </span><span class="s3">= </span><span class="s1">_resource_tracker</span><span class="s3">.</span><span class="s1">ensure_running</span>
+<span class="s1">register </span><span class="s3">= </span><span class="s1">_resource_tracker</span><span class="s3">.</span><span class="s1">register</span>
+<span class="s1">maybe_unlink </span><span class="s3">= </span><span class="s1">_resource_tracker</span><span class="s3">.</span><span class="s1">maybe_unlink</span>
+<span class="s1">unregister </span><span class="s3">= </span><span class="s1">_resource_tracker</span><span class="s3">.</span><span class="s1">unregister</span>
+<span class="s1">getfd </span><span class="s3">= </span><span class="s1">_resource_tracker</span><span class="s3">.</span><span class="s1">getfd</span>
+
+
+<span class="s2">def </span><span class="s1">main</span><span class="s3">(</span><span class="s1">fd</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">=</span><span class="s6">0</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;Run resource tracker.&quot;&quot;&quot;</span>
+    <span class="s0"># protect the process from ^C and &quot;killall python&quot; etc</span>
+    <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+        <span class="s1">util</span><span class="s3">.</span><span class="s1">log_to_stderr</span><span class="s3">(</span><span class="s1">level</span><span class="s3">=</span><span class="s1">util</span><span class="s3">.</span><span class="s1">DEBUG</span><span class="s3">)</span>
+
+    <span class="s1">signal</span><span class="s3">.</span><span class="s1">signal</span><span class="s3">(</span><span class="s1">signal</span><span class="s3">.</span><span class="s1">SIGINT</span><span class="s3">, </span><span class="s1">signal</span><span class="s3">.</span><span class="s1">SIG_IGN</span><span class="s3">)</span>
+    <span class="s1">signal</span><span class="s3">.</span><span class="s1">signal</span><span class="s3">(</span><span class="s1">signal</span><span class="s3">.</span><span class="s1">SIGTERM</span><span class="s3">, </span><span class="s1">signal</span><span class="s3">.</span><span class="s1">SIG_IGN</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">_HAVE_SIGMASK</span><span class="s3">:</span>
+        <span class="s1">signal</span><span class="s3">.</span><span class="s1">pthread_sigmask</span><span class="s3">(</span><span class="s1">signal</span><span class="s3">.</span><span class="s1">SIG_UNBLOCK</span><span class="s3">, </span><span class="s1">_IGNORED_SIGNALS</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stdin</span><span class="s3">, </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stdout</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">f</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s2">pass</span>
+
+    <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+        <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">&quot;Main resource tracker is running&quot;</span><span class="s3">)</span>
+
+    <span class="s1">registry </span><span class="s3">= {</span><span class="s1">rtype</span><span class="s3">: {} </span><span class="s2">for </span><span class="s1">rtype </span><span class="s2">in </span><span class="s1">_CLEANUP_FUNCS</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()}</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s0"># keep track of registered/unregistered resources</span>
+        <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform </span><span class="s3">== </span><span class="s4">&quot;win32&quot;</span><span class="s3">:</span>
+            <span class="s1">fd </span><span class="s3">= </span><span class="s1">msvcrt</span><span class="s3">.</span><span class="s1">open_osfhandle</span><span class="s3">(</span><span class="s1">fd</span><span class="s3">, </span><span class="s1">os</span><span class="s3">.</span><span class="s1">O_RDONLY</span><span class="s3">)</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">fd</span><span class="s3">, </span><span class="s4">&quot;rb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+            <span class="s2">while True</span><span class="s3">:</span>
+                <span class="s1">line </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">readline</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">line </span><span class="s3">== </span><span class="s7">b&quot;&quot;</span><span class="s3">:  </span><span class="s0"># EOF</span>
+                    <span class="s2">break</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">splitted </span><span class="s3">= </span><span class="s1">line</span><span class="s3">.</span><span class="s1">strip</span><span class="s3">().</span><span class="s1">decode</span><span class="s3">(</span><span class="s4">&quot;ascii&quot;</span><span class="s3">).</span><span class="s1">split</span><span class="s3">(</span><span class="s4">&quot;:&quot;</span><span class="s3">)</span>
+                    <span class="s0"># name can potentially contain separator symbols (for</span>
+                    <span class="s0"># instance folders on Windows)</span>
+                    <span class="s1">cmd</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">rtype </span><span class="s3">= (</span>
+                        <span class="s1">splitted</span><span class="s3">[</span><span class="s6">0</span><span class="s3">],</span>
+                        <span class="s4">&quot;:&quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">splitted</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:-</span><span class="s6">1</span><span class="s3">]),</span>
+                        <span class="s1">splitted</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">],</span>
+                    <span class="s3">)</span>
+
+                    <span class="s2">if </span><span class="s1">cmd </span><span class="s3">== </span><span class="s4">&quot;PROBE&quot;</span><span class="s3">:</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s2">if </span><span class="s1">rtype </span><span class="s2">not in </span><span class="s1">_CLEANUP_FUNCS</span><span class="s3">:</span>
+                        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                            <span class="s4">f&quot;Cannot register </span><span class="s2">{</span><span class="s1">name</span><span class="s2">} </span><span class="s4">for automatic cleanup: &quot;</span>
+                            <span class="s4">f&quot;unknown resource type (</span><span class="s2">{</span><span class="s1">rtype</span><span class="s2">}</span><span class="s4">). Resource type &quot;</span>
+                            <span class="s4">&quot;should be one of the following: &quot;</span>
+                            <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">list</span><span class="s3">(</span><span class="s1">_CLEANUP_FUNCS</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">())</span><span class="s2">}</span><span class="s4">&quot;</span>
+                        <span class="s3">)</span>
+
+                    <span class="s2">if </span><span class="s1">cmd </span><span class="s3">== </span><span class="s4">&quot;REGISTER&quot;</span><span class="s3">:</span>
+                        <span class="s2">if </span><span class="s1">name </span><span class="s2">not in </span><span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">]:</span>
+                            <span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">] = </span><span class="s6">1</span>
+                        <span class="s2">else</span><span class="s3">:</span>
+                            <span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">] += </span><span class="s6">1</span>
+
+                        <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+                            <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+                                <span class="s4">&quot;[ResourceTracker] incremented refcount of &quot;</span>
+                                <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">rtype</span><span class="s2">} {</span><span class="s1">name</span><span class="s2">} </span><span class="s4">&quot;</span>
+                                <span class="s4">f&quot;(current </span><span class="s2">{</span><span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">]</span><span class="s2">}</span><span class="s4">)&quot;</span>
+                            <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">cmd </span><span class="s3">== </span><span class="s4">&quot;UNREGISTER&quot;</span><span class="s3">:</span>
+                        <span class="s2">del </span><span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">]</span>
+                        <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+                            <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+                                <span class="s4">f&quot;[ResourceTracker] unregister </span><span class="s2">{</span><span class="s1">name</span><span class="s2">} {</span><span class="s1">rtype</span><span class="s2">}</span><span class="s4">: &quot;</span>
+                                <span class="s4">f&quot;registry(</span><span class="s2">{</span><span class="s1">len</span><span class="s3">(</span><span class="s1">registry</span><span class="s3">)</span><span class="s2">}</span><span class="s4">)&quot;</span>
+                            <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">cmd </span><span class="s3">== </span><span class="s4">&quot;MAYBE_UNLINK&quot;</span><span class="s3">:</span>
+                        <span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">] -= </span><span class="s6">1</span>
+                        <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+                            <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+                                <span class="s4">&quot;[ResourceTracker] decremented refcount of &quot;</span>
+                                <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">rtype</span><span class="s2">} {</span><span class="s1">name</span><span class="s2">} </span><span class="s4">&quot;</span>
+                                <span class="s4">f&quot;(current </span><span class="s2">{</span><span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">]</span><span class="s2">}</span><span class="s4">)&quot;</span>
+                            <span class="s3">)</span>
+
+                        <span class="s2">if </span><span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">] == </span><span class="s6">0</span><span class="s3">:</span>
+                            <span class="s2">del </span><span class="s1">registry</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">][</span><span class="s1">name</span><span class="s3">]</span>
+                            <span class="s2">try</span><span class="s3">:</span>
+                                <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+                                    <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+                                        <span class="s4">f&quot;[ResourceTracker] unlink </span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">&quot;</span>
+                                    <span class="s3">)</span>
+                                <span class="s1">_CLEANUP_FUNCS</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">](</span><span class="s1">name</span><span class="s3">)</span>
+                            <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                                    <span class="s4">f&quot;resource_tracker: </span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">: </span><span class="s2">{</span><span class="s1">e</span><span class="s2">!r}</span><span class="s4">&quot;</span>
+                                <span class="s3">)</span>
+
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">f&quot;unrecognized command </span><span class="s2">{</span><span class="s1">cmd</span><span class="s2">!r}</span><span class="s4">&quot;</span><span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">BaseException</span><span class="s3">:</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">sys</span><span class="s3">.</span><span class="s1">excepthook</span><span class="s3">(*</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">exc_info</span><span class="s3">())</span>
+                    <span class="s2">except </span><span class="s1">BaseException</span><span class="s3">:</span>
+                        <span class="s2">pass</span>
+    <span class="s2">finally</span><span class="s3">:</span>
+        <span class="s0"># all processes have terminated; cleanup any remaining resources</span>
+        <span class="s2">def </span><span class="s1">_unlink_resources</span><span class="s3">(</span><span class="s1">rtype_registry</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">rtype_registry</span><span class="s3">:</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                        <span class="s4">&quot;resource_tracker: There appear to be &quot;</span>
+                        <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">len</span><span class="s3">(</span><span class="s1">rtype_registry</span><span class="s3">)</span><span class="s2">} </span><span class="s4">leaked </span><span class="s2">{</span><span class="s1">rtype</span><span class="s2">} </span><span class="s4">objects to &quot;</span>
+                        <span class="s4">&quot;clean up at shutdown&quot;</span>
+                    <span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+                    <span class="s2">pass</span>
+            <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">rtype_registry</span><span class="s3">:</span>
+                <span class="s0"># For some reason the process which created and registered this</span>
+                <span class="s0"># resource has failed to unregister it. Presumably it has</span>
+                <span class="s0"># died.  We therefore clean it up.</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">_CLEANUP_FUNCS</span><span class="s3">[</span><span class="s1">rtype</span><span class="s3">](</span><span class="s1">name</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+                        <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">f&quot;[ResourceTracker] unlink </span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                    <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s4">f&quot;resource_tracker: </span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">: </span><span class="s2">{</span><span class="s1">e</span><span class="s2">!r}</span><span class="s4">&quot;</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">rtype</span><span class="s3">, </span><span class="s1">rtype_registry </span><span class="s2">in </span><span class="s1">registry</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">rtype </span><span class="s3">== </span><span class="s4">&quot;folder&quot;</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">_unlink_resources</span><span class="s3">(</span><span class="s1">rtype_registry</span><span class="s3">, </span><span class="s1">rtype</span><span class="s3">)</span>
+
+        <span class="s0"># The default cleanup routine for folders deletes everything inside</span>
+        <span class="s0"># those folders recursively, which can include other resources tracked</span>
+        <span class="s0"># by the resource tracker). To limit the risk of the resource tracker</span>
+        <span class="s0"># attempting to delete twice a resource (once as part of a tracked</span>
+        <span class="s0"># folder, and once as a resource), we delete the folders after all</span>
+        <span class="s0"># other resource types.</span>
+        <span class="s2">if </span><span class="s4">&quot;folder&quot; </span><span class="s2">in </span><span class="s1">registry</span><span class="s3">:</span>
+            <span class="s1">_unlink_resources</span><span class="s3">(</span><span class="s1">registry</span><span class="s3">[</span><span class="s4">&quot;folder&quot;</span><span class="s3">], </span><span class="s4">&quot;folder&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">verbose</span><span class="s3">:</span>
+        <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">&quot;resource tracker shut down&quot;</span><span class="s3">)</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Start a program with only specified fds kept open</span>
+<span class="s0">#</span>
+
+
+<span class="s2">def </span><span class="s1">spawnv_passfds</span><span class="s3">(</span><span class="s1">path</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">passfds</span><span class="s3">):</span>
+    <span class="s1">passfds </span><span class="s3">= </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">passfds</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform </span><span class="s3">!= </span><span class="s4">&quot;win32&quot;</span><span class="s3">:</span>
+        <span class="s1">errpipe_read</span><span class="s3">, </span><span class="s1">errpipe_write </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">pipe</span><span class="s3">()</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">from </span><span class="s3">.</span><span class="s1">reduction </span><span class="s2">import </span><span class="s1">_mk_inheritable</span>
+            <span class="s2">from </span><span class="s3">.</span><span class="s1">fork_exec </span><span class="s2">import </span><span class="s1">fork_exec</span>
+
+            <span class="s1">_pass </span><span class="s3">= [</span><span class="s1">_mk_inheritable</span><span class="s3">(</span><span class="s1">fd</span><span class="s3">) </span><span class="s2">for </span><span class="s1">fd </span><span class="s2">in </span><span class="s1">passfds</span><span class="s3">]</span>
+            <span class="s2">return </span><span class="s1">fork_exec</span><span class="s3">(</span><span class="s1">args</span><span class="s3">, </span><span class="s1">_pass</span><span class="s3">)</span>
+        <span class="s2">finally</span><span class="s3">:</span>
+            <span class="s1">os</span><span class="s3">.</span><span class="s1">close</span><span class="s3">(</span><span class="s1">errpipe_read</span><span class="s3">)</span>
+            <span class="s1">os</span><span class="s3">.</span><span class="s1">close</span><span class="s3">(</span><span class="s1">errpipe_write</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">cmd </span><span class="s3">= </span><span class="s4">&quot; &quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s4">f'&quot;</span><span class="s2">{</span><span class="s1">x</span><span class="s2">}</span><span class="s4">&quot;' </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">args</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">_</span><span class="s3">, </span><span class="s1">ht</span><span class="s3">, </span><span class="s1">pid</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">_winapi</span><span class="s3">.</span><span class="s1">CreateProcess</span><span class="s3">(</span>
+                <span class="s1">path</span><span class="s3">, </span><span class="s1">cmd</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">True</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span>
+            <span class="s3">)</span>
+            <span class="s1">_winapi</span><span class="s3">.</span><span class="s1">CloseHandle</span><span class="s3">(</span><span class="s1">ht</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">BaseException</span><span class="s3">:</span>
+            <span class="s2">pass</span>
+        <span class="s2">return </span><span class="s1">pid</span>
+</pre>
+</body>
+</html>

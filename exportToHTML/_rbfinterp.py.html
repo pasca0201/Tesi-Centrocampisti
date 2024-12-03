@@ -1,0 +1,573 @@
+<html>
+<head>
+<title>_rbfinterp.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_rbfinterp.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Module for RBF interpolation.&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s1">itertools </span><span class="s2">import </span><span class="s1">combinations_with_replacement</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">LinAlgError</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">spatial </span><span class="s2">import </span><span class="s1">KDTree</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">special </span><span class="s2">import </span><span class="s1">comb</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">linalg</span><span class="s3">.</span><span class="s1">lapack </span><span class="s2">import </span><span class="s1">dgesv  </span><span class="s4"># type: ignore[attr-defined]</span>
+
+<span class="s2">from </span><span class="s3">.</span><span class="s1">_rbfinterp_pythran </span><span class="s2">import </span><span class="s3">(</span><span class="s1">_build_system</span><span class="s3">,</span>
+                                 <span class="s1">_build_evaluation_coefficients</span><span class="s3">,</span>
+                                 <span class="s1">_polynomial_matrix</span><span class="s3">)</span>
+
+
+<span class="s1">__all__ </span><span class="s3">= [</span><span class="s5">&quot;RBFInterpolator&quot;</span><span class="s3">]</span>
+
+
+<span class="s4"># These RBFs are implemented.</span>
+<span class="s1">_AVAILABLE </span><span class="s3">= {</span>
+    <span class="s5">&quot;linear&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;thin_plate_spline&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;cubic&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;quintic&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;multiquadric&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;inverse_multiquadric&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;inverse_quadratic&quot;</span><span class="s3">,</span>
+    <span class="s5">&quot;gaussian&quot;</span>
+    <span class="s3">}</span>
+
+
+<span class="s4"># The shape parameter does not need to be specified when using these RBFs.</span>
+<span class="s1">_SCALE_INVARIANT </span><span class="s3">= {</span><span class="s5">&quot;linear&quot;</span><span class="s3">, </span><span class="s5">&quot;thin_plate_spline&quot;</span><span class="s3">, </span><span class="s5">&quot;cubic&quot;</span><span class="s3">, </span><span class="s5">&quot;quintic&quot;</span><span class="s3">}</span>
+
+
+<span class="s4"># For RBFs that are conditionally positive definite of order m, the interpolant</span>
+<span class="s4"># should include polynomial terms with degree &gt;= m - 1. Define the minimum</span>
+<span class="s4"># degrees here. These values are from Chapter 8 of Fasshauer's &quot;Meshfree</span>
+<span class="s4"># Approximation Methods with MATLAB&quot;. The RBFs that are not in this dictionary</span>
+<span class="s4"># are positive definite and do not need polynomial terms.</span>
+<span class="s1">_NAME_TO_MIN_DEGREE </span><span class="s3">= {</span>
+    <span class="s5">&quot;multiquadric&quot;</span><span class="s3">: </span><span class="s6">0</span><span class="s3">,</span>
+    <span class="s5">&quot;linear&quot;</span><span class="s3">: </span><span class="s6">0</span><span class="s3">,</span>
+    <span class="s5">&quot;thin_plate_spline&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">,</span>
+    <span class="s5">&quot;cubic&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">,</span>
+    <span class="s5">&quot;quintic&quot;</span><span class="s3">: </span><span class="s6">2</span>
+    <span class="s3">}</span>
+
+
+<span class="s2">def </span><span class="s1">_monomial_powers</span><span class="s3">(</span><span class="s1">ndim</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Return the powers for each monomial in a polynomial. 
+ 
+    Parameters 
+    ---------- 
+    ndim : int 
+        Number of variables in the polynomial. 
+    degree : int 
+        Degree of the polynomial. 
+ 
+    Returns 
+    ------- 
+    (nmonos, ndim) int ndarray 
+        Array where each row contains the powers for each variable in a 
+        monomial. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">nmonos </span><span class="s3">= </span><span class="s1">comb</span><span class="s3">(</span><span class="s1">degree </span><span class="s3">+ </span><span class="s1">ndim</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">, </span><span class="s1">exact</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s1">out </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">nmonos</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s5">&quot;long&quot;</span><span class="s3">))</span>
+    <span class="s1">count </span><span class="s3">= </span><span class="s6">0</span>
+    <span class="s2">for </span><span class="s1">deg </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">degree </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">mono </span><span class="s2">in </span><span class="s1">combinations_with_replacement</span><span class="s3">(</span><span class="s1">range</span><span class="s3">(</span><span class="s1">ndim</span><span class="s3">), </span><span class="s1">deg</span><span class="s3">):</span>
+            <span class="s4"># `mono` is a tuple of variables in the current monomial with</span>
+            <span class="s4"># multiplicity indicating power (e.g., (0, 1, 1) represents x*y**2)</span>
+            <span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">mono</span><span class="s3">:</span>
+                <span class="s1">out</span><span class="s3">[</span><span class="s1">count</span><span class="s3">, </span><span class="s1">var</span><span class="s3">] += </span><span class="s6">1</span>
+
+            <span class="s1">count </span><span class="s3">+= </span><span class="s6">1</span>
+
+    <span class="s2">return </span><span class="s1">out</span>
+
+
+<span class="s2">def </span><span class="s1">_build_and_solve_system</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">smoothing</span><span class="s3">, </span><span class="s1">kernel</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">powers</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Build and solve the RBF interpolation system of equations. 
+ 
+    Parameters 
+    ---------- 
+    y : (P, N) float ndarray 
+        Data point coordinates. 
+    d : (P, S) float ndarray 
+        Data values at `y`. 
+    smoothing : (P,) float ndarray 
+        Smoothing parameter for each data point. 
+    kernel : str 
+        Name of the RBF. 
+    epsilon : float 
+        Shape parameter. 
+    powers : (R, N) int ndarray 
+        The exponents for each monomial in the polynomial. 
+ 
+    Returns 
+    ------- 
+    coeffs : (P + R, S) float ndarray 
+        Coefficients for each RBF and monomial. 
+    shift : (N,) float ndarray 
+        Domain shift used to create the polynomial matrix. 
+    scale : (N,) float ndarray 
+        Domain scaling used to create the polynomial matrix. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">lhs</span><span class="s3">, </span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">shift</span><span class="s3">, </span><span class="s1">scale </span><span class="s3">= </span><span class="s1">_build_system</span><span class="s3">(</span>
+        <span class="s1">y</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">smoothing</span><span class="s3">, </span><span class="s1">kernel</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">powers</span>
+        <span class="s3">)</span>
+    <span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">coeffs</span><span class="s3">, </span><span class="s1">info </span><span class="s3">= </span><span class="s1">dgesv</span><span class="s3">(</span><span class="s1">lhs</span><span class="s3">, </span><span class="s1">rhs</span><span class="s3">, </span><span class="s1">overwrite_a</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">overwrite_b</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">info </span><span class="s3">&lt; </span><span class="s6">0</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;The </span><span class="s2">{</span><span class="s3">-</span><span class="s1">info</span><span class="s2">}</span><span class="s5">-th argument had an illegal value.&quot;</span><span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">info </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+        <span class="s1">msg </span><span class="s3">= </span><span class="s5">&quot;Singular matrix.&quot;</span>
+        <span class="s1">nmonos </span><span class="s3">= </span><span class="s1">powers</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">nmonos </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">pmat </span><span class="s3">= </span><span class="s1">_polynomial_matrix</span><span class="s3">((</span><span class="s1">y </span><span class="s3">- </span><span class="s1">shift</span><span class="s3">)/</span><span class="s1">scale</span><span class="s3">, </span><span class="s1">powers</span><span class="s3">)</span>
+            <span class="s1">rank </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">linalg</span><span class="s3">.</span><span class="s1">matrix_rank</span><span class="s3">(</span><span class="s1">pmat</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">rank </span><span class="s3">&lt; </span><span class="s1">nmonos</span><span class="s3">:</span>
+                <span class="s1">msg </span><span class="s3">= (</span>
+                    <span class="s5">&quot;Singular matrix. The matrix of monomials evaluated at &quot;</span>
+                    <span class="s5">&quot;the data point coordinates does not have full column &quot;</span>
+                    <span class="s5">f&quot;rank (</span><span class="s2">{</span><span class="s1">rank</span><span class="s2">}</span><span class="s5">/</span><span class="s2">{</span><span class="s1">nmonos</span><span class="s2">}</span><span class="s5">).&quot;</span>
+                    <span class="s3">)</span>
+
+        <span class="s2">raise </span><span class="s1">LinAlgError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">shift</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">coeffs</span>
+
+
+<span class="s2">class </span><span class="s1">RBFInterpolator</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot;Radial basis function (RBF) interpolation in N dimensions. 
+ 
+    Parameters 
+    ---------- 
+    y : (npoints, ndims) array_like 
+        2-D array of data point coordinates. 
+    d : (npoints, ...) array_like 
+        N-D array of data values at `y`. The length of `d` along the first 
+        axis must be equal to the length of `y`. Unlike some interpolators, the 
+        interpolation axis cannot be changed. 
+    neighbors : int, optional 
+        If specified, the value of the interpolant at each evaluation point 
+        will be computed using only this many nearest data points. All the data 
+        points are used by default. 
+    smoothing : float or (npoints, ) array_like, optional 
+        Smoothing parameter. The interpolant perfectly fits the data when this 
+        is set to 0. For large values, the interpolant approaches a least 
+        squares fit of a polynomial with the specified degree. Default is 0. 
+    kernel : str, optional 
+        Type of RBF. This should be one of 
+ 
+            - 'linear'               : ``-r`` 
+            - 'thin_plate_spline'    : ``r**2 * log(r)`` 
+            - 'cubic'                : ``r**3`` 
+            - 'quintic'              : ``-r**5`` 
+            - 'multiquadric'         : ``-sqrt(1 + r**2)`` 
+            - 'inverse_multiquadric' : ``1/sqrt(1 + r**2)`` 
+            - 'inverse_quadratic'    : ``1/(1 + r**2)`` 
+            - 'gaussian'             : ``exp(-r**2)`` 
+ 
+        Default is 'thin_plate_spline'. 
+    epsilon : float, optional 
+        Shape parameter that scales the input to the RBF. If `kernel` is 
+        'linear', 'thin_plate_spline', 'cubic', or 'quintic', this defaults to 
+        1 and can be ignored because it has the same effect as scaling the 
+        smoothing parameter. Otherwise, this must be specified. 
+    degree : int, optional 
+        Degree of the added polynomial. For some RBFs the interpolant may not 
+        be well-posed if the polynomial degree is too small. Those RBFs and 
+        their corresponding minimum degrees are 
+ 
+            - 'multiquadric'      : 0 
+            - 'linear'            : 0 
+            - 'thin_plate_spline' : 1 
+            - 'cubic'             : 1 
+            - 'quintic'           : 2 
+ 
+        The default value is the minimum degree for `kernel` or 0 if there is 
+        no minimum degree. Set this to -1 for no added polynomial. 
+ 
+    Notes 
+    ----- 
+    An RBF is a scalar valued function in N-dimensional space whose value at 
+    :math:`x` can be expressed in terms of :math:`r=||x - c||`, where :math:`c` 
+    is the center of the RBF. 
+ 
+    An RBF interpolant for the vector of data values :math:`d`, which are from 
+    locations :math:`y`, is a linear combination of RBFs centered at :math:`y` 
+    plus a polynomial with a specified degree. The RBF interpolant is written 
+    as 
+ 
+    .. math:: 
+        f(x) = K(x, y) a + P(x) b, 
+ 
+    where :math:`K(x, y)` is a matrix of RBFs with centers at :math:`y` 
+    evaluated at the points :math:`x`, and :math:`P(x)` is a matrix of 
+    monomials, which span polynomials with the specified degree, evaluated at 
+    :math:`x`. The coefficients :math:`a` and :math:`b` are the solution to the 
+    linear equations 
+ 
+    .. math:: 
+        (K(y, y) + \\lambda I) a + P(y) b = d 
+ 
+    and 
+ 
+    .. math:: 
+        P(y)^T a = 0, 
+ 
+    where :math:`\\lambda` is a non-negative smoothing parameter that controls 
+    how well we want to fit the data. The data are fit exactly when the 
+    smoothing parameter is 0. 
+ 
+    The above system is uniquely solvable if the following requirements are 
+    met: 
+ 
+        - :math:`P(y)` must have full column rank. :math:`P(y)` always has full 
+          column rank when `degree` is -1 or 0. When `degree` is 1, 
+          :math:`P(y)` has full column rank if the data point locations are not 
+          all collinear (N=2), coplanar (N=3), etc. 
+        - If `kernel` is 'multiquadric', 'linear', 'thin_plate_spline', 
+          'cubic', or 'quintic', then `degree` must not be lower than the 
+          minimum value listed above. 
+        - If `smoothing` is 0, then each data point location must be distinct. 
+ 
+    When using an RBF that is not scale invariant ('multiquadric', 
+    'inverse_multiquadric', 'inverse_quadratic', or 'gaussian'), an appropriate 
+    shape parameter must be chosen (e.g., through cross validation). Smaller 
+    values for the shape parameter correspond to wider RBFs. The problem can 
+    become ill-conditioned or singular when the shape parameter is too small. 
+ 
+    The memory required to solve for the RBF interpolation coefficients 
+    increases quadratically with the number of data points, which can become 
+    impractical when interpolating more than about a thousand data points. 
+    To overcome memory limitations for large interpolation problems, the 
+    `neighbors` argument can be specified to compute an RBF interpolant for 
+    each evaluation point using only the nearest data points. 
+ 
+    .. versionadded:: 1.7.0 
+ 
+    See Also 
+    -------- 
+    NearestNDInterpolator 
+    LinearNDInterpolator 
+    CloughTocher2DInterpolator 
+ 
+    References 
+    ---------- 
+    .. [1] Fasshauer, G., 2007. Meshfree Approximation Methods with Matlab. 
+        World Scientific Publishing Co. 
+ 
+    .. [2] http://amadeus.math.iit.edu/~fass/603_ch3.pdf 
+ 
+    .. [3] Wahba, G., 1990. Spline Models for Observational Data. SIAM. 
+ 
+    .. [4] http://pages.stat.wisc.edu/~wahba/stat860public/lect/lect8/lect8.pdf 
+ 
+    Examples 
+    -------- 
+    Demonstrate interpolating scattered data to a grid in 2-D. 
+ 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; import matplotlib.pyplot as plt 
+    &gt;&gt;&gt; from scipy.interpolate import RBFInterpolator 
+    &gt;&gt;&gt; from scipy.stats.qmc import Halton 
+ 
+    &gt;&gt;&gt; rng = np.random.default_rng() 
+    &gt;&gt;&gt; xobs = 2*Halton(2, seed=rng).random(100) - 1 
+    &gt;&gt;&gt; yobs = np.sum(xobs, axis=1)*np.exp(-6*np.sum(xobs**2, axis=1)) 
+ 
+    &gt;&gt;&gt; xgrid = np.mgrid[-1:1:50j, -1:1:50j] 
+    &gt;&gt;&gt; xflat = xgrid.reshape(2, -1).T 
+    &gt;&gt;&gt; yflat = RBFInterpolator(xobs, yobs)(xflat) 
+    &gt;&gt;&gt; ygrid = yflat.reshape(50, 50) 
+ 
+    &gt;&gt;&gt; fig, ax = plt.subplots() 
+    &gt;&gt;&gt; ax.pcolormesh(*xgrid, ygrid, vmin=-0.25, vmax=0.25, shading='gouraud') 
+    &gt;&gt;&gt; p = ax.scatter(*xobs.T, c=yobs, s=50, ec='k', vmin=-0.25, vmax=0.25) 
+    &gt;&gt;&gt; fig.colorbar(p) 
+    &gt;&gt;&gt; plt.show() 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">d</span><span class="s3">,</span>
+                 <span class="s1">neighbors</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                 <span class="s1">smoothing</span><span class="s3">=</span><span class="s6">0.0</span><span class="s3">,</span>
+                 <span class="s1">kernel</span><span class="s3">=</span><span class="s5">&quot;thin_plate_spline&quot;</span><span class="s3">,</span>
+                 <span class="s1">epsilon</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                 <span class="s1">degree</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">y </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;C&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">y</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">!= </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;`y` must be a 2-dimensional array.&quot;</span><span class="s3">)</span>
+
+        <span class="s1">ny</span><span class="s3">, </span><span class="s1">ndim </span><span class="s3">= </span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span>
+
+        <span class="s1">d_dtype </span><span class="s3">= </span><span class="s1">complex </span><span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">iscomplexobj</span><span class="s3">(</span><span class="s1">d</span><span class="s3">) </span><span class="s2">else </span><span class="s1">float</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">d</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">d_dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;C&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">d</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] != </span><span class="s1">ny</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s5">f&quot;Expected the first axis of `d` to have length </span><span class="s2">{</span><span class="s1">ny</span><span class="s2">}</span><span class="s5">.&quot;</span>
+                <span class="s3">)</span>
+
+        <span class="s1">d_shape </span><span class="s3">= </span><span class="s1">d</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">d</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">((</span><span class="s1">ny</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">))</span>
+        <span class="s4"># If `d` is complex, convert it to a float array with twice as many</span>
+        <span class="s4"># columns. Otherwise, the LHS matrix would need to be converted to</span>
+        <span class="s4"># complex and take up 2x more memory than necessary.</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">d</span><span class="s3">.</span><span class="s1">view</span><span class="s3">(</span><span class="s1">float</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isscalar</span><span class="s3">(</span><span class="s1">smoothing</span><span class="s3">):</span>
+            <span class="s1">smoothing </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">ny</span><span class="s3">, </span><span class="s1">smoothing</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">smoothing </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">smoothing</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;C&quot;</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">smoothing</span><span class="s3">.</span><span class="s1">shape </span><span class="s3">!= (</span><span class="s1">ny</span><span class="s3">,):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                    <span class="s5">&quot;Expected `smoothing` to be a scalar or have shape &quot;</span>
+                    <span class="s5">f&quot;(</span><span class="s2">{</span><span class="s1">ny</span><span class="s2">}</span><span class="s5">,).&quot;</span>
+                    <span class="s3">)</span>
+
+        <span class="s1">kernel </span><span class="s3">= </span><span class="s1">kernel</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">kernel </span><span class="s2">not in </span><span class="s1">_AVAILABLE</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;`kernel` must be one of </span><span class="s2">{</span><span class="s1">_AVAILABLE</span><span class="s2">}</span><span class="s5">.&quot;</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">epsilon </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">kernel </span><span class="s2">in </span><span class="s1">_SCALE_INVARIANT</span><span class="s3">:</span>
+                <span class="s1">epsilon </span><span class="s3">= </span><span class="s6">1.0</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                    <span class="s5">&quot;`epsilon` must be specified if `kernel` is not one of &quot;</span>
+                    <span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">_SCALE_INVARIANT</span><span class="s2">}</span><span class="s5">.&quot;</span>
+                    <span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">epsilon </span><span class="s3">= </span><span class="s1">float</span><span class="s3">(</span><span class="s1">epsilon</span><span class="s3">)</span>
+
+        <span class="s1">min_degree </span><span class="s3">= </span><span class="s1">_NAME_TO_MIN_DEGREE</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">kernel</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">degree </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">degree </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">min_degree</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">degree </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">degree</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">degree </span><span class="s3">&lt; -</span><span class="s6">1</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;`degree` must be at least -1.&quot;</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s3">-</span><span class="s6">1 </span><span class="s3">&lt; </span><span class="s1">degree </span><span class="s3">&lt; </span><span class="s1">min_degree</span><span class="s3">:</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                    <span class="s5">f&quot;`degree` should not be below </span><span class="s2">{</span><span class="s1">min_degree</span><span class="s2">} </span><span class="s5">except -1 &quot;</span>
+                    <span class="s5">f&quot;when `kernel` is '</span><span class="s2">{</span><span class="s1">kernel</span><span class="s2">}</span><span class="s5">'.&quot;</span>
+                    <span class="s5">f&quot;The interpolant may not be uniquely &quot;</span>
+                    <span class="s5">f&quot;solvable, and the smoothing parameter may have an &quot;</span>
+                    <span class="s5">f&quot;unintuitive effect.&quot;</span><span class="s3">,</span>
+                    <span class="s1">UserWarning</span><span class="s3">, </span><span class="s1">stacklevel</span><span class="s3">=</span><span class="s6">2</span>
+                <span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">neighbors </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">nobs </span><span class="s3">= </span><span class="s1">ny</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># Make sure the number of nearest neighbors used for interpolation</span>
+            <span class="s4"># does not exceed the number of observations.</span>
+            <span class="s1">neighbors </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">min</span><span class="s3">(</span><span class="s1">neighbors</span><span class="s3">, </span><span class="s1">ny</span><span class="s3">))</span>
+            <span class="s1">nobs </span><span class="s3">= </span><span class="s1">neighbors</span>
+
+        <span class="s1">powers </span><span class="s3">= </span><span class="s1">_monomial_powers</span><span class="s3">(</span><span class="s1">ndim</span><span class="s3">, </span><span class="s1">degree</span><span class="s3">)</span>
+        <span class="s4"># The polynomial matrix must have full column rank in order for the</span>
+        <span class="s4"># interpolant to be well-posed, which is not possible if there are</span>
+        <span class="s4"># fewer observations than monomials.</span>
+        <span class="s2">if </span><span class="s1">powers</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] &gt; </span><span class="s1">nobs</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s5">f&quot;At least </span><span class="s2">{</span><span class="s1">powers</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span><span class="s2">} </span><span class="s5">data points are required when &quot;</span>
+                <span class="s5">f&quot;`degree` is </span><span class="s2">{</span><span class="s1">degree</span><span class="s2">} </span><span class="s5">and the number of dimensions is </span><span class="s2">{</span><span class="s1">ndim</span><span class="s2">}</span><span class="s5">.&quot;</span>
+                <span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">neighbors </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">shift</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">coeffs </span><span class="s3">= </span><span class="s1">_build_and_solve_system</span><span class="s3">(</span>
+                <span class="s1">y</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">smoothing</span><span class="s3">, </span><span class="s1">kernel</span><span class="s3">, </span><span class="s1">epsilon</span><span class="s3">, </span><span class="s1">powers</span>
+                <span class="s3">)</span>
+
+            <span class="s4"># Make these attributes private since they do not always exist.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_shift </span><span class="s3">= </span><span class="s1">shift</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_scale </span><span class="s3">= </span><span class="s1">scale</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_coeffs </span><span class="s3">= </span><span class="s1">coeffs</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_tree </span><span class="s3">= </span><span class="s1">KDTree</span><span class="s3">(</span><span class="s1">y</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">y </span><span class="s3">= </span><span class="s1">y</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">d </span><span class="s3">= </span><span class="s1">d</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">d_shape </span><span class="s3">= </span><span class="s1">d_shape</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">d_dtype </span><span class="s3">= </span><span class="s1">d_dtype</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">neighbors </span><span class="s3">= </span><span class="s1">neighbors</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">smoothing </span><span class="s3">= </span><span class="s1">smoothing</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">kernel </span><span class="s3">= </span><span class="s1">kernel</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">epsilon </span><span class="s3">= </span><span class="s1">epsilon</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">powers </span><span class="s3">= </span><span class="s1">powers</span>
+
+    <span class="s2">def </span><span class="s1">_chunk_evaluator</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">,</span>
+            <span class="s1">x</span><span class="s3">,</span>
+            <span class="s1">y</span><span class="s3">,</span>
+            <span class="s1">shift</span><span class="s3">,</span>
+            <span class="s1">scale</span><span class="s3">,</span>
+            <span class="s1">coeffs</span><span class="s3">,</span>
+            <span class="s1">memory_budget</span><span class="s3">=</span><span class="s6">1000000</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Evaluate the interpolation while controlling memory consumption. 
+        We chunk the input if we need more memory than specified. 
+ 
+        Parameters 
+        ---------- 
+        x : (Q, N) float ndarray 
+            array of points on which to evaluate 
+        y: (P, N) float ndarray 
+            array of points on which we know function values 
+        shift: (N, ) ndarray 
+            Domain shift used to create the polynomial matrix. 
+        scale : (N,) float ndarray 
+            Domain scaling used to create the polynomial matrix. 
+        coeffs: (P+R, S) float ndarray 
+            Coefficients in front of basis functions 
+        memory_budget: int 
+            Total amount of memory (in units of sizeof(float)) we wish 
+            to devote for storing the array of coefficients for 
+            interpolated points. If we need more memory than that, we 
+            chunk the input. 
+ 
+        Returns 
+        ------- 
+        (Q, S) float ndarray 
+        Interpolated array 
+        &quot;&quot;&quot;</span>
+        <span class="s1">nx</span><span class="s3">, </span><span class="s1">ndim </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">neighbors </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">nnei </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">nnei </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">neighbors</span>
+        <span class="s4"># in each chunk we consume the same space we already occupy</span>
+        <span class="s1">chunksize </span><span class="s3">= </span><span class="s1">memory_budget </span><span class="s3">// (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">powers</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] + </span><span class="s1">nnei</span><span class="s3">) + </span><span class="s6">1</span>
+        <span class="s2">if </span><span class="s1">chunksize </span><span class="s3">&lt;= </span><span class="s1">nx</span><span class="s3">:</span>
+            <span class="s1">out </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">nx</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">d</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s1">nx</span><span class="s3">, </span><span class="s1">chunksize</span><span class="s3">):</span>
+                <span class="s1">vec </span><span class="s3">= </span><span class="s1">_build_evaluation_coefficients</span><span class="s3">(</span>
+                    <span class="s1">x</span><span class="s3">[</span><span class="s1">i</span><span class="s3">:</span><span class="s1">i </span><span class="s3">+ </span><span class="s1">chunksize</span><span class="s3">, :],</span>
+                    <span class="s1">y</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">kernel</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">epsilon</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">powers</span><span class="s3">,</span>
+                    <span class="s1">shift</span><span class="s3">,</span>
+                    <span class="s1">scale</span><span class="s3">)</span>
+                <span class="s1">out</span><span class="s3">[</span><span class="s1">i</span><span class="s3">:</span><span class="s1">i </span><span class="s3">+ </span><span class="s1">chunksize</span><span class="s3">, :] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">vec</span><span class="s3">, </span><span class="s1">coeffs</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">vec </span><span class="s3">= </span><span class="s1">_build_evaluation_coefficients</span><span class="s3">(</span>
+                <span class="s1">x</span><span class="s3">,</span>
+                <span class="s1">y</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">kernel</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">epsilon</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">powers</span><span class="s3">,</span>
+                <span class="s1">shift</span><span class="s3">,</span>
+                <span class="s1">scale</span><span class="s3">)</span>
+            <span class="s1">out </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">vec</span><span class="s3">, </span><span class="s1">coeffs</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">out</span>
+
+    <span class="s2">def </span><span class="s1">__call__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Evaluate the interpolant at `x`. 
+ 
+        Parameters 
+        ---------- 
+        x : (Q, N) array_like 
+            Evaluation point coordinates. 
+ 
+        Returns 
+        ------- 
+        (Q, ...) ndarray 
+            Values of the interpolant at `x`. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;C&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">x</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">!= </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;`x` must be a 2-dimensional array.&quot;</span><span class="s3">)</span>
+
+        <span class="s1">nx</span><span class="s3">, </span><span class="s1">ndim </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span>
+        <span class="s2">if </span><span class="s1">ndim </span><span class="s3">!= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">&quot;Expected the second axis of `x` to have length &quot;</span>
+                             <span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span><span class="s2">}</span><span class="s5">.&quot;</span><span class="s3">)</span>
+
+        <span class="s4"># Our memory budget for storing RBF coefficients is</span>
+        <span class="s4"># based on how many floats in memory we already occupy</span>
+        <span class="s4"># If this number is below 1e6 we just use 1e6</span>
+        <span class="s4"># This memory budget is used to decide how we chunk</span>
+        <span class="s4"># the inputs</span>
+        <span class="s1">memory_budget </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">size </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">.</span><span class="s1">size </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">d</span><span class="s3">.</span><span class="s1">size</span><span class="s3">, </span><span class="s6">1000000</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">neighbors </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">out </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_chunk_evaluator</span><span class="s3">(</span>
+                <span class="s1">x</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_shift</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_scale</span><span class="s3">,</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_coeffs</span><span class="s3">,</span>
+                <span class="s1">memory_budget</span><span class="s3">=</span><span class="s1">memory_budget</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># Get the indices of the k nearest observation points to each</span>
+            <span class="s4"># evaluation point.</span>
+            <span class="s1">_</span><span class="s3">, </span><span class="s1">yindices </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_tree</span><span class="s3">.</span><span class="s1">query</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">neighbors</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">neighbors </span><span class="s3">== </span><span class="s6">1</span><span class="s3">:</span>
+                <span class="s4"># `KDTree` squeezes the output when neighbors=1.</span>
+                <span class="s1">yindices </span><span class="s3">= </span><span class="s1">yindices</span><span class="s3">[:, </span><span class="s2">None</span><span class="s3">]</span>
+
+            <span class="s4"># Multiple evaluation points may have the same neighborhood of</span>
+            <span class="s4"># observation points. Make the neighborhoods unique so that we only</span>
+            <span class="s4"># compute the interpolation coefficients once for each</span>
+            <span class="s4"># neighborhood.</span>
+            <span class="s1">yindices </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">(</span><span class="s1">yindices</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">yindices</span><span class="s3">, </span><span class="s1">inv </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">unique</span><span class="s3">(</span><span class="s1">yindices</span><span class="s3">, </span><span class="s1">return_inverse</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s1">inv </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">inv</span><span class="s3">, (-</span><span class="s6">1</span><span class="s3">,))  </span><span class="s4"># flatten, we need 1-D indices</span>
+            <span class="s4"># `inv` tells us which neighborhood will be used by each evaluation</span>
+            <span class="s4"># point. Now we find which evaluation points will be using each</span>
+            <span class="s4"># neighborhood.</span>
+            <span class="s1">xindices </span><span class="s3">= [[] </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">yindices</span><span class="s3">))]</span>
+            <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">j </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">inv</span><span class="s3">):</span>
+                <span class="s1">xindices</span><span class="s3">[</span><span class="s1">j</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">i</span><span class="s3">)</span>
+
+            <span class="s1">out </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">nx</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">d</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">xidx</span><span class="s3">, </span><span class="s1">yidx </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">xindices</span><span class="s3">, </span><span class="s1">yindices</span><span class="s3">):</span>
+                <span class="s4"># `yidx` are the indices of the observations in this</span>
+                <span class="s4"># neighborhood. `xidx` are the indices of the evaluation points</span>
+                <span class="s4"># that are using this neighborhood.</span>
+                <span class="s1">xnbr </span><span class="s3">= </span><span class="s1">x</span><span class="s3">[</span><span class="s1">xidx</span><span class="s3">]</span>
+                <span class="s1">ynbr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">y</span><span class="s3">[</span><span class="s1">yidx</span><span class="s3">]</span>
+                <span class="s1">dnbr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">d</span><span class="s3">[</span><span class="s1">yidx</span><span class="s3">]</span>
+                <span class="s1">snbr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">smoothing</span><span class="s3">[</span><span class="s1">yidx</span><span class="s3">]</span>
+                <span class="s1">shift</span><span class="s3">, </span><span class="s1">scale</span><span class="s3">, </span><span class="s1">coeffs </span><span class="s3">= </span><span class="s1">_build_and_solve_system</span><span class="s3">(</span>
+                    <span class="s1">ynbr</span><span class="s3">,</span>
+                    <span class="s1">dnbr</span><span class="s3">,</span>
+                    <span class="s1">snbr</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">kernel</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">epsilon</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">powers</span><span class="s3">,</span>
+                <span class="s3">)</span>
+                <span class="s1">out</span><span class="s3">[</span><span class="s1">xidx</span><span class="s3">] = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_chunk_evaluator</span><span class="s3">(</span>
+                    <span class="s1">xnbr</span><span class="s3">,</span>
+                    <span class="s1">ynbr</span><span class="s3">,</span>
+                    <span class="s1">shift</span><span class="s3">,</span>
+                    <span class="s1">scale</span><span class="s3">,</span>
+                    <span class="s1">coeffs</span><span class="s3">,</span>
+                    <span class="s1">memory_budget</span><span class="s3">=</span><span class="s1">memory_budget</span><span class="s3">)</span>
+
+        <span class="s1">out </span><span class="s3">= </span><span class="s1">out</span><span class="s3">.</span><span class="s1">view</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">d_dtype</span><span class="s3">)</span>
+        <span class="s1">out </span><span class="s3">= </span><span class="s1">out</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">((</span><span class="s1">nx</span><span class="s3">, ) + </span><span class="s1">self</span><span class="s3">.</span><span class="s1">d_shape</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">out</span>
+</pre>
+</body>
+</html>

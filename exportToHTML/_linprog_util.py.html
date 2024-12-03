@@ -1,0 +1,1545 @@
+<html>
+<head>
+<title>_linprog_util.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_linprog_util.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Method agnostic utility functions for linear programming 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">sparse </span><span class="s2">as </span><span class="s1">sps</span>
+<span class="s2">from </span><span class="s1">warnings </span><span class="s2">import </span><span class="s1">warn</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">_optimize </span><span class="s2">import </span><span class="s1">OptimizeWarning</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">optimize</span><span class="s3">.</span><span class="s1">_remove_redundancy </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">_remove_redundancy_svd</span><span class="s3">, </span><span class="s1">_remove_redundancy_pivot_sparse</span><span class="s3">,</span>
+    <span class="s1">_remove_redundancy_pivot_dense</span><span class="s3">, </span><span class="s1">_remove_redundancy_id</span>
+    <span class="s3">)</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">namedtuple</span>
+
+<span class="s1">_LPProblem </span><span class="s3">= </span><span class="s1">namedtuple</span><span class="s3">(</span><span class="s4">'_LPProblem'</span><span class="s3">,</span>
+                        <span class="s4">'c A_ub b_ub A_eq b_eq bounds x0 integrality'</span><span class="s3">)</span>
+<span class="s1">_LPProblem</span><span class="s3">.</span><span class="s1">__new__</span><span class="s3">.</span><span class="s1">__defaults__ </span><span class="s3">= (</span><span class="s2">None</span><span class="s3">,) * </span><span class="s5">7  </span><span class="s6"># make c the only required arg</span>
+<span class="s1">_LPProblem</span><span class="s3">.</span><span class="s1">__doc__ </span><span class="s3">= </span><span class="s1">\</span>
+    <span class="s4">&quot;&quot;&quot; Represents a linear-programming problem. 
+ 
+    Attributes 
+    ---------- 
+    c : 1D array 
+        The coefficients of the linear objective function to be minimized. 
+    A_ub : 2D array, optional 
+        The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+        coefficients of a linear inequality constraint on ``x``. 
+    b_ub : 1D array, optional 
+        The inequality constraint vector. Each element represents an 
+        upper bound on the corresponding value of ``A_ub @ x``. 
+    A_eq : 2D array, optional 
+        The equality constraint matrix. Each row of ``A_eq`` specifies the 
+        coefficients of a linear equality constraint on ``x``. 
+    b_eq : 1D array, optional 
+        The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+        the corresponding element of ``b_eq``. 
+    bounds : various valid formats, optional 
+        The bounds of ``x``, as ``min`` and ``max`` pairs. 
+        If bounds are specified for all N variables separately, valid formats 
+        are: 
+        * a 2D array (N x 2); 
+        * a sequence of N sequences, each with 2 values. 
+        If all variables have the same bounds, the bounds can be specified as 
+        a 1-D or 2-D array or sequence with 2 scalar values. 
+        If all variables have a lower bound of 0 and no upper bound, the bounds 
+        parameter can be omitted (or given as None). 
+        Absent lower and/or upper bounds can be specified as -numpy.inf (no 
+        lower bound), numpy.inf (no upper bound) or None (both). 
+    x0 : 1D array, optional 
+        Guess values of the decision variables, which will be refined by 
+        the optimization algorithm. This argument is currently used only by the 
+        'revised simplex' method, and can only be used if `x0` represents a 
+        basic feasible solution. 
+    integrality : 1-D array or int, optional 
+        Indicates the type of integrality constraint on each decision variable. 
+ 
+        ``0`` : Continuous variable; no integrality constraint. 
+ 
+        ``1`` : Integer variable; decision variable must be an integer 
+        within `bounds`. 
+ 
+        ``2`` : Semi-continuous variable; decision variable must be within 
+        `bounds` or take value ``0``. 
+ 
+        ``3`` : Semi-integer variable; decision variable must be an integer 
+        within `bounds` or take value ``0``. 
+ 
+        By default, all variables are continuous. 
+ 
+        For mixed integrality constraints, supply an array of shape `c.shape`. 
+        To infer a constraint on each decision variable from shorter inputs, 
+        the argument will be broadcasted to `c.shape` using `np.broadcast_to`. 
+ 
+        This argument is currently used only by the ``'highs'`` method and 
+        ignored otherwise. 
+ 
+    Notes 
+    ----- 
+    This namedtuple supports 2 ways of initialization: 
+    &gt;&gt;&gt; lp1 = _LPProblem(c=[-1, 4], A_ub=[[-3, 1], [1, 2]], b_ub=[6, 4]) 
+    &gt;&gt;&gt; lp2 = _LPProblem([-1, 4], [[-3, 1], [1, 2]], [6, 4]) 
+ 
+    Note that only ``c`` is a required argument here, whereas all other arguments 
+    ``A_ub``, ``b_ub``, ``A_eq``, ``b_eq``, ``bounds``, ``x0`` are optional with 
+    default values of None. 
+    For example, ``A_eq`` and ``b_eq`` can be set without ``A_ub`` or ``b_ub``: 
+    &gt;&gt;&gt; lp3 = _LPProblem(c=[-1, 4], A_eq=[[2, 1]], b_eq=[10]) 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s2">def </span><span class="s1">_check_sparse_inputs</span><span class="s3">(</span><span class="s1">options</span><span class="s3">, </span><span class="s1">meth</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Check the provided ``A_ub`` and ``A_eq`` matrices conform to the specified 
+    optional sparsity variables. 
+ 
+    Parameters 
+    ---------- 
+    A_ub : 2-D array, optional 
+        2-D array such that ``A_ub @ x`` gives the values of the upper-bound 
+        inequality constraints at ``x``. 
+    A_eq : 2-D array, optional 
+        2-D array such that ``A_eq @ x`` gives the values of the equality 
+        constraints at ``x``. 
+    options : dict 
+        A dictionary of solver options. All methods accept the following 
+        generic options: 
+ 
+            maxiter : int 
+                Maximum number of iterations to perform. 
+            disp : bool 
+                Set to True to print convergence messages. 
+ 
+        For method-specific options, see :func:`show_options('linprog')`. 
+    method : str, optional 
+        The algorithm used to solve the standard form problem. 
+ 
+    Returns 
+    ------- 
+    A_ub : 2-D array, optional 
+        2-D array such that ``A_ub @ x`` gives the values of the upper-bound 
+        inequality constraints at ``x``. 
+    A_eq : 2-D array, optional 
+        2-D array such that ``A_eq @ x`` gives the values of the equality 
+        constraints at ``x``. 
+    options : dict 
+        A dictionary of solver options. All methods accept the following 
+        generic options: 
+ 
+            maxiter : int 
+                Maximum number of iterations to perform. 
+            disp : bool 
+                Set to True to print convergence messages. 
+ 
+        For method-specific options, see :func:`show_options('linprog')`. 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># This is an undocumented option for unit testing sparse presolve</span>
+    <span class="s1">_sparse_presolve </span><span class="s3">= </span><span class="s1">options</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s4">'_sparse_presolve'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">_sparse_presolve </span><span class="s2">and </span><span class="s1">A_eq </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">coo_matrix</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">_sparse_presolve </span><span class="s2">and </span><span class="s1">A_ub </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">coo_matrix</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">)</span>
+
+    <span class="s1">sparse_constraint </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">) </span><span class="s2">or </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">)</span>
+
+    <span class="s1">preferred_methods </span><span class="s3">= {</span><span class="s4">&quot;highs&quot;</span><span class="s3">, </span><span class="s4">&quot;highs-ds&quot;</span><span class="s3">, </span><span class="s4">&quot;highs-ipm&quot;</span><span class="s3">}</span>
+    <span class="s1">dense_methods </span><span class="s3">= {</span><span class="s4">&quot;simplex&quot;</span><span class="s3">, </span><span class="s4">&quot;revised simplex&quot;</span><span class="s3">}</span>
+    <span class="s2">if </span><span class="s1">meth </span><span class="s2">in </span><span class="s1">dense_methods </span><span class="s2">and </span><span class="s1">sparse_constraint</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">f&quot;Method '</span><span class="s2">{</span><span class="s1">meth</span><span class="s2">}</span><span class="s4">' does not support sparse &quot;</span>
+                         <span class="s4">&quot;constraint matrices. Please consider using one of &quot;</span>
+                         <span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">preferred_methods</span><span class="s2">}</span><span class="s4">.&quot;</span><span class="s3">)</span>
+
+    <span class="s1">sparse </span><span class="s3">= </span><span class="s1">options</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'sparse'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s1">sparse </span><span class="s2">and </span><span class="s1">sparse_constraint </span><span class="s2">and </span><span class="s1">meth </span><span class="s3">== </span><span class="s4">'interior-point'</span><span class="s3">:</span>
+        <span class="s1">options</span><span class="s3">[</span><span class="s4">'sparse'</span><span class="s3">] = </span><span class="s2">True</span>
+        <span class="s1">warn</span><span class="s3">(</span><span class="s4">&quot;Sparse constraint matrix detected; setting 'sparse':True.&quot;</span><span class="s3">,</span>
+             <span class="s1">OptimizeWarning</span><span class="s3">, </span><span class="s1">stacklevel</span><span class="s3">=</span><span class="s5">4</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">options</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">A_eq</span>
+
+
+<span class="s2">def </span><span class="s1">_format_A_constraints</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">n_x</span><span class="s3">, </span><span class="s1">sparse_lhs</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Format the left hand side of the constraints to a 2-D array 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D array 
+        2-D array such that ``A @ x`` gives the values of the upper-bound 
+        (in)equality constraints at ``x``. 
+    n_x : int 
+        The number of variables in the linear programming problem. 
+    sparse_lhs : bool 
+        Whether either of `A_ub` or `A_eq` are sparse. If true return a 
+        coo_matrix instead of a numpy array. 
+ 
+    Returns 
+    ------- 
+    np.ndarray or sparse.coo_matrix 
+        2-D array such that ``A @ x`` gives the values of the upper-bound 
+        (in)equality constraints at ``x``. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">sparse_lhs</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">coo_matrix</span><span class="s3">(</span>
+            <span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">n_x</span><span class="s3">) </span><span class="s2">if </span><span class="s1">A </span><span class="s2">is None else </span><span class="s1">A</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">True</span>
+        <span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">A </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s5">0</span><span class="s3">, </span><span class="s1">n_x</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_format_b_constraints</span><span class="s3">(</span><span class="s1">b</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Format the upper bounds of the constraints to a 1-D array 
+ 
+    Parameters 
+    ---------- 
+    b : 1-D array 
+        1-D array of values representing the upper-bound of each (in)equality 
+        constraint (row) in ``A``. 
+ 
+    Returns 
+    ------- 
+    1-D np.array 
+        1-D array of values representing the upper-bound of each (in)equality 
+        constraint (row) in ``A``. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">b </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">)</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">True</span><span class="s3">).</span><span class="s1">squeeze</span><span class="s3">()</span>
+    <span class="s2">return </span><span class="s1">b </span><span class="s2">if </span><span class="s1">b</span><span class="s3">.</span><span class="s1">size </span><span class="s3">!= </span><span class="s5">1 </span><span class="s2">else </span><span class="s1">b</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s5">1</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_clean_inputs</span><span class="s3">(</span><span class="s1">lp</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given user inputs for a linear programming problem, return the 
+    objective vector, upper bound constraints, equality constraints, 
+    and simple bounds in a preferred format. 
+ 
+    Parameters 
+    ---------- 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : various valid formats, optional 
+            The bounds of ``x``, as ``min`` and ``max`` pairs. 
+            If bounds are specified for all N variables separately, valid formats are: 
+            * a 2D array (2 x N or N x 2); 
+            * a sequence of N sequences, each with 2 values. 
+            If all variables have the same bounds, a single pair of values can 
+            be specified. Valid formats are: 
+            * a sequence with 2 scalar values; 
+            * a sequence with a single element containing 2 scalar values. 
+            If all variables have a lower bound of 0 and no upper bound, the bounds 
+            parameter can be omitted (or given as None). 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    Returns 
+    ------- 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : 2D array 
+            The bounds of ``x``, as ``min`` and ``max`` pairs, one for each of the N 
+            elements of ``x``. The N x 2 array contains lower bounds in the first 
+            column and upper bounds in the 2nd. Unbounded variables have lower 
+            bound -np.inf and/or upper bound np.inf. 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">integrality </span><span class="s3">= </span><span class="s1">lp</span>
+
+    <span class="s2">if </span><span class="s1">c </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">c </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">True</span><span class="s3">).</span><span class="s1">squeeze</span><span class="s3">()</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: c must be a 1-D array of numerical &quot;</span>
+            <span class="s4">&quot;coefficients&quot;</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s6"># If c is a single value, convert it to a 1-D array.</span>
+        <span class="s2">if </span><span class="s1">c</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s1">c </span><span class="s3">= </span><span class="s1">c</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s5">1</span><span class="s3">)</span>
+
+        <span class="s1">n_x </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">c</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">n_x </span><span class="s3">== </span><span class="s5">0 </span><span class="s2">or </span><span class="s1">len</span><span class="s3">(</span><span class="s1">c</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">) != </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: c must be a 1-D array and must &quot;</span>
+                <span class="s4">&quot;not have more than one non-singleton dimension&quot;</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">c</span><span class="s3">).</span><span class="s1">all</span><span class="s3">():</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: c must not contain values &quot;</span>
+                <span class="s4">&quot;inf, nan, or None&quot;</span><span class="s3">)</span>
+
+    <span class="s1">sparse_lhs </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">) </span><span class="s2">or </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">)</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">_format_A_constraints</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">n_x</span><span class="s3">, </span><span class="s1">sparse_lhs</span><span class="s3">=</span><span class="s1">sparse_lhs</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: A_ub must be a 2-D array &quot;</span>
+            <span class="s4">&quot;of numerical values&quot;</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">n_ub </span><span class="s3">= </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">) != </span><span class="s5">2 </span><span class="s2">or </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">1</span><span class="s3">] != </span><span class="s1">n_x</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: A_ub must have exactly two &quot;</span>
+                <span class="s4">&quot;dimensions, and the number of columns in A_ub must be &quot;</span>
+                <span class="s4">&quot;equal to the size of c&quot;</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">) </span><span class="s2">and not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">data</span><span class="s3">).</span><span class="s1">all</span><span class="s3">()</span>
+                <span class="s2">or not </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">) </span><span class="s2">and not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">).</span><span class="s1">all</span><span class="s3">()):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: A_ub must not contain values &quot;</span>
+                <span class="s4">&quot;inf, nan, or None&quot;</span><span class="s3">)</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">b_ub </span><span class="s3">= </span><span class="s1">_format_b_constraints</span><span class="s3">(</span><span class="s1">b_ub</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: b_ub must be a 1-D array of &quot;</span>
+            <span class="s4">&quot;numerical values, each representing the upper bound of an &quot;</span>
+            <span class="s4">&quot;inequality constraint (row) in A_ub&quot;</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">b_ub</span><span class="s3">.</span><span class="s1">shape </span><span class="s3">!= (</span><span class="s1">n_ub</span><span class="s3">,):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: b_ub must be a 1-D array; b_ub &quot;</span>
+                <span class="s4">&quot;must not have more than one non-singleton dimension and &quot;</span>
+                <span class="s4">&quot;the number of rows in A_ub must equal the number of values &quot;</span>
+                <span class="s4">&quot;in b_ub&quot;</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">b_ub</span><span class="s3">).</span><span class="s1">all</span><span class="s3">():</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: b_ub must not contain values &quot;</span>
+                <span class="s4">&quot;inf, nan, or None&quot;</span><span class="s3">)</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">_format_A_constraints</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">n_x</span><span class="s3">, </span><span class="s1">sparse_lhs</span><span class="s3">=</span><span class="s1">sparse_lhs</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: A_eq must be a 2-D array &quot;</span>
+            <span class="s4">&quot;of numerical values&quot;</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">n_eq </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">) != </span><span class="s5">2 </span><span class="s2">or </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">1</span><span class="s3">] != </span><span class="s1">n_x</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: A_eq must have exactly two &quot;</span>
+                <span class="s4">&quot;dimensions, and the number of columns in A_eq must be &quot;</span>
+                <span class="s4">&quot;equal to the size of c&quot;</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">) </span><span class="s2">and not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">data</span><span class="s3">).</span><span class="s1">all</span><span class="s3">()</span>
+                <span class="s2">or not </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">) </span><span class="s2">and not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">).</span><span class="s1">all</span><span class="s3">()):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: A_eq must not contain values &quot;</span>
+                <span class="s4">&quot;inf, nan, or None&quot;</span><span class="s3">)</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">b_eq </span><span class="s3">= </span><span class="s1">_format_b_constraints</span><span class="s3">(</span><span class="s1">b_eq</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: b_eq must be a dense, 1-D array of &quot;</span>
+            <span class="s4">&quot;numerical values, each representing the right hand side of an &quot;</span>
+            <span class="s4">&quot;equality constraint (row) in A_eq&quot;</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">b_eq</span><span class="s3">.</span><span class="s1">shape </span><span class="s3">!= (</span><span class="s1">n_eq</span><span class="s3">,):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: b_eq must be a 1-D array; b_eq &quot;</span>
+                <span class="s4">&quot;must not have more than one non-singleton dimension and &quot;</span>
+                <span class="s4">&quot;the number of rows in A_eq must equal the number of values &quot;</span>
+                <span class="s4">&quot;in b_eq&quot;</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">b_eq</span><span class="s3">).</span><span class="s1">all</span><span class="s3">():</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: b_eq must not contain values &quot;</span>
+                <span class="s4">&quot;inf, nan, or None&quot;</span><span class="s3">)</span>
+
+    <span class="s6"># x0 gives a (optional) starting solution to the solver. If x0 is None,</span>
+    <span class="s6"># skip the checks. Initial solution will be generated automatically.</span>
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">x0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">True</span><span class="s3">).</span><span class="s1">squeeze</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: x0 must be a 1-D array of &quot;</span>
+                <span class="s4">&quot;numerical coefficients&quot;</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+        <span class="s2">if </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">x0 </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s5">1</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">) == </span><span class="s5">0 </span><span class="s2">or </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">!= </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: x0 should be a 1-D array; it &quot;</span>
+                <span class="s4">&quot;must not have more than one non-singleton dimension&quot;</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s1">c</span><span class="s3">.</span><span class="s1">size</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: x0 and c should contain the &quot;</span>
+                <span class="s4">&quot;same number of elements&quot;</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">).</span><span class="s1">all</span><span class="s3">():</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s4">&quot;Invalid input for linprog: x0 must not contain values &quot;</span>
+                <span class="s4">&quot;inf, nan, or None&quot;</span><span class="s3">)</span>
+
+    <span class="s6"># Bounds can be one of these formats:</span>
+    <span class="s6"># (1) a 2-D array or sequence, with shape N x 2</span>
+    <span class="s6"># (2) a 1-D or 2-D sequence or array with 2 scalars</span>
+    <span class="s6"># (3) None (or an empty sequence or array)</span>
+    <span class="s6"># Unspecified bounds can be represented by None or (-)np.inf.</span>
+    <span class="s6"># All formats are converted into a N x 2 np.array with (-)np.inf where</span>
+    <span class="s6"># bounds are unspecified.</span>
+
+    <span class="s6"># Prepare clean bounds array</span>
+    <span class="s1">bounds_clean </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">n_x</span><span class="s3">, </span><span class="s5">2</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">)</span>
+
+    <span class="s6"># Convert to a numpy array.</span>
+    <span class="s6"># np.array(..,dtype=float) raises an error if dimensions are inconsistent</span>
+    <span class="s6"># or if there are invalid data types in bounds. Just add a linprog prefix</span>
+    <span class="s6"># to the error and re-raise.</span>
+    <span class="s6"># Creating at least a 2-D array simplifies the cases to distinguish below.</span>
+    <span class="s2">if </span><span class="s1">bounds </span><span class="s2">is None or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array_equal</span><span class="s3">(</span><span class="s1">bounds</span><span class="s3">, []) </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array_equal</span><span class="s3">(</span><span class="s1">bounds</span><span class="s3">, [[]]):</span>
+        <span class="s1">bounds </span><span class="s3">= (</span><span class="s5">0</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">bounds_conv </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_2d</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">))</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: unable to interpret bounds, &quot;</span>
+            <span class="s4">&quot;check values and dimensions: &quot; </span><span class="s3">+ </span><span class="s1">e</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s2">except </span><span class="s1">TypeError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: unable to interpret bounds, &quot;</span>
+            <span class="s4">&quot;check values and dimensions: &quot; </span><span class="s3">+ </span><span class="s1">e</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]) </span><span class="s2">from </span><span class="s1">e</span>
+
+    <span class="s6"># Check bounds options</span>
+    <span class="s1">bsh </span><span class="s3">= </span><span class="s1">bounds_conv</span><span class="s3">.</span><span class="s1">shape</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">bsh</span><span class="s3">) &gt; </span><span class="s5">2</span><span class="s3">:</span>
+        <span class="s6"># Do not try to handle multidimensional bounds input</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: provide a 2-D array for bounds, &quot;</span>
+            <span class="s4">f&quot;not a </span><span class="s2">{</span><span class="s1">len</span><span class="s3">(</span><span class="s1">bsh</span><span class="s3">)</span><span class="s2">:</span><span class="s4">d</span><span class="s2">}</span><span class="s4">-D array.&quot;</span><span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">bsh </span><span class="s3">== (</span><span class="s1">n_x</span><span class="s3">, </span><span class="s5">2</span><span class="s3">)):</span>
+        <span class="s6"># Regular N x 2 array</span>
+        <span class="s1">bounds_clean </span><span class="s3">= </span><span class="s1">bounds_conv</span>
+    <span class="s2">elif </span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">bsh </span><span class="s3">== (</span><span class="s5">2</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)) </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">bsh </span><span class="s3">== (</span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">))):</span>
+        <span class="s6"># 2 values: interpret as overall lower and upper bound</span>
+        <span class="s1">bounds_flat </span><span class="s3">= </span><span class="s1">bounds_conv</span><span class="s3">.</span><span class="s1">flatten</span><span class="s3">()</span>
+        <span class="s1">bounds_clean</span><span class="s3">[:, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">bounds_flat</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">bounds_clean</span><span class="s3">[:, </span><span class="s5">1</span><span class="s3">] = </span><span class="s1">bounds_flat</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]</span>
+    <span class="s2">elif </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">bsh </span><span class="s3">== (</span><span class="s5">2</span><span class="s3">, </span><span class="s1">n_x</span><span class="s3">)):</span>
+        <span class="s6"># Reject a 2 x N array</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+            <span class="s4">f&quot;Invalid input for linprog: provide a </span><span class="s2">{</span><span class="s1">n_x</span><span class="s2">:</span><span class="s4">d</span><span class="s2">} </span><span class="s4">x 2 array for bounds, &quot;</span>
+            <span class="s4">f&quot;not a 2 x </span><span class="s2">{</span><span class="s1">n_x</span><span class="s2">:</span><span class="s4">d</span><span class="s2">} </span><span class="s4">array.&quot;</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+            <span class="s4">&quot;Invalid input for linprog: unable to interpret bounds with this &quot;</span>
+            <span class="s4">f&quot;dimension tuple: </span><span class="s2">{</span><span class="s1">bsh</span><span class="s2">}</span><span class="s4">.&quot;</span><span class="s3">)</span>
+
+    <span class="s6"># The process above creates nan-s where the input specified None</span>
+    <span class="s6"># Convert the nan-s in the 1st column to -np.inf and in the 2nd column</span>
+    <span class="s6"># to np.inf</span>
+    <span class="s1">i_none </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">bounds_clean</span><span class="s3">[:, </span><span class="s5">0</span><span class="s3">])</span>
+    <span class="s1">bounds_clean</span><span class="s3">[</span><span class="s1">i_none</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+    <span class="s1">i_none </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">bounds_clean</span><span class="s3">[:, </span><span class="s5">1</span><span class="s3">])</span>
+    <span class="s1">bounds_clean</span><span class="s3">[</span><span class="s1">i_none</span><span class="s3">, </span><span class="s5">1</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+
+    <span class="s2">return </span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds_clean</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">integrality</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_presolve</span><span class="s3">(</span><span class="s1">lp</span><span class="s3">, </span><span class="s1">rr</span><span class="s3">, </span><span class="s1">rr_method</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">=</span><span class="s5">1e-9</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given inputs for a linear programming problem in preferred format, 
+    presolve the problem: identify trivial infeasibilities, redundancies, 
+    and unboundedness, tighten bounds where possible, and eliminate fixed 
+    variables. 
+ 
+    Parameters 
+    ---------- 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : 2D array 
+            The bounds of ``x``, as ``min`` and ``max`` pairs, one for each of the N 
+            elements of ``x``. The N x 2 array contains lower bounds in the first 
+            column and upper bounds in the 2nd. Unbounded variables have lower 
+            bound -np.inf and/or upper bound np.inf. 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    rr : bool 
+        If ``True`` attempts to eliminate any redundant rows in ``A_eq``. 
+        Set False if ``A_eq`` is known to be of full row rank, or if you are 
+        looking for a potential speedup (at the expense of reliability). 
+    rr_method : string 
+        Method used to identify and remove redundant rows from the 
+        equality constraint matrix after presolve. 
+    tol : float 
+        The tolerance which determines when a solution is &quot;close enough&quot; to 
+        zero in Phase 1 to be considered a basic feasible solution or close 
+        enough to positive to serve as an optimal solution. 
+ 
+    Returns 
+    ------- 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : 2D array 
+            The bounds of ``x``, as ``min`` and ``max`` pairs, possibly tightened. 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    c0 : 1D array 
+        Constant term in objective function due to fixed (and eliminated) 
+        variables. 
+    x : 1D array 
+        Solution vector (when the solution is trivial and can be determined 
+        in presolve) 
+    revstack: list of functions 
+        the functions in the list reverse the operations of _presolve() 
+        the function signature is x_org = f(x_mod), where x_mod is the result 
+        of a presolve step and x_org the value at the start of the step 
+        (currently, the revstack contains only one function) 
+    complete: bool 
+        Whether the solution is complete (solved or determined to be infeasible 
+        or unbounded in presolve) 
+    status : int 
+        An integer representing the exit status of the optimization:: 
+ 
+         0 : Optimization terminated successfully 
+         1 : Iteration limit reached 
+         2 : Problem appears to be infeasible 
+         3 : Problem appears to be unbounded 
+         4 : Serious numerical difficulties encountered 
+ 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+ 
+    References 
+    ---------- 
+    .. [5] Andersen, Erling D. &quot;Finding all linearly dependent rows in 
+           large-scale linear programming.&quot; Optimization Methods and Software 
+           6.3 (1995): 219-227. 
+    .. [8] Andersen, Erling D., and Knud D. Andersen. &quot;Presolving in linear 
+           programming.&quot; Mathematical Programming 71.2 (1995): 221-245. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># ideas from Reference [5] by Andersen and Andersen</span>
+    <span class="s6"># however, unlike the reference, this is performed before converting</span>
+    <span class="s6"># problem to standard form</span>
+    <span class="s6"># There are a few advantages:</span>
+    <span class="s6">#  * artificial variables have not been added, so matrices are smaller</span>
+    <span class="s6">#  * bounds have not been converted to constraints yet. (It is better to</span>
+    <span class="s6">#    do that after presolve because presolve may adjust the simple bounds.)</span>
+    <span class="s6"># There are many improvements that can be made, namely:</span>
+    <span class="s6">#  * implement remaining checks from [5]</span>
+    <span class="s6">#  * loop presolve until no additional changes are made</span>
+    <span class="s6">#  * implement additional efficiency improvements in redundancy removal [2]</span>
+
+    <span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">lp</span>
+
+    <span class="s1">revstack </span><span class="s3">= []               </span><span class="s6"># record of variables eliminated from problem</span>
+    <span class="s6"># constant term in cost function may be added if variables are eliminated</span>
+    <span class="s1">c0 </span><span class="s3">= </span><span class="s5">0</span>
+    <span class="s1">complete </span><span class="s3">= </span><span class="s2">False        </span><span class="s6"># complete is True if detected infeasible/unbounded</span>
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">c</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)   </span><span class="s6"># this is solution vector if completed in presolve</span>
+
+    <span class="s1">status </span><span class="s3">= </span><span class="s5">0              </span><span class="s6"># all OK unless determined otherwise</span>
+    <span class="s1">message </span><span class="s3">= </span><span class="s4">&quot;&quot;</span>
+
+    <span class="s6"># Lower and upper bounds. Copy to prevent feedback.</span>
+    <span class="s1">lb </span><span class="s3">= </span><span class="s1">bounds</span><span class="s3">[:, </span><span class="s5">0</span><span class="s3">].</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">ub </span><span class="s3">= </span><span class="s1">bounds</span><span class="s3">[:, </span><span class="s5">1</span><span class="s3">].</span><span class="s1">copy</span><span class="s3">()</span>
+
+    <span class="s1">m_eq</span><span class="s3">, </span><span class="s1">n </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span>
+    <span class="s1">m_ub</span><span class="s3">, </span><span class="s1">n </span><span class="s3">= </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span>
+
+    <span class="s2">if </span><span class="s3">(</span><span class="s1">rr_method </span><span class="s2">is not None</span>
+            <span class="s2">and </span><span class="s1">rr_method</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">() </span><span class="s2">not in </span><span class="s3">{</span><span class="s4">&quot;svd&quot;</span><span class="s3">, </span><span class="s4">&quot;pivot&quot;</span><span class="s3">, </span><span class="s4">&quot;id&quot;</span><span class="s3">}):</span>
+        <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;'&quot; </span><span class="s3">+ </span><span class="s1">str</span><span class="s3">(</span><span class="s1">rr_method</span><span class="s3">) + </span><span class="s4">&quot;' is not a valid option &quot;</span>
+                   <span class="s4">&quot;for redundancy removal. Valid options are 'SVD', &quot;</span>
+                   <span class="s4">&quot;'pivot', and 'ID'.&quot;</span><span class="s3">)</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">):</span>
+        <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">tocsr</span><span class="s3">()</span>
+        <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">tocsr</span><span class="s3">()</span>
+
+        <span class="s2">def </span><span class="s1">where</span><span class="s3">(</span><span class="s1">A</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">A</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">()</span>
+
+        <span class="s1">vstack </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">vstack</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">where </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">where</span>
+        <span class="s1">vstack </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">vstack</span>
+
+    <span class="s6"># upper bounds &gt; lower bounds</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">ub </span><span class="s3">&lt; </span><span class="s1">lb</span><span class="s3">) </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">lb </span><span class="s3">== </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">) </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">ub </span><span class="s3">== -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">):</span>
+        <span class="s1">status </span><span class="s3">= </span><span class="s5">2</span>
+        <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The problem is (trivially) infeasible since one &quot;</span>
+                   <span class="s4">&quot;or more upper bounds are smaller than the corresponding &quot;</span>
+                   <span class="s4">&quot;lower bounds, a lower bound is np.inf or an upper bound &quot;</span>
+                   <span class="s4">&quot;is -np.inf.&quot;</span><span class="s3">)</span>
+        <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s6"># zero row in equality constraints</span>
+    <span class="s1">zero_row </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">A_eq </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s5">1</span><span class="s3">) == </span><span class="s5">0</span><span class="s3">).</span><span class="s1">flatten</span><span class="s3">()</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">zero_row</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span>
+                <span class="s1">zero_row</span><span class="s3">,</span>
+                <span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">b_eq</span><span class="s3">) &gt; </span><span class="s1">tol</span><span class="s3">)):  </span><span class="s6"># test_zero_row_1</span>
+            <span class="s6"># infeasible if RHS is not zero</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">2</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The problem is (trivially) infeasible due to a row &quot;</span>
+                       <span class="s4">&quot;of zeros in the equality constraint matrix with a &quot;</span>
+                       <span class="s4">&quot;nonzero corresponding constraint value.&quot;</span><span class="s3">)</span>
+            <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                    <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:  </span><span class="s6"># test_zero_row_2</span>
+            <span class="s6"># if RHS is zero, we can eliminate this equation entirely</span>
+            <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">zero_row</span><span class="s3">), :]</span>
+            <span class="s1">b_eq </span><span class="s3">= </span><span class="s1">b_eq</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">zero_row</span><span class="s3">)]</span>
+
+    <span class="s6"># zero row in inequality constraints</span>
+    <span class="s1">zero_row </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">A_ub </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s5">1</span><span class="s3">) == </span><span class="s5">0</span><span class="s3">).</span><span class="s1">flatten</span><span class="s3">()</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">zero_row</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_row</span><span class="s3">, </span><span class="s1">b_ub </span><span class="s3">&lt; -</span><span class="s1">tol</span><span class="s3">)):  </span><span class="s6"># test_zero_row_1</span>
+            <span class="s6"># infeasible if RHS is less than zero (because LHS is zero)</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">2</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The problem is (trivially) infeasible due to a row &quot;</span>
+                       <span class="s4">&quot;of zeros in the equality constraint matrix with a &quot;</span>
+                       <span class="s4">&quot;nonzero corresponding  constraint value.&quot;</span><span class="s3">)</span>
+            <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                    <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:  </span><span class="s6"># test_zero_row_2</span>
+            <span class="s6"># if LHS is &gt;= 0, we can eliminate this constraint entirely</span>
+            <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">A_ub</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">zero_row</span><span class="s3">), :]</span>
+            <span class="s1">b_ub </span><span class="s3">= </span><span class="s1">b_ub</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">zero_row</span><span class="s3">)]</span>
+
+    <span class="s6"># zero column in (both) constraints</span>
+    <span class="s6"># this indicates that a variable isn't constrained and can be removed</span>
+    <span class="s1">A </span><span class="s3">= </span><span class="s1">vstack</span><span class="s3">((</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">))</span>
+    <span class="s2">if </span><span class="s1">A</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] &gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">zero_col </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">A </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s5">0</span><span class="s3">) == </span><span class="s5">0</span><span class="s3">).</span><span class="s1">flatten</span><span class="s3">()</span>
+        <span class="s6"># variable will be at upper or lower bound, depending on objective</span>
+        <span class="s1">x</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">)] = </span><span class="s1">ub</span><span class="s3">[</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">)]</span>
+        <span class="s1">x</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">)] = </span><span class="s1">lb</span><span class="s3">[</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">)]</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)):  </span><span class="s6"># if an unconstrained variable has no bound</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">3</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;If feasible, the problem is (trivially) unbounded &quot;</span>
+                       <span class="s4">&quot;due  to a zero column in the constraint matrices. If &quot;</span>
+                       <span class="s4">&quot;you wish to check whether the problem is infeasible, &quot;</span>
+                       <span class="s4">&quot;turn presolve off.&quot;</span><span class="s3">)</span>
+            <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                    <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+        <span class="s6"># variables will equal upper/lower bounds will be removed later</span>
+        <span class="s1">lb</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">)] = </span><span class="s1">ub</span><span class="s3">[</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">)]</span>
+        <span class="s1">ub</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">)] = </span><span class="s1">lb</span><span class="s3">[</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">zero_col</span><span class="s3">, </span><span class="s1">c </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">)]</span>
+
+    <span class="s6"># row singleton in equality constraints</span>
+    <span class="s6"># this fixes a variable and removes the constraint</span>
+    <span class="s1">singleton_row </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">A_eq </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s5">1</span><span class="s3">) == </span><span class="s5">1</span><span class="s3">).</span><span class="s1">flatten</span><span class="s3">()</span>
+    <span class="s1">rows </span><span class="s3">= </span><span class="s1">where</span><span class="s3">(</span><span class="s1">singleton_row</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">cols </span><span class="s3">= </span><span class="s1">where</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">, :])[</span><span class="s5">1</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">) &gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">row</span><span class="s3">, </span><span class="s1">col </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">, </span><span class="s1">cols</span><span class="s3">):</span>
+            <span class="s1">val </span><span class="s3">= </span><span class="s1">b_eq</span><span class="s3">[</span><span class="s1">row</span><span class="s3">] / </span><span class="s1">A_eq</span><span class="s3">[</span><span class="s1">row</span><span class="s3">, </span><span class="s1">col</span><span class="s3">]</span>
+            <span class="s2">if not </span><span class="s1">lb</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] - </span><span class="s1">tol </span><span class="s3">&lt;= </span><span class="s1">val </span><span class="s3">&lt;= </span><span class="s1">ub</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] + </span><span class="s1">tol</span><span class="s3">:</span>
+                <span class="s6"># infeasible if fixed value is not within bounds</span>
+                <span class="s1">status </span><span class="s3">= </span><span class="s5">2</span>
+                <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The problem is (trivially) infeasible because a &quot;</span>
+                           <span class="s4">&quot;singleton row in the equality constraints is &quot;</span>
+                           <span class="s4">&quot;inconsistent with the bounds.&quot;</span><span class="s3">)</span>
+                <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                        <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s6"># sets upper and lower bounds at that fixed value - variable</span>
+                <span class="s6"># will be removed later</span>
+                <span class="s1">lb</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] = </span><span class="s1">val</span>
+                <span class="s1">ub</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] = </span><span class="s1">val</span>
+        <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">singleton_row</span><span class="s3">), :]</span>
+        <span class="s1">b_eq </span><span class="s3">= </span><span class="s1">b_eq</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">singleton_row</span><span class="s3">)]</span>
+
+    <span class="s6"># row singleton in inequality constraints</span>
+    <span class="s6"># this indicates a simple bound and the constraint can be removed</span>
+    <span class="s6"># simple bounds may be adjusted here</span>
+    <span class="s6"># After all of the simple bound information is combined here, get_Abc will</span>
+    <span class="s6"># turn the simple bounds into constraints</span>
+    <span class="s1">singleton_row </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">A_ub </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s5">1</span><span class="s3">) == </span><span class="s5">1</span><span class="s3">).</span><span class="s1">flatten</span><span class="s3">()</span>
+    <span class="s1">cols </span><span class="s3">= </span><span class="s1">where</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">[</span><span class="s1">singleton_row</span><span class="s3">, :])[</span><span class="s5">1</span><span class="s3">]</span>
+    <span class="s1">rows </span><span class="s3">= </span><span class="s1">where</span><span class="s3">(</span><span class="s1">singleton_row</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">) &gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">row</span><span class="s3">, </span><span class="s1">col </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">, </span><span class="s1">cols</span><span class="s3">):</span>
+            <span class="s1">val </span><span class="s3">= </span><span class="s1">b_ub</span><span class="s3">[</span><span class="s1">row</span><span class="s3">] / </span><span class="s1">A_ub</span><span class="s3">[</span><span class="s1">row</span><span class="s3">, </span><span class="s1">col</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">A_ub</span><span class="s3">[</span><span class="s1">row</span><span class="s3">, </span><span class="s1">col</span><span class="s3">] &gt; </span><span class="s5">0</span><span class="s3">:  </span><span class="s6"># upper bound</span>
+                <span class="s2">if </span><span class="s1">val </span><span class="s3">&lt; </span><span class="s1">lb</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] - </span><span class="s1">tol</span><span class="s3">:  </span><span class="s6"># infeasible</span>
+                    <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s2">elif </span><span class="s1">val </span><span class="s3">&lt; </span><span class="s1">ub</span><span class="s3">[</span><span class="s1">col</span><span class="s3">]:  </span><span class="s6"># new upper bound</span>
+                    <span class="s1">ub</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] = </span><span class="s1">val</span>
+            <span class="s2">else</span><span class="s3">:  </span><span class="s6"># lower bound</span>
+                <span class="s2">if </span><span class="s1">val </span><span class="s3">&gt; </span><span class="s1">ub</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] + </span><span class="s1">tol</span><span class="s3">:  </span><span class="s6"># infeasible</span>
+                    <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s2">elif </span><span class="s1">val </span><span class="s3">&gt; </span><span class="s1">lb</span><span class="s3">[</span><span class="s1">col</span><span class="s3">]:  </span><span class="s6"># new lower bound</span>
+                    <span class="s1">lb</span><span class="s3">[</span><span class="s1">col</span><span class="s3">] = </span><span class="s1">val</span>
+            <span class="s2">if </span><span class="s1">complete</span><span class="s3">:</span>
+                <span class="s1">status </span><span class="s3">= </span><span class="s5">2</span>
+                <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The problem is (trivially) infeasible because a &quot;</span>
+                           <span class="s4">&quot;singleton row in the upper bound constraints is &quot;</span>
+                           <span class="s4">&quot;inconsistent with the bounds.&quot;</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                        <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+        <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">A_ub</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">singleton_row</span><span class="s3">), :]</span>
+        <span class="s1">b_ub </span><span class="s3">= </span><span class="s1">b_ub</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">singleton_row</span><span class="s3">)]</span>
+
+    <span class="s6"># identical bounds indicate that variable can be removed</span>
+    <span class="s1">i_f </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">lb </span><span class="s3">- </span><span class="s1">ub</span><span class="s3">) &lt; </span><span class="s1">tol   </span><span class="s6"># indices of &quot;fixed&quot; variables</span>
+    <span class="s1">i_nf </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">i_f</span><span class="s3">)  </span><span class="s6"># indices of &quot;not fixed&quot; variables</span>
+
+    <span class="s6"># test_bounds_equal_but_infeasible</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">i_f</span><span class="s3">):  </span><span class="s6"># if bounds define solution, check for consistency</span>
+        <span class="s1">residual </span><span class="s3">= </span><span class="s1">b_eq </span><span class="s3">- </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">lb</span><span class="s3">)</span>
+        <span class="s1">slack </span><span class="s3">= </span><span class="s1">b_ub </span><span class="s3">- </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">lb</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s3">((</span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">slack </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">)) </span><span class="s2">or</span>
+                <span class="s3">(</span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s5">0 </span><span class="s2">and not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">allclose</span><span class="s3">(</span><span class="s1">residual</span><span class="s3">, </span><span class="s5">0</span><span class="s3">))):</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">2</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The problem is (trivially) infeasible because the &quot;</span>
+                       <span class="s4">&quot;bounds fix all variables to values inconsistent with &quot;</span>
+                       <span class="s4">&quot;the constraints&quot;</span><span class="s3">)</span>
+            <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+            <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                    <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s1">ub_mod </span><span class="s3">= </span><span class="s1">ub</span>
+    <span class="s1">lb_mod </span><span class="s3">= </span><span class="s1">lb</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">i_f</span><span class="s3">):</span>
+        <span class="s1">c0 </span><span class="s3">+= </span><span class="s1">c</span><span class="s3">[</span><span class="s1">i_f</span><span class="s3">].</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">lb</span><span class="s3">[</span><span class="s1">i_f</span><span class="s3">])</span>
+        <span class="s1">b_eq </span><span class="s3">= </span><span class="s1">b_eq </span><span class="s3">- </span><span class="s1">A_eq</span><span class="s3">[:, </span><span class="s1">i_f</span><span class="s3">].</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">lb</span><span class="s3">[</span><span class="s1">i_f</span><span class="s3">])</span>
+        <span class="s1">b_ub </span><span class="s3">= </span><span class="s1">b_ub </span><span class="s3">- </span><span class="s1">A_ub</span><span class="s3">[:, </span><span class="s1">i_f</span><span class="s3">].</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">lb</span><span class="s3">[</span><span class="s1">i_f</span><span class="s3">])</span>
+        <span class="s1">c </span><span class="s3">= </span><span class="s1">c</span><span class="s3">[</span><span class="s1">i_nf</span><span class="s3">]</span>
+        <span class="s1">x_undo </span><span class="s3">= </span><span class="s1">lb</span><span class="s3">[</span><span class="s1">i_f</span><span class="s3">]  </span><span class="s6"># not x[i_f], x is just zeroes</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">x</span><span class="s3">[</span><span class="s1">i_nf</span><span class="s3">]</span>
+        <span class="s6"># user guess x0 stays separate from presolve solution x</span>
+        <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">x0 </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">[</span><span class="s1">i_nf</span><span class="s3">]</span>
+        <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">[:, </span><span class="s1">i_nf</span><span class="s3">]</span>
+        <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">A_ub</span><span class="s3">[:, </span><span class="s1">i_nf</span><span class="s3">]</span>
+        <span class="s6"># modify bounds</span>
+        <span class="s1">lb_mod </span><span class="s3">= </span><span class="s1">lb</span><span class="s3">[</span><span class="s1">i_nf</span><span class="s3">]</span>
+        <span class="s1">ub_mod </span><span class="s3">= </span><span class="s1">ub</span><span class="s3">[</span><span class="s1">i_nf</span><span class="s3">]</span>
+
+        <span class="s2">def </span><span class="s1">rev</span><span class="s3">(</span><span class="s1">x_mod</span><span class="s3">):</span>
+            <span class="s6"># Function to restore x: insert x_undo into x_mod.</span>
+            <span class="s6"># When elements have been removed at positions k1, k2, k3, ...</span>
+            <span class="s6"># then these must be replaced at (after) positions k1-1, k2-2,</span>
+            <span class="s6"># k3-3, ... in the modified array to recreate the original</span>
+            <span class="s1">i </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">flatnonzero</span><span class="s3">(</span><span class="s1">i_f</span><span class="s3">)</span>
+            <span class="s6"># Number of variables to restore</span>
+            <span class="s1">N </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">i</span><span class="s3">)</span>
+            <span class="s1">index_offset </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">N</span><span class="s3">)</span>
+            <span class="s6"># Create insert indices</span>
+            <span class="s1">insert_indices </span><span class="s3">= </span><span class="s1">i </span><span class="s3">- </span><span class="s1">index_offset</span>
+            <span class="s1">x_rev </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">insert</span><span class="s3">(</span><span class="s1">x_mod</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">float</span><span class="s3">), </span><span class="s1">insert_indices</span><span class="s3">, </span><span class="s1">x_undo</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">x_rev</span>
+
+        <span class="s6"># Use revstack as a list of functions, currently just this one.</span>
+        <span class="s1">revstack</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">rev</span><span class="s3">)</span>
+
+    <span class="s6"># no constraints indicates that problem is trivial</span>
+    <span class="s2">if </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">b_eq </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([])</span>
+        <span class="s1">b_ub </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([])</span>
+        <span class="s6"># test_empty_constraint_1</span>
+        <span class="s2">if </span><span class="s1">c</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">0</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The solution was determined in presolve as there are &quot;</span>
+                       <span class="s4">&quot;no non-trivial constraints.&quot;</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">c </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">, </span><span class="s1">ub_mod </span><span class="s3">== </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)) </span><span class="s2">or</span>
+              <span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">c </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">, </span><span class="s1">lb_mod </span><span class="s3">== -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">))):</span>
+            <span class="s6"># test_no_constraints()</span>
+            <span class="s6"># test_unbounded_no_nontrivial_constraints_1</span>
+            <span class="s6"># test_unbounded_no_nontrivial_constraints_2</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">3</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The problem is (trivially) unbounded &quot;</span>
+                       <span class="s4">&quot;because there are no non-trivial constraints and &quot;</span>
+                       <span class="s4">&quot;a) at least one decision variable is unbounded &quot;</span>
+                       <span class="s4">&quot;above and its corresponding cost is negative, or &quot;</span>
+                       <span class="s4">&quot;b) at least one decision variable is unbounded below &quot;</span>
+                       <span class="s4">&quot;and its corresponding cost is positive. &quot;</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:  </span><span class="s6"># test_empty_constraint_2</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">0</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The solution was determined in presolve as there are &quot;</span>
+                       <span class="s4">&quot;no non-trivial constraints.&quot;</span><span class="s3">)</span>
+        <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s1">x</span><span class="s3">[</span><span class="s1">c </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">ub_mod</span><span class="s3">[</span><span class="s1">c </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">x</span><span class="s3">[</span><span class="s1">c </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">lb_mod</span><span class="s3">[</span><span class="s1">c </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s6"># where c is zero, set x to a finite bound or zero</span>
+        <span class="s1">x_zero_c </span><span class="s3">= </span><span class="s1">ub_mod</span><span class="s3">[</span><span class="s1">c </span><span class="s3">== </span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">x_zero_c</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">x_zero_c</span><span class="s3">)] = </span><span class="s1">ub_mod</span><span class="s3">[</span><span class="s1">c </span><span class="s3">== </span><span class="s5">0</span><span class="s3">][</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">x_zero_c</span><span class="s3">)]</span>
+        <span class="s1">x_zero_c</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">x_zero_c</span><span class="s3">)] = </span><span class="s5">0</span>
+        <span class="s1">x</span><span class="s3">[</span><span class="s1">c </span><span class="s3">== </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">x_zero_c</span>
+        <span class="s6"># if this is not the last step of presolve, should convert bounds back</span>
+        <span class="s6"># to array and return here</span>
+
+    <span class="s6"># Convert modified lb and ub back into N x 2 bounds</span>
+    <span class="s1">bounds </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">hstack</span><span class="s3">((</span><span class="s1">lb_mod</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">], </span><span class="s1">ub_mod</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">]))</span>
+
+    <span class="s6"># remove redundant (linearly dependent) rows from equality constraints</span>
+    <span class="s1">n_rows_A </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">redundancy_warning </span><span class="s3">= (</span><span class="s4">&quot;A_eq does not appear to be of full row rank. To &quot;</span>
+                          <span class="s4">&quot;improve performance, check the problem formulation &quot;</span>
+                          <span class="s4">&quot;for redundant equality constraints.&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s3">(</span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">)):</span>
+        <span class="s2">if </span><span class="s1">rr </span><span class="s2">and </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:  </span><span class="s6"># TODO: Fast sparse rank check?</span>
+            <span class="s1">rr_res </span><span class="s3">= </span><span class="s1">_remove_redundancy_pivot_sparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">)</span>
+            <span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message </span><span class="s3">= </span><span class="s1">rr_res</span>
+            <span class="s2">if </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] &lt; </span><span class="s1">n_rows_A</span><span class="s3">:</span>
+                <span class="s1">warn</span><span class="s3">(</span><span class="s1">redundancy_warning</span><span class="s3">, </span><span class="s1">OptimizeWarning</span><span class="s3">, </span><span class="s1">stacklevel</span><span class="s3">=</span><span class="s5">1</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">status </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">:</span>
+                <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+                <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s6"># This is a wild guess for which redundancy removal algorithm will be</span>
+    <span class="s6"># faster. More testing would be good.</span>
+    <span class="s1">small_nullspace </span><span class="s3">= </span><span class="s5">5</span>
+    <span class="s2">if </span><span class="s1">rr </span><span class="s2">and </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s2">try</span><span class="s3">:  </span><span class="s6"># TODO: use results of first SVD in _remove_redundancy_svd</span>
+            <span class="s1">rank </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">linalg</span><span class="s3">.</span><span class="s1">matrix_rank</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">)</span>
+        <span class="s6"># oh well, we'll have to go with _remove_redundancy_pivot_dense</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s1">rank </span><span class="s3">= </span><span class="s5">0</span>
+    <span class="s2">if </span><span class="s1">rr </span><span class="s2">and </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">rank </span><span class="s3">&lt; </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]:</span>
+        <span class="s1">warn</span><span class="s3">(</span><span class="s1">redundancy_warning</span><span class="s3">, </span><span class="s1">OptimizeWarning</span><span class="s3">, </span><span class="s1">stacklevel</span><span class="s3">=</span><span class="s5">3</span><span class="s3">)</span>
+        <span class="s1">dim_row_nullspace </span><span class="s3">= </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]-</span><span class="s1">rank</span>
+        <span class="s2">if </span><span class="s1">rr_method </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">dim_row_nullspace </span><span class="s3">&lt;= </span><span class="s1">small_nullspace</span><span class="s3">:</span>
+                <span class="s1">rr_res </span><span class="s3">= </span><span class="s1">_remove_redundancy_svd</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">)</span>
+                <span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message </span><span class="s3">= </span><span class="s1">rr_res</span>
+            <span class="s2">if </span><span class="s1">dim_row_nullspace </span><span class="s3">&gt; </span><span class="s1">small_nullspace </span><span class="s2">or </span><span class="s1">status </span><span class="s3">== </span><span class="s5">4</span><span class="s3">:</span>
+                <span class="s1">rr_res </span><span class="s3">= </span><span class="s1">_remove_redundancy_pivot_dense</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">)</span>
+                <span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message </span><span class="s3">= </span><span class="s1">rr_res</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">rr_method </span><span class="s3">= </span><span class="s1">rr_method</span><span class="s3">.</span><span class="s1">lower</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">rr_method </span><span class="s3">== </span><span class="s4">&quot;svd&quot;</span><span class="s3">:</span>
+                <span class="s1">rr_res </span><span class="s3">= </span><span class="s1">_remove_redundancy_svd</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">)</span>
+                <span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message </span><span class="s3">= </span><span class="s1">rr_res</span>
+            <span class="s2">elif </span><span class="s1">rr_method </span><span class="s3">== </span><span class="s4">&quot;pivot&quot;</span><span class="s3">:</span>
+                <span class="s1">rr_res </span><span class="s3">= </span><span class="s1">_remove_redundancy_pivot_dense</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">)</span>
+                <span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message </span><span class="s3">= </span><span class="s1">rr_res</span>
+            <span class="s2">elif </span><span class="s1">rr_method </span><span class="s3">== </span><span class="s4">&quot;id&quot;</span><span class="s3">:</span>
+                <span class="s1">rr_res </span><span class="s3">= </span><span class="s1">_remove_redundancy_id</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">rank</span><span class="s3">)</span>
+                <span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message </span><span class="s3">= </span><span class="s1">rr_res</span>
+            <span class="s2">else</span><span class="s3">:  </span><span class="s6"># shouldn't get here; option validity checked above</span>
+                <span class="s2">pass</span>
+        <span class="s2">if </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] &lt; </span><span class="s1">rank</span><span class="s3">:</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;Due to numerical issues, redundant equality &quot;</span>
+                       <span class="s4">&quot;constraints could not be removed automatically. &quot;</span>
+                       <span class="s4">&quot;Try providing your constraint matrices as sparse &quot;</span>
+                       <span class="s4">&quot;matrices to activate sparse presolve, try turning &quot;</span>
+                       <span class="s4">&quot;off redundancy removal, or try turning off presolve &quot;</span>
+                       <span class="s4">&quot;altogether.&quot;</span><span class="s3">)</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">4</span>
+        <span class="s2">if </span><span class="s1">status </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">complete </span><span class="s3">= </span><span class="s2">True</span>
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">_LPProblem</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">),</span>
+            <span class="s1">c0</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">revstack</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_parse_linprog</span><span class="s3">(</span><span class="s1">lp</span><span class="s3">, </span><span class="s1">options</span><span class="s3">, </span><span class="s1">meth</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Parse the provided linear programming problem 
+ 
+    ``_parse_linprog`` employs two main steps ``_check_sparse_inputs`` and 
+    ``_clean_inputs``. ``_check_sparse_inputs`` checks for sparsity in the 
+    provided constraints (``A_ub`` and ``A_eq) and if these match the provided 
+    sparsity optional values. 
+ 
+    ``_clean inputs`` checks of the provided inputs. If no violations are 
+    identified the objective vector, upper bound constraints, equality 
+    constraints, and simple bounds are returned in the expected format. 
+ 
+    Parameters 
+    ---------- 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : various valid formats, optional 
+            The bounds of ``x``, as ``min`` and ``max`` pairs. 
+            If bounds are specified for all N variables separately, valid formats are: 
+            * a 2D array (2 x N or N x 2); 
+            * a sequence of N sequences, each with 2 values. 
+            If all variables have the same bounds, a single pair of values can 
+            be specified. Valid formats are: 
+            * a sequence with 2 scalar values; 
+            * a sequence with a single element containing 2 scalar values. 
+            If all variables have a lower bound of 0 and no upper bound, the bounds 
+            parameter can be omitted (or given as None). 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    options : dict 
+        A dictionary of solver options. All methods accept the following 
+        generic options: 
+ 
+            maxiter : int 
+                Maximum number of iterations to perform. 
+            disp : bool 
+                Set to True to print convergence messages. 
+ 
+        For method-specific options, see :func:`show_options('linprog')`. 
+ 
+    Returns 
+    ------- 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : 2D array 
+            The bounds of ``x``, as ``min`` and ``max`` pairs, one for each of the N 
+            elements of ``x``. The N x 2 array contains lower bounds in the first 
+            column and upper bounds in the 2nd. Unbounded variables have lower 
+            bound -np.inf and/or upper bound np.inf. 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    options : dict, optional 
+        A dictionary of solver options. All methods accept the following 
+        generic options: 
+ 
+            maxiter : int 
+                Maximum number of iterations to perform. 
+            disp : bool 
+                Set to True to print convergence messages. 
+ 
+        For method-specific options, see :func:`show_options('linprog')`. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">options </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">options </span><span class="s3">= {}</span>
+
+    <span class="s1">solver_options </span><span class="s3">= {</span><span class="s1">k</span><span class="s3">: </span><span class="s1">v </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">options</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()}</span>
+    <span class="s1">solver_options</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">A_eq </span><span class="s3">= </span><span class="s1">_check_sparse_inputs</span><span class="s3">(</span><span class="s1">solver_options</span><span class="s3">, </span><span class="s1">meth</span><span class="s3">,</span>
+                                                      <span class="s1">lp</span><span class="s3">.</span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">lp</span><span class="s3">.</span><span class="s1">A_eq</span><span class="s3">)</span>
+    <span class="s6"># Convert lists to numpy arrays, etc...</span>
+    <span class="s1">lp </span><span class="s3">= </span><span class="s1">_clean_inputs</span><span class="s3">(</span><span class="s1">lp</span><span class="s3">.</span><span class="s1">_replace</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">=</span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">=</span><span class="s1">A_eq</span><span class="s3">))</span>
+    <span class="s2">return </span><span class="s1">lp</span><span class="s3">, </span><span class="s1">solver_options</span>
+
+
+<span class="s2">def </span><span class="s1">_get_Abc</span><span class="s3">(</span><span class="s1">lp</span><span class="s3">, </span><span class="s1">c0</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given a linear programming problem of the form: 
+ 
+    Minimize:: 
+ 
+        c @ x 
+ 
+    Subject to:: 
+ 
+        A_ub @ x &lt;= b_ub 
+        A_eq @ x == b_eq 
+         lb &lt;= x &lt;= ub 
+ 
+    where ``lb = 0`` and ``ub = None`` unless set in ``bounds``. 
+ 
+    Return the problem in standard form: 
+ 
+    Minimize:: 
+ 
+        c @ x 
+ 
+    Subject to:: 
+ 
+        A @ x == b 
+            x &gt;= 0 
+ 
+    by adding slack variables and making variable substitutions as necessary. 
+ 
+    Parameters 
+    ---------- 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : 2D array 
+            The bounds of ``x``, lower bounds in the 1st column, upper 
+            bounds in the 2nd column. The bounds are possibly tightened 
+            by the presolve procedure. 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    c0 : float 
+        Constant term in objective function due to fixed (and eliminated) 
+        variables. 
+ 
+    Returns 
+    ------- 
+    A : 2-D array 
+        2-D array such that ``A`` @ ``x``, gives the values of the equality 
+        constraints at ``x``. 
+    b : 1-D array 
+        1-D array of values representing the RHS of each equality constraint 
+        (row) in A (for standard form problem). 
+    c : 1-D array 
+        Coefficients of the linear objective function to be minimized (for 
+        standard form problem). 
+    c0 : float 
+        Constant term in objective function due to fixed (and eliminated) 
+        variables. 
+    x0 : 1-D array 
+        Starting values of the independent variables, which will be refined by 
+        the optimization algorithm 
+ 
+    References 
+    ---------- 
+    .. [9] Bertsimas, Dimitris, and J. Tsitsiklis. &quot;Introduction to linear 
+           programming.&quot; Athena Scientific 1 (1997): 997. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">integrality </span><span class="s3">= </span><span class="s1">lp</span>
+
+    <span class="s2">if </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">):</span>
+        <span class="s1">sparse </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">csr_matrix</span><span class="s3">(</span><span class="s1">A_eq</span><span class="s3">)</span>
+        <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">csr_matrix</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">hstack</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">hstack</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">format</span><span class="s3">=</span><span class="s4">&quot;csr&quot;</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">vstack</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">vstack</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">, </span><span class="s1">format</span><span class="s3">=</span><span class="s4">&quot;csr&quot;</span><span class="s3">)</span>
+
+        <span class="s1">zeros </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">csr_matrix</span>
+        <span class="s1">eye </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">eye</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">sparse </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s1">hstack </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">hstack</span>
+        <span class="s1">vstack </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">vstack</span>
+        <span class="s1">zeros </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span>
+        <span class="s1">eye </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">eye</span>
+
+    <span class="s6"># Variables lbs and ubs (see below) may be changed, which feeds back into</span>
+    <span class="s6"># bounds, so copy.</span>
+    <span class="s1">bounds </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s6"># modify problem such that all variables have only non-negativity bounds</span>
+    <span class="s1">lbs </span><span class="s3">= </span><span class="s1">bounds</span><span class="s3">[:, </span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">ubs </span><span class="s3">= </span><span class="s1">bounds</span><span class="s3">[:, </span><span class="s5">1</span><span class="s3">]</span>
+    <span class="s1">m_ub</span><span class="s3">, </span><span class="s1">n_ub </span><span class="s3">= </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span>
+
+    <span class="s1">lb_none </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">equal</span><span class="s3">(</span><span class="s1">lbs</span><span class="s3">, -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+    <span class="s1">ub_none </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">equal</span><span class="s3">(</span><span class="s1">ubs</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+    <span class="s1">lb_some </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">lb_none</span><span class="s3">)</span>
+    <span class="s1">ub_some </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">ub_none</span><span class="s3">)</span>
+
+    <span class="s6"># unbounded below: substitute xi = -xi' (unbounded above)</span>
+    <span class="s6"># if -inf &lt;= xi &lt;= ub, then -ub &lt;= -xi &lt;= inf, so swap and invert bounds</span>
+    <span class="s1">l_nolb_someub </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">lb_none</span><span class="s3">, </span><span class="s1">ub_some</span><span class="s3">)</span>
+    <span class="s1">i_nolb </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">l_nolb_someub</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">lbs</span><span class="s3">[</span><span class="s1">l_nolb_someub</span><span class="s3">], </span><span class="s1">ubs</span><span class="s3">[</span><span class="s1">l_nolb_someub</span><span class="s3">] = (</span>
+        <span class="s3">-</span><span class="s1">ubs</span><span class="s3">[</span><span class="s1">l_nolb_someub</span><span class="s3">], -</span><span class="s1">lbs</span><span class="s3">[</span><span class="s1">l_nolb_someub</span><span class="s3">])</span>
+    <span class="s1">lb_none </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">equal</span><span class="s3">(</span><span class="s1">lbs</span><span class="s3">, -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+    <span class="s1">ub_none </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">equal</span><span class="s3">(</span><span class="s1">ubs</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+    <span class="s1">lb_some </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">lb_none</span><span class="s3">)</span>
+    <span class="s1">ub_some </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_not</span><span class="s3">(</span><span class="s1">ub_none</span><span class="s3">)</span>
+    <span class="s1">c</span><span class="s3">[</span><span class="s1">i_nolb</span><span class="s3">] *= -</span><span class="s5">1</span>
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">x0</span><span class="s3">[</span><span class="s1">i_nolb</span><span class="s3">] *= -</span><span class="s5">1</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">i_nolb</span><span class="s3">) &gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] &gt; </span><span class="s5">0</span><span class="s3">:  </span><span class="s6"># sometimes needed for sparse arrays... weird</span>
+            <span class="s1">A_ub</span><span class="s3">[:, </span><span class="s1">i_nolb</span><span class="s3">] *= -</span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] &gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">A_eq</span><span class="s3">[:, </span><span class="s1">i_nolb</span><span class="s3">] *= -</span><span class="s5">1</span>
+
+    <span class="s6"># upper bound: add inequality constraint</span>
+    <span class="s1">i_newub</span><span class="s3">, = </span><span class="s1">ub_some</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">()</span>
+    <span class="s1">ub_newub </span><span class="s3">= </span><span class="s1">ubs</span><span class="s3">[</span><span class="s1">ub_some</span><span class="s3">]</span>
+    <span class="s1">n_bounds </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">i_newub</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">n_bounds </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">shape </span><span class="s3">= (</span><span class="s1">n_bounds</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">1</span><span class="s3">])</span>
+        <span class="s2">if </span><span class="s1">sparse</span><span class="s3">:</span>
+            <span class="s1">idxs </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">n_bounds</span><span class="s3">), </span><span class="s1">i_newub</span><span class="s3">)</span>
+            <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">vstack</span><span class="s3">((</span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">csr_matrix</span><span class="s3">((</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">n_bounds</span><span class="s3">), </span><span class="s1">idxs</span><span class="s3">),</span>
+                                                <span class="s1">shape</span><span class="s3">=</span><span class="s1">shape</span><span class="s3">)))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">A_ub </span><span class="s3">= </span><span class="s1">vstack</span><span class="s3">((</span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">)))</span>
+            <span class="s1">A_ub</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">m_ub</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]), </span><span class="s1">i_newub</span><span class="s3">] = </span><span class="s5">1</span>
+        <span class="s1">b_ub </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_bounds</span><span class="s3">)))</span>
+        <span class="s1">b_ub</span><span class="s3">[</span><span class="s1">m_ub</span><span class="s3">:] = </span><span class="s1">ub_newub</span>
+
+    <span class="s1">A1 </span><span class="s3">= </span><span class="s1">vstack</span><span class="s3">((</span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">))</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">))</span>
+    <span class="s1">c </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">c</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">],))))</span>
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">x0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">x0</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">],))))</span>
+    <span class="s6"># unbounded: substitute xi = xi+ + xi-</span>
+    <span class="s1">l_free </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">logical_and</span><span class="s3">(</span><span class="s1">lb_none</span><span class="s3">, </span><span class="s1">ub_none</span><span class="s3">)</span>
+    <span class="s1">i_free </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">l_free</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">n_free </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">i_free</span><span class="s3">)</span>
+    <span class="s1">c </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">c</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_free</span><span class="s3">)))</span>
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">x0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">x0</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n_free</span><span class="s3">)))</span>
+    <span class="s1">A1 </span><span class="s3">= </span><span class="s1">hstack</span><span class="s3">((</span><span class="s1">A1</span><span class="s3">[:, :</span><span class="s1">n_ub</span><span class="s3">], -</span><span class="s1">A1</span><span class="s3">[:, </span><span class="s1">i_free</span><span class="s3">]))</span>
+    <span class="s1">c</span><span class="s3">[</span><span class="s1">n_ub</span><span class="s3">:</span><span class="s1">n_ub</span><span class="s3">+</span><span class="s1">n_free</span><span class="s3">] = -</span><span class="s1">c</span><span class="s3">[</span><span class="s1">i_free</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">i_free_neg </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">[</span><span class="s1">i_free</span><span class="s3">] &lt; </span><span class="s5">0</span>
+        <span class="s1">x0</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">n_ub</span><span class="s3">, </span><span class="s1">A1</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">1</span><span class="s3">])[</span><span class="s1">i_free_neg</span><span class="s3">]] = -</span><span class="s1">x0</span><span class="s3">[</span><span class="s1">i_free</span><span class="s3">[</span><span class="s1">i_free_neg</span><span class="s3">]]</span>
+        <span class="s1">x0</span><span class="s3">[</span><span class="s1">i_free</span><span class="s3">[</span><span class="s1">i_free_neg</span><span class="s3">]] = </span><span class="s5">0</span>
+
+    <span class="s6"># add slack variables</span>
+    <span class="s1">A2 </span><span class="s3">= </span><span class="s1">vstack</span><span class="s3">([</span><span class="s1">eye</span><span class="s3">(</span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]), </span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">], </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]))])</span>
+
+    <span class="s1">A </span><span class="s3">= </span><span class="s1">hstack</span><span class="s3">([</span><span class="s1">A1</span><span class="s3">, </span><span class="s1">A2</span><span class="s3">])</span>
+
+    <span class="s6"># lower bound: substitute xi = xi' + lb</span>
+    <span class="s6"># now there is a constant term in objective</span>
+    <span class="s1">i_shift </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">lb_some</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">lb_shift </span><span class="s3">= </span><span class="s1">lbs</span><span class="s3">[</span><span class="s1">lb_some</span><span class="s3">].</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">float</span><span class="s3">)</span>
+    <span class="s1">c0 </span><span class="s3">+= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">lb_shift </span><span class="s3">* </span><span class="s1">c</span><span class="s3">[</span><span class="s1">i_shift</span><span class="s3">])</span>
+    <span class="s2">if </span><span class="s1">sparse</span><span class="s3">:</span>
+        <span class="s1">b </span><span class="s3">= </span><span class="s1">b</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+        <span class="s1">A </span><span class="s3">= </span><span class="s1">A</span><span class="s3">.</span><span class="s1">tocsc</span><span class="s3">()</span>
+        <span class="s1">b </span><span class="s3">-= (</span><span class="s1">A</span><span class="s3">[:, </span><span class="s1">i_shift</span><span class="s3">] * </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">diags</span><span class="s3">(</span><span class="s1">lb_shift</span><span class="s3">)).</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s5">1</span><span class="s3">)</span>
+        <span class="s1">b </span><span class="s3">= </span><span class="s1">b</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">b </span><span class="s3">-= (</span><span class="s1">A</span><span class="s3">[:, </span><span class="s1">i_shift</span><span class="s3">] * </span><span class="s1">lb_shift</span><span class="s3">).</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s5">1</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">x0</span><span class="s3">[</span><span class="s1">i_shift</span><span class="s3">] -= </span><span class="s1">lb_shift</span>
+
+    <span class="s2">return </span><span class="s1">A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">c0</span><span class="s3">, </span><span class="s1">x0</span>
+
+
+<span class="s2">def </span><span class="s1">_round_to_power_of_two</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Round elements of the array to the nearest power of two. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s5">2</span><span class="s3">**</span><span class="s1">np</span><span class="s3">.</span><span class="s1">around</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log2</span><span class="s3">(</span><span class="s1">x</span><span class="s3">))</span>
+
+
+<span class="s2">def </span><span class="s1">_autoscale</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Scales the problem according to equilibration from [12]. 
+    Also normalizes the right hand side vector by its maximum element. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">m</span><span class="s3">, </span><span class="s1">n </span><span class="s3">= </span><span class="s1">A</span><span class="s3">.</span><span class="s1">shape</span>
+
+    <span class="s1">C </span><span class="s3">= </span><span class="s5">1</span>
+    <span class="s1">R </span><span class="s3">= </span><span class="s5">1</span>
+
+    <span class="s2">if </span><span class="s1">A</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+
+        <span class="s1">R </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">A</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=</span><span class="s5">1</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A</span><span class="s3">):</span>
+            <span class="s1">R </span><span class="s3">= </span><span class="s1">R</span><span class="s3">.</span><span class="s1">toarray</span><span class="s3">().</span><span class="s1">flatten</span><span class="s3">()</span>
+        <span class="s1">R</span><span class="s3">[</span><span class="s1">R </span><span class="s3">== </span><span class="s5">0</span><span class="s3">] = </span><span class="s5">1</span>
+        <span class="s1">R </span><span class="s3">= </span><span class="s5">1</span><span class="s3">/</span><span class="s1">_round_to_power_of_two</span><span class="s3">(</span><span class="s1">R</span><span class="s3">)</span>
+        <span class="s1">A </span><span class="s3">= </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">diags</span><span class="s3">(</span><span class="s1">R</span><span class="s3">)*</span><span class="s1">A </span><span class="s2">if </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A</span><span class="s3">) </span><span class="s2">else </span><span class="s1">A</span><span class="s3">*</span><span class="s1">R</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">m</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+        <span class="s1">b </span><span class="s3">= </span><span class="s1">b</span><span class="s3">*</span><span class="s1">R</span>
+
+        <span class="s1">C </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">A</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=</span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A</span><span class="s3">):</span>
+            <span class="s1">C </span><span class="s3">= </span><span class="s1">C</span><span class="s3">.</span><span class="s1">toarray</span><span class="s3">().</span><span class="s1">flatten</span><span class="s3">()</span>
+        <span class="s1">C</span><span class="s3">[</span><span class="s1">C </span><span class="s3">== </span><span class="s5">0</span><span class="s3">] = </span><span class="s5">1</span>
+        <span class="s1">C </span><span class="s3">= </span><span class="s5">1</span><span class="s3">/</span><span class="s1">_round_to_power_of_two</span><span class="s3">(</span><span class="s1">C</span><span class="s3">)</span>
+        <span class="s1">A </span><span class="s3">= </span><span class="s1">A</span><span class="s3">*</span><span class="s1">sps</span><span class="s3">.</span><span class="s1">diags</span><span class="s3">(</span><span class="s1">C</span><span class="s3">) </span><span class="s2">if </span><span class="s1">sps</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A</span><span class="s3">) </span><span class="s2">else </span><span class="s1">A</span><span class="s3">*</span><span class="s1">C</span>
+        <span class="s1">c </span><span class="s3">= </span><span class="s1">c</span><span class="s3">*</span><span class="s1">C</span>
+
+    <span class="s1">b_scale </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)) </span><span class="s2">if </span><span class="s1">b</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s5">0 </span><span class="s2">else </span><span class="s5">1</span>
+    <span class="s2">if </span><span class="s1">b_scale </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">b_scale </span><span class="s3">= </span><span class="s5">1.</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">b</span><span class="s3">/</span><span class="s1">b_scale</span>
+
+    <span class="s2">if </span><span class="s1">x0 </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">x0 </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">/</span><span class="s1">b_scale</span><span class="s3">*(</span><span class="s5">1</span><span class="s3">/</span><span class="s1">C</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">A</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">c</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">C</span><span class="s3">, </span><span class="s1">b_scale</span>
+
+
+<span class="s2">def </span><span class="s1">_unscale</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">C</span><span class="s3">, </span><span class="s1">b_scale</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Converts solution to _autoscale problem -&gt; solution to original problem. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">C</span><span class="s3">)</span>
+        <span class="s6"># fails if sparse or scalar; that's OK.</span>
+        <span class="s6"># this is only needed for original simplex (never sparse)</span>
+    <span class="s2">except </span><span class="s1">TypeError</span><span class="s3">:</span>
+        <span class="s1">n </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">x</span><span class="s3">[:</span><span class="s1">n</span><span class="s3">]*</span><span class="s1">b_scale</span><span class="s3">*</span><span class="s1">C</span>
+
+
+<span class="s2">def </span><span class="s1">_display_summary</span><span class="s3">(</span><span class="s1">message</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">fun</span><span class="s3">, </span><span class="s1">iteration</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Print the termination summary of the linear program 
+ 
+    Parameters 
+    ---------- 
+    message : str 
+            A string descriptor of the exit status of the optimization. 
+    status : int 
+        An integer representing the exit status of the optimization:: 
+ 
+                0 : Optimization terminated successfully 
+                1 : Iteration limit reached 
+                2 : Problem appears to be infeasible 
+                3 : Problem appears to be unbounded 
+                4 : Serious numerical difficulties encountered 
+ 
+    fun : float 
+        Value of the objective function. 
+    iteration : iteration 
+        The number of iterations performed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">print</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">status </span><span class="s2">in </span><span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">):</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s4">f&quot;         Current function value: </span><span class="s2">{</span><span class="s1">fun</span><span class="s2">: </span><span class="s4">&lt;12.6f</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+    <span class="s1">print</span><span class="s3">(</span><span class="s4">f&quot;         Iterations: </span><span class="s2">{</span><span class="s1">iteration</span><span class="s2">:</span><span class="s4">d</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_postsolve</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">postsolve_args</span><span class="s3">, </span><span class="s1">complete</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given solution x to presolved, standard form linear program x, add 
+    fixed variables back into the problem and undo the variable substitutions 
+    to get solution to original linear program. Also, calculate the objective 
+    function value, slack in original upper bound constraints, and residuals 
+    in original equality constraints. 
+ 
+    Parameters 
+    ---------- 
+    x : 1-D array 
+        Solution vector to the standard-form problem. 
+    postsolve_args : tuple 
+        Data needed by _postsolve to convert the solution to the standard-form 
+        problem into the solution to the original problem, including: 
+ 
+    lp : A `scipy.optimize._linprog_util._LPProblem` consisting of the following fields: 
+ 
+        c : 1D array 
+            The coefficients of the linear objective function to be minimized. 
+        A_ub : 2D array, optional 
+            The inequality constraint matrix. Each row of ``A_ub`` specifies the 
+            coefficients of a linear inequality constraint on ``x``. 
+        b_ub : 1D array, optional 
+            The inequality constraint vector. Each element represents an 
+            upper bound on the corresponding value of ``A_ub @ x``. 
+        A_eq : 2D array, optional 
+            The equality constraint matrix. Each row of ``A_eq`` specifies the 
+            coefficients of a linear equality constraint on ``x``. 
+        b_eq : 1D array, optional 
+            The equality constraint vector. Each element of ``A_eq @ x`` must equal 
+            the corresponding element of ``b_eq``. 
+        bounds : 2D array 
+            The bounds of ``x``, lower bounds in the 1st column, upper 
+            bounds in the 2nd column. The bounds are possibly tightened 
+            by the presolve procedure. 
+        x0 : 1D array, optional 
+            Guess values of the decision variables, which will be refined by 
+            the optimization algorithm. This argument is currently used only by the 
+            'revised simplex' method, and can only be used if `x0` represents a 
+            basic feasible solution. 
+ 
+    revstack: list of functions 
+        the functions in the list reverse the operations of _presolve() 
+        the function signature is x_org = f(x_mod), where x_mod is the result 
+        of a presolve step and x_org the value at the start of the step 
+    complete : bool 
+        Whether the solution is was determined in presolve (``True`` if so) 
+ 
+    Returns 
+    ------- 
+    x : 1-D array 
+        Solution vector to original linear programming problem 
+    fun: float 
+        optimal objective value for original problem 
+    slack : 1-D array 
+        The (non-negative) slack in the upper bound constraints, that is, 
+        ``b_ub - A_ub @ x`` 
+    con : 1-D array 
+        The (nominally zero) residuals of the equality constraints, that is, 
+        ``b - A_eq @ x`` 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># note that all the inputs are the ORIGINAL, unmodified versions</span>
+    <span class="s6"># no rows, columns have been removed</span>
+
+    <span class="s1">c</span><span class="s3">, </span><span class="s1">A_ub</span><span class="s3">, </span><span class="s1">b_ub</span><span class="s3">, </span><span class="s1">A_eq</span><span class="s3">, </span><span class="s1">b_eq</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">integrality </span><span class="s3">= </span><span class="s1">postsolve_args</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">revstack</span><span class="s3">, </span><span class="s1">C</span><span class="s3">, </span><span class="s1">b_scale </span><span class="s3">= </span><span class="s1">postsolve_args</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]</span>
+
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">_unscale</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">C</span><span class="s3">, </span><span class="s1">b_scale</span><span class="s3">)</span>
+
+    <span class="s6"># Undo variable substitutions of _get_Abc()</span>
+    <span class="s6"># if &quot;complete&quot;, problem was solved in presolve; don't do anything here</span>
+    <span class="s1">n_x </span><span class="s3">= </span><span class="s1">bounds</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s2">if not </span><span class="s1">complete </span><span class="s2">and </span><span class="s1">bounds </span><span class="s2">is not None</span><span class="s3">:  </span><span class="s6"># bounds are never none, probably</span>
+        <span class="s1">n_unbounded </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">bi </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">bounds</span><span class="s3">):</span>
+            <span class="s1">lbi </span><span class="s3">= </span><span class="s1">bi</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+            <span class="s1">ubi </span><span class="s3">= </span><span class="s1">bi</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">lbi </span><span class="s3">== -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf </span><span class="s2">and </span><span class="s1">ubi </span><span class="s3">== </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">:</span>
+                <span class="s1">n_unbounded </span><span class="s3">+= </span><span class="s5">1</span>
+                <span class="s1">x</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">x</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] - </span><span class="s1">x</span><span class="s3">[</span><span class="s1">n_x </span><span class="s3">+ </span><span class="s1">n_unbounded </span><span class="s3">- </span><span class="s5">1</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">lbi </span><span class="s3">== -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">:</span>
+                    <span class="s1">x</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">ubi </span><span class="s3">- </span><span class="s1">x</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">x</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s1">lbi</span>
+    <span class="s6"># all the rest of the variables were artificial</span>
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">x</span><span class="s3">[:</span><span class="s1">n_x</span><span class="s3">]</span>
+
+    <span class="s6"># If there were variables removed from the problem, add them back into the</span>
+    <span class="s6"># solution vector</span>
+    <span class="s6"># Apply the functions in revstack (reverse direction)</span>
+    <span class="s2">for </span><span class="s1">rev </span><span class="s2">in </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">revstack</span><span class="s3">):</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">rev</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+
+    <span class="s1">fun </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">c</span><span class="s3">)</span>
+    <span class="s1">slack </span><span class="s3">= </span><span class="s1">b_ub </span><span class="s3">- </span><span class="s1">A_ub</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)  </span><span class="s6"># report slack for ORIGINAL UB constraints</span>
+    <span class="s6"># report residuals of ORIGINAL EQ constraints</span>
+    <span class="s1">con </span><span class="s3">= </span><span class="s1">b_eq </span><span class="s3">- </span><span class="s1">A_eq</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">x</span><span class="s3">, </span><span class="s1">fun</span><span class="s3">, </span><span class="s1">slack</span><span class="s3">, </span><span class="s1">con</span>
+
+
+<span class="s2">def </span><span class="s1">_check_result</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">fun</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">slack</span><span class="s3">, </span><span class="s1">con</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">tol</span><span class="s3">, </span><span class="s1">message</span><span class="s3">,</span>
+                  <span class="s1">integrality</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Check the validity of the provided solution. 
+ 
+    A valid (optimal) solution satisfies all bounds, all slack variables are 
+    negative and all equality constraint residuals are strictly non-zero. 
+    Further, the lower-bounds, upper-bounds, slack and residuals contain 
+    no nan values. 
+ 
+    Parameters 
+    ---------- 
+    x : 1-D array 
+        Solution vector to original linear programming problem 
+    fun: float 
+        optimal objective value for original problem 
+    status : int 
+        An integer representing the exit status of the optimization:: 
+ 
+             0 : Optimization terminated successfully 
+             1 : Iteration limit reached 
+             2 : Problem appears to be infeasible 
+             3 : Problem appears to be unbounded 
+             4 : Serious numerical difficulties encountered 
+ 
+    slack : 1-D array 
+        The (non-negative) slack in the upper bound constraints, that is, 
+        ``b_ub - A_ub @ x`` 
+    con : 1-D array 
+        The (nominally zero) residuals of the equality constraints, that is, 
+        ``b - A_eq @ x`` 
+    bounds : 2D array 
+        The bounds on the original variables ``x`` 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+    tol : float 
+        Termination tolerance; see [1]_ Section 4.5. 
+ 
+    Returns 
+    ------- 
+    status : int 
+        An integer representing the exit status of the optimization:: 
+ 
+             0 : Optimization terminated successfully 
+             1 : Iteration limit reached 
+             2 : Problem appears to be infeasible 
+             3 : Problem appears to be unbounded 
+             4 : Serious numerical difficulties encountered 
+ 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># Somewhat arbitrary</span>
+    <span class="s1">tol </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sqrt</span><span class="s3">(</span><span class="s1">tol</span><span class="s3">) * </span><span class="s5">10</span>
+
+    <span class="s2">if </span><span class="s1">x </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s6"># HiGHS does not provide x if infeasible/unbounded</span>
+        <span class="s2">if </span><span class="s1">status </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:  </span><span class="s6"># Observed with HiGHS Simplex Primal</span>
+            <span class="s1">status </span><span class="s3">= </span><span class="s5">4</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The solver did not provide a solution nor did it &quot;</span>
+                       <span class="s4">&quot;report a failure. Please submit a bug report.&quot;</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span>
+
+    <span class="s1">contains_nans </span><span class="s3">= (</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">x</span><span class="s3">).</span><span class="s1">any</span><span class="s3">()</span>
+        <span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">)</span>
+        <span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">slack</span><span class="s3">).</span><span class="s1">any</span><span class="s3">()</span>
+        <span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">con</span><span class="s3">).</span><span class="s1">any</span><span class="s3">()</span>
+    <span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">contains_nans</span><span class="s3">:</span>
+        <span class="s1">is_feasible </span><span class="s3">= </span><span class="s2">False</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">integrality </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">integrality </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">valid_bounds </span><span class="s3">= (</span><span class="s1">x </span><span class="s3">&gt;= </span><span class="s1">bounds</span><span class="s3">[:, </span><span class="s5">0</span><span class="s3">] - </span><span class="s1">tol</span><span class="s3">) &amp; (</span><span class="s1">x </span><span class="s3">&lt;= </span><span class="s1">bounds</span><span class="s3">[:, </span><span class="s5">1</span><span class="s3">] + </span><span class="s1">tol</span><span class="s3">)</span>
+        <span class="s6"># When integrality is 2 or 3, x must be within bounds OR take value 0</span>
+        <span class="s1">valid_bounds </span><span class="s3">|= (</span><span class="s1">integrality </span><span class="s3">&gt; </span><span class="s5">1</span><span class="s3">) &amp; </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isclose</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">=</span><span class="s1">tol</span><span class="s3">)</span>
+        <span class="s1">invalid_bounds </span><span class="s3">= </span><span class="s2">not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">valid_bounds</span><span class="s3">)</span>
+
+        <span class="s1">invalid_slack </span><span class="s3">= </span><span class="s1">status </span><span class="s3">!= </span><span class="s5">3 </span><span class="s2">and </span><span class="s3">(</span><span class="s1">slack </span><span class="s3">&lt; -</span><span class="s1">tol</span><span class="s3">).</span><span class="s1">any</span><span class="s3">()</span>
+        <span class="s1">invalid_con </span><span class="s3">= </span><span class="s1">status </span><span class="s3">!= </span><span class="s5">3 </span><span class="s2">and </span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">con</span><span class="s3">) &gt; </span><span class="s1">tol</span><span class="s3">).</span><span class="s1">any</span><span class="s3">()</span>
+        <span class="s1">is_feasible </span><span class="s3">= </span><span class="s2">not </span><span class="s3">(</span><span class="s1">invalid_bounds </span><span class="s2">or </span><span class="s1">invalid_slack </span><span class="s2">or </span><span class="s1">invalid_con</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">status </span><span class="s3">== </span><span class="s5">0 </span><span class="s2">and not </span><span class="s1">is_feasible</span><span class="s3">:</span>
+        <span class="s1">status </span><span class="s3">= </span><span class="s5">4</span>
+        <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The solution does not satisfy the constraints within the &quot;</span>
+                   <span class="s4">&quot;required tolerance of &quot; </span><span class="s3">+ </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">tol</span><span class="s2">:</span><span class="s4">.2E</span><span class="s2">}</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot;, yet &quot;</span>
+                   <span class="s4">&quot;no errors were raised and there is no certificate of &quot;</span>
+                   <span class="s4">&quot;infeasibility or unboundedness. Check whether &quot;</span>
+                   <span class="s4">&quot;the slack and constraint residuals are acceptable; &quot;</span>
+                   <span class="s4">&quot;if not, consider enabling presolve, adjusting the &quot;</span>
+                   <span class="s4">&quot;tolerance option(s), and/or using a different method. &quot;</span>
+                   <span class="s4">&quot;Please consider submitting a bug report.&quot;</span><span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">status </span><span class="s3">== </span><span class="s5">2 </span><span class="s2">and </span><span class="s1">is_feasible</span><span class="s3">:</span>
+        <span class="s6"># Occurs if the simplex method exits after phase one with a very</span>
+        <span class="s6"># nearly basic feasible solution. Postsolving can make the solution</span>
+        <span class="s6"># basic, however, this solution is NOT optimal</span>
+        <span class="s1">status </span><span class="s3">= </span><span class="s5">4</span>
+        <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;The solution is feasible, but the solver did not report &quot;</span>
+                   <span class="s4">&quot;that the solution was optimal. Please try a different &quot;</span>
+                   <span class="s4">&quot;method.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">status</span><span class="s3">, </span><span class="s1">message</span>
+</pre>
+</body>
+</html>

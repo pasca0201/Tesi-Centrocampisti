@@ -1,0 +1,545 @@
+<html>
+<head>
+<title>_remove_redundancy.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_remove_redundancy.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Routines for removing redundant (linearly dependent) equations from linear 
+programming equality constraints. 
+&quot;&quot;&quot;</span>
+<span class="s2"># Author: Matt Haberland</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg </span><span class="s3">import </span><span class="s1">svd</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">interpolative </span><span class="s3">import </span><span class="s1">interp_decomp</span>
+<span class="s3">import </span><span class="s1">scipy</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">blas </span><span class="s3">import </span><span class="s1">dtrsm</span>
+
+
+<span class="s3">def </span><span class="s1">_row_count</span><span class="s4">(</span><span class="s1">A</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Counts the number of nonzeros in each row of input array A. 
+    Nonzeros are defined as any element with absolute value greater than 
+    tol = 1e-13. This value should probably be an input to the function. 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D array 
+        An array representing a matrix 
+ 
+    Returns 
+    ------- 
+    rowcount : 1-D array 
+        Number of nonzeros in each row of A 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">tol </span><span class="s4">= </span><span class="s5">1e-13</span>
+    <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">((</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">A</span><span class="s4">) &gt; </span><span class="s1">tol</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s5">1</span><span class="s4">)).</span><span class="s1">flatten</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">_get_densest</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">eligibleRows</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Returns the index of the densest row of A. Ignores rows that are not 
+    eligible for consideration. 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D array 
+        An array representing a matrix 
+    eligibleRows : 1-D logical array 
+        Values indicate whether the corresponding row of A is eligible 
+        to be considered 
+ 
+    Returns 
+    ------- 
+    i_densest : int 
+        Index of the densest row in A eligible for consideration 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">rowCounts </span><span class="s4">= </span><span class="s1">_row_count</span><span class="s4">(</span><span class="s1">A</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">argmax</span><span class="s4">(</span><span class="s1">rowCounts </span><span class="s4">* </span><span class="s1">eligibleRows</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_remove_zero_rows</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Eliminates trivial equations from system of equations defined by Ax = b 
+   and identifies trivial infeasibilities 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D array 
+        An array representing the left-hand side of a system of equations 
+    b : 1-D array 
+        An array representing the right-hand side of a system of equations 
+ 
+    Returns 
+    ------- 
+    A : 2-D array 
+        An array representing the left-hand side of a system of equations 
+    b : 1-D array 
+        An array representing the right-hand side of a system of equations 
+    status: int 
+        An integer indicating the status of the removal operation 
+        0: No infeasibility identified 
+        2: Trivially infeasible 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">status </span><span class="s4">= </span><span class="s5">0</span>
+    <span class="s1">message </span><span class="s4">= </span><span class="s6">&quot;&quot;</span>
+    <span class="s1">i_zero </span><span class="s4">= </span><span class="s1">_row_count</span><span class="s4">(</span><span class="s1">A</span><span class="s4">) == </span><span class="s5">0</span>
+    <span class="s1">A </span><span class="s4">= </span><span class="s1">A</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logical_not</span><span class="s4">(</span><span class="s1">i_zero</span><span class="s4">), :]</span>
+    <span class="s3">if not </span><span class="s1">np</span><span class="s4">.</span><span class="s1">allclose</span><span class="s4">(</span><span class="s1">b</span><span class="s4">[</span><span class="s1">i_zero</span><span class="s4">], </span><span class="s5">0</span><span class="s4">):</span>
+        <span class="s1">status </span><span class="s4">= </span><span class="s5">2</span>
+        <span class="s1">message </span><span class="s4">= </span><span class="s6">&quot;There is a zero row in A_eq with a nonzero corresponding &quot; </span><span class="s1">\</span>
+                  <span class="s6">&quot;entry in b_eq. The problem is infeasible.&quot;</span>
+    <span class="s1">b </span><span class="s4">= </span><span class="s1">b</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">logical_not</span><span class="s4">(</span><span class="s1">i_zero</span><span class="s4">)]</span>
+    <span class="s3">return </span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+
+<span class="s3">def </span><span class="s1">bg_update_dense</span><span class="s4">(</span><span class="s1">plu</span><span class="s4">, </span><span class="s1">perm_r</span><span class="s4">, </span><span class="s1">v</span><span class="s4">, </span><span class="s1">j</span><span class="s4">):</span>
+    <span class="s1">LU</span><span class="s4">, </span><span class="s1">p </span><span class="s4">= </span><span class="s1">plu</span>
+
+    <span class="s1">vperm </span><span class="s4">= </span><span class="s1">v</span><span class="s4">[</span><span class="s1">perm_r</span><span class="s4">]</span>
+    <span class="s1">u </span><span class="s4">= </span><span class="s1">dtrsm</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">LU</span><span class="s4">, </span><span class="s1">vperm</span><span class="s4">, </span><span class="s1">lower</span><span class="s4">=</span><span class="s5">1</span><span class="s4">, </span><span class="s1">diag</span><span class="s4">=</span><span class="s5">1</span><span class="s4">)</span>
+    <span class="s1">LU</span><span class="s4">[:</span><span class="s1">j</span><span class="s4">+</span><span class="s5">1</span><span class="s4">, </span><span class="s1">j</span><span class="s4">] = </span><span class="s1">u</span><span class="s4">[:</span><span class="s1">j</span><span class="s4">+</span><span class="s5">1</span><span class="s4">]</span>
+    <span class="s1">l </span><span class="s4">= </span><span class="s1">u</span><span class="s4">[</span><span class="s1">j</span><span class="s4">+</span><span class="s5">1</span><span class="s4">:]</span>
+    <span class="s1">piv </span><span class="s4">= </span><span class="s1">LU</span><span class="s4">[</span><span class="s1">j</span><span class="s4">, </span><span class="s1">j</span><span class="s4">]</span>
+    <span class="s1">LU</span><span class="s4">[</span><span class="s1">j</span><span class="s4">+</span><span class="s5">1</span><span class="s4">:, </span><span class="s1">j</span><span class="s4">] += (</span><span class="s1">l</span><span class="s4">/</span><span class="s1">piv</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">LU</span><span class="s4">, </span><span class="s1">p</span>
+
+
+<span class="s3">def </span><span class="s1">_remove_redundancy_pivot_dense</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">true_rank</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Eliminates redundant equations from system of equations defined by Ax = b 
+    and identifies infeasibilities. 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D sparse matrix 
+        An matrix representing the left-hand side of a system of equations 
+    rhs : 1-D array 
+        An array representing the right-hand side of a system of equations 
+ 
+    Returns 
+    ------- 
+    A : 2-D sparse matrix 
+        A matrix representing the left-hand side of a system of equations 
+    rhs : 1-D array 
+        An array representing the right-hand side of a system of equations 
+    status: int 
+        An integer indicating the status of the system 
+        0: No infeasibility identified 
+        2: Trivially infeasible 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+ 
+    References 
+    ---------- 
+    .. [2] Andersen, Erling D. &quot;Finding all linearly dependent rows in 
+           large-scale linear programming.&quot; Optimization Methods and Software 
+           6.3 (1995): 219-227. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">tolapiv </span><span class="s4">= </span><span class="s5">1e-8</span>
+    <span class="s1">tolprimal </span><span class="s4">= </span><span class="s5">1e-8</span>
+    <span class="s1">status </span><span class="s4">= </span><span class="s5">0</span>
+    <span class="s1">message </span><span class="s4">= </span><span class="s6">&quot;&quot;</span>
+    <span class="s1">inconsistent </span><span class="s4">= (</span><span class="s6">&quot;There is a linear combination of rows of A_eq that &quot;</span>
+                    <span class="s6">&quot;results in zero, suggesting a redundant constraint. &quot;</span>
+                    <span class="s6">&quot;However the same linear combination of b_eq is &quot;</span>
+                    <span class="s6">&quot;nonzero, suggesting that the constraints conflict &quot;</span>
+                    <span class="s6">&quot;and the problem is infeasible.&quot;</span><span class="s4">)</span>
+    <span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message </span><span class="s4">= </span><span class="s1">_remove_zero_rows</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">status </span><span class="s4">!= </span><span class="s5">0</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+    <span class="s1">m</span><span class="s4">, </span><span class="s1">n </span><span class="s4">= </span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span>
+
+    <span class="s1">v </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">range</span><span class="s4">(</span><span class="s1">m</span><span class="s4">))      </span><span class="s2"># Artificial column indices.</span>
+    <span class="s1">b </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">v</span><span class="s4">)             </span><span class="s2"># Basis column indices.</span>
+    <span class="s2"># This is better as a list than a set because column order of basis matrix</span>
+    <span class="s2"># needs to be consistent.</span>
+    <span class="s1">d </span><span class="s4">= []                  </span><span class="s2"># Indices of dependent rows</span>
+    <span class="s1">perm_r </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s1">A_orig </span><span class="s4">= </span><span class="s1">A</span>
+    <span class="s1">A </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">m</span><span class="s4">, </span><span class="s1">m </span><span class="s4">+ </span><span class="s1">n</span><span class="s4">), </span><span class="s1">order</span><span class="s4">=</span><span class="s6">'F'</span><span class="s4">)</span>
+    <span class="s1">np</span><span class="s4">.</span><span class="s1">fill_diagonal</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s5">1</span><span class="s4">)</span>
+    <span class="s1">A</span><span class="s4">[:, </span><span class="s1">m</span><span class="s4">:] = </span><span class="s1">A_orig</span>
+    <span class="s1">e </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">m</span><span class="s4">)</span>
+
+    <span class="s1">js_candidates </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">arange</span><span class="s4">(</span><span class="s1">m</span><span class="s4">, </span><span class="s1">m</span><span class="s4">+</span><span class="s1">n</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">int</span><span class="s4">)  </span><span class="s2"># candidate columns for basis</span>
+    <span class="s2"># manual masking was faster than masked array</span>
+    <span class="s1">js_mask </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">js_candidates</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">bool</span><span class="s4">)</span>
+
+    <span class="s2"># Implements basic algorithm from [2]</span>
+    <span class="s2"># Uses some of the suggested improvements (removing zero rows and</span>
+    <span class="s2"># Bartels-Golub update idea).</span>
+    <span class="s2"># Removing column singletons would be easy, but it is not as important</span>
+    <span class="s2"># because the procedure is performed only on the equality constraint</span>
+    <span class="s2"># matrix from the original problem - not on the canonical form matrix,</span>
+    <span class="s2"># which would have many more column singletons due to slack variables</span>
+    <span class="s2"># from the inequality constraints.</span>
+    <span class="s2"># The thoughts on &quot;crashing&quot; the initial basis are only really useful if</span>
+    <span class="s2"># the matrix is sparse.</span>
+
+    <span class="s1">lu </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">eye</span><span class="s4">(</span><span class="s1">m</span><span class="s4">, </span><span class="s1">order</span><span class="s4">=</span><span class="s6">'F'</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">arange</span><span class="s4">(</span><span class="s1">m</span><span class="s4">)  </span><span class="s2"># initial LU is trivial</span>
+    <span class="s1">perm_r </span><span class="s4">= </span><span class="s1">lu</span><span class="s4">[</span><span class="s5">1</span><span class="s4">]</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">v</span><span class="s4">:</span>
+
+        <span class="s1">e</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s5">1</span>
+        <span class="s3">if </span><span class="s1">i </span><span class="s4">&gt; </span><span class="s5">0</span><span class="s4">:</span>
+            <span class="s1">e</span><span class="s4">[</span><span class="s1">i</span><span class="s4">-</span><span class="s5">1</span><span class="s4">] = </span><span class="s5">0</span>
+
+        <span class="s3">try</span><span class="s4">:  </span><span class="s2"># fails for i==0 and any time it gets ill-conditioned</span>
+            <span class="s1">j </span><span class="s4">= </span><span class="s1">b</span><span class="s4">[</span><span class="s1">i</span><span class="s4">-</span><span class="s5">1</span><span class="s4">]</span>
+            <span class="s1">lu </span><span class="s4">= </span><span class="s1">bg_update_dense</span><span class="s4">(</span><span class="s1">lu</span><span class="s4">, </span><span class="s1">perm_r</span><span class="s4">, </span><span class="s1">A</span><span class="s4">[:, </span><span class="s1">j</span><span class="s4">], </span><span class="s1">i</span><span class="s4">-</span><span class="s5">1</span><span class="s4">)</span>
+        <span class="s3">except </span><span class="s1">Exception</span><span class="s4">:</span>
+            <span class="s1">lu </span><span class="s4">= </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">lu_factor</span><span class="s4">(</span><span class="s1">A</span><span class="s4">[:, </span><span class="s1">b</span><span class="s4">])</span>
+            <span class="s1">LU</span><span class="s4">, </span><span class="s1">p </span><span class="s4">= </span><span class="s1">lu</span>
+            <span class="s1">perm_r </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">range</span><span class="s4">(</span><span class="s1">m</span><span class="s4">))</span>
+            <span class="s3">for </span><span class="s1">i1</span><span class="s4">, </span><span class="s1">i2 </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">p</span><span class="s4">):</span>
+                <span class="s1">perm_r</span><span class="s4">[</span><span class="s1">i1</span><span class="s4">], </span><span class="s1">perm_r</span><span class="s4">[</span><span class="s1">i2</span><span class="s4">] = </span><span class="s1">perm_r</span><span class="s4">[</span><span class="s1">i2</span><span class="s4">], </span><span class="s1">perm_r</span><span class="s4">[</span><span class="s1">i1</span><span class="s4">]</span>
+
+        <span class="s1">pi </span><span class="s4">= </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">lu_solve</span><span class="s4">(</span><span class="s1">lu</span><span class="s4">, </span><span class="s1">e</span><span class="s4">, </span><span class="s1">trans</span><span class="s4">=</span><span class="s5">1</span><span class="s4">)</span>
+
+        <span class="s1">js </span><span class="s4">= </span><span class="s1">js_candidates</span><span class="s4">[</span><span class="s1">js_mask</span><span class="s4">]</span>
+        <span class="s1">batch </span><span class="s4">= </span><span class="s5">50</span>
+
+        <span class="s2"># This is a tiny bit faster than looping over columns individually,</span>
+        <span class="s2"># like for j in js: if abs(A[:,j].transpose().dot(pi)) &gt; tolapiv:</span>
+        <span class="s3">for </span><span class="s1">j_index </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">len</span><span class="s4">(</span><span class="s1">js</span><span class="s4">), </span><span class="s1">batch</span><span class="s4">):</span>
+            <span class="s1">j_indices </span><span class="s4">= </span><span class="s1">js</span><span class="s4">[</span><span class="s1">j_index</span><span class="s4">: </span><span class="s1">min</span><span class="s4">(</span><span class="s1">j_index</span><span class="s4">+</span><span class="s1">batch</span><span class="s4">, </span><span class="s1">len</span><span class="s4">(</span><span class="s1">js</span><span class="s4">))]</span>
+
+            <span class="s1">c </span><span class="s4">= </span><span class="s1">abs</span><span class="s4">(</span><span class="s1">A</span><span class="s4">[:, </span><span class="s1">j_indices</span><span class="s4">].</span><span class="s1">transpose</span><span class="s4">().</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">pi</span><span class="s4">))</span>
+            <span class="s3">if </span><span class="s4">(</span><span class="s1">c </span><span class="s4">&gt; </span><span class="s1">tolapiv</span><span class="s4">).</span><span class="s1">any</span><span class="s4">():</span>
+                <span class="s1">j </span><span class="s4">= </span><span class="s1">js</span><span class="s4">[</span><span class="s1">j_index </span><span class="s4">+ </span><span class="s1">np</span><span class="s4">.</span><span class="s1">argmax</span><span class="s4">(</span><span class="s1">c</span><span class="s4">)]  </span><span class="s2"># very independent column</span>
+                <span class="s1">b</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">j</span>
+                <span class="s1">js_mask</span><span class="s4">[</span><span class="s1">j</span><span class="s4">-</span><span class="s1">m</span><span class="s4">] = </span><span class="s3">False</span>
+                <span class="s3">break</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">bibar </span><span class="s4">= </span><span class="s1">pi</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">rhs</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s5">1</span><span class="s4">, </span><span class="s5">1</span><span class="s4">))</span>
+            <span class="s1">bnorm </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">norm</span><span class="s4">(</span><span class="s1">rhs</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">abs</span><span class="s4">(</span><span class="s1">bibar</span><span class="s4">)/(</span><span class="s5">1</span><span class="s4">+</span><span class="s1">bnorm</span><span class="s4">) &gt; </span><span class="s1">tolprimal</span><span class="s4">:  </span><span class="s2"># inconsistent</span>
+                <span class="s1">status </span><span class="s4">= </span><span class="s5">2</span>
+                <span class="s1">message </span><span class="s4">= </span><span class="s1">inconsistent</span>
+                <span class="s3">return </span><span class="s1">A_orig</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+            <span class="s3">else</span><span class="s4">:  </span><span class="s2"># dependent</span>
+                <span class="s1">d</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">i</span><span class="s4">)</span>
+                <span class="s3">if </span><span class="s1">true_rank </span><span class="s3">is not None and </span><span class="s1">len</span><span class="s4">(</span><span class="s1">d</span><span class="s4">) == </span><span class="s1">m </span><span class="s4">- </span><span class="s1">true_rank</span><span class="s4">:</span>
+                    <span class="s3">break   </span><span class="s2"># found all redundancies</span>
+
+    <span class="s1">keep </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">range</span><span class="s4">(</span><span class="s1">m</span><span class="s4">))</span>
+    <span class="s1">keep </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">keep </span><span class="s4">- </span><span class="s1">set</span><span class="s4">(</span><span class="s1">d</span><span class="s4">))</span>
+    <span class="s3">return </span><span class="s1">A_orig</span><span class="s4">[</span><span class="s1">keep</span><span class="s4">, :], </span><span class="s1">rhs</span><span class="s4">[</span><span class="s1">keep</span><span class="s4">], </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+
+<span class="s3">def </span><span class="s1">_remove_redundancy_pivot_sparse</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Eliminates redundant equations from system of equations defined by Ax = b 
+    and identifies infeasibilities. 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D sparse matrix 
+        An matrix representing the left-hand side of a system of equations 
+    rhs : 1-D array 
+        An array representing the right-hand side of a system of equations 
+ 
+    Returns 
+    ------- 
+    A : 2-D sparse matrix 
+        A matrix representing the left-hand side of a system of equations 
+    rhs : 1-D array 
+        An array representing the right-hand side of a system of equations 
+    status: int 
+        An integer indicating the status of the system 
+        0: No infeasibility identified 
+        2: Trivially infeasible 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+ 
+    References 
+    ---------- 
+    .. [2] Andersen, Erling D. &quot;Finding all linearly dependent rows in 
+           large-scale linear programming.&quot; Optimization Methods and Software 
+           6.3 (1995): 219-227. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">tolapiv </span><span class="s4">= </span><span class="s5">1e-8</span>
+    <span class="s1">tolprimal </span><span class="s4">= </span><span class="s5">1e-8</span>
+    <span class="s1">status </span><span class="s4">= </span><span class="s5">0</span>
+    <span class="s1">message </span><span class="s4">= </span><span class="s6">&quot;&quot;</span>
+    <span class="s1">inconsistent </span><span class="s4">= (</span><span class="s6">&quot;There is a linear combination of rows of A_eq that &quot;</span>
+                    <span class="s6">&quot;results in zero, suggesting a redundant constraint. &quot;</span>
+                    <span class="s6">&quot;However the same linear combination of b_eq is &quot;</span>
+                    <span class="s6">&quot;nonzero, suggesting that the constraints conflict &quot;</span>
+                    <span class="s6">&quot;and the problem is infeasible.&quot;</span><span class="s4">)</span>
+    <span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message </span><span class="s4">= </span><span class="s1">_remove_zero_rows</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">status </span><span class="s4">!= </span><span class="s5">0</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+    <span class="s1">m</span><span class="s4">, </span><span class="s1">n </span><span class="s4">= </span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span>
+
+    <span class="s1">v </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">range</span><span class="s4">(</span><span class="s1">m</span><span class="s4">))      </span><span class="s2"># Artificial column indices.</span>
+    <span class="s1">b </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">v</span><span class="s4">)             </span><span class="s2"># Basis column indices.</span>
+    <span class="s2"># This is better as a list than a set because column order of basis matrix</span>
+    <span class="s2"># needs to be consistent.</span>
+    <span class="s1">k </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">range</span><span class="s4">(</span><span class="s1">m</span><span class="s4">, </span><span class="s1">m</span><span class="s4">+</span><span class="s1">n</span><span class="s4">))  </span><span class="s2"># Structural column indices.</span>
+    <span class="s1">d </span><span class="s4">= []                  </span><span class="s2"># Indices of dependent rows</span>
+
+    <span class="s1">A_orig </span><span class="s4">= </span><span class="s1">A</span>
+    <span class="s1">A </span><span class="s4">= </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">hstack</span><span class="s4">((</span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">eye</span><span class="s4">(</span><span class="s1">m</span><span class="s4">), </span><span class="s1">A</span><span class="s4">)).</span><span class="s1">tocsc</span><span class="s4">()</span>
+    <span class="s1">e </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">m</span><span class="s4">)</span>
+
+    <span class="s2"># Implements basic algorithm from [2]</span>
+    <span class="s2"># Uses only one of the suggested improvements (removing zero rows).</span>
+    <span class="s2"># Removing column singletons would be easy, but it is not as important</span>
+    <span class="s2"># because the procedure is performed only on the equality constraint</span>
+    <span class="s2"># matrix from the original problem - not on the canonical form matrix,</span>
+    <span class="s2"># which would have many more column singletons due to slack variables</span>
+    <span class="s2"># from the inequality constraints.</span>
+    <span class="s2"># The thoughts on &quot;crashing&quot; the initial basis sound useful, but the</span>
+    <span class="s2"># description of the procedure seems to assume a lot of familiarity with</span>
+    <span class="s2"># the subject; it is not very explicit. I already went through enough</span>
+    <span class="s2"># trouble getting the basic algorithm working, so I was not interested in</span>
+    <span class="s2"># trying to decipher this, too. (Overall, the paper is fraught with</span>
+    <span class="s2"># mistakes and ambiguities - which is strange, because the rest of</span>
+    <span class="s2"># Andersen's papers are quite good.)</span>
+    <span class="s2"># I tried and tried and tried to improve performance using the</span>
+    <span class="s2"># Bartels-Golub update. It works, but it's only practical if the LU</span>
+    <span class="s2"># factorization can be specialized as described, and that is not possible</span>
+    <span class="s2"># until the SciPy SuperLU interface permits control over column</span>
+    <span class="s2"># permutation - see issue #7700.</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">v</span><span class="s4">:</span>
+        <span class="s1">B </span><span class="s4">= </span><span class="s1">A</span><span class="s4">[:, </span><span class="s1">b</span><span class="s4">]</span>
+
+        <span class="s1">e</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s5">1</span>
+        <span class="s3">if </span><span class="s1">i </span><span class="s4">&gt; </span><span class="s5">0</span><span class="s4">:</span>
+            <span class="s1">e</span><span class="s4">[</span><span class="s1">i</span><span class="s4">-</span><span class="s5">1</span><span class="s4">] = </span><span class="s5">0</span>
+
+        <span class="s1">pi </span><span class="s4">= </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">spsolve</span><span class="s4">(</span><span class="s1">B</span><span class="s4">.</span><span class="s1">transpose</span><span class="s4">(), </span><span class="s1">e</span><span class="s4">).</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s5">1</span><span class="s4">, </span><span class="s5">1</span><span class="s4">)</span>
+
+        <span class="s1">js </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">k</span><span class="s4">-</span><span class="s1">set</span><span class="s4">(</span><span class="s1">b</span><span class="s4">))  </span><span class="s2"># not efficient, but this is not the time sink...</span>
+
+        <span class="s2"># Due to overhead, it tends to be faster (for problems tested) to</span>
+        <span class="s2"># compute the full matrix-vector product rather than individual</span>
+        <span class="s2"># vector-vector products (with the chance of terminating as soon</span>
+        <span class="s2"># as any are nonzero). For very large matrices, it might be worth</span>
+        <span class="s2"># it to compute, say, 100 or 1000 at a time and stop when a nonzero</span>
+        <span class="s2"># is found.</span>
+
+        <span class="s1">c </span><span class="s4">= (</span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">A</span><span class="s4">[:, </span><span class="s1">js</span><span class="s4">].</span><span class="s1">transpose</span><span class="s4">().</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">pi</span><span class="s4">)) &gt; </span><span class="s1">tolapiv</span><span class="s4">).</span><span class="s1">nonzero</span><span class="s4">()[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">c</span><span class="s4">) &gt; </span><span class="s5">0</span><span class="s4">:  </span><span class="s2"># independent</span>
+            <span class="s1">j </span><span class="s4">= </span><span class="s1">js</span><span class="s4">[</span><span class="s1">c</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]]</span>
+            <span class="s2"># in a previous commit, the previous line was changed to choose</span>
+            <span class="s2"># index j corresponding with the maximum dot product.</span>
+            <span class="s2"># While this avoided issues with almost</span>
+            <span class="s2"># singular matrices, it slowed the routine in most NETLIB tests.</span>
+            <span class="s2"># I think this is because these columns were denser than the</span>
+            <span class="s2"># first column with nonzero dot product (c[0]).</span>
+            <span class="s2"># It would be nice to have a heuristic that balances sparsity with</span>
+            <span class="s2"># high dot product, but I don't think it's worth the time to</span>
+            <span class="s2"># develop one right now. Bartels-Golub update is a much higher</span>
+            <span class="s2"># priority.</span>
+            <span class="s1">b</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">j  </span><span class="s2"># replace artificial column</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">bibar </span><span class="s4">= </span><span class="s1">pi</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">rhs</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s5">1</span><span class="s4">, </span><span class="s5">1</span><span class="s4">))</span>
+            <span class="s1">bnorm </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">norm</span><span class="s4">(</span><span class="s1">rhs</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">abs</span><span class="s4">(</span><span class="s1">bibar</span><span class="s4">)/(</span><span class="s5">1 </span><span class="s4">+ </span><span class="s1">bnorm</span><span class="s4">) &gt; </span><span class="s1">tolprimal</span><span class="s4">:</span>
+                <span class="s1">status </span><span class="s4">= </span><span class="s5">2</span>
+                <span class="s1">message </span><span class="s4">= </span><span class="s1">inconsistent</span>
+                <span class="s3">return </span><span class="s1">A_orig</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+            <span class="s3">else</span><span class="s4">:  </span><span class="s2"># dependent</span>
+                <span class="s1">d</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">i</span><span class="s4">)</span>
+
+    <span class="s1">keep </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">range</span><span class="s4">(</span><span class="s1">m</span><span class="s4">))</span>
+    <span class="s1">keep </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">keep </span><span class="s4">- </span><span class="s1">set</span><span class="s4">(</span><span class="s1">d</span><span class="s4">))</span>
+    <span class="s3">return </span><span class="s1">A_orig</span><span class="s4">[</span><span class="s1">keep</span><span class="s4">, :], </span><span class="s1">rhs</span><span class="s4">[</span><span class="s1">keep</span><span class="s4">], </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+
+<span class="s3">def </span><span class="s1">_remove_redundancy_svd</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Eliminates redundant equations from system of equations defined by Ax = b 
+    and identifies infeasibilities. 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D array 
+        An array representing the left-hand side of a system of equations 
+    b : 1-D array 
+        An array representing the right-hand side of a system of equations 
+ 
+    Returns 
+    ------- 
+    A : 2-D array 
+        An array representing the left-hand side of a system of equations 
+    b : 1-D array 
+        An array representing the right-hand side of a system of equations 
+    status: int 
+        An integer indicating the status of the system 
+        0: No infeasibility identified 
+        2: Trivially infeasible 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+ 
+    References 
+    ---------- 
+    .. [2] Andersen, Erling D. &quot;Finding all linearly dependent rows in 
+           large-scale linear programming.&quot; Optimization Methods and Software 
+           6.3 (1995): 219-227. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message </span><span class="s4">= </span><span class="s1">_remove_zero_rows</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">status </span><span class="s4">!= </span><span class="s5">0</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+    <span class="s1">U</span><span class="s4">, </span><span class="s1">s</span><span class="s4">, </span><span class="s1">Vh </span><span class="s4">= </span><span class="s1">svd</span><span class="s4">(</span><span class="s1">A</span><span class="s4">)</span>
+    <span class="s1">eps </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">float</span><span class="s4">).</span><span class="s1">eps</span>
+    <span class="s1">tol </span><span class="s4">= </span><span class="s1">s</span><span class="s4">.</span><span class="s1">max</span><span class="s4">() * </span><span class="s1">max</span><span class="s4">(</span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">) * </span><span class="s1">eps</span>
+
+    <span class="s1">m</span><span class="s4">, </span><span class="s1">n </span><span class="s4">= </span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span>
+    <span class="s1">s_min </span><span class="s4">= </span><span class="s1">s</span><span class="s4">[-</span><span class="s5">1</span><span class="s4">] </span><span class="s3">if </span><span class="s1">m </span><span class="s4">&lt;= </span><span class="s1">n </span><span class="s3">else </span><span class="s5">0</span>
+
+    <span class="s2"># this algorithm is faster than that of [2] when the nullspace is small</span>
+    <span class="s2"># but it could probably be improvement by randomized algorithms and with</span>
+    <span class="s2"># a sparse implementation.</span>
+    <span class="s2"># it relies on repeated singular value decomposition to find linearly</span>
+    <span class="s2"># dependent rows (as identified by columns of U that correspond with zero</span>
+    <span class="s2"># singular values). Unfortunately, only one row can be removed per</span>
+    <span class="s2"># decomposition (I tried otherwise; doing so can cause problems.)</span>
+    <span class="s2"># It would be nice if we could do truncated SVD like sp.sparse.linalg.svds</span>
+    <span class="s2"># but that function is unreliable at finding singular values near zero.</span>
+    <span class="s2"># Finding max eigenvalue L of A A^T, then largest eigenvalue (and</span>
+    <span class="s2"># associated eigenvector) of -A A^T + L I (I is identity) via power</span>
+    <span class="s2"># iteration would also work in theory, but is only efficient if the</span>
+    <span class="s2"># smallest nonzero eigenvalue of A A^T is close to the largest nonzero</span>
+    <span class="s2"># eigenvalue.</span>
+
+    <span class="s3">while </span><span class="s1">abs</span><span class="s4">(</span><span class="s1">s_min</span><span class="s4">) &lt; </span><span class="s1">tol</span><span class="s4">:</span>
+        <span class="s1">v </span><span class="s4">= </span><span class="s1">U</span><span class="s4">[:, -</span><span class="s5">1</span><span class="s4">]  </span><span class="s2"># TODO: return these so user can eliminate from problem?</span>
+        <span class="s2"># rows need to be represented in significant amount</span>
+        <span class="s1">eligibleRows </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">v</span><span class="s4">) &gt; </span><span class="s1">tol </span><span class="s4">* </span><span class="s5">10e6</span>
+        <span class="s3">if not </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">eligibleRows</span><span class="s4">) </span><span class="s3">or </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">v</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">A</span><span class="s4">)) &gt; </span><span class="s1">tol</span><span class="s4">):</span>
+            <span class="s1">status </span><span class="s4">= </span><span class="s5">4</span>
+            <span class="s1">message </span><span class="s4">= (</span><span class="s6">&quot;Due to numerical issues, redundant equality &quot;</span>
+                       <span class="s6">&quot;constraints could not be removed automatically. &quot;</span>
+                       <span class="s6">&quot;Try providing your constraint matrices as sparse &quot;</span>
+                       <span class="s6">&quot;matrices to activate sparse presolve, try turning &quot;</span>
+                       <span class="s6">&quot;off redundancy removal, or try turning off presolve &quot;</span>
+                       <span class="s6">&quot;altogether.&quot;</span><span class="s4">)</span>
+            <span class="s3">break</span>
+        <span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">v</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">b</span><span class="s4">)) &gt; </span><span class="s1">tol </span><span class="s4">* </span><span class="s5">100</span><span class="s4">):  </span><span class="s2"># factor of 100 to fix 10038 and 10349</span>
+            <span class="s1">status </span><span class="s4">= </span><span class="s5">2</span>
+            <span class="s1">message </span><span class="s4">= (</span><span class="s6">&quot;There is a linear combination of rows of A_eq that &quot;</span>
+                       <span class="s6">&quot;results in zero, suggesting a redundant constraint. &quot;</span>
+                       <span class="s6">&quot;However the same linear combination of b_eq is &quot;</span>
+                       <span class="s6">&quot;nonzero, suggesting that the constraints conflict &quot;</span>
+                       <span class="s6">&quot;and the problem is infeasible.&quot;</span><span class="s4">)</span>
+            <span class="s3">break</span>
+
+        <span class="s1">i_remove </span><span class="s4">= </span><span class="s1">_get_densest</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">eligibleRows</span><span class="s4">)</span>
+        <span class="s1">A </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">delete</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">i_remove</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s5">0</span><span class="s4">)</span>
+        <span class="s1">b </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">delete</span><span class="s4">(</span><span class="s1">b</span><span class="s4">, </span><span class="s1">i_remove</span><span class="s4">)</span>
+        <span class="s1">U</span><span class="s4">, </span><span class="s1">s</span><span class="s4">, </span><span class="s1">Vh </span><span class="s4">= </span><span class="s1">svd</span><span class="s4">(</span><span class="s1">A</span><span class="s4">)</span>
+        <span class="s1">m</span><span class="s4">, </span><span class="s1">n </span><span class="s4">= </span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span>
+        <span class="s1">s_min </span><span class="s4">= </span><span class="s1">s</span><span class="s4">[-</span><span class="s5">1</span><span class="s4">] </span><span class="s3">if </span><span class="s1">m </span><span class="s4">&lt;= </span><span class="s1">n </span><span class="s3">else </span><span class="s5">0</span>
+
+    <span class="s3">return </span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+
+<span class="s3">def </span><span class="s1">_remove_redundancy_id</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">rank</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">randomized</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Eliminates redundant equations from a system of equations. 
+ 
+    Eliminates redundant equations from system of equations defined by Ax = b 
+    and identifies infeasibilities. 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D array 
+        An array representing the left-hand side of a system of equations 
+    rhs : 1-D array 
+        An array representing the right-hand side of a system of equations 
+    rank : int, optional 
+        The rank of A 
+    randomized: bool, optional 
+        True for randomized interpolative decomposition 
+ 
+    Returns 
+    ------- 
+    A : 2-D array 
+        An array representing the left-hand side of a system of equations 
+    rhs : 1-D array 
+        An array representing the right-hand side of a system of equations 
+    status: int 
+        An integer indicating the status of the system 
+        0: No infeasibility identified 
+        2: Trivially infeasible 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">status </span><span class="s4">= </span><span class="s5">0</span>
+    <span class="s1">message </span><span class="s4">= </span><span class="s6">&quot;&quot;</span>
+    <span class="s1">inconsistent </span><span class="s4">= (</span><span class="s6">&quot;There is a linear combination of rows of A_eq that &quot;</span>
+                    <span class="s6">&quot;results in zero, suggesting a redundant constraint. &quot;</span>
+                    <span class="s6">&quot;However the same linear combination of b_eq is &quot;</span>
+                    <span class="s6">&quot;nonzero, suggesting that the constraints conflict &quot;</span>
+                    <span class="s6">&quot;and the problem is infeasible.&quot;</span><span class="s4">)</span>
+
+    <span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message </span><span class="s4">= </span><span class="s1">_remove_zero_rows</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">status </span><span class="s4">!= </span><span class="s5">0</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+
+    <span class="s1">m</span><span class="s4">, </span><span class="s1">n </span><span class="s4">= </span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span>
+
+    <span class="s1">k </span><span class="s4">= </span><span class="s1">rank</span>
+    <span class="s3">if </span><span class="s1">rank </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">k </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">matrix_rank</span><span class="s4">(</span><span class="s1">A</span><span class="s4">)</span>
+
+    <span class="s1">idx</span><span class="s4">, </span><span class="s1">proj </span><span class="s4">= </span><span class="s1">interp_decomp</span><span class="s4">(</span><span class="s1">A</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">k</span><span class="s4">, </span><span class="s1">rand</span><span class="s4">=</span><span class="s1">randomized</span><span class="s4">)</span>
+
+    <span class="s2"># first k entries in idx are indices of the independent rows</span>
+    <span class="s2"># remaining entries are the indices of the m-k dependent rows</span>
+    <span class="s2"># proj provides a linear combinations of rows of A2 that form the</span>
+    <span class="s2"># remaining m-k (dependent) rows. The same linear combination of entries</span>
+    <span class="s2"># in rhs2 must give the remaining m-k entries. If not, the system is</span>
+    <span class="s2"># inconsistent, and the problem is infeasible.</span>
+    <span class="s3">if not </span><span class="s1">np</span><span class="s4">.</span><span class="s1">allclose</span><span class="s4">(</span><span class="s1">rhs</span><span class="s4">[</span><span class="s1">idx</span><span class="s4">[:</span><span class="s1">k</span><span class="s4">]] @ </span><span class="s1">proj</span><span class="s4">, </span><span class="s1">rhs</span><span class="s4">[</span><span class="s1">idx</span><span class="s4">[</span><span class="s1">k</span><span class="s4">:]]):</span>
+        <span class="s1">status </span><span class="s4">= </span><span class="s5">2</span>
+        <span class="s1">message </span><span class="s4">= </span><span class="s1">inconsistent</span>
+
+    <span class="s2"># sort indices because the other redundancy removal routines leave rows</span>
+    <span class="s2"># in original order and tests were written with that in mind</span>
+    <span class="s1">idx </span><span class="s4">= </span><span class="s1">sorted</span><span class="s4">(</span><span class="s1">idx</span><span class="s4">[:</span><span class="s1">k</span><span class="s4">])</span>
+    <span class="s1">A2 </span><span class="s4">= </span><span class="s1">A</span><span class="s4">[</span><span class="s1">idx</span><span class="s4">, :]</span>
+    <span class="s1">rhs2 </span><span class="s4">= </span><span class="s1">rhs</span><span class="s4">[</span><span class="s1">idx</span><span class="s4">]</span>
+    <span class="s3">return </span><span class="s1">A2</span><span class="s4">, </span><span class="s1">rhs2</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span>
+</pre>
+</body>
+</html>

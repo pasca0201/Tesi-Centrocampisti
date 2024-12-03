@@ -1,0 +1,1172 @@
+<html>
+<head>
+<title>interpolatable.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+interpolatable.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Tool to find wrong contour order between different masters, and 
+other interpolatability (or lack thereof) issues. 
+ 
+Call as: 
+$ fonttools varLib.interpolatable font1 font2 ... 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s3">.</span><span class="s1">interpolatableHelpers </span><span class="s2">import </span><span class="s3">*</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">interpolatableTestContourOrder </span><span class="s2">import </span><span class="s1">test_contour_order</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">interpolatableTestStartingPoint </span><span class="s2">import </span><span class="s1">test_starting_point</span>
+<span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">pens</span><span class="s3">.</span><span class="s1">recordingPen </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">RecordingPen</span><span class="s3">,</span>
+    <span class="s1">DecomposingRecordingPen</span><span class="s3">,</span>
+    <span class="s1">lerpRecordings</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">pens</span><span class="s3">.</span><span class="s1">transformPen </span><span class="s2">import </span><span class="s1">TransformPen</span>
+<span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">pens</span><span class="s3">.</span><span class="s1">statisticsPen </span><span class="s2">import </span><span class="s1">StatisticsPen</span><span class="s3">, </span><span class="s1">StatisticsControlPen</span>
+<span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">pens</span><span class="s3">.</span><span class="s1">momentsPen </span><span class="s2">import </span><span class="s1">OpenContourError</span>
+<span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">varLib</span><span class="s3">.</span><span class="s1">models </span><span class="s2">import </span><span class="s1">piecewiseLinearMap</span><span class="s3">, </span><span class="s1">normalizeLocation</span>
+<span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">misc</span><span class="s3">.</span><span class="s1">fixedTools </span><span class="s2">import </span><span class="s1">floatToFixedToStr</span>
+<span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">misc</span><span class="s3">.</span><span class="s1">transform </span><span class="s2">import </span><span class="s1">Transform</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">defaultdict</span>
+<span class="s2">from </span><span class="s1">types </span><span class="s2">import </span><span class="s1">SimpleNamespace</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">wraps</span>
+<span class="s2">from </span><span class="s1">pprint </span><span class="s2">import </span><span class="s1">pformat</span>
+<span class="s2">from </span><span class="s1">math </span><span class="s2">import </span><span class="s1">sqrt</span><span class="s3">, </span><span class="s1">atan2</span><span class="s3">, </span><span class="s1">pi</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">os</span>
+
+<span class="s1">log </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s4">&quot;fontTools.varLib.interpolatable&quot;</span><span class="s3">)</span>
+
+<span class="s1">DEFAULT_TOLERANCE </span><span class="s3">= </span><span class="s5">0.95</span>
+<span class="s1">DEFAULT_KINKINESS </span><span class="s3">= </span><span class="s5">0.5</span>
+<span class="s1">DEFAULT_KINKINESS_LENGTH </span><span class="s3">= </span><span class="s5">0.002  </span><span class="s6"># ratio of UPEM</span>
+<span class="s1">DEFAULT_UPEM </span><span class="s3">= </span><span class="s5">1000</span>
+
+
+<span class="s2">class </span><span class="s1">Glyph</span><span class="s3">:</span>
+    <span class="s1">ITEMS </span><span class="s3">= (</span>
+        <span class="s4">&quot;recordings&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;greenStats&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;controlStats&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;greenVectors&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;controlVectors&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;nodeTypes&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;isomorphisms&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;points&quot;</span><span class="s3">,</span>
+        <span class="s4">&quot;openContours&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">glyphname</span><span class="s3">, </span><span class="s1">glyphset</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">name </span><span class="s3">= </span><span class="s1">glyphname</span>
+        <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ITEMS</span><span class="s3">:</span>
+            <span class="s1">setattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">item</span><span class="s3">, [])</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_populate</span><span class="s3">(</span><span class="s1">glyphset</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_fill_in</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">ix</span><span class="s3">):</span>
+        <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ITEMS</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">item</span><span class="s3">)) == </span><span class="s1">ix</span><span class="s3">:</span>
+                <span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">item</span><span class="s3">).</span><span class="s1">append</span><span class="s3">(</span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_populate</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">glyphset</span><span class="s3">):</span>
+        <span class="s1">glyph </span><span class="s3">= </span><span class="s1">glyphset</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">name</span><span class="s3">]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">doesnt_exist </span><span class="s3">= </span><span class="s1">glyph </span><span class="s2">is None</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">doesnt_exist</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">perContourPen </span><span class="s3">= </span><span class="s1">PerContourOrComponentPen</span><span class="s3">(</span><span class="s1">RecordingPen</span><span class="s3">, </span><span class="s1">glyphset</span><span class="s3">=</span><span class="s1">glyphset</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">glyph</span><span class="s3">.</span><span class="s1">draw</span><span class="s3">(</span><span class="s1">perContourPen</span><span class="s3">, </span><span class="s1">outputImpliedClosingLine</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">TypeError</span><span class="s3">:</span>
+            <span class="s1">glyph</span><span class="s3">.</span><span class="s1">draw</span><span class="s3">(</span><span class="s1">perContourPen</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">recordings </span><span class="s3">= </span><span class="s1">perContourPen</span><span class="s3">.</span><span class="s1">value</span>
+        <span class="s2">del </span><span class="s1">perContourPen</span>
+
+        <span class="s2">for </span><span class="s1">ix</span><span class="s3">, </span><span class="s1">contour </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">recordings</span><span class="s3">):</span>
+            <span class="s1">nodeTypes </span><span class="s3">= [</span><span class="s1">op </span><span class="s2">for </span><span class="s1">op</span><span class="s3">, </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">contour</span><span class="s3">.</span><span class="s1">value</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">nodeTypes</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">nodeTypes</span><span class="s3">)</span>
+
+            <span class="s1">greenStats </span><span class="s3">= </span><span class="s1">StatisticsPen</span><span class="s3">(</span><span class="s1">glyphset</span><span class="s3">=</span><span class="s1">glyphset</span><span class="s3">)</span>
+            <span class="s1">controlStats </span><span class="s3">= </span><span class="s1">StatisticsControlPen</span><span class="s3">(</span><span class="s1">glyphset</span><span class="s3">=</span><span class="s1">glyphset</span><span class="s3">)</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">contour</span><span class="s3">.</span><span class="s1">replay</span><span class="s3">(</span><span class="s1">greenStats</span><span class="s3">)</span>
+                <span class="s1">contour</span><span class="s3">.</span><span class="s1">replay</span><span class="s3">(</span><span class="s1">controlStats</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">openContours</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">OpenContourError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">openContours</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s2">True</span><span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_fill_in</span><span class="s3">(</span><span class="s1">ix</span><span class="s3">)</span>
+                <span class="s2">continue</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">greenStats</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">greenStats</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">controlStats</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">controlStats</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">greenVectors</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">contour_vector_from_stats</span><span class="s3">(</span><span class="s1">greenStats</span><span class="s3">))</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">controlVectors</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">contour_vector_from_stats</span><span class="s3">(</span><span class="s1">controlStats</span><span class="s3">))</span>
+
+            <span class="s6"># Check starting point</span>
+            <span class="s2">if </span><span class="s1">nodeTypes</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] == </span><span class="s4">&quot;addComponent&quot;</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_fill_in</span><span class="s3">(</span><span class="s1">ix</span><span class="s3">)</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">assert </span><span class="s1">nodeTypes</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] == </span><span class="s4">&quot;moveTo&quot;</span>
+            <span class="s2">assert </span><span class="s1">nodeTypes</span><span class="s3">[-</span><span class="s5">1</span><span class="s3">] </span><span class="s2">in </span><span class="s3">(</span><span class="s4">&quot;closePath&quot;</span><span class="s3">, </span><span class="s4">&quot;endPath&quot;</span><span class="s3">)</span>
+            <span class="s1">points </span><span class="s3">= </span><span class="s1">SimpleRecordingPointPen</span><span class="s3">()</span>
+            <span class="s1">converter </span><span class="s3">= </span><span class="s1">SegmentToPointPen</span><span class="s3">(</span><span class="s1">points</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s1">contour</span><span class="s3">.</span><span class="s1">replay</span><span class="s3">(</span><span class="s1">converter</span><span class="s3">)</span>
+            <span class="s6"># points.value is a list of pt,bool where bool is true if on-curve and false if off-curve;</span>
+            <span class="s6"># now check all rotations and mirror-rotations of the contour and build list of isomorphic</span>
+            <span class="s6"># possible starting points.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">points</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">points</span><span class="s3">.</span><span class="s1">value</span><span class="s3">)</span>
+
+            <span class="s1">isomorphisms </span><span class="s3">= []</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">isomorphisms</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">isomorphisms</span><span class="s3">)</span>
+
+            <span class="s6"># Add rotations</span>
+            <span class="s1">add_isomorphisms</span><span class="s3">(</span><span class="s1">points</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">isomorphisms</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s6"># Add mirrored rotations</span>
+            <span class="s1">add_isomorphisms</span><span class="s3">(</span><span class="s1">points</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">isomorphisms</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">draw</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">pen</span><span class="s3">, </span><span class="s1">countor_idx</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">countor_idx </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">contour </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">recordings</span><span class="s3">:</span>
+                <span class="s1">contour</span><span class="s3">.</span><span class="s1">draw</span><span class="s3">(</span><span class="s1">pen</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">recordings</span><span class="s3">[</span><span class="s1">countor_idx</span><span class="s3">].</span><span class="s1">draw</span><span class="s3">(</span><span class="s1">pen</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_gen</span><span class="s3">(</span>
+    <span class="s1">glyphsets</span><span class="s3">,</span>
+    <span class="s1">glyphs</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s1">names</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s1">ignore_missing</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+    <span class="s3">*,</span>
+    <span class="s1">locations</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s1">tolerance</span><span class="s3">=</span><span class="s1">DEFAULT_TOLERANCE</span><span class="s3">,</span>
+    <span class="s1">kinkiness</span><span class="s3">=</span><span class="s1">DEFAULT_KINKINESS</span><span class="s3">,</span>
+    <span class="s1">upem</span><span class="s3">=</span><span class="s1">DEFAULT_UPEM</span><span class="s3">,</span>
+    <span class="s1">show_all</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+    <span class="s1">discrete_axes</span><span class="s3">=[],</span>
+<span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">tolerance </span><span class="s3">&gt;= </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s1">tolerance </span><span class="s3">*= </span><span class="s5">0.01</span>
+    <span class="s2">assert </span><span class="s5">0 </span><span class="s3">&lt;= </span><span class="s1">tolerance </span><span class="s3">&lt;= </span><span class="s5">1</span>
+    <span class="s2">if </span><span class="s1">kinkiness </span><span class="s3">&gt;= </span><span class="s5">10</span><span class="s3">:</span>
+        <span class="s1">kinkiness </span><span class="s3">*= </span><span class="s5">0.01</span>
+    <span class="s2">assert </span><span class="s5">0 </span><span class="s3">&lt;= </span><span class="s1">kinkiness</span>
+
+    <span class="s1">names </span><span class="s3">= </span><span class="s1">names </span><span class="s2">or </span><span class="s3">[</span><span class="s1">repr</span><span class="s3">(</span><span class="s1">g</span><span class="s3">) </span><span class="s2">for </span><span class="s1">g </span><span class="s2">in </span><span class="s1">glyphsets</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">glyphs </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s6"># `glyphs = glyphsets[0].keys()` is faster, certainly, but doesn't allow for sparse TTFs/OTFs given out of order</span>
+        <span class="s6"># ... risks the sparse master being the first one, and only processing a subset of the glyphs</span>
+        <span class="s1">glyphs </span><span class="s3">= {</span><span class="s1">g </span><span class="s2">for </span><span class="s1">glyphset </span><span class="s2">in </span><span class="s1">glyphsets </span><span class="s2">for </span><span class="s1">g </span><span class="s2">in </span><span class="s1">glyphset</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()}</span>
+
+    <span class="s1">parents</span><span class="s3">, </span><span class="s1">order </span><span class="s3">= </span><span class="s1">find_parents_and_order</span><span class="s3">(</span>
+        <span class="s1">glyphsets</span><span class="s3">, </span><span class="s1">locations</span><span class="s3">, </span><span class="s1">discrete_axes</span><span class="s3">=</span><span class="s1">discrete_axes</span>
+    <span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">grand_parent</span><span class="s3">(</span><span class="s1">i</span><span class="s3">, </span><span class="s1">glyphname</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">i </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return None</span>
+        <span class="s1">i </span><span class="s3">= </span><span class="s1">parents</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">i </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return None</span>
+        <span class="s2">while </span><span class="s1">parents</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] </span><span class="s2">is not None and </span><span class="s1">glyphsets</span><span class="s3">[</span><span class="s1">i</span><span class="s3">][</span><span class="s1">glyphname</span><span class="s3">] </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">i </span><span class="s3">= </span><span class="s1">parents</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+        <span class="s2">return </span><span class="s1">i</span>
+
+    <span class="s2">for </span><span class="s1">glyph_name </span><span class="s2">in </span><span class="s1">glyphs</span><span class="s3">:</span>
+        <span class="s1">log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">&quot;Testing glyph %s&quot;</span><span class="s3">, </span><span class="s1">glyph_name</span><span class="s3">)</span>
+        <span class="s1">allGlyphs </span><span class="s3">= [</span><span class="s1">Glyph</span><span class="s3">(</span><span class="s1">glyph_name</span><span class="s3">, </span><span class="s1">glyphset</span><span class="s3">) </span><span class="s2">for </span><span class="s1">glyphset </span><span class="s2">in </span><span class="s1">glyphsets</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">([</span><span class="s5">1 </span><span class="s2">for </span><span class="s1">glyph </span><span class="s2">in </span><span class="s1">allGlyphs </span><span class="s2">if </span><span class="s1">glyph </span><span class="s2">is not None</span><span class="s3">]) &lt;= </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+        <span class="s2">for </span><span class="s1">master_idx</span><span class="s3">, (</span><span class="s1">glyph</span><span class="s3">, </span><span class="s1">glyphset</span><span class="s3">, </span><span class="s1">name</span><span class="s3">) </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span>
+            <span class="s1">zip</span><span class="s3">(</span><span class="s1">allGlyphs</span><span class="s3">, </span><span class="s1">glyphsets</span><span class="s3">, </span><span class="s1">names</span><span class="s3">)</span>
+        <span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">glyph</span><span class="s3">.</span><span class="s1">doesnt_exist</span><span class="s3">:</span>
+                <span class="s2">if not </span><span class="s1">ignore_missing</span><span class="s3">:</span>
+                    <span class="s2">yield </span><span class="s3">(</span>
+                        <span class="s1">glyph_name</span><span class="s3">,</span>
+                        <span class="s3">{</span>
+                            <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">MISSING</span><span class="s3">,</span>
+                            <span class="s4">&quot;master&quot;</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+                            <span class="s4">&quot;master_idx&quot;</span><span class="s3">: </span><span class="s1">master_idx</span><span class="s3">,</span>
+                        <span class="s3">},</span>
+                    <span class="s3">)</span>
+                <span class="s2">continue</span>
+
+            <span class="s1">has_open </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s2">for </span><span class="s1">ix</span><span class="s3">, </span><span class="s1">open </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">glyph</span><span class="s3">.</span><span class="s1">openContours</span><span class="s3">):</span>
+                <span class="s2">if not </span><span class="s1">open</span><span class="s3">:</span>
+                    <span class="s2">continue</span>
+                <span class="s1">has_open </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s2">yield </span><span class="s3">(</span>
+                    <span class="s1">glyph_name</span><span class="s3">,</span>
+                    <span class="s3">{</span>
+                        <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">OPEN_PATH</span><span class="s3">,</span>
+                        <span class="s4">&quot;master&quot;</span><span class="s3">: </span><span class="s1">name</span><span class="s3">,</span>
+                        <span class="s4">&quot;master_idx&quot;</span><span class="s3">: </span><span class="s1">master_idx</span><span class="s3">,</span>
+                        <span class="s4">&quot;contour&quot;</span><span class="s3">: </span><span class="s1">ix</span><span class="s3">,</span>
+                    <span class="s3">},</span>
+                <span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">has_open</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+
+        <span class="s1">matchings </span><span class="s3">= [</span><span class="s2">None</span><span class="s3">] * </span><span class="s1">len</span><span class="s3">(</span><span class="s1">glyphsets</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">m1idx </span><span class="s2">in </span><span class="s1">order</span><span class="s3">:</span>
+            <span class="s1">glyph1 </span><span class="s3">= </span><span class="s1">allGlyphs</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">glyph1 </span><span class="s2">is None or not </span><span class="s1">glyph1</span><span class="s3">.</span><span class="s1">nodeTypes</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">m0idx </span><span class="s3">= </span><span class="s1">grand_parent</span><span class="s3">(</span><span class="s1">m1idx</span><span class="s3">, </span><span class="s1">glyph_name</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">m0idx </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">glyph0 </span><span class="s3">= </span><span class="s1">allGlyphs</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">glyph0 </span><span class="s2">is None or not </span><span class="s1">glyph0</span><span class="s3">.</span><span class="s1">nodeTypes</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+
+            <span class="s6">#</span>
+            <span class="s6"># Basic compatibility checks</span>
+            <span class="s6">#</span>
+
+            <span class="s1">m1 </span><span class="s3">= </span><span class="s1">glyph0</span><span class="s3">.</span><span class="s1">nodeTypes</span>
+            <span class="s1">m0 </span><span class="s3">= </span><span class="s1">glyph1</span><span class="s3">.</span><span class="s1">nodeTypes</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">m0</span><span class="s3">) != </span><span class="s1">len</span><span class="s3">(</span><span class="s1">m1</span><span class="s3">):</span>
+                <span class="s2">yield </span><span class="s3">(</span>
+                    <span class="s1">glyph_name</span><span class="s3">,</span>
+                    <span class="s3">{</span>
+                        <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">PATH_COUNT</span><span class="s3">,</span>
+                        <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                        <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                        <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                        <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                        <span class="s4">&quot;value_1&quot;</span><span class="s3">: </span><span class="s1">len</span><span class="s3">(</span><span class="s1">m0</span><span class="s3">),</span>
+                        <span class="s4">&quot;value_2&quot;</span><span class="s3">: </span><span class="s1">len</span><span class="s3">(</span><span class="s1">m1</span><span class="s3">),</span>
+                    <span class="s3">},</span>
+                <span class="s3">)</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">if </span><span class="s1">m0 </span><span class="s3">!= </span><span class="s1">m1</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">pathIx</span><span class="s3">, (</span><span class="s1">nodes1</span><span class="s3">, </span><span class="s1">nodes2</span><span class="s3">) </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">m0</span><span class="s3">, </span><span class="s1">m1</span><span class="s3">)):</span>
+                    <span class="s2">if </span><span class="s1">nodes1 </span><span class="s3">== </span><span class="s1">nodes2</span><span class="s3">:</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">nodes1</span><span class="s3">) != </span><span class="s1">len</span><span class="s3">(</span><span class="s1">nodes2</span><span class="s3">):</span>
+                        <span class="s2">yield </span><span class="s3">(</span>
+                            <span class="s1">glyph_name</span><span class="s3">,</span>
+                            <span class="s3">{</span>
+                                <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">NODE_COUNT</span><span class="s3">,</span>
+                                <span class="s4">&quot;path&quot;</span><span class="s3">: </span><span class="s1">pathIx</span><span class="s3">,</span>
+                                <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                                <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                                <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                                <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                                <span class="s4">&quot;value_1&quot;</span><span class="s3">: </span><span class="s1">len</span><span class="s3">(</span><span class="s1">nodes1</span><span class="s3">),</span>
+                                <span class="s4">&quot;value_2&quot;</span><span class="s3">: </span><span class="s1">len</span><span class="s3">(</span><span class="s1">nodes2</span><span class="s3">),</span>
+                            <span class="s3">},</span>
+                        <span class="s3">)</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">for </span><span class="s1">nodeIx</span><span class="s3">, (</span><span class="s1">n1</span><span class="s3">, </span><span class="s1">n2</span><span class="s3">) </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">nodes1</span><span class="s3">, </span><span class="s1">nodes2</span><span class="s3">)):</span>
+                        <span class="s2">if </span><span class="s1">n1 </span><span class="s3">!= </span><span class="s1">n2</span><span class="s3">:</span>
+                            <span class="s2">yield </span><span class="s3">(</span>
+                                <span class="s1">glyph_name</span><span class="s3">,</span>
+                                <span class="s3">{</span>
+                                    <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">NODE_INCOMPATIBILITY</span><span class="s3">,</span>
+                                    <span class="s4">&quot;path&quot;</span><span class="s3">: </span><span class="s1">pathIx</span><span class="s3">,</span>
+                                    <span class="s4">&quot;node&quot;</span><span class="s3">: </span><span class="s1">nodeIx</span><span class="s3">,</span>
+                                    <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                                    <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                                    <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                                    <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                                    <span class="s4">&quot;value_1&quot;</span><span class="s3">: </span><span class="s1">n1</span><span class="s3">,</span>
+                                    <span class="s4">&quot;value_2&quot;</span><span class="s3">: </span><span class="s1">n2</span><span class="s3">,</span>
+                                <span class="s3">},</span>
+                            <span class="s3">)</span>
+                            <span class="s2">continue</span>
+
+            <span class="s6">#</span>
+            <span class="s6"># InterpolatableProblem.CONTOUR_ORDER check</span>
+            <span class="s6">#</span>
+
+            <span class="s1">this_tolerance</span><span class="s3">, </span><span class="s1">matching </span><span class="s3">= </span><span class="s1">test_contour_order</span><span class="s3">(</span><span class="s1">glyph0</span><span class="s3">, </span><span class="s1">glyph1</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">this_tolerance </span><span class="s3">&lt; </span><span class="s1">tolerance</span><span class="s3">:</span>
+                <span class="s2">yield </span><span class="s3">(</span>
+                    <span class="s1">glyph_name</span><span class="s3">,</span>
+                    <span class="s3">{</span>
+                        <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">CONTOUR_ORDER</span><span class="s3">,</span>
+                        <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                        <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                        <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                        <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                        <span class="s4">&quot;value_1&quot;</span><span class="s3">: </span><span class="s1">list</span><span class="s3">(</span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">matching</span><span class="s3">))),</span>
+                        <span class="s4">&quot;value_2&quot;</span><span class="s3">: </span><span class="s1">matching</span><span class="s3">,</span>
+                        <span class="s4">&quot;tolerance&quot;</span><span class="s3">: </span><span class="s1">this_tolerance</span><span class="s3">,</span>
+                    <span class="s3">},</span>
+                <span class="s3">)</span>
+                <span class="s1">matchings</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">] = </span><span class="s1">matching</span>
+
+            <span class="s6">#</span>
+            <span class="s6"># wrong-start-point / weight check</span>
+            <span class="s6">#</span>
+
+            <span class="s1">m0Isomorphisms </span><span class="s3">= </span><span class="s1">glyph0</span><span class="s3">.</span><span class="s1">isomorphisms</span>
+            <span class="s1">m1Isomorphisms </span><span class="s3">= </span><span class="s1">glyph1</span><span class="s3">.</span><span class="s1">isomorphisms</span>
+            <span class="s1">m0Vectors </span><span class="s3">= </span><span class="s1">glyph0</span><span class="s3">.</span><span class="s1">greenVectors</span>
+            <span class="s1">m1Vectors </span><span class="s3">= </span><span class="s1">glyph1</span><span class="s3">.</span><span class="s1">greenVectors</span>
+            <span class="s1">recording0 </span><span class="s3">= </span><span class="s1">glyph0</span><span class="s3">.</span><span class="s1">recordings</span>
+            <span class="s1">recording1 </span><span class="s3">= </span><span class="s1">glyph1</span><span class="s3">.</span><span class="s1">recordings</span>
+
+            <span class="s6"># If contour-order is wrong, adjust it</span>
+            <span class="s1">matching </span><span class="s3">= </span><span class="s1">matchings</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s3">(</span>
+                <span class="s1">matching </span><span class="s2">is not None and </span><span class="s1">m1Isomorphisms</span>
+            <span class="s3">):  </span><span class="s6"># m1 is empty for composite glyphs</span>
+                <span class="s1">m1Isomorphisms </span><span class="s3">= [</span><span class="s1">m1Isomorphisms</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">matching</span><span class="s3">]</span>
+                <span class="s1">m1Vectors </span><span class="s3">= [</span><span class="s1">m1Vectors</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">matching</span><span class="s3">]</span>
+                <span class="s1">recording1 </span><span class="s3">= [</span><span class="s1">recording1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">matching</span><span class="s3">]</span>
+
+            <span class="s1">midRecording </span><span class="s3">= []</span>
+            <span class="s2">for </span><span class="s1">c0</span><span class="s3">, </span><span class="s1">c1 </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">recording0</span><span class="s3">, </span><span class="s1">recording1</span><span class="s3">):</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">r </span><span class="s3">= </span><span class="s1">RecordingPen</span><span class="s3">()</span>
+                    <span class="s1">r</span><span class="s3">.</span><span class="s1">value </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">lerpRecordings</span><span class="s3">(</span><span class="s1">c0</span><span class="s3">.</span><span class="s1">value</span><span class="s3">, </span><span class="s1">c1</span><span class="s3">.</span><span class="s1">value</span><span class="s3">))</span>
+                    <span class="s1">midRecording</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">r</span><span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:</span>
+                    <span class="s6"># Mismatch because of the reordering above</span>
+                    <span class="s1">midRecording</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s2">None</span><span class="s3">)</span>
+
+            <span class="s2">for </span><span class="s1">ix</span><span class="s3">, (</span><span class="s1">contour0</span><span class="s3">, </span><span class="s1">contour1</span><span class="s3">) </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span>
+                <span class="s1">zip</span><span class="s3">(</span><span class="s1">m0Isomorphisms</span><span class="s3">, </span><span class="s1">m1Isomorphisms</span><span class="s3">)</span>
+            <span class="s3">):</span>
+                <span class="s2">if </span><span class="s3">(</span>
+                    <span class="s1">contour0 </span><span class="s2">is None</span>
+                    <span class="s2">or </span><span class="s1">contour1 </span><span class="s2">is None</span>
+                    <span class="s2">or </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour0</span><span class="s3">) == </span><span class="s5">0</span>
+                    <span class="s2">or </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour0</span><span class="s3">) != </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour1</span><span class="s3">)</span>
+                <span class="s3">):</span>
+                    <span class="s6"># We already reported this; or nothing to do; or not compatible</span>
+                    <span class="s6"># after reordering above.</span>
+                    <span class="s2">continue</span>
+
+                <span class="s1">this_tolerance</span><span class="s3">, </span><span class="s1">proposed_point</span><span class="s3">, </span><span class="s1">reverse </span><span class="s3">= </span><span class="s1">test_starting_point</span><span class="s3">(</span>
+                    <span class="s1">glyph0</span><span class="s3">, </span><span class="s1">glyph1</span><span class="s3">, </span><span class="s1">ix</span><span class="s3">, </span><span class="s1">tolerance</span><span class="s3">, </span><span class="s1">matching</span>
+                <span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">this_tolerance </span><span class="s3">&lt; </span><span class="s1">tolerance</span><span class="s3">:</span>
+                    <span class="s2">yield </span><span class="s3">(</span>
+                        <span class="s1">glyph_name</span><span class="s3">,</span>
+                        <span class="s3">{</span>
+                            <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">WRONG_START_POINT</span><span class="s3">,</span>
+                            <span class="s4">&quot;contour&quot;</span><span class="s3">: </span><span class="s1">ix</span><span class="s3">,</span>
+                            <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                            <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                            <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                            <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                            <span class="s4">&quot;value_1&quot;</span><span class="s3">: </span><span class="s5">0</span><span class="s3">,</span>
+                            <span class="s4">&quot;value_2&quot;</span><span class="s3">: </span><span class="s1">proposed_point</span><span class="s3">,</span>
+                            <span class="s4">&quot;reversed&quot;</span><span class="s3">: </span><span class="s1">reverse</span><span class="s3">,</span>
+                            <span class="s4">&quot;tolerance&quot;</span><span class="s3">: </span><span class="s1">this_tolerance</span><span class="s3">,</span>
+                        <span class="s3">},</span>
+                    <span class="s3">)</span>
+
+                <span class="s6"># Weight check.</span>
+                <span class="s6">#</span>
+                <span class="s6"># If contour could be mid-interpolated, and the two</span>
+                <span class="s6"># contours have the same area sign, proceeed.</span>
+                <span class="s6">#</span>
+                <span class="s6"># The sign difference can happen if it's a weirdo</span>
+                <span class="s6"># self-intersecting contour; ignore it.</span>
+                <span class="s1">contour </span><span class="s3">= </span><span class="s1">midRecording</span><span class="s3">[</span><span class="s1">ix</span><span class="s3">]</span>
+
+                <span class="s2">if </span><span class="s1">contour </span><span class="s2">and </span><span class="s3">(</span><span class="s1">m0Vectors</span><span class="s3">[</span><span class="s1">ix</span><span class="s3">][</span><span class="s5">0</span><span class="s3">] &lt; </span><span class="s5">0</span><span class="s3">) == (</span><span class="s1">m1Vectors</span><span class="s3">[</span><span class="s1">ix</span><span class="s3">][</span><span class="s5">0</span><span class="s3">] &lt; </span><span class="s5">0</span><span class="s3">):</span>
+                    <span class="s1">midStats </span><span class="s3">= </span><span class="s1">StatisticsPen</span><span class="s3">(</span><span class="s1">glyphset</span><span class="s3">=</span><span class="s2">None</span><span class="s3">)</span>
+                    <span class="s1">contour</span><span class="s3">.</span><span class="s1">replay</span><span class="s3">(</span><span class="s1">midStats</span><span class="s3">)</span>
+
+                    <span class="s1">midVector </span><span class="s3">= </span><span class="s1">contour_vector_from_stats</span><span class="s3">(</span><span class="s1">midStats</span><span class="s3">)</span>
+
+                    <span class="s1">m0Vec </span><span class="s3">= </span><span class="s1">m0Vectors</span><span class="s3">[</span><span class="s1">ix</span><span class="s3">]</span>
+                    <span class="s1">m1Vec </span><span class="s3">= </span><span class="s1">m1Vectors</span><span class="s3">[</span><span class="s1">ix</span><span class="s3">]</span>
+                    <span class="s1">size0 </span><span class="s3">= </span><span class="s1">m0Vec</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] * </span><span class="s1">m0Vec</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+                    <span class="s1">size1 </span><span class="s3">= </span><span class="s1">m1Vec</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] * </span><span class="s1">m1Vec</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+                    <span class="s1">midSize </span><span class="s3">= </span><span class="s1">midVector</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] * </span><span class="s1">midVector</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+
+                    <span class="s2">for </span><span class="s1">overweight</span><span class="s3">, </span><span class="s1">problem_type </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span>
+                        <span class="s3">(</span>
+                            <span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">UNDERWEIGHT</span><span class="s3">,</span>
+                            <span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">OVERWEIGHT</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s3">):</span>
+                        <span class="s2">if </span><span class="s1">overweight</span><span class="s3">:</span>
+                            <span class="s1">expectedSize </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">size0</span><span class="s3">, </span><span class="s1">size1</span><span class="s3">)</span>
+                            <span class="s2">continue</span>
+                        <span class="s2">else</span><span class="s3">:</span>
+                            <span class="s1">expectedSize </span><span class="s3">= </span><span class="s1">sqrt</span><span class="s3">(</span><span class="s1">size0 </span><span class="s3">* </span><span class="s1">size1</span><span class="s3">)</span>
+
+                        <span class="s1">log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+                            <span class="s4">&quot;%s: actual size %g; threshold size %g, master sizes: %g, %g&quot;</span><span class="s3">,</span>
+                            <span class="s1">problem_type</span><span class="s3">,</span>
+                            <span class="s1">midSize</span><span class="s3">,</span>
+                            <span class="s1">expectedSize</span><span class="s3">,</span>
+                            <span class="s1">size0</span><span class="s3">,</span>
+                            <span class="s1">size1</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+
+                        <span class="s2">if </span><span class="s3">(</span>
+                            <span class="s2">not </span><span class="s1">overweight </span><span class="s2">and </span><span class="s1">expectedSize </span><span class="s3">* </span><span class="s1">tolerance </span><span class="s3">&gt; </span><span class="s1">midSize </span><span class="s3">+ </span><span class="s5">1e-5</span>
+                        <span class="s3">) </span><span class="s2">or </span><span class="s3">(</span><span class="s1">overweight </span><span class="s2">and </span><span class="s5">1e-5 </span><span class="s3">+ </span><span class="s1">expectedSize </span><span class="s3">/ </span><span class="s1">tolerance </span><span class="s3">&lt; </span><span class="s1">midSize</span><span class="s3">):</span>
+                            <span class="s2">try</span><span class="s3">:</span>
+                                <span class="s2">if </span><span class="s1">overweight</span><span class="s3">:</span>
+                                    <span class="s1">this_tolerance </span><span class="s3">= </span><span class="s1">expectedSize </span><span class="s3">/ </span><span class="s1">midSize</span>
+                                <span class="s2">else</span><span class="s3">:</span>
+                                    <span class="s1">this_tolerance </span><span class="s3">= </span><span class="s1">midSize </span><span class="s3">/ </span><span class="s1">expectedSize</span>
+                            <span class="s2">except </span><span class="s1">ZeroDivisionError</span><span class="s3">:</span>
+                                <span class="s1">this_tolerance </span><span class="s3">= </span><span class="s5">0</span>
+                            <span class="s1">log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">&quot;tolerance %g&quot;</span><span class="s3">, </span><span class="s1">this_tolerance</span><span class="s3">)</span>
+                            <span class="s2">yield </span><span class="s3">(</span>
+                                <span class="s1">glyph_name</span><span class="s3">,</span>
+                                <span class="s3">{</span>
+                                    <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">problem_type</span><span class="s3">,</span>
+                                    <span class="s4">&quot;contour&quot;</span><span class="s3">: </span><span class="s1">ix</span><span class="s3">,</span>
+                                    <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                                    <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                                    <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                                    <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                                    <span class="s4">&quot;tolerance&quot;</span><span class="s3">: </span><span class="s1">this_tolerance</span><span class="s3">,</span>
+                                <span class="s3">},</span>
+                            <span class="s3">)</span>
+
+            <span class="s6">#</span>
+            <span class="s6"># &quot;kink&quot; detector</span>
+            <span class="s6">#</span>
+            <span class="s1">m0 </span><span class="s3">= </span><span class="s1">glyph0</span><span class="s3">.</span><span class="s1">points</span>
+            <span class="s1">m1 </span><span class="s3">= </span><span class="s1">glyph1</span><span class="s3">.</span><span class="s1">points</span>
+
+            <span class="s6"># If contour-order is wrong, adjust it</span>
+            <span class="s2">if </span><span class="s1">matchings</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">] </span><span class="s2">is not None and </span><span class="s1">m1</span><span class="s3">:  </span><span class="s6"># m1 is empty for composite glyphs</span>
+                <span class="s1">m1 </span><span class="s3">= [</span><span class="s1">m1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">matchings</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">]]</span>
+
+            <span class="s1">t </span><span class="s3">= </span><span class="s5">0.1  </span><span class="s6"># ~sin(radian(6)) for tolerance 0.95</span>
+            <span class="s1">deviation_threshold </span><span class="s3">= (</span>
+                <span class="s1">upem </span><span class="s3">* </span><span class="s1">DEFAULT_KINKINESS_LENGTH </span><span class="s3">* </span><span class="s1">DEFAULT_KINKINESS </span><span class="s3">/ </span><span class="s1">kinkiness</span>
+            <span class="s3">)</span>
+
+            <span class="s2">for </span><span class="s1">ix</span><span class="s3">, (</span><span class="s1">contour0</span><span class="s3">, </span><span class="s1">contour1</span><span class="s3">) </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">m0</span><span class="s3">, </span><span class="s1">m1</span><span class="s3">)):</span>
+                <span class="s2">if </span><span class="s3">(</span>
+                    <span class="s1">contour0 </span><span class="s2">is None</span>
+                    <span class="s2">or </span><span class="s1">contour1 </span><span class="s2">is None</span>
+                    <span class="s2">or </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour0</span><span class="s3">) == </span><span class="s5">0</span>
+                    <span class="s2">or </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour0</span><span class="s3">) != </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour1</span><span class="s3">)</span>
+                <span class="s3">):</span>
+                    <span class="s6"># We already reported this; or nothing to do; or not compatible</span>
+                    <span class="s6"># after reordering above.</span>
+                    <span class="s2">continue</span>
+
+                <span class="s6"># Walk the contour, keeping track of three consecutive points, with</span>
+                <span class="s6"># middle one being an on-curve. If the three are co-linear then</span>
+                <span class="s6"># check for kinky-ness.</span>
+                <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour0</span><span class="s3">)):</span>
+                    <span class="s1">pt0 </span><span class="s3">= </span><span class="s1">contour0</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+                    <span class="s1">pt1 </span><span class="s3">= </span><span class="s1">contour1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+                    <span class="s2">if not </span><span class="s1">pt0</span><span class="s3">[</span><span class="s5">1</span><span class="s3">] </span><span class="s2">or not </span><span class="s1">pt1</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]:</span>
+                        <span class="s6"># Skip off-curves</span>
+                        <span class="s2">continue</span>
+                    <span class="s1">pt0_prev </span><span class="s3">= </span><span class="s1">contour0</span><span class="s3">[</span><span class="s1">i </span><span class="s3">- </span><span class="s5">1</span><span class="s3">]</span>
+                    <span class="s1">pt1_prev </span><span class="s3">= </span><span class="s1">contour1</span><span class="s3">[</span><span class="s1">i </span><span class="s3">- </span><span class="s5">1</span><span class="s3">]</span>
+                    <span class="s1">pt0_next </span><span class="s3">= </span><span class="s1">contour0</span><span class="s3">[(</span><span class="s1">i </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">) % </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour0</span><span class="s3">)]</span>
+                    <span class="s1">pt1_next </span><span class="s3">= </span><span class="s1">contour1</span><span class="s3">[(</span><span class="s1">i </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">) % </span><span class="s1">len</span><span class="s3">(</span><span class="s1">contour1</span><span class="s3">)]</span>
+
+                    <span class="s2">if </span><span class="s1">pt0_prev</span><span class="s3">[</span><span class="s5">1</span><span class="s3">] </span><span class="s2">and </span><span class="s1">pt1_prev</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]:</span>
+                        <span class="s6"># At least one off-curve is required</span>
+                        <span class="s2">continue</span>
+                    <span class="s2">if </span><span class="s1">pt0_prev</span><span class="s3">[</span><span class="s5">1</span><span class="s3">] </span><span class="s2">and </span><span class="s1">pt1_prev</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]:</span>
+                        <span class="s6"># At least one off-curve is required</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s1">pt0 </span><span class="s3">= </span><span class="s1">complex</span><span class="s3">(*</span><span class="s1">pt0</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+                    <span class="s1">pt1 </span><span class="s3">= </span><span class="s1">complex</span><span class="s3">(*</span><span class="s1">pt1</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+                    <span class="s1">pt0_prev </span><span class="s3">= </span><span class="s1">complex</span><span class="s3">(*</span><span class="s1">pt0_prev</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+                    <span class="s1">pt1_prev </span><span class="s3">= </span><span class="s1">complex</span><span class="s3">(*</span><span class="s1">pt1_prev</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+                    <span class="s1">pt0_next </span><span class="s3">= </span><span class="s1">complex</span><span class="s3">(*</span><span class="s1">pt0_next</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+                    <span class="s1">pt1_next </span><span class="s3">= </span><span class="s1">complex</span><span class="s3">(*</span><span class="s1">pt1_next</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+
+                    <span class="s6"># We have three consecutive points. Check whether</span>
+                    <span class="s6"># they are colinear.</span>
+                    <span class="s1">d0_prev </span><span class="s3">= </span><span class="s1">pt0 </span><span class="s3">- </span><span class="s1">pt0_prev</span>
+                    <span class="s1">d0_next </span><span class="s3">= </span><span class="s1">pt0_next </span><span class="s3">- </span><span class="s1">pt0</span>
+                    <span class="s1">d1_prev </span><span class="s3">= </span><span class="s1">pt1 </span><span class="s3">- </span><span class="s1">pt1_prev</span>
+                    <span class="s1">d1_next </span><span class="s3">= </span><span class="s1">pt1_next </span><span class="s3">- </span><span class="s1">pt1</span>
+
+                    <span class="s1">sin0 </span><span class="s3">= </span><span class="s1">d0_prev</span><span class="s3">.</span><span class="s1">real </span><span class="s3">* </span><span class="s1">d0_next</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">- </span><span class="s1">d0_prev</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">* </span><span class="s1">d0_next</span><span class="s3">.</span><span class="s1">real</span>
+                    <span class="s1">sin1 </span><span class="s3">= </span><span class="s1">d1_prev</span><span class="s3">.</span><span class="s1">real </span><span class="s3">* </span><span class="s1">d1_next</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">- </span><span class="s1">d1_prev</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">* </span><span class="s1">d1_next</span><span class="s3">.</span><span class="s1">real</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">sin0 </span><span class="s3">/= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d0_prev</span><span class="s3">) * </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d0_next</span><span class="s3">)</span>
+                        <span class="s1">sin1 </span><span class="s3">/= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d1_prev</span><span class="s3">) * </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d1_next</span><span class="s3">)</span>
+                    <span class="s2">except </span><span class="s1">ZeroDivisionError</span><span class="s3">:</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s2">if </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">sin0</span><span class="s3">) &gt; </span><span class="s1">t </span><span class="s2">or </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">sin1</span><span class="s3">) &gt; </span><span class="s1">t</span><span class="s3">:</span>
+                        <span class="s6"># Not colinear / not smooth.</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s6"># Check the mid-point is actually, well, in the middle.</span>
+                    <span class="s1">dot0 </span><span class="s3">= </span><span class="s1">d0_prev</span><span class="s3">.</span><span class="s1">real </span><span class="s3">* </span><span class="s1">d0_next</span><span class="s3">.</span><span class="s1">real </span><span class="s3">+ </span><span class="s1">d0_prev</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">* </span><span class="s1">d0_next</span><span class="s3">.</span><span class="s1">imag</span>
+                    <span class="s1">dot1 </span><span class="s3">= </span><span class="s1">d1_prev</span><span class="s3">.</span><span class="s1">real </span><span class="s3">* </span><span class="s1">d1_next</span><span class="s3">.</span><span class="s1">real </span><span class="s3">+ </span><span class="s1">d1_prev</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">* </span><span class="s1">d1_next</span><span class="s3">.</span><span class="s1">imag</span>
+                    <span class="s2">if </span><span class="s1">dot0 </span><span class="s3">&lt; </span><span class="s5">0 </span><span class="s2">or </span><span class="s1">dot1 </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">:</span>
+                        <span class="s6"># Sharp corner.</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s6"># Fine, if handle ratios are similar...</span>
+                    <span class="s1">r0 </span><span class="s3">= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d0_prev</span><span class="s3">) / (</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d0_prev</span><span class="s3">) + </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d0_next</span><span class="s3">))</span>
+                    <span class="s1">r1 </span><span class="s3">= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d1_prev</span><span class="s3">) / (</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d1_prev</span><span class="s3">) + </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">d1_next</span><span class="s3">))</span>
+                    <span class="s1">r_diff </span><span class="s3">= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">r0 </span><span class="s3">- </span><span class="s1">r1</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">r_diff</span><span class="s3">) &lt; </span><span class="s1">t</span><span class="s3">:</span>
+                        <span class="s6"># Smooth enough.</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s1">mid </span><span class="s3">= (</span><span class="s1">pt0 </span><span class="s3">+ </span><span class="s1">pt1</span><span class="s3">) / </span><span class="s5">2</span>
+                    <span class="s1">mid_prev </span><span class="s3">= (</span><span class="s1">pt0_prev </span><span class="s3">+ </span><span class="s1">pt1_prev</span><span class="s3">) / </span><span class="s5">2</span>
+                    <span class="s1">mid_next </span><span class="s3">= (</span><span class="s1">pt0_next </span><span class="s3">+ </span><span class="s1">pt1_next</span><span class="s3">) / </span><span class="s5">2</span>
+
+                    <span class="s1">mid_d0 </span><span class="s3">= </span><span class="s1">mid </span><span class="s3">- </span><span class="s1">mid_prev</span>
+                    <span class="s1">mid_d1 </span><span class="s3">= </span><span class="s1">mid_next </span><span class="s3">- </span><span class="s1">mid</span>
+
+                    <span class="s1">sin_mid </span><span class="s3">= </span><span class="s1">mid_d0</span><span class="s3">.</span><span class="s1">real </span><span class="s3">* </span><span class="s1">mid_d1</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">- </span><span class="s1">mid_d0</span><span class="s3">.</span><span class="s1">imag </span><span class="s3">* </span><span class="s1">mid_d1</span><span class="s3">.</span><span class="s1">real</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">sin_mid </span><span class="s3">/= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">mid_d0</span><span class="s3">) * </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">mid_d1</span><span class="s3">)</span>
+                    <span class="s2">except </span><span class="s1">ZeroDivisionError</span><span class="s3">:</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s6"># ...or if the angles are similar.</span>
+                    <span class="s2">if </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">sin_mid</span><span class="s3">) * (</span><span class="s1">tolerance </span><span class="s3">* </span><span class="s1">kinkiness</span><span class="s3">) &lt;= </span><span class="s1">t</span><span class="s3">:</span>
+                        <span class="s6"># Smooth enough.</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s6"># How visible is the kink?</span>
+
+                    <span class="s1">cross </span><span class="s3">= </span><span class="s1">sin_mid </span><span class="s3">* </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">mid_d0</span><span class="s3">) * </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">mid_d1</span><span class="s3">)</span>
+                    <span class="s1">arc_len </span><span class="s3">= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">mid_d0 </span><span class="s3">+ </span><span class="s1">mid_d1</span><span class="s3">)</span>
+                    <span class="s1">deviation </span><span class="s3">= </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">cross </span><span class="s3">/ </span><span class="s1">arc_len</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">deviation </span><span class="s3">&lt; </span><span class="s1">deviation_threshold</span><span class="s3">:</span>
+                        <span class="s2">continue</span>
+                    <span class="s1">deviation_ratio </span><span class="s3">= </span><span class="s1">deviation </span><span class="s3">/ </span><span class="s1">arc_len</span>
+                    <span class="s2">if </span><span class="s1">deviation_ratio </span><span class="s3">&gt; </span><span class="s1">t</span><span class="s3">:</span>
+                        <span class="s2">continue</span>
+
+                    <span class="s1">this_tolerance </span><span class="s3">= </span><span class="s1">t </span><span class="s3">/ (</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">sin_mid</span><span class="s3">) * </span><span class="s1">kinkiness</span><span class="s3">)</span>
+
+                    <span class="s1">log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+                        <span class="s4">&quot;kink: deviation %g; deviation_ratio %g; sin_mid %g; r_diff %g&quot;</span><span class="s3">,</span>
+                        <span class="s1">deviation</span><span class="s3">,</span>
+                        <span class="s1">deviation_ratio</span><span class="s3">,</span>
+                        <span class="s1">sin_mid</span><span class="s3">,</span>
+                        <span class="s1">r_diff</span><span class="s3">,</span>
+                    <span class="s3">)</span>
+                    <span class="s1">log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">&quot;tolerance %g&quot;</span><span class="s3">, </span><span class="s1">this_tolerance</span><span class="s3">)</span>
+                    <span class="s2">yield </span><span class="s3">(</span>
+                        <span class="s1">glyph_name</span><span class="s3">,</span>
+                        <span class="s3">{</span>
+                            <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">KINK</span><span class="s3">,</span>
+                            <span class="s4">&quot;contour&quot;</span><span class="s3">: </span><span class="s1">ix</span><span class="s3">,</span>
+                            <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                            <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                            <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                            <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                            <span class="s4">&quot;value&quot;</span><span class="s3">: </span><span class="s1">i</span><span class="s3">,</span>
+                            <span class="s4">&quot;tolerance&quot;</span><span class="s3">: </span><span class="s1">this_tolerance</span><span class="s3">,</span>
+                        <span class="s3">},</span>
+                    <span class="s3">)</span>
+
+            <span class="s6">#</span>
+            <span class="s6"># --show-all</span>
+            <span class="s6">#</span>
+
+            <span class="s2">if </span><span class="s1">show_all</span><span class="s3">:</span>
+                <span class="s2">yield </span><span class="s3">(</span>
+                    <span class="s1">glyph_name</span><span class="s3">,</span>
+                    <span class="s3">{</span>
+                        <span class="s4">&quot;type&quot;</span><span class="s3">: </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">NOTHING</span><span class="s3">,</span>
+                        <span class="s4">&quot;master_1&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m0idx</span><span class="s3">],</span>
+                        <span class="s4">&quot;master_2&quot;</span><span class="s3">: </span><span class="s1">names</span><span class="s3">[</span><span class="s1">m1idx</span><span class="s3">],</span>
+                        <span class="s4">&quot;master_1_idx&quot;</span><span class="s3">: </span><span class="s1">m0idx</span><span class="s3">,</span>
+                        <span class="s4">&quot;master_2_idx&quot;</span><span class="s3">: </span><span class="s1">m1idx</span><span class="s3">,</span>
+                    <span class="s3">},</span>
+                <span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">wraps</span><span class="s3">(</span><span class="s1">test_gen</span><span class="s3">)</span>
+<span class="s2">def </span><span class="s1">test</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+    <span class="s1">problems </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">list</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">glyphname</span><span class="s3">, </span><span class="s1">problem </span><span class="s2">in </span><span class="s1">test_gen</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">):</span>
+        <span class="s1">problems</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">problem</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">problems</span>
+
+
+<span class="s2">def </span><span class="s1">recursivelyAddGlyph</span><span class="s3">(</span><span class="s1">glyphname</span><span class="s3">, </span><span class="s1">glyphset</span><span class="s3">, </span><span class="s1">ttGlyphSet</span><span class="s3">, </span><span class="s1">glyf</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">glyphname </span><span class="s2">in </span><span class="s1">glyphset</span><span class="s3">:</span>
+        <span class="s2">return</span>
+    <span class="s1">glyphset</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">] = </span><span class="s1">ttGlyphSet</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">]</span>
+
+    <span class="s2">for </span><span class="s1">component </span><span class="s2">in </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">glyf</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">], </span><span class="s4">&quot;components&quot;</span><span class="s3">, []):</span>
+        <span class="s1">recursivelyAddGlyph</span><span class="s3">(</span><span class="s1">component</span><span class="s3">.</span><span class="s1">glyphName</span><span class="s3">, </span><span class="s1">glyphset</span><span class="s3">, </span><span class="s1">ttGlyphSet</span><span class="s3">, </span><span class="s1">glyf</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">ensure_parent_dir</span><span class="s3">(</span><span class="s1">path</span><span class="s3">):</span>
+    <span class="s1">dirname </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">path</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">dirname</span><span class="s3">:</span>
+        <span class="s1">os</span><span class="s3">.</span><span class="s1">makedirs</span><span class="s3">(</span><span class="s1">dirname</span><span class="s3">, </span><span class="s1">exist_ok</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">path</span>
+
+
+<span class="s2">def </span><span class="s1">main</span><span class="s3">(</span><span class="s1">args</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Test for interpolatability issues between fonts&quot;&quot;&quot;</span>
+    <span class="s2">import </span><span class="s1">argparse</span>
+    <span class="s2">import </span><span class="s1">sys</span>
+
+    <span class="s1">parser </span><span class="s3">= </span><span class="s1">argparse</span><span class="s3">.</span><span class="s1">ArgumentParser</span><span class="s3">(</span>
+        <span class="s4">&quot;fonttools varLib.interpolatable&quot;</span><span class="s3">,</span>
+        <span class="s1">description</span><span class="s3">=</span><span class="s1">main</span><span class="s3">.</span><span class="s1">__doc__</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--glyphs&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Space-separate name of glyphs to check&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--show-all&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store_true&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Show all glyph pairs, even if no problems are found&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--tolerance&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">type</span><span class="s3">=</span><span class="s1">float</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Error tolerance. Between 0 and 1. Default %s&quot; </span><span class="s3">% </span><span class="s1">DEFAULT_TOLERANCE</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--kinkiness&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">type</span><span class="s3">=</span><span class="s1">float</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;How aggressively report kinks. Default %s&quot; </span><span class="s3">% </span><span class="s1">DEFAULT_KINKINESS</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--json&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store_true&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Output report in JSON format&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--pdf&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Output report in PDF format&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--ps&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Output report in PostScript format&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--html&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Output report in HTML format&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--quiet&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store_true&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Only exit with code 1 or 0, no output&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--output&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Output file for the problem report; Default: stdout&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--ignore-missing&quot;</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store_true&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Will not report glyphs missing from sparse masters as errors&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;inputs&quot;</span><span class="s3">,</span>
+        <span class="s1">metavar</span><span class="s3">=</span><span class="s4">&quot;FILE&quot;</span><span class="s3">,</span>
+        <span class="s1">type</span><span class="s3">=</span><span class="s1">str</span><span class="s3">,</span>
+        <span class="s1">nargs</span><span class="s3">=</span><span class="s4">&quot;+&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Input a single variable font / DesignSpace / Glyphs file, or multiple TTF/UFO files&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span>
+        <span class="s4">&quot;--name&quot;</span><span class="s3">,</span>
+        <span class="s1">metavar</span><span class="s3">=</span><span class="s4">&quot;NAME&quot;</span><span class="s3">,</span>
+        <span class="s1">type</span><span class="s3">=</span><span class="s1">str</span><span class="s3">,</span>
+        <span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;append&quot;</span><span class="s3">,</span>
+        <span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Name of the master to use in the report. If not provided, all are used.&quot;</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span><span class="s4">&quot;-v&quot;</span><span class="s3">, </span><span class="s4">&quot;--verbose&quot;</span><span class="s3">, </span><span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store_true&quot;</span><span class="s3">, </span><span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Run verbosely.&quot;</span><span class="s3">)</span>
+    <span class="s1">parser</span><span class="s3">.</span><span class="s1">add_argument</span><span class="s3">(</span><span class="s4">&quot;--debug&quot;</span><span class="s3">, </span><span class="s1">action</span><span class="s3">=</span><span class="s4">&quot;store_true&quot;</span><span class="s3">, </span><span class="s1">help</span><span class="s3">=</span><span class="s4">&quot;Run with debug output.&quot;</span><span class="s3">)</span>
+
+    <span class="s1">args </span><span class="s3">= </span><span class="s1">parser</span><span class="s3">.</span><span class="s1">parse_args</span><span class="s3">(</span><span class="s1">args</span><span class="s3">)</span>
+
+    <span class="s2">from </span><span class="s1">fontTools </span><span class="s2">import </span><span class="s1">configLogger</span>
+
+    <span class="s1">configLogger</span><span class="s3">(</span><span class="s1">level</span><span class="s3">=(</span><span class="s4">&quot;INFO&quot; </span><span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">verbose </span><span class="s2">else </span><span class="s4">&quot;ERROR&quot;</span><span class="s3">))</span>
+    <span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">:</span>
+        <span class="s1">configLogger</span><span class="s3">(</span><span class="s1">level</span><span class="s3">=</span><span class="s4">&quot;DEBUG&quot;</span><span class="s3">)</span>
+
+    <span class="s1">glyphs </span><span class="s3">= </span><span class="s1">args</span><span class="s3">.</span><span class="s1">glyphs</span><span class="s3">.</span><span class="s1">split</span><span class="s3">() </span><span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">glyphs </span><span class="s2">else None</span>
+
+    <span class="s2">from </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path </span><span class="s2">import </span><span class="s1">basename</span>
+
+    <span class="s1">fonts </span><span class="s3">= []</span>
+    <span class="s1">names </span><span class="s3">= []</span>
+    <span class="s1">locations </span><span class="s3">= []</span>
+    <span class="s1">discrete_axes </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+    <span class="s1">upem </span><span class="s3">= </span><span class="s1">DEFAULT_UPEM</span>
+
+    <span class="s1">original_args_inputs </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">) == </span><span class="s5">1</span><span class="s3">:</span>
+        <span class="s1">designspace </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">&quot;.designspace&quot;</span><span class="s3">):</span>
+            <span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">designspaceLib </span><span class="s2">import </span><span class="s1">DesignSpaceDocument</span>
+
+            <span class="s1">designspace </span><span class="s3">= </span><span class="s1">DesignSpaceDocument</span><span class="s3">.</span><span class="s1">fromfile</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+            <span class="s1">args</span><span class="s3">.</span><span class="s1">inputs </span><span class="s3">= [</span><span class="s1">master</span><span class="s3">.</span><span class="s1">path </span><span class="s2">for </span><span class="s1">master </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">sources</span><span class="s3">]</span>
+            <span class="s1">locations </span><span class="s3">= [</span><span class="s1">master</span><span class="s3">.</span><span class="s1">location </span><span class="s2">for </span><span class="s1">master </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">sources</span><span class="s3">]</span>
+            <span class="s1">discrete_axes </span><span class="s3">= {</span>
+                <span class="s1">a</span><span class="s3">.</span><span class="s1">name </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">axes </span><span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s4">&quot;minimum&quot;</span><span class="s3">)</span>
+            <span class="s3">}</span>
+            <span class="s1">axis_triples </span><span class="s3">= {</span>
+                <span class="s1">a</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: (</span><span class="s1">a</span><span class="s3">.</span><span class="s1">minimum</span><span class="s3">, </span><span class="s1">a</span><span class="s3">.</span><span class="s1">default</span><span class="s3">, </span><span class="s1">a</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">axes</span>
+                <span class="s2">if </span><span class="s1">a</span><span class="s3">.</span><span class="s1">name </span><span class="s2">not in </span><span class="s1">discrete_axes</span>
+            <span class="s3">}</span>
+            <span class="s1">axis_mappings </span><span class="s3">= {</span><span class="s1">a</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: </span><span class="s1">a</span><span class="s3">.</span><span class="s1">map </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">axes</span><span class="s3">}</span>
+            <span class="s1">axis_triples </span><span class="s3">= {</span>
+                <span class="s1">k</span><span class="s3">: </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">piecewiseLinearMap</span><span class="s3">(</span><span class="s1">v</span><span class="s3">, </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">axis_mappings</span><span class="s3">[</span><span class="s1">k</span><span class="s3">])) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">vv</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">vv </span><span class="s2">in </span><span class="s1">axis_triples</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()</span>
+            <span class="s3">}</span>
+
+        <span class="s2">elif </span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">endswith</span><span class="s3">((</span><span class="s4">&quot;.glyphs&quot;</span><span class="s3">, </span><span class="s4">&quot;.glyphspackage&quot;</span><span class="s3">)):</span>
+            <span class="s2">from </span><span class="s1">glyphsLib </span><span class="s2">import </span><span class="s1">GSFont</span><span class="s3">, </span><span class="s1">to_designspace</span>
+
+            <span class="s1">gsfont </span><span class="s3">= </span><span class="s1">GSFont</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+            <span class="s1">upem </span><span class="s3">= </span><span class="s1">gsfont</span><span class="s3">.</span><span class="s1">upm</span>
+            <span class="s1">designspace </span><span class="s3">= </span><span class="s1">to_designspace</span><span class="s3">(</span><span class="s1">gsfont</span><span class="s3">)</span>
+            <span class="s1">fonts </span><span class="s3">= [</span><span class="s1">source</span><span class="s3">.</span><span class="s1">font </span><span class="s2">for </span><span class="s1">source </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">sources</span><span class="s3">]</span>
+            <span class="s1">names </span><span class="s3">= [</span><span class="s4">&quot;%s-%s&quot; </span><span class="s3">% (</span><span class="s1">f</span><span class="s3">.</span><span class="s1">info</span><span class="s3">.</span><span class="s1">familyName</span><span class="s3">, </span><span class="s1">f</span><span class="s3">.</span><span class="s1">info</span><span class="s3">.</span><span class="s1">styleName</span><span class="s3">) </span><span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">fonts</span><span class="s3">]</span>
+            <span class="s1">args</span><span class="s3">.</span><span class="s1">inputs </span><span class="s3">= []</span>
+            <span class="s1">locations </span><span class="s3">= [</span><span class="s1">master</span><span class="s3">.</span><span class="s1">location </span><span class="s2">for </span><span class="s1">master </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">sources</span><span class="s3">]</span>
+            <span class="s1">axis_triples </span><span class="s3">= {</span>
+                <span class="s1">a</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: (</span><span class="s1">a</span><span class="s3">.</span><span class="s1">minimum</span><span class="s3">, </span><span class="s1">a</span><span class="s3">.</span><span class="s1">default</span><span class="s3">, </span><span class="s1">a</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">) </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">axes</span>
+            <span class="s3">}</span>
+            <span class="s1">axis_mappings </span><span class="s3">= {</span><span class="s1">a</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: </span><span class="s1">a</span><span class="s3">.</span><span class="s1">map </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">designspace</span><span class="s3">.</span><span class="s1">axes</span><span class="s3">}</span>
+            <span class="s1">axis_triples </span><span class="s3">= {</span>
+                <span class="s1">k</span><span class="s3">: </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">piecewiseLinearMap</span><span class="s3">(</span><span class="s1">v</span><span class="s3">, </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">axis_mappings</span><span class="s3">[</span><span class="s1">k</span><span class="s3">])) </span><span class="s2">for </span><span class="s1">v </span><span class="s2">in </span><span class="s1">vv</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">vv </span><span class="s2">in </span><span class="s1">axis_triples</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()</span>
+            <span class="s3">}</span>
+
+        <span class="s2">elif </span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">&quot;.ttf&quot;</span><span class="s3">):</span>
+            <span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">ttLib </span><span class="s2">import </span><span class="s1">TTFont</span>
+
+            <span class="s1">font </span><span class="s3">= </span><span class="s1">TTFont</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+            <span class="s1">upem </span><span class="s3">= </span><span class="s1">font</span><span class="s3">[</span><span class="s4">&quot;head&quot;</span><span class="s3">].</span><span class="s1">unitsPerEm</span>
+            <span class="s2">if </span><span class="s4">&quot;gvar&quot; </span><span class="s2">in </span><span class="s1">font</span><span class="s3">:</span>
+                <span class="s6"># Is variable font</span>
+
+                <span class="s1">fvar </span><span class="s3">= </span><span class="s1">font</span><span class="s3">[</span><span class="s4">&quot;fvar&quot;</span><span class="s3">]</span>
+                <span class="s1">axisMapping </span><span class="s3">= {}</span>
+                <span class="s2">for </span><span class="s1">axis </span><span class="s2">in </span><span class="s1">fvar</span><span class="s3">.</span><span class="s1">axes</span><span class="s3">:</span>
+                    <span class="s1">axisMapping</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">.</span><span class="s1">axisTag</span><span class="s3">] = {</span>
+                        <span class="s3">-</span><span class="s5">1</span><span class="s3">: </span><span class="s1">axis</span><span class="s3">.</span><span class="s1">minValue</span><span class="s3">,</span>
+                        <span class="s5">0</span><span class="s3">: </span><span class="s1">axis</span><span class="s3">.</span><span class="s1">defaultValue</span><span class="s3">,</span>
+                        <span class="s5">1</span><span class="s3">: </span><span class="s1">axis</span><span class="s3">.</span><span class="s1">maxValue</span><span class="s3">,</span>
+                    <span class="s3">}</span>
+                <span class="s1">normalized </span><span class="s3">= </span><span class="s2">False</span>
+                <span class="s2">if </span><span class="s4">&quot;avar&quot; </span><span class="s2">in </span><span class="s1">font</span><span class="s3">:</span>
+                    <span class="s1">avar </span><span class="s3">= </span><span class="s1">font</span><span class="s3">[</span><span class="s4">&quot;avar&quot;</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">avar</span><span class="s3">.</span><span class="s1">table</span><span class="s3">, </span><span class="s4">&quot;VarStore&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">):</span>
+                        <span class="s1">axisMapping </span><span class="s3">= {</span><span class="s1">tag</span><span class="s3">: {-</span><span class="s5">1</span><span class="s3">: -</span><span class="s5">1</span><span class="s3">, </span><span class="s5">0</span><span class="s3">: </span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">: </span><span class="s5">1</span><span class="s3">} </span><span class="s2">for </span><span class="s1">tag </span><span class="s2">in </span><span class="s1">axisMapping</span><span class="s3">}</span>
+                        <span class="s1">normalized </span><span class="s3">= </span><span class="s2">True</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s2">for </span><span class="s1">axisTag</span><span class="s3">, </span><span class="s1">segments </span><span class="s2">in </span><span class="s1">avar</span><span class="s3">.</span><span class="s1">segments</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+                            <span class="s1">fvarMapping </span><span class="s3">= </span><span class="s1">axisMapping</span><span class="s3">[</span><span class="s1">axisTag</span><span class="s3">].</span><span class="s1">copy</span><span class="s3">()</span>
+                            <span class="s2">for </span><span class="s1">location</span><span class="s3">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">segments</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+                                <span class="s1">axisMapping</span><span class="s3">[</span><span class="s1">axisTag</span><span class="s3">][</span><span class="s1">value</span><span class="s3">] = </span><span class="s1">piecewiseLinearMap</span><span class="s3">(</span>
+                                    <span class="s1">location</span><span class="s3">, </span><span class="s1">fvarMapping</span>
+                                <span class="s3">)</span>
+
+                <span class="s1">gvar </span><span class="s3">= </span><span class="s1">font</span><span class="s3">[</span><span class="s4">&quot;gvar&quot;</span><span class="s3">]</span>
+                <span class="s1">glyf </span><span class="s3">= </span><span class="s1">font</span><span class="s3">[</span><span class="s4">&quot;glyf&quot;</span><span class="s3">]</span>
+                <span class="s6"># Gather all glyphs at their &quot;master&quot; locations</span>
+                <span class="s1">ttGlyphSets </span><span class="s3">= {}</span>
+                <span class="s1">glyphsets </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">dict</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">glyphs </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s1">glyphs </span><span class="s3">= </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">gvar</span><span class="s3">.</span><span class="s1">variations</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">())</span>
+                <span class="s2">for </span><span class="s1">glyphname </span><span class="s2">in </span><span class="s1">glyphs</span><span class="s3">:</span>
+                    <span class="s2">for </span><span class="s1">var </span><span class="s2">in </span><span class="s1">gvar</span><span class="s3">.</span><span class="s1">variations</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">]:</span>
+                        <span class="s1">locDict </span><span class="s3">= {}</span>
+                        <span class="s1">loc </span><span class="s3">= []</span>
+                        <span class="s2">for </span><span class="s1">tag</span><span class="s3">, </span><span class="s1">val </span><span class="s2">in </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">var</span><span class="s3">.</span><span class="s1">axes</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()):</span>
+                            <span class="s1">locDict</span><span class="s3">[</span><span class="s1">tag</span><span class="s3">] = </span><span class="s1">val</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]</span>
+                            <span class="s1">loc</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s1">tag</span><span class="s3">, </span><span class="s1">val</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]))</span>
+
+                        <span class="s1">locTuple </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">loc</span><span class="s3">)</span>
+                        <span class="s2">if </span><span class="s1">locTuple </span><span class="s2">not in </span><span class="s1">ttGlyphSets</span><span class="s3">:</span>
+                            <span class="s1">ttGlyphSets</span><span class="s3">[</span><span class="s1">locTuple</span><span class="s3">] = </span><span class="s1">font</span><span class="s3">.</span><span class="s1">getGlyphSet</span><span class="s3">(</span>
+                                <span class="s1">location</span><span class="s3">=</span><span class="s1">locDict</span><span class="s3">, </span><span class="s1">normalized</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">recalcBounds</span><span class="s3">=</span><span class="s2">False</span>
+                            <span class="s3">)</span>
+
+                        <span class="s1">recursivelyAddGlyph</span><span class="s3">(</span>
+                            <span class="s1">glyphname</span><span class="s3">, </span><span class="s1">glyphsets</span><span class="s3">[</span><span class="s1">locTuple</span><span class="s3">], </span><span class="s1">ttGlyphSets</span><span class="s3">[</span><span class="s1">locTuple</span><span class="s3">], </span><span class="s1">glyf</span>
+                        <span class="s3">)</span>
+
+                <span class="s1">names </span><span class="s3">= [</span><span class="s4">&quot;''&quot;</span><span class="s3">]</span>
+                <span class="s1">fonts </span><span class="s3">= [</span><span class="s1">font</span><span class="s3">.</span><span class="s1">getGlyphSet</span><span class="s3">()]</span>
+                <span class="s1">locations </span><span class="s3">= [{}]</span>
+                <span class="s1">axis_triples </span><span class="s3">= {</span><span class="s1">a</span><span class="s3">: (-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, +</span><span class="s5">1</span><span class="s3">) </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">axisMapping</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">())}</span>
+                <span class="s2">for </span><span class="s1">locTuple </span><span class="s2">in </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">glyphsets</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">(), </span><span class="s1">key</span><span class="s3">=</span><span class="s2">lambda </span><span class="s1">v</span><span class="s3">: (</span><span class="s1">len</span><span class="s3">(</span><span class="s1">v</span><span class="s3">), </span><span class="s1">v</span><span class="s3">)):</span>
+                    <span class="s1">name </span><span class="s3">= (</span>
+                        <span class="s4">&quot;'&quot;</span>
+                        <span class="s3">+ </span><span class="s4">&quot; &quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span>
+                            <span class="s4">&quot;%s=%s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">k</span><span class="s3">,</span>
+                                <span class="s1">floatToFixedToStr</span><span class="s3">(</span>
+                                    <span class="s1">piecewiseLinearMap</span><span class="s3">(</span><span class="s1">v</span><span class="s3">, </span><span class="s1">axisMapping</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]), </span><span class="s5">14</span>
+                                <span class="s3">),</span>
+                            <span class="s3">)</span>
+                            <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">locTuple</span>
+                        <span class="s3">)</span>
+                        <span class="s3">+ </span><span class="s4">&quot;'&quot;</span>
+                    <span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">normalized</span><span class="s3">:</span>
+                        <span class="s1">name </span><span class="s3">+= </span><span class="s4">&quot; (normalized)&quot;</span>
+                    <span class="s1">names</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+                    <span class="s1">fonts</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">glyphsets</span><span class="s3">[</span><span class="s1">locTuple</span><span class="s3">])</span>
+                    <span class="s1">locations</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">dict</span><span class="s3">(</span><span class="s1">locTuple</span><span class="s3">))</span>
+                <span class="s1">args</span><span class="s3">.</span><span class="s1">ignore_missing </span><span class="s3">= </span><span class="s2">True</span>
+                <span class="s1">args</span><span class="s3">.</span><span class="s1">inputs </span><span class="s3">= []</span>
+
+    <span class="s2">if not </span><span class="s1">locations</span><span class="s3">:</span>
+        <span class="s1">locations </span><span class="s3">= [{} </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">fonts</span><span class="s3">]</span>
+
+    <span class="s2">for </span><span class="s1">filename </span><span class="s2">in </span><span class="s1">args</span><span class="s3">.</span><span class="s1">inputs</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">filename</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s4">&quot;.ufo&quot;</span><span class="s3">):</span>
+            <span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">ufoLib </span><span class="s2">import </span><span class="s1">UFOReader</span>
+
+            <span class="s1">font </span><span class="s3">= </span><span class="s1">UFOReader</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+            <span class="s1">info </span><span class="s3">= </span><span class="s1">SimpleNamespace</span><span class="s3">()</span>
+            <span class="s1">font</span><span class="s3">.</span><span class="s1">readInfo</span><span class="s3">(</span><span class="s1">info</span><span class="s3">)</span>
+            <span class="s1">upem </span><span class="s3">= </span><span class="s1">info</span><span class="s3">.</span><span class="s1">unitsPerEm</span>
+            <span class="s1">fonts</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">font</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">from </span><span class="s1">fontTools</span><span class="s3">.</span><span class="s1">ttLib </span><span class="s2">import </span><span class="s1">TTFont</span>
+
+            <span class="s1">font </span><span class="s3">= </span><span class="s1">TTFont</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+            <span class="s1">upem </span><span class="s3">= </span><span class="s1">font</span><span class="s3">[</span><span class="s4">&quot;head&quot;</span><span class="s3">].</span><span class="s1">unitsPerEm</span>
+            <span class="s1">fonts</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">font</span><span class="s3">)</span>
+
+        <span class="s1">names</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">basename</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">).</span><span class="s1">rsplit</span><span class="s3">(</span><span class="s4">&quot;.&quot;</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">])</span>
+
+    <span class="s1">glyphsets </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">font </span><span class="s2">in </span><span class="s1">fonts</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">font</span><span class="s3">, </span><span class="s4">&quot;getGlyphSet&quot;</span><span class="s3">):</span>
+            <span class="s1">glyphset </span><span class="s3">= </span><span class="s1">font</span><span class="s3">.</span><span class="s1">getGlyphSet</span><span class="s3">()</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">glyphset </span><span class="s3">= </span><span class="s1">font</span>
+        <span class="s1">glyphsets</span><span class="s3">.</span><span class="s1">append</span><span class="s3">({</span><span class="s1">k</span><span class="s3">: </span><span class="s1">glyphset</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">glyphset</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()})</span>
+
+    <span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">name</span><span class="s3">:</span>
+        <span class="s1">accepted_names </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s1">glyphsets </span><span class="s3">= [</span>
+            <span class="s1">glyphset</span>
+            <span class="s2">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">glyphset </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">names</span><span class="s3">, </span><span class="s1">glyphsets</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">accepted_names</span>
+        <span class="s3">]</span>
+        <span class="s1">locations </span><span class="s3">= [</span>
+            <span class="s1">location</span>
+            <span class="s2">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">location </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">names</span><span class="s3">, </span><span class="s1">locations</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">accepted_names</span>
+        <span class="s3">]</span>
+        <span class="s1">names </span><span class="s3">= [</span><span class="s1">name </span><span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">names </span><span class="s2">if </span><span class="s1">name </span><span class="s2">in </span><span class="s1">accepted_names</span><span class="s3">]</span>
+
+    <span class="s2">if not </span><span class="s1">glyphs</span><span class="s3">:</span>
+        <span class="s1">glyphs </span><span class="s3">= </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">set</span><span class="s3">([</span><span class="s1">gn </span><span class="s2">for </span><span class="s1">glyphset </span><span class="s2">in </span><span class="s1">glyphsets </span><span class="s2">for </span><span class="s1">gn </span><span class="s2">in </span><span class="s1">glyphset</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">()]))</span>
+
+    <span class="s1">glyphsSet </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">glyphs</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">glyphset </span><span class="s2">in </span><span class="s1">glyphsets</span><span class="s3">:</span>
+        <span class="s1">glyphSetGlyphNames </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">glyphset</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">())</span>
+        <span class="s1">diff </span><span class="s3">= </span><span class="s1">glyphsSet </span><span class="s3">- </span><span class="s1">glyphSetGlyphNames</span>
+        <span class="s2">if </span><span class="s1">diff</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">gn </span><span class="s2">in </span><span class="s1">diff</span><span class="s3">:</span>
+                <span class="s1">glyphset</span><span class="s3">[</span><span class="s1">gn</span><span class="s3">] = </span><span class="s2">None</span>
+
+    <span class="s6"># Normalize locations</span>
+    <span class="s1">locations </span><span class="s3">= [</span>
+        <span class="s3">{</span>
+            <span class="s3">**</span><span class="s1">normalizeLocation</span><span class="s3">(</span><span class="s1">loc</span><span class="s3">, </span><span class="s1">axis_triples</span><span class="s3">),</span>
+            <span class="s3">**{</span><span class="s1">k</span><span class="s3">: </span><span class="s1">v </span><span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">loc</span><span class="s3">.</span><span class="s1">items</span><span class="s3">() </span><span class="s2">if </span><span class="s1">k </span><span class="s2">in </span><span class="s1">discrete_axes</span><span class="s3">},</span>
+        <span class="s3">}</span>
+        <span class="s2">for </span><span class="s1">loc </span><span class="s2">in </span><span class="s1">locations</span>
+    <span class="s3">]</span>
+    <span class="s1">tolerance </span><span class="s3">= </span><span class="s1">args</span><span class="s3">.</span><span class="s1">tolerance </span><span class="s2">or </span><span class="s1">DEFAULT_TOLERANCE</span>
+    <span class="s1">kinkiness </span><span class="s3">= </span><span class="s1">args</span><span class="s3">.</span><span class="s1">kinkiness </span><span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">kinkiness </span><span class="s2">is not None else </span><span class="s1">DEFAULT_KINKINESS</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">&quot;Running on %d glyphsets&quot;</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">glyphsets</span><span class="s3">))</span>
+        <span class="s1">log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">&quot;Locations: %s&quot;</span><span class="s3">, </span><span class="s1">pformat</span><span class="s3">(</span><span class="s1">locations</span><span class="s3">))</span>
+        <span class="s1">problems_gen </span><span class="s3">= </span><span class="s1">test_gen</span><span class="s3">(</span>
+            <span class="s1">glyphsets</span><span class="s3">,</span>
+            <span class="s1">glyphs</span><span class="s3">=</span><span class="s1">glyphs</span><span class="s3">,</span>
+            <span class="s1">names</span><span class="s3">=</span><span class="s1">names</span><span class="s3">,</span>
+            <span class="s1">locations</span><span class="s3">=</span><span class="s1">locations</span><span class="s3">,</span>
+            <span class="s1">upem</span><span class="s3">=</span><span class="s1">upem</span><span class="s3">,</span>
+            <span class="s1">ignore_missing</span><span class="s3">=</span><span class="s1">args</span><span class="s3">.</span><span class="s1">ignore_missing</span><span class="s3">,</span>
+            <span class="s1">tolerance</span><span class="s3">=</span><span class="s1">tolerance</span><span class="s3">,</span>
+            <span class="s1">kinkiness</span><span class="s3">=</span><span class="s1">kinkiness</span><span class="s3">,</span>
+            <span class="s1">show_all</span><span class="s3">=</span><span class="s1">args</span><span class="s3">.</span><span class="s1">show_all</span><span class="s3">,</span>
+            <span class="s1">discrete_axes</span><span class="s3">=</span><span class="s1">discrete_axes</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">problems </span><span class="s3">= </span><span class="s1">defaultdict</span><span class="s3">(</span><span class="s1">list</span><span class="s3">)</span>
+
+        <span class="s1">f </span><span class="s3">= (</span>
+            <span class="s1">sys</span><span class="s3">.</span><span class="s1">stdout</span>
+            <span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">output </span><span class="s2">is None</span>
+            <span class="s2">else </span><span class="s1">open</span><span class="s3">(</span><span class="s1">ensure_parent_dir</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">output</span><span class="s3">), </span><span class="s4">&quot;w&quot;</span><span class="s3">)</span>
+        <span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s1">args</span><span class="s3">.</span><span class="s1">quiet</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">json</span><span class="s3">:</span>
+                <span class="s2">import </span><span class="s1">json</span>
+
+                <span class="s2">for </span><span class="s1">glyphname</span><span class="s3">, </span><span class="s1">problem </span><span class="s2">in </span><span class="s1">problems_gen</span><span class="s3">:</span>
+                    <span class="s1">problems</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">problem</span><span class="s3">)</span>
+
+                <span class="s1">print</span><span class="s3">(</span><span class="s1">json</span><span class="s3">.</span><span class="s1">dumps</span><span class="s3">(</span><span class="s1">problems</span><span class="s3">), </span><span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">last_glyphname </span><span class="s3">= </span><span class="s2">None</span>
+                <span class="s2">for </span><span class="s1">glyphname</span><span class="s3">, </span><span class="s1">p </span><span class="s2">in </span><span class="s1">problems_gen</span><span class="s3">:</span>
+                    <span class="s1">problems</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)</span>
+
+                    <span class="s2">if </span><span class="s1">glyphname </span><span class="s3">!= </span><span class="s1">last_glyphname</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span><span class="s4">f&quot;Glyph </span><span class="s2">{</span><span class="s1">glyphname</span><span class="s2">} </span><span class="s4">was not compatible:&quot;</span><span class="s3">, </span><span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">)</span>
+                        <span class="s1">last_glyphname </span><span class="s3">= </span><span class="s1">glyphname</span>
+                        <span class="s1">last_master_idxs </span><span class="s3">= </span><span class="s2">None</span>
+
+                    <span class="s1">master_idxs </span><span class="s3">= (</span>
+                        <span class="s3">(</span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_idx&quot;</span><span class="s3">],)</span>
+                        <span class="s2">if </span><span class="s4">&quot;master_idx&quot; </span><span class="s2">in </span><span class="s1">p</span>
+                        <span class="s2">else </span><span class="s3">(</span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1_idx&quot;</span><span class="s3">], </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2_idx&quot;</span><span class="s3">])</span>
+                    <span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">master_idxs </span><span class="s3">!= </span><span class="s1">last_master_idxs</span><span class="s3">:</span>
+                        <span class="s1">master_names </span><span class="s3">= (</span>
+                            <span class="s3">(</span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master&quot;</span><span class="s3">],)</span>
+                            <span class="s2">if </span><span class="s4">&quot;master&quot; </span><span class="s2">in </span><span class="s1">p</span>
+                            <span class="s2">else </span><span class="s3">(</span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">], </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">])</span>
+                        <span class="s3">)</span>
+                        <span class="s1">print</span><span class="s3">(</span><span class="s4">f&quot;  Masters: %s:&quot; </span><span class="s3">% </span><span class="s4">&quot;, &quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">master_names</span><span class="s3">), </span><span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">)</span>
+                        <span class="s1">last_master_idxs </span><span class="s3">= </span><span class="s1">master_idxs</span>
+
+                    <span class="s2">if </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">MISSING</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Glyph was missing in master %s&quot; </span><span class="s3">% </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master&quot;</span><span class="s3">], </span><span class="s1">file</span><span class="s3">=</span><span class="s1">f</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">OPEN_PATH</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Glyph has an open path in master %s&quot; </span><span class="s3">% </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master&quot;</span><span class="s3">],</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">PATH_COUNT</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Path count differs: %i in %s, %i in %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_2&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">NODE_COUNT</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Node count differs in path %i: %i in %s, %i in %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;path&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_2&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">NODE_INCOMPATIBILITY</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Node %o incompatible in path %i: %s in %s, %s in %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;node&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;path&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_2&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">CONTOUR_ORDER</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Contour order differs: %s in %s, %s in %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_2&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">WRONG_START_POINT</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Contour %d start point differs: %s in %s, %s in %s; reversed: %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;contour&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value_2&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;reversed&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">UNDERWEIGHT</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Contour %d interpolation is underweight: %s, %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;contour&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">OVERWEIGHT</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Contour %d interpolation is overweight: %s, %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;contour&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">KINK</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Contour %d has a kink at %s: %s, %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;contour&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;value&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+                    <span class="s2">elif </span><span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;type&quot;</span><span class="s3">] == </span><span class="s1">InterpolatableProblem</span><span class="s3">.</span><span class="s1">NOTHING</span><span class="s3">:</span>
+                        <span class="s1">print</span><span class="s3">(</span>
+                            <span class="s4">&quot;    Showing %s and %s&quot;</span>
+                            <span class="s3">% (</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_1&quot;</span><span class="s3">],</span>
+                                <span class="s1">p</span><span class="s3">[</span><span class="s4">&quot;master_2&quot;</span><span class="s3">],</span>
+                            <span class="s3">),</span>
+                            <span class="s1">file</span><span class="s3">=</span><span class="s1">f</span><span class="s3">,</span>
+                        <span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">glyphname</span><span class="s3">, </span><span class="s1">problem </span><span class="s2">in </span><span class="s1">problems_gen</span><span class="s3">:</span>
+                <span class="s1">problems</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">problem</span><span class="s3">)</span>
+
+        <span class="s1">problems </span><span class="s3">= </span><span class="s1">sort_problems</span><span class="s3">(</span><span class="s1">problems</span><span class="s3">)</span>
+
+        <span class="s2">for </span><span class="s1">p </span><span class="s2">in </span><span class="s4">&quot;ps&quot;</span><span class="s3">, </span><span class="s4">&quot;pdf&quot;</span><span class="s3">:</span>
+            <span class="s1">arg </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">args</span><span class="s3">, </span><span class="s1">p</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">arg </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+            <span class="s1">log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">&quot;Writing %s to %s&quot;</span><span class="s3">, </span><span class="s1">p</span><span class="s3">.</span><span class="s1">upper</span><span class="s3">(), </span><span class="s1">arg</span><span class="s3">)</span>
+            <span class="s2">from </span><span class="s3">.</span><span class="s1">interpolatablePlot </span><span class="s2">import </span><span class="s1">InterpolatablePS</span><span class="s3">, </span><span class="s1">InterpolatablePDF</span>
+
+            <span class="s1">PlotterClass </span><span class="s3">= </span><span class="s1">InterpolatablePS </span><span class="s2">if </span><span class="s1">p </span><span class="s3">== </span><span class="s4">&quot;ps&quot; </span><span class="s2">else </span><span class="s1">InterpolatablePDF</span>
+
+            <span class="s2">with </span><span class="s1">PlotterClass</span><span class="s3">(</span>
+                <span class="s1">ensure_parent_dir</span><span class="s3">(</span><span class="s1">arg</span><span class="s3">), </span><span class="s1">glyphsets</span><span class="s3">=</span><span class="s1">glyphsets</span><span class="s3">, </span><span class="s1">names</span><span class="s3">=</span><span class="s1">names</span>
+            <span class="s3">) </span><span class="s2">as </span><span class="s1">doc</span><span class="s3">:</span>
+                <span class="s1">doc</span><span class="s3">.</span><span class="s1">add_title_page</span><span class="s3">(</span>
+                    <span class="s1">original_args_inputs</span><span class="s3">, </span><span class="s1">tolerance</span><span class="s3">=</span><span class="s1">tolerance</span><span class="s3">, </span><span class="s1">kinkiness</span><span class="s3">=</span><span class="s1">kinkiness</span>
+                <span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">problems</span><span class="s3">:</span>
+                    <span class="s1">doc</span><span class="s3">.</span><span class="s1">add_summary</span><span class="s3">(</span><span class="s1">problems</span><span class="s3">)</span>
+                <span class="s1">doc</span><span class="s3">.</span><span class="s1">add_problems</span><span class="s3">(</span><span class="s1">problems</span><span class="s3">)</span>
+                <span class="s2">if not </span><span class="s1">problems </span><span class="s2">and not </span><span class="s1">args</span><span class="s3">.</span><span class="s1">quiet</span><span class="s3">:</span>
+                    <span class="s1">doc</span><span class="s3">.</span><span class="s1">draw_cupcake</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">problems</span><span class="s3">:</span>
+                    <span class="s1">doc</span><span class="s3">.</span><span class="s1">add_index</span><span class="s3">()</span>
+                    <span class="s1">doc</span><span class="s3">.</span><span class="s1">add_table_of_contents</span><span class="s3">()</span>
+
+        <span class="s2">if </span><span class="s1">args</span><span class="s3">.</span><span class="s1">html</span><span class="s3">:</span>
+            <span class="s1">log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">&quot;Writing HTML to %s&quot;</span><span class="s3">, </span><span class="s1">args</span><span class="s3">.</span><span class="s1">html</span><span class="s3">)</span>
+            <span class="s2">from </span><span class="s3">.</span><span class="s1">interpolatablePlot </span><span class="s2">import </span><span class="s1">InterpolatableSVG</span>
+
+            <span class="s1">svgs </span><span class="s3">= []</span>
+            <span class="s1">glyph_starts </span><span class="s3">= {}</span>
+            <span class="s2">with </span><span class="s1">InterpolatableSVG</span><span class="s3">(</span><span class="s1">svgs</span><span class="s3">, </span><span class="s1">glyphsets</span><span class="s3">=</span><span class="s1">glyphsets</span><span class="s3">, </span><span class="s1">names</span><span class="s3">=</span><span class="s1">names</span><span class="s3">) </span><span class="s2">as </span><span class="s1">svg</span><span class="s3">:</span>
+                <span class="s1">svg</span><span class="s3">.</span><span class="s1">add_title_page</span><span class="s3">(</span>
+                    <span class="s1">original_args_inputs</span><span class="s3">,</span>
+                    <span class="s1">show_tolerance</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+                    <span class="s1">tolerance</span><span class="s3">=</span><span class="s1">tolerance</span><span class="s3">,</span>
+                    <span class="s1">kinkiness</span><span class="s3">=</span><span class="s1">kinkiness</span><span class="s3">,</span>
+                <span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">glyph</span><span class="s3">, </span><span class="s1">glyph_problems </span><span class="s2">in </span><span class="s1">problems</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+                    <span class="s1">glyph_starts</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">svgs</span><span class="s3">)] = </span><span class="s1">glyph</span>
+                    <span class="s1">svg</span><span class="s3">.</span><span class="s1">add_problems</span><span class="s3">(</span>
+                        <span class="s3">{</span><span class="s1">glyph</span><span class="s3">: </span><span class="s1">glyph_problems</span><span class="s3">},</span>
+                        <span class="s1">show_tolerance</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+                        <span class="s1">show_page_number</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+                    <span class="s3">)</span>
+                <span class="s2">if not </span><span class="s1">problems </span><span class="s2">and not </span><span class="s1">args</span><span class="s3">.</span><span class="s1">quiet</span><span class="s3">:</span>
+                    <span class="s1">svg</span><span class="s3">.</span><span class="s1">draw_cupcake</span><span class="s3">()</span>
+
+            <span class="s2">import </span><span class="s1">base64</span>
+
+            <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">ensure_parent_dir</span><span class="s3">(</span><span class="s1">args</span><span class="s3">.</span><span class="s1">html</span><span class="s3">), </span><span class="s4">&quot;wb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s7">b&quot;&lt;!DOCTYPE html&gt;</span><span class="s2">\n</span><span class="s7">&quot;</span><span class="s3">)</span>
+                <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span>
+                    <span class="s7">b'&lt;html&gt;&lt;body align=&quot;center&quot; style=&quot;font-family: sans-serif; text-color: #222&quot;&gt;</span><span class="s2">\n</span><span class="s7">'</span>
+                <span class="s3">)</span>
+                <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s7">b&quot;&lt;title&gt;fonttools varLib.interpolatable report&lt;/title&gt;</span><span class="s2">\n</span><span class="s7">&quot;</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">svg </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">svgs</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">i </span><span class="s2">in </span><span class="s1">glyph_starts</span><span class="s3">:</span>
+                        <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s4">f&quot;&lt;h1&gt;Glyph </span><span class="s2">{</span><span class="s1">glyph_starts</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span><span class="s2">}</span><span class="s4">&lt;/h1&gt;</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">&quot;utf-8&quot;</span><span class="s3">))</span>
+                    <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s4">&quot;&lt;img src='data:image/svg+xml;base64,&quot;</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">&quot;utf-8&quot;</span><span class="s3">))</span>
+                    <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">base64</span><span class="s3">.</span><span class="s1">b64encode</span><span class="s3">(</span><span class="s1">svg</span><span class="s3">))</span>
+                    <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s7">b&quot;' /&gt;</span><span class="s2">\n</span><span class="s7">&quot;</span><span class="s3">)</span>
+                    <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s7">b&quot;&lt;hr&gt;</span><span class="s2">\n</span><span class="s7">&quot;</span><span class="s3">)</span>
+                <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s7">b&quot;&lt;/body&gt;&lt;/html&gt;</span><span class="s2">\n</span><span class="s7">&quot;</span><span class="s3">)</span>
+
+    <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s1">e</span><span class="s3">.</span><span class="s1">args </span><span class="s3">+= </span><span class="s1">original_args_inputs</span>
+        <span class="s1">log</span><span class="s3">.</span><span class="s1">error</span><span class="s3">(</span><span class="s1">e</span><span class="s3">)</span>
+        <span class="s2">raise</span>
+
+    <span class="s2">if </span><span class="s1">problems</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">problems</span>
+
+
+<span class="s2">if </span><span class="s1">__name__ </span><span class="s3">== </span><span class="s4">&quot;__main__&quot;</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">sys</span>
+
+    <span class="s1">problems </span><span class="s3">= </span><span class="s1">main</span><span class="s3">()</span>
+    <span class="s1">sys</span><span class="s3">.</span><span class="s1">exit</span><span class="s3">(</span><span class="s1">int</span><span class="s3">(</span><span class="s1">bool</span><span class="s3">(</span><span class="s1">problems</span><span class="s3">)))</span>
+</pre>
+</body>
+</html>

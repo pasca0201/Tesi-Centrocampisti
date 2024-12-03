@@ -1,0 +1,744 @@
+<html>
+<head>
+<title>_partial_dependence.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_partial_dependence.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Partial dependence plots for regression and classification models.&quot;&quot;&quot;</span>
+
+<span class="s2"># Authors: Peter Prettenhofer</span>
+<span class="s2">#          Trevor Stephens</span>
+<span class="s2">#          Nicolas Hug</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">from </span><span class="s1">collections</span><span class="s4">.</span><span class="s1">abc </span><span class="s3">import </span><span class="s1">Iterable</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">sparse</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">stats</span><span class="s4">.</span><span class="s1">mstats </span><span class="s3">import </span><span class="s1">mquantiles</span>
+
+<span class="s3">from </span><span class="s4">..</span><span class="s1">base </span><span class="s3">import </span><span class="s1">is_classifier</span><span class="s4">, </span><span class="s1">is_regressor</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">ensemble </span><span class="s3">import </span><span class="s1">RandomForestRegressor</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">ensemble</span><span class="s4">.</span><span class="s1">_gb </span><span class="s3">import </span><span class="s1">BaseGradientBoosting</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">ensemble</span><span class="s4">.</span><span class="s1">_hist_gradient_boosting</span><span class="s4">.</span><span class="s1">gradient_boosting </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">BaseHistGradientBoosting</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">NotFittedError</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">tree </span><span class="s3">import </span><span class="s1">DecisionTreeRegressor</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils </span><span class="s3">import </span><span class="s1">Bunch</span><span class="s4">, </span><span class="s1">_safe_indexing</span><span class="s4">, </span><span class="s1">check_array</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_indexing </span><span class="s3">import </span><span class="s1">_determine_key_type</span><span class="s4">, </span><span class="s1">_get_column_indices</span><span class="s4">, </span><span class="s1">_safe_assign</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_optional_dependencies </span><span class="s3">import </span><span class="s1">check_matplotlib_support  </span><span class="s2"># noqa</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">HasMethods</span><span class="s4">,</span>
+    <span class="s1">Integral</span><span class="s4">,</span>
+    <span class="s1">Interval</span><span class="s4">,</span>
+    <span class="s1">StrOptions</span><span class="s4">,</span>
+    <span class="s1">validate_params</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">extmath </span><span class="s3">import </span><span class="s1">cartesian</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">validation </span><span class="s3">import </span><span class="s1">_check_sample_weight</span><span class="s4">, </span><span class="s1">check_is_fitted</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_pd_utils </span><span class="s3">import </span><span class="s1">_check_feature_names</span><span class="s4">, </span><span class="s1">_get_feature_index</span>
+
+<span class="s1">__all__ </span><span class="s4">= [</span>
+    <span class="s5">&quot;partial_dependence&quot;</span><span class="s4">,</span>
+<span class="s4">]</span>
+
+
+<span class="s3">def </span><span class="s1">_grid_from_X</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">percentiles</span><span class="s4">, </span><span class="s1">is_categorical</span><span class="s4">, </span><span class="s1">grid_resolution</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Generate a grid of points based on the percentiles of X. 
+ 
+    The grid is a cartesian product between the columns of ``values``. The 
+    ith column of ``values`` consists in ``grid_resolution`` equally-spaced 
+    points between the percentiles of the jth column of X. 
+ 
+    If ``grid_resolution`` is bigger than the number of unique values in the 
+    j-th column of X or if the feature is a categorical feature (by inspecting 
+    `is_categorical`) , then those unique values will be used instead. 
+ 
+    Parameters 
+    ---------- 
+    X : array-like of shape (n_samples, n_target_features) 
+        The data. 
+ 
+    percentiles : tuple of float 
+        The percentiles which are used to construct the extreme values of 
+        the grid. Must be in [0, 1]. 
+ 
+    is_categorical : list of bool 
+        For each feature, tells whether it is categorical or not. If a feature 
+        is categorical, then the values used will be the unique ones 
+        (i.e. categories) instead of the percentiles. 
+ 
+    grid_resolution : int 
+        The number of equally spaced points to be placed on the grid for each 
+        feature. 
+ 
+    Returns 
+    ------- 
+    grid : ndarray of shape (n_points, n_target_features) 
+        A value for each feature at each point in the grid. ``n_points`` is 
+        always ``&lt;= grid_resolution ** X.shape[1]``. 
+ 
+    values : list of 1d ndarrays 
+        The values with which the grid has been created. The size of each 
+        array ``values[j]`` is either ``grid_resolution``, or the number of 
+        unique values in ``X[:, j]``, whichever is smaller. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">percentiles</span><span class="s4">, </span><span class="s1">Iterable</span><span class="s4">) </span><span class="s3">or </span><span class="s1">len</span><span class="s4">(</span><span class="s1">percentiles</span><span class="s4">) != </span><span class="s6">2</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;'percentiles' must be a sequence of 2 elements.&quot;</span><span class="s4">)</span>
+    <span class="s3">if not </span><span class="s1">all</span><span class="s4">(</span><span class="s6">0 </span><span class="s4">&lt;= </span><span class="s1">x </span><span class="s4">&lt;= </span><span class="s6">1 </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">percentiles</span><span class="s4">):</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;'percentiles' values must be in [0, 1].&quot;</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">percentiles</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] &gt;= </span><span class="s1">percentiles</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;percentiles[0] must be strictly less than percentiles[1].&quot;</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">grid_resolution </span><span class="s4">&lt;= </span><span class="s6">1</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;'grid_resolution' must be strictly greater than 1.&quot;</span><span class="s4">)</span>
+
+    <span class="s1">values </span><span class="s4">= []</span>
+    <span class="s2"># TODO: we should handle missing values (i.e. `np.nan`) specifically and store them</span>
+    <span class="s2"># in a different Bunch attribute.</span>
+    <span class="s3">for </span><span class="s1">feature</span><span class="s4">, </span><span class="s1">is_cat </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">is_categorical</span><span class="s4">):</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">uniques </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">unique</span><span class="s4">(</span><span class="s1">_safe_indexing</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">feature</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">))</span>
+        <span class="s3">except </span><span class="s1">TypeError </span><span class="s3">as </span><span class="s1">exc</span><span class="s4">:</span>
+            <span class="s2"># `np.unique` will fail in the presence of `np.nan` and `str` categories</span>
+            <span class="s2"># due to sorting. Temporary, we reraise an error explaining the problem.</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">f&quot;The column #</span><span class="s3">{</span><span class="s1">feature</span><span class="s3">} </span><span class="s5">contains mixed data types. Finding unique &quot;</span>
+                <span class="s5">&quot;categories fail due to sorting. It usually means that the column &quot;</span>
+                <span class="s5">&quot;contains `np.nan` values together with `str` categories. Such use &quot;</span>
+                <span class="s5">&quot;case is not yet supported in scikit-learn.&quot;</span>
+            <span class="s4">) </span><span class="s3">from </span><span class="s1">exc</span>
+        <span class="s3">if </span><span class="s1">is_cat </span><span class="s3">or </span><span class="s1">uniques</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] &lt; </span><span class="s1">grid_resolution</span><span class="s4">:</span>
+            <span class="s2"># Use the unique values either because:</span>
+            <span class="s2"># - feature has low resolution use unique values</span>
+            <span class="s2"># - feature is categorical</span>
+            <span class="s1">axis </span><span class="s4">= </span><span class="s1">uniques</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s2"># create axis based on percentiles and grid resolution</span>
+            <span class="s1">emp_percentiles </span><span class="s4">= </span><span class="s1">mquantiles</span><span class="s4">(</span>
+                <span class="s1">_safe_indexing</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">feature</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">), </span><span class="s1">prob</span><span class="s4">=</span><span class="s1">percentiles</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span>
+            <span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">allclose</span><span class="s4">(</span><span class="s1">emp_percentiles</span><span class="s4">[</span><span class="s6">0</span><span class="s4">], </span><span class="s1">emp_percentiles</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]):</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">&quot;percentiles are too close to each other, &quot;</span>
+                    <span class="s5">&quot;unable to build the grid. Please choose percentiles &quot;</span>
+                    <span class="s5">&quot;that are further apart.&quot;</span>
+                <span class="s4">)</span>
+            <span class="s1">axis </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linspace</span><span class="s4">(</span>
+                <span class="s1">emp_percentiles</span><span class="s4">[</span><span class="s6">0</span><span class="s4">],</span>
+                <span class="s1">emp_percentiles</span><span class="s4">[</span><span class="s6">1</span><span class="s4">],</span>
+                <span class="s1">num</span><span class="s4">=</span><span class="s1">grid_resolution</span><span class="s4">,</span>
+                <span class="s1">endpoint</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s4">)</span>
+        <span class="s1">values</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">cartesian</span><span class="s4">(</span><span class="s1">values</span><span class="s4">), </span><span class="s1">values</span>
+
+
+<span class="s3">def </span><span class="s1">_partial_dependence_recursion</span><span class="s4">(</span><span class="s1">est</span><span class="s4">, </span><span class="s1">grid</span><span class="s4">, </span><span class="s1">features</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Calculate partial dependence via the recursion method. 
+ 
+    The recursion method is in particular enabled for tree-based estimators. 
+ 
+    For each `grid` value, a weighted tree traversal is performed: if a split node 
+    involves an input feature of interest, the corresponding left or right branch 
+    is followed; otherwise both branches are followed, each branch being weighted 
+    by the fraction of training samples that entered that branch. Finally, the 
+    partial dependence is given by a weighted average of all the visited leaves 
+    values. 
+ 
+    This method is more efficient in terms of speed than the `'brute'` method 
+    (:func:`~sklearn.inspection._partial_dependence._partial_dependence_brute`). 
+    However, here, the partial dependence computation is done explicitly with the 
+    `X` used during training of `est`. 
+ 
+    Parameters 
+    ---------- 
+    est : BaseEstimator 
+        A fitted estimator object implementing :term:`predict` or 
+        :term:`decision_function`. Multioutput-multiclass classifiers are not 
+        supported. Note that `'recursion'` is only supported for some tree-based 
+        estimators (namely 
+        :class:`~sklearn.ensemble.GradientBoostingClassifier`, 
+        :class:`~sklearn.ensemble.GradientBoostingRegressor`, 
+        :class:`~sklearn.ensemble.HistGradientBoostingClassifier`, 
+        :class:`~sklearn.ensemble.HistGradientBoostingRegressor`, 
+        :class:`~sklearn.tree.DecisionTreeRegressor`, 
+        :class:`~sklearn.ensemble.RandomForestRegressor`, 
+        ). 
+ 
+    grid : array-like of shape (n_points, n_target_features) 
+        The grid of feature values for which the partial dependence is calculated. 
+        Note that `n_points` is the number of points in the grid and `n_target_features` 
+        is the number of features you are doing partial dependence at. 
+ 
+    features : array-like of {int, str} 
+        The feature (e.g. `[0]`) or pair of interacting features 
+        (e.g. `[(0, 1)]`) for which the partial dependency should be computed. 
+ 
+    Returns 
+    ------- 
+    averaged_predictions : array-like of shape (n_targets, n_points) 
+        The averaged predictions for the given `grid` of features values. 
+        Note that `n_targets` is the number of targets (e.g. 1 for binary 
+        classification, `n_tasks` for multi-output regression, and `n_classes` for 
+        multiclass classification) and `n_points` is the number of points in the `grid`. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">est</span><span class="s4">.</span><span class="s1">_compute_partial_dependence_recursion</span><span class="s4">(</span><span class="s1">grid</span><span class="s4">, </span><span class="s1">features</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+        <span class="s2"># reshape to (1, n_points) for consistency with</span>
+        <span class="s2"># _partial_dependence_brute</span>
+        <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, -</span><span class="s6">1</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">averaged_predictions</span>
+
+
+<span class="s3">def </span><span class="s1">_partial_dependence_brute</span><span class="s4">(</span>
+    <span class="s1">est</span><span class="s4">, </span><span class="s1">grid</span><span class="s4">, </span><span class="s1">features</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">response_method</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Calculate partial dependence via the brute force method. 
+ 
+    The brute method explicitly averages the predictions of an estimator over a 
+    grid of feature values. 
+ 
+    For each `grid` value, all the samples from `X` have their variables of 
+    interest replaced by that specific `grid` value. The predictions are then made 
+    and averaged across the samples. 
+ 
+    This method is slower than the `'recursion'` 
+    (:func:`~sklearn.inspection._partial_dependence._partial_dependence_recursion`) 
+    version for estimators with this second option. However, with the `'brute'` 
+    force method, the average will be done with the given `X` and not the `X` 
+    used during training, as it is done in the `'recursion'` version. Therefore 
+    the average can always accept `sample_weight` (even when the estimator was 
+    fitted without). 
+ 
+    Parameters 
+    ---------- 
+    est : BaseEstimator 
+        A fitted estimator object implementing :term:`predict`, 
+        :term:`predict_proba`, or :term:`decision_function`. 
+        Multioutput-multiclass classifiers are not supported. 
+ 
+    grid : array-like of shape (n_points, n_target_features) 
+        The grid of feature values for which the partial dependence is calculated. 
+        Note that `n_points` is the number of points in the grid and `n_target_features` 
+        is the number of features you are doing partial dependence at. 
+ 
+    features : array-like of {int, str} 
+        The feature (e.g. `[0]`) or pair of interacting features 
+        (e.g. `[(0, 1)]`) for which the partial dependency should be computed. 
+ 
+    X : array-like of shape (n_samples, n_features) 
+        `X` is used to generate values for the complement features. That is, for 
+        each value in `grid`, the method will average the prediction of each 
+        sample from `X` having that grid value for `features`. 
+ 
+    response_method : {'auto', 'predict_proba', 'decision_function'}, \ 
+            default='auto' 
+        Specifies whether to use :term:`predict_proba` or 
+        :term:`decision_function` as the target response. For regressors 
+        this parameter is ignored and the response is always the output of 
+        :term:`predict`. By default, :term:`predict_proba` is tried first 
+        and we revert to :term:`decision_function` if it doesn't exist. 
+ 
+    sample_weight : array-like of shape (n_samples,), default=None 
+        Sample weights are used to calculate weighted means when averaging the 
+        model output. If `None`, then samples are equally weighted. Note that 
+        `sample_weight` does not change the individual predictions. 
+ 
+    Returns 
+    ------- 
+    averaged_predictions : array-like of shape (n_targets, n_points) 
+        The averaged predictions for the given `grid` of features values. 
+        Note that `n_targets` is the number of targets (e.g. 1 for binary 
+        classification, `n_tasks` for multi-output regression, and `n_classes` for 
+        multiclass classification) and `n_points` is the number of points in the `grid`. 
+ 
+    predictions : array-like 
+        The predictions for the given `grid` of features values over the samples 
+        from `X`. For non-multioutput regression and binary classification the 
+        shape is `(n_instances, n_points)` and for multi-output regression and 
+        multiclass classification the shape is `(n_targets, n_instances, n_points)`, 
+        where `n_targets` is the number of targets (`n_tasks` for multi-output 
+        regression, and `n_classes` for multiclass classification), `n_instances` 
+        is the number of instances in `X`, and `n_points` is the number of points 
+        in the `grid`. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">predictions </span><span class="s4">= []</span>
+    <span class="s1">averaged_predictions </span><span class="s4">= []</span>
+
+    <span class="s2"># define the prediction_method (predict, predict_proba, decision_function).</span>
+    <span class="s3">if </span><span class="s1">is_regressor</span><span class="s4">(</span><span class="s1">est</span><span class="s4">):</span>
+        <span class="s1">prediction_method </span><span class="s4">= </span><span class="s1">est</span><span class="s4">.</span><span class="s1">predict</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">predict_proba </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">est</span><span class="s4">, </span><span class="s5">&quot;predict_proba&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+        <span class="s1">decision_function </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">est</span><span class="s4">, </span><span class="s5">&quot;decision_function&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">response_method </span><span class="s4">== </span><span class="s5">&quot;auto&quot;</span><span class="s4">:</span>
+            <span class="s2"># try predict_proba, then decision_function if it doesn't exist</span>
+            <span class="s1">prediction_method </span><span class="s4">= </span><span class="s1">predict_proba </span><span class="s3">or </span><span class="s1">decision_function</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">prediction_method </span><span class="s4">= (</span>
+                <span class="s1">predict_proba</span>
+                <span class="s3">if </span><span class="s1">response_method </span><span class="s4">== </span><span class="s5">&quot;predict_proba&quot;</span>
+                <span class="s3">else </span><span class="s1">decision_function</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">prediction_method </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">response_method </span><span class="s4">== </span><span class="s5">&quot;auto&quot;</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">&quot;The estimator has no predict_proba and no &quot;</span>
+                    <span class="s5">&quot;decision_function method.&quot;</span>
+                <span class="s4">)</span>
+            <span class="s3">elif </span><span class="s1">response_method </span><span class="s4">== </span><span class="s5">&quot;predict_proba&quot;</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;The estimator has no predict_proba method.&quot;</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;The estimator has no decision_function method.&quot;</span><span class="s4">)</span>
+
+    <span class="s1">X_eval </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+    <span class="s3">for </span><span class="s1">new_values </span><span class="s3">in </span><span class="s1">grid</span><span class="s4">:</span>
+        <span class="s3">for </span><span class="s1">i</span><span class="s4">, </span><span class="s1">variable </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">features</span><span class="s4">):</span>
+            <span class="s1">_safe_assign</span><span class="s4">(</span><span class="s1">X_eval</span><span class="s4">, </span><span class="s1">new_values</span><span class="s4">[</span><span class="s1">i</span><span class="s4">], </span><span class="s1">column_indexer</span><span class="s4">=</span><span class="s1">variable</span><span class="s4">)</span>
+
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s2"># Note: predictions is of shape</span>
+            <span class="s2"># (n_points,) for non-multioutput regressors</span>
+            <span class="s2"># (n_points, n_tasks) for multioutput regressors</span>
+            <span class="s2"># (n_points, 1) for the regressors in cross_decomposition (I think)</span>
+            <span class="s2"># (n_points, 2) for binary classification</span>
+            <span class="s2"># (n_points, n_classes) for multiclass classification</span>
+            <span class="s1">pred </span><span class="s4">= </span><span class="s1">prediction_method</span><span class="s4">(</span><span class="s1">X_eval</span><span class="s4">)</span>
+
+            <span class="s1">predictions</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">pred</span><span class="s4">)</span>
+            <span class="s2"># average over samples</span>
+            <span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">average</span><span class="s4">(</span><span class="s1">pred</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">))</span>
+        <span class="s3">except </span><span class="s1">NotFittedError </span><span class="s3">as </span><span class="s1">e</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;'estimator' parameter must be a fitted estimator&quot;</span><span class="s4">) </span><span class="s3">from </span><span class="s1">e</span>
+
+    <span class="s1">n_samples </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+
+    <span class="s2"># reshape to (n_targets, n_instances, n_points) where n_targets is:</span>
+    <span class="s2"># - 1 for non-multioutput regression and binary classification (shape is</span>
+    <span class="s2">#   already correct in those cases)</span>
+    <span class="s2"># - n_tasks for multi-output regression</span>
+    <span class="s2"># - n_classes for multiclass classification.</span>
+    <span class="s1">predictions </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">predictions</span><span class="s4">).</span><span class="s1">T</span>
+    <span class="s3">if </span><span class="s1">is_regressor</span><span class="s4">(</span><span class="s1">est</span><span class="s4">) </span><span class="s3">and </span><span class="s1">predictions</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">== </span><span class="s6">2</span><span class="s4">:</span>
+        <span class="s2"># non-multioutput regression, shape is (n_instances, n_points,)</span>
+        <span class="s1">predictions </span><span class="s4">= </span><span class="s1">predictions</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, -</span><span class="s6">1</span><span class="s4">)</span>
+    <span class="s3">elif </span><span class="s1">is_classifier</span><span class="s4">(</span><span class="s1">est</span><span class="s4">) </span><span class="s3">and </span><span class="s1">predictions</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] == </span><span class="s6">2</span><span class="s4">:</span>
+        <span class="s2"># Binary classification, shape is (2, n_instances, n_points).</span>
+        <span class="s2"># we output the effect of **positive** class</span>
+        <span class="s1">predictions </span><span class="s4">= </span><span class="s1">predictions</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+        <span class="s1">predictions </span><span class="s4">= </span><span class="s1">predictions</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, -</span><span class="s6">1</span><span class="s4">)</span>
+
+    <span class="s2"># reshape averaged_predictions to (n_targets, n_points) where n_targets is:</span>
+    <span class="s2"># - 1 for non-multioutput regression and binary classification (shape is</span>
+    <span class="s2">#   already correct in those cases)</span>
+    <span class="s2"># - n_tasks for multi-output regression</span>
+    <span class="s2"># - n_classes for multiclass classification.</span>
+    <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">averaged_predictions</span><span class="s4">).</span><span class="s1">T</span>
+    <span class="s3">if </span><span class="s1">is_regressor</span><span class="s4">(</span><span class="s1">est</span><span class="s4">) </span><span class="s3">and </span><span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+        <span class="s2"># non-multioutput regression, shape is (n_points,)</span>
+        <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, -</span><span class="s6">1</span><span class="s4">)</span>
+    <span class="s3">elif </span><span class="s1">is_classifier</span><span class="s4">(</span><span class="s1">est</span><span class="s4">) </span><span class="s3">and </span><span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] == </span><span class="s6">2</span><span class="s4">:</span>
+        <span class="s2"># Binary classification, shape is (2, n_points).</span>
+        <span class="s2"># we output the effect of **positive** class</span>
+        <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">averaged_predictions</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+        <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, -</span><span class="s6">1</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">averaged_predictions</span><span class="s4">, </span><span class="s1">predictions</span>
+
+
+<span class="s4">@</span><span class="s1">validate_params</span><span class="s4">(</span>
+    <span class="s4">{</span>
+        <span class="s5">&quot;estimator&quot;</span><span class="s4">: [</span>
+            <span class="s1">HasMethods</span><span class="s4">([</span><span class="s5">&quot;fit&quot;</span><span class="s4">, </span><span class="s5">&quot;predict&quot;</span><span class="s4">]),</span>
+            <span class="s1">HasMethods</span><span class="s4">([</span><span class="s5">&quot;fit&quot;</span><span class="s4">, </span><span class="s5">&quot;predict_proba&quot;</span><span class="s4">]),</span>
+            <span class="s1">HasMethods</span><span class="s4">([</span><span class="s5">&quot;fit&quot;</span><span class="s4">, </span><span class="s5">&quot;decision_function&quot;</span><span class="s4">]),</span>
+        <span class="s4">],</span>
+        <span class="s5">&quot;X&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">, </span><span class="s5">&quot;sparse matrix&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;features&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">, </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">str</span><span class="s4">],</span>
+        <span class="s5">&quot;sample_weight&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;categorical_features&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;feature_names&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;response_method&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;auto&quot;</span><span class="s4">, </span><span class="s5">&quot;predict_proba&quot;</span><span class="s4">, </span><span class="s5">&quot;decision_function&quot;</span><span class="s4">})],</span>
+        <span class="s5">&quot;percentiles&quot;</span><span class="s4">: [</span><span class="s1">tuple</span><span class="s4">],</span>
+        <span class="s5">&quot;grid_resolution&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;method&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;auto&quot;</span><span class="s4">, </span><span class="s5">&quot;recursion&quot;</span><span class="s4">, </span><span class="s5">&quot;brute&quot;</span><span class="s4">})],</span>
+        <span class="s5">&quot;kind&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;average&quot;</span><span class="s4">, </span><span class="s5">&quot;individual&quot;</span><span class="s4">, </span><span class="s5">&quot;both&quot;</span><span class="s4">})],</span>
+    <span class="s4">},</span>
+    <span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">def </span><span class="s1">partial_dependence</span><span class="s4">(</span>
+    <span class="s1">estimator</span><span class="s4">,</span>
+    <span class="s1">X</span><span class="s4">,</span>
+    <span class="s1">features</span><span class="s4">,</span>
+    <span class="s4">*,</span>
+    <span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">categorical_features</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">feature_names</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">response_method</span><span class="s4">=</span><span class="s5">&quot;auto&quot;</span><span class="s4">,</span>
+    <span class="s1">percentiles</span><span class="s4">=(</span><span class="s6">0.05</span><span class="s4">, </span><span class="s6">0.95</span><span class="s4">),</span>
+    <span class="s1">grid_resolution</span><span class="s4">=</span><span class="s6">100</span><span class="s4">,</span>
+    <span class="s1">method</span><span class="s4">=</span><span class="s5">&quot;auto&quot;</span><span class="s4">,</span>
+    <span class="s1">kind</span><span class="s4">=</span><span class="s5">&quot;average&quot;</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Partial dependence of ``features``. 
+ 
+    Partial dependence of a feature (or a set of features) corresponds to 
+    the average response of an estimator for each possible value of the 
+    feature. 
+ 
+    Read more in the :ref:`User Guide &lt;partial_dependence&gt;`. 
+ 
+    .. warning:: 
+ 
+        For :class:`~sklearn.ensemble.GradientBoostingClassifier` and 
+        :class:`~sklearn.ensemble.GradientBoostingRegressor`, the 
+        `'recursion'` method (used by default) will not account for the `init` 
+        predictor of the boosting process. In practice, this will produce 
+        the same values as `'brute'` up to a constant offset in the target 
+        response, provided that `init` is a constant estimator (which is the 
+        default). However, if `init` is not a constant estimator, the 
+        partial dependence values are incorrect for `'recursion'` because the 
+        offset will be sample-dependent. It is preferable to use the `'brute'` 
+        method. Note that this only applies to 
+        :class:`~sklearn.ensemble.GradientBoostingClassifier` and 
+        :class:`~sklearn.ensemble.GradientBoostingRegressor`, not to 
+        :class:`~sklearn.ensemble.HistGradientBoostingClassifier` and 
+        :class:`~sklearn.ensemble.HistGradientBoostingRegressor`. 
+ 
+    Parameters 
+    ---------- 
+    estimator : BaseEstimator 
+        A fitted estimator object implementing :term:`predict`, 
+        :term:`predict_proba`, or :term:`decision_function`. 
+        Multioutput-multiclass classifiers are not supported. 
+ 
+    X : {array-like, sparse matrix or dataframe} of shape (n_samples, n_features) 
+        ``X`` is used to generate a grid of values for the target 
+        ``features`` (where the partial dependence will be evaluated), and 
+        also to generate values for the complement features when the 
+        `method` is 'brute'. 
+ 
+    features : array-like of {int, str, bool} or int or str 
+        The feature (e.g. `[0]`) or pair of interacting features 
+        (e.g. `[(0, 1)]`) for which the partial dependency should be computed. 
+ 
+    sample_weight : array-like of shape (n_samples,), default=None 
+        Sample weights are used to calculate weighted means when averaging the 
+        model output. If `None`, then samples are equally weighted. If 
+        `sample_weight` is not `None`, then `method` will be set to `'brute'`. 
+        Note that `sample_weight` is ignored for `kind='individual'`. 
+ 
+        .. versionadded:: 1.3 
+ 
+    categorical_features : array-like of shape (n_features,) or shape \ 
+            (n_categorical_features,), dtype={bool, int, str}, default=None 
+        Indicates the categorical features. 
+ 
+        - `None`: no feature will be considered categorical; 
+        - boolean array-like: boolean mask of shape `(n_features,)` 
+            indicating which features are categorical. Thus, this array has 
+            the same shape has `X.shape[1]`; 
+        - integer or string array-like: integer indices or strings 
+            indicating categorical features. 
+ 
+        .. versionadded:: 1.2 
+ 
+    feature_names : array-like of shape (n_features,), dtype=str, default=None 
+        Name of each feature; `feature_names[i]` holds the name of the feature 
+        with index `i`. 
+        By default, the name of the feature corresponds to their numerical 
+        index for NumPy array and their column name for pandas dataframe. 
+ 
+        .. versionadded:: 1.2 
+ 
+    response_method : {'auto', 'predict_proba', 'decision_function'}, \ 
+            default='auto' 
+        Specifies whether to use :term:`predict_proba` or 
+        :term:`decision_function` as the target response. For regressors 
+        this parameter is ignored and the response is always the output of 
+        :term:`predict`. By default, :term:`predict_proba` is tried first 
+        and we revert to :term:`decision_function` if it doesn't exist. If 
+        ``method`` is 'recursion', the response is always the output of 
+        :term:`decision_function`. 
+ 
+    percentiles : tuple of float, default=(0.05, 0.95) 
+        The lower and upper percentile used to create the extreme values 
+        for the grid. Must be in [0, 1]. 
+ 
+    grid_resolution : int, default=100 
+        The number of equally spaced points on the grid, for each target 
+        feature. 
+ 
+    method : {'auto', 'recursion', 'brute'}, default='auto' 
+        The method used to calculate the averaged predictions: 
+ 
+        - `'recursion'` is only supported for some tree-based estimators 
+          (namely 
+          :class:`~sklearn.ensemble.GradientBoostingClassifier`, 
+          :class:`~sklearn.ensemble.GradientBoostingRegressor`, 
+          :class:`~sklearn.ensemble.HistGradientBoostingClassifier`, 
+          :class:`~sklearn.ensemble.HistGradientBoostingRegressor`, 
+          :class:`~sklearn.tree.DecisionTreeRegressor`, 
+          :class:`~sklearn.ensemble.RandomForestRegressor`, 
+          ) when `kind='average'`. 
+          This is more efficient in terms of speed. 
+          With this method, the target response of a 
+          classifier is always the decision function, not the predicted 
+          probabilities. Since the `'recursion'` method implicitly computes 
+          the average of the Individual Conditional Expectation (ICE) by 
+          design, it is not compatible with ICE and thus `kind` must be 
+          `'average'`. 
+ 
+        - `'brute'` is supported for any estimator, but is more 
+          computationally intensive. 
+ 
+        - `'auto'`: the `'recursion'` is used for estimators that support it, 
+          and `'brute'` is used otherwise. If `sample_weight` is not `None`, 
+          then `'brute'` is used regardless of the estimator. 
+ 
+        Please see :ref:`this note &lt;pdp_method_differences&gt;` for 
+        differences between the `'brute'` and `'recursion'` method. 
+ 
+    kind : {'average', 'individual', 'both'}, default='average' 
+        Whether to return the partial dependence averaged across all the 
+        samples in the dataset or one value per sample or both. 
+        See Returns below. 
+ 
+        Note that the fast `method='recursion'` option is only available for 
+        `kind='average'` and `sample_weights=None`. Computing individual 
+        dependencies and doing weighted averages requires using the slower 
+        `method='brute'`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    Returns 
+    ------- 
+    predictions : :class:`~sklearn.utils.Bunch` 
+        Dictionary-like object, with the following attributes. 
+ 
+        individual : ndarray of shape (n_outputs, n_instances, \ 
+                len(values[0]), len(values[1]), ...) 
+            The predictions for all the points in the grid for all 
+            samples in X. This is also known as Individual 
+            Conditional Expectation (ICE). 
+            Only available when `kind='individual'` or `kind='both'`. 
+ 
+        average : ndarray of shape (n_outputs, len(values[0]), \ 
+                len(values[1]), ...) 
+            The predictions for all the points in the grid, averaged 
+            over all samples in X (or over the training data if 
+            `method` is 'recursion'). 
+            Only available when `kind='average'` or `kind='both'`. 
+ 
+        grid_values : seq of 1d ndarrays 
+            The values with which the grid has been created. The generated 
+            grid is a cartesian product of the arrays in `grid_values` where 
+            `len(grid_values) == len(features)`. The size of each array 
+            `grid_values[j]` is either `grid_resolution`, or the number of 
+            unique values in `X[:, j]`, whichever is smaller. 
+ 
+            .. versionadded:: 1.3 
+ 
+        `n_outputs` corresponds to the number of classes in a multi-class 
+        setting, or to the number of tasks for multi-output regression. 
+        For classical regression and binary classification `n_outputs==1`. 
+        `n_values_feature_j` corresponds to the size `grid_values[j]`. 
+ 
+    See Also 
+    -------- 
+    PartialDependenceDisplay.from_estimator : Plot Partial Dependence. 
+    PartialDependenceDisplay : Partial Dependence visualization. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; X = [[0, 0, 2], [1, 0, 0]] 
+    &gt;&gt;&gt; y = [0, 1] 
+    &gt;&gt;&gt; from sklearn.ensemble import GradientBoostingClassifier 
+    &gt;&gt;&gt; gb = GradientBoostingClassifier(random_state=0).fit(X, y) 
+    &gt;&gt;&gt; partial_dependence(gb, features=[0], X=X, percentiles=(0, 1), 
+    ...                    grid_resolution=2) # doctest: +SKIP 
+    (array([[-4.52...,  4.52...]]), [array([ 0.,  1.])]) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">)</span>
+
+    <span class="s3">if not </span><span class="s4">(</span><span class="s1">is_classifier</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">) </span><span class="s3">or </span><span class="s1">is_regressor</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">)):</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;'estimator' must be a fitted regressor or classifier.&quot;</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">is_classifier</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">) </span><span class="s3">and </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">[</span><span class="s6">0</span><span class="s4">], </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ndarray</span><span class="s4">):</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;Multiclass-multioutput estimators are not supported&quot;</span><span class="s4">)</span>
+
+    <span class="s2"># Use check_array only on lists and other non-array-likes / sparse. Do not</span>
+    <span class="s2"># convert DataFrame into a NumPy array.</span>
+    <span class="s3">if not </span><span class="s4">(</span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s5">&quot;__array__&quot;</span><span class="s4">) </span><span class="s3">or </span><span class="s1">sparse</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)):</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">force_all_finite</span><span class="s4">=</span><span class="s5">&quot;allow-nan&quot;</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">object</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">is_regressor</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">) </span><span class="s3">and </span><span class="s1">response_method </span><span class="s4">!= </span><span class="s5">&quot;auto&quot;</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">&quot;The response_method parameter is ignored for regressors and &quot;</span>
+            <span class="s5">&quot;must be 'auto'.&quot;</span>
+        <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">kind </span><span class="s4">!= </span><span class="s5">&quot;average&quot;</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">method </span><span class="s4">== </span><span class="s5">&quot;recursion&quot;</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;The 'recursion' method only applies when 'kind' is set to 'average'&quot;</span>
+            <span class="s4">)</span>
+        <span class="s1">method </span><span class="s4">= </span><span class="s5">&quot;brute&quot;</span>
+
+    <span class="s3">if </span><span class="s1">method </span><span class="s4">== </span><span class="s5">&quot;recursion&quot; </span><span class="s3">and </span><span class="s1">sample_weight </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">&quot;The 'recursion' method can only be applied when sample_weight is None.&quot;</span>
+        <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">method </span><span class="s4">== </span><span class="s5">&quot;auto&quot;</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">sample_weight </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">method </span><span class="s4">= </span><span class="s5">&quot;brute&quot;</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">, </span><span class="s1">BaseGradientBoosting</span><span class="s4">) </span><span class="s3">and </span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">init </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">method </span><span class="s4">= </span><span class="s5">&quot;recursion&quot;</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span>
+            <span class="s1">estimator</span><span class="s4">,</span>
+            <span class="s4">(</span><span class="s1">BaseHistGradientBoosting</span><span class="s4">, </span><span class="s1">DecisionTreeRegressor</span><span class="s4">, </span><span class="s1">RandomForestRegressor</span><span class="s4">),</span>
+        <span class="s4">):</span>
+            <span class="s1">method </span><span class="s4">= </span><span class="s5">&quot;recursion&quot;</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">method </span><span class="s4">= </span><span class="s5">&quot;brute&quot;</span>
+
+    <span class="s3">if </span><span class="s1">method </span><span class="s4">== </span><span class="s5">&quot;recursion&quot;</span><span class="s4">:</span>
+        <span class="s3">if not </span><span class="s1">isinstance</span><span class="s4">(</span>
+            <span class="s1">estimator</span><span class="s4">,</span>
+            <span class="s4">(</span>
+                <span class="s1">BaseGradientBoosting</span><span class="s4">,</span>
+                <span class="s1">BaseHistGradientBoosting</span><span class="s4">,</span>
+                <span class="s1">DecisionTreeRegressor</span><span class="s4">,</span>
+                <span class="s1">RandomForestRegressor</span><span class="s4">,</span>
+            <span class="s4">),</span>
+        <span class="s4">):</span>
+            <span class="s1">supported_classes_recursion </span><span class="s4">= (</span>
+                <span class="s5">&quot;GradientBoostingClassifier&quot;</span><span class="s4">,</span>
+                <span class="s5">&quot;GradientBoostingRegressor&quot;</span><span class="s4">,</span>
+                <span class="s5">&quot;HistGradientBoostingClassifier&quot;</span><span class="s4">,</span>
+                <span class="s5">&quot;HistGradientBoostingRegressor&quot;</span><span class="s4">,</span>
+                <span class="s5">&quot;HistGradientBoostingRegressor&quot;</span><span class="s4">,</span>
+                <span class="s5">&quot;DecisionTreeRegressor&quot;</span><span class="s4">,</span>
+                <span class="s5">&quot;RandomForestRegressor&quot;</span><span class="s4">,</span>
+            <span class="s4">)</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;Only the following estimators support the 'recursion' &quot;</span>
+                <span class="s5">&quot;method: {}. Try using method='brute'.&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+                    <span class="s5">&quot;, &quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">supported_classes_recursion</span><span class="s4">)</span>
+                <span class="s4">)</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">response_method </span><span class="s4">== </span><span class="s5">&quot;auto&quot;</span><span class="s4">:</span>
+            <span class="s1">response_method </span><span class="s4">= </span><span class="s5">&quot;decision_function&quot;</span>
+
+        <span class="s3">if </span><span class="s1">response_method </span><span class="s4">!= </span><span class="s5">&quot;decision_function&quot;</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;With the 'recursion' method, the response_method must be &quot;</span>
+                <span class="s5">&quot;'decision_function'. Got {}.&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">response_method</span><span class="s4">)</span>
+            <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">sample_weight </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">_check_sample_weight</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">X</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">_determine_key_type</span><span class="s4">(</span><span class="s1">features</span><span class="s4">, </span><span class="s1">accept_slice</span><span class="s4">=</span><span class="s3">False</span><span class="s4">) == </span><span class="s5">&quot;int&quot;</span><span class="s4">:</span>
+        <span class="s2"># _get_column_indices() supports negative indexing. Here, we limit</span>
+        <span class="s2"># the indexing to be positive. The upper bound will be checked</span>
+        <span class="s2"># by _get_column_indices()</span>
+        <span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">less</span><span class="s4">(</span><span class="s1">features</span><span class="s4">, </span><span class="s6">0</span><span class="s4">)):</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;all features must be in [0, {}]&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">] - </span><span class="s6">1</span><span class="s4">))</span>
+
+    <span class="s1">features_indices </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span>
+        <span class="s1">_get_column_indices</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">features</span><span class="s4">), </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">intp</span><span class="s4">, </span><span class="s1">order</span><span class="s4">=</span><span class="s5">&quot;C&quot;</span>
+    <span class="s4">).</span><span class="s1">ravel</span><span class="s4">()</span>
+
+    <span class="s1">feature_names </span><span class="s4">= </span><span class="s1">_check_feature_names</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">feature_names</span><span class="s4">)</span>
+
+    <span class="s1">n_features </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+    <span class="s3">if </span><span class="s1">categorical_features </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s1">is_categorical </span><span class="s4">= [</span><span class="s3">False</span><span class="s4">] * </span><span class="s1">len</span><span class="s4">(</span><span class="s1">features_indices</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">categorical_features </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">categorical_features</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">categorical_features</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">kind </span><span class="s4">== </span><span class="s5">&quot;b&quot;</span><span class="s4">:</span>
+            <span class="s2"># categorical features provided as a list of boolean</span>
+            <span class="s3">if </span><span class="s1">categorical_features</span><span class="s4">.</span><span class="s1">size </span><span class="s4">!= </span><span class="s1">n_features</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">&quot;When `categorical_features` is a boolean array-like, &quot;</span>
+                    <span class="s5">&quot;the array should be of shape (n_features,). Got &quot;</span>
+                    <span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">categorical_features</span><span class="s4">.</span><span class="s1">size</span><span class="s3">} </span><span class="s5">elements while `X` contains &quot;</span>
+                    <span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">n_features</span><span class="s3">} </span><span class="s5">features.&quot;</span>
+                <span class="s4">)</span>
+            <span class="s1">is_categorical </span><span class="s4">= [</span><span class="s1">categorical_features</span><span class="s4">[</span><span class="s1">idx</span><span class="s4">] </span><span class="s3">for </span><span class="s1">idx </span><span class="s3">in </span><span class="s1">features_indices</span><span class="s4">]</span>
+        <span class="s3">elif </span><span class="s1">categorical_features</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">kind </span><span class="s3">in </span><span class="s4">(</span><span class="s5">&quot;i&quot;</span><span class="s4">, </span><span class="s5">&quot;O&quot;</span><span class="s4">, </span><span class="s5">&quot;U&quot;</span><span class="s4">):</span>
+            <span class="s2"># categorical features provided as a list of indices or feature names</span>
+            <span class="s1">categorical_features_idx </span><span class="s4">= [</span>
+                <span class="s1">_get_feature_index</span><span class="s4">(</span><span class="s1">cat</span><span class="s4">, </span><span class="s1">feature_names</span><span class="s4">=</span><span class="s1">feature_names</span><span class="s4">)</span>
+                <span class="s3">for </span><span class="s1">cat </span><span class="s3">in </span><span class="s1">categorical_features</span>
+            <span class="s4">]</span>
+            <span class="s1">is_categorical </span><span class="s4">= [</span>
+                <span class="s1">idx </span><span class="s3">in </span><span class="s1">categorical_features_idx </span><span class="s3">for </span><span class="s1">idx </span><span class="s3">in </span><span class="s1">features_indices</span>
+            <span class="s4">]</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;Expected `categorical_features` to be an array-like of boolean,&quot;</span>
+                <span class="s5">f&quot; integer, or string. Got </span><span class="s3">{</span><span class="s1">categorical_features</span><span class="s4">.</span><span class="s1">dtype</span><span class="s3">} </span><span class="s5">instead.&quot;</span>
+            <span class="s4">)</span>
+
+    <span class="s1">grid</span><span class="s4">, </span><span class="s1">values </span><span class="s4">= </span><span class="s1">_grid_from_X</span><span class="s4">(</span>
+        <span class="s1">_safe_indexing</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">features_indices</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">),</span>
+        <span class="s1">percentiles</span><span class="s4">,</span>
+        <span class="s1">is_categorical</span><span class="s4">,</span>
+        <span class="s1">grid_resolution</span><span class="s4">,</span>
+    <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">method </span><span class="s4">== </span><span class="s5">&quot;brute&quot;</span><span class="s4">:</span>
+        <span class="s1">averaged_predictions</span><span class="s4">, </span><span class="s1">predictions </span><span class="s4">= </span><span class="s1">_partial_dependence_brute</span><span class="s4">(</span>
+            <span class="s1">estimator</span><span class="s4">, </span><span class="s1">grid</span><span class="s4">, </span><span class="s1">features_indices</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">response_method</span><span class="s4">, </span><span class="s1">sample_weight</span>
+        <span class="s4">)</span>
+
+        <span class="s2"># reshape predictions to</span>
+        <span class="s2"># (n_outputs, n_instances, n_values_feature_0, n_values_feature_1, ...)</span>
+        <span class="s1">predictions </span><span class="s4">= </span><span class="s1">predictions</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(</span>
+            <span class="s4">-</span><span class="s6">1</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">], *[</span><span class="s1">val</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] </span><span class="s3">for </span><span class="s1">val </span><span class="s3">in </span><span class="s1">values</span><span class="s4">]</span>
+        <span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">_partial_dependence_recursion</span><span class="s4">(</span>
+            <span class="s1">estimator</span><span class="s4">, </span><span class="s1">grid</span><span class="s4">, </span><span class="s1">features_indices</span>
+        <span class="s4">)</span>
+
+    <span class="s2"># reshape averaged_predictions to</span>
+    <span class="s2"># (n_outputs, n_values_feature_0, n_values_feature_1, ...)</span>
+    <span class="s1">averaged_predictions </span><span class="s4">= </span><span class="s1">averaged_predictions</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(</span>
+        <span class="s4">-</span><span class="s6">1</span><span class="s4">, *[</span><span class="s1">val</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] </span><span class="s3">for </span><span class="s1">val </span><span class="s3">in </span><span class="s1">values</span><span class="s4">]</span>
+    <span class="s4">)</span>
+    <span class="s1">pdp_results </span><span class="s4">= </span><span class="s1">Bunch</span><span class="s4">(</span><span class="s1">grid_values</span><span class="s4">=</span><span class="s1">values</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">kind </span><span class="s4">== </span><span class="s5">&quot;average&quot;</span><span class="s4">:</span>
+        <span class="s1">pdp_results</span><span class="s4">[</span><span class="s5">&quot;average&quot;</span><span class="s4">] = </span><span class="s1">averaged_predictions</span>
+    <span class="s3">elif </span><span class="s1">kind </span><span class="s4">== </span><span class="s5">&quot;individual&quot;</span><span class="s4">:</span>
+        <span class="s1">pdp_results</span><span class="s4">[</span><span class="s5">&quot;individual&quot;</span><span class="s4">] = </span><span class="s1">predictions</span>
+    <span class="s3">else</span><span class="s4">:  </span><span class="s2"># kind='both'</span>
+        <span class="s1">pdp_results</span><span class="s4">[</span><span class="s5">&quot;average&quot;</span><span class="s4">] = </span><span class="s1">averaged_predictions</span>
+        <span class="s1">pdp_results</span><span class="s4">[</span><span class="s5">&quot;individual&quot;</span><span class="s4">] = </span><span class="s1">predictions</span>
+
+    <span class="s3">return </span><span class="s1">pdp_results</span>
+</pre>
+</body>
+</html>

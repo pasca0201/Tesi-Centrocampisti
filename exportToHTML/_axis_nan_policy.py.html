@@ -1,0 +1,709 @@
+<html>
+<head>
+<title>_axis_nan_policy.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_axis_nan_policy.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Many scipy.stats functions support `axis` and `nan_policy` parameters.</span>
+<span class="s0"># When the two are combined, it can be tricky to get all the behavior just</span>
+<span class="s0"># right. This file contains utility functions useful for scipy.stats functions</span>
+<span class="s0"># that support `axis` and `nan_policy`, including a decorator that</span>
+<span class="s0"># automatically adds `axis` and `nan_policy` arguments to a function.</span>
+
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">functools </span><span class="s2">import </span><span class="s1">wraps</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">_lib</span><span class="s3">.</span><span class="s1">_docscrape </span><span class="s2">import </span><span class="s1">FunctionDoc</span><span class="s3">, </span><span class="s1">Parameter</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">_lib</span><span class="s3">.</span><span class="s1">_util </span><span class="s2">import </span><span class="s1">_contains_nan</span><span class="s3">, </span><span class="s1">AxisError</span><span class="s3">, </span><span class="s1">_get_nan</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">_lib</span><span class="s3">.</span><span class="s1">_array_api </span><span class="s2">import </span><span class="s1">array_namespace</span><span class="s3">, </span><span class="s1">is_numpy</span>
+
+<span class="s2">import </span><span class="s1">inspect</span>
+
+<span class="s1">too_small_1d_not_omit </span><span class="s3">= (</span>
+    <span class="s4">&quot;One or more sample arguments is too small; all &quot;</span>
+    <span class="s4">&quot;returned values will be NaN. &quot;</span>
+    <span class="s4">&quot;See documentation for sample size requirements.&quot;</span><span class="s3">)</span>
+
+<span class="s1">too_small_1d_omit </span><span class="s3">= (</span>
+    <span class="s4">&quot;After omitting NaNs, one or more sample arguments &quot;</span>
+    <span class="s4">&quot;is too small; all returned values will be NaN. &quot;</span>
+    <span class="s4">&quot;See documentation for sample size requirements.&quot;</span><span class="s3">)</span>
+
+<span class="s1">too_small_nd_not_omit </span><span class="s3">= (</span>
+    <span class="s4">&quot;All axis-slices of one or more sample arguments are &quot;</span>
+    <span class="s4">&quot;too small; all elements of returned arrays will be NaN. &quot;</span>
+    <span class="s4">&quot;See documentation for sample size requirements.&quot;</span><span class="s3">)</span>
+
+<span class="s1">too_small_nd_omit </span><span class="s3">= (</span>
+    <span class="s4">&quot;After omitting NaNs, one or more axis-slices of one &quot;</span>
+    <span class="s4">&quot;or more sample arguments is too small; corresponding &quot;</span>
+    <span class="s4">&quot;elements of returned arrays will be NaN. &quot;</span>
+    <span class="s4">&quot;See documentation for sample size requirements.&quot;</span><span class="s3">)</span>
+
+<span class="s2">class </span><span class="s1">SmallSampleWarning</span><span class="s3">(</span><span class="s1">RuntimeWarning</span><span class="s3">):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">def </span><span class="s1">_broadcast_arrays</span><span class="s3">(</span><span class="s1">arrays</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">xp</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Broadcast shapes of arrays, ignoring incompatibility of specified axes 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if not </span><span class="s1">arrays</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">arrays</span>
+    <span class="s1">xp </span><span class="s3">= </span><span class="s1">array_namespace</span><span class="s3">(*</span><span class="s1">arrays</span><span class="s3">) </span><span class="s2">if </span><span class="s1">xp </span><span class="s2">is None else </span><span class="s1">xp</span>
+    <span class="s1">arrays </span><span class="s3">= [</span><span class="s1">xp</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">) </span><span class="s2">for </span><span class="s1">arr </span><span class="s2">in </span><span class="s1">arrays</span><span class="s3">]</span>
+    <span class="s1">shapes </span><span class="s3">= [</span><span class="s1">arr</span><span class="s3">.</span><span class="s1">shape </span><span class="s2">for </span><span class="s1">arr </span><span class="s2">in </span><span class="s1">arrays</span><span class="s3">]</span>
+    <span class="s1">new_shapes </span><span class="s3">= </span><span class="s1">_broadcast_shapes</span><span class="s3">(</span><span class="s1">shapes</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">axis </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">new_shapes </span><span class="s3">= [</span><span class="s1">new_shapes</span><span class="s3">]*</span><span class="s1">len</span><span class="s3">(</span><span class="s1">arrays</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s3">[</span><span class="s1">xp</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">array</span><span class="s3">, </span><span class="s1">new_shape</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">array</span><span class="s3">, </span><span class="s1">new_shape </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">arrays</span><span class="s3">, </span><span class="s1">new_shapes</span><span class="s3">)]</span>
+
+
+<span class="s2">def </span><span class="s1">_broadcast_shapes</span><span class="s3">(</span><span class="s1">shapes</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Broadcast shapes, ignoring incompatibility of specified axes 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if not </span><span class="s1">shapes</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">shapes</span>
+
+    <span class="s0"># input validation</span>
+    <span class="s2">if </span><span class="s1">axis </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">axis </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_1d</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+        <span class="s1">axis_int </span><span class="s3">= </span><span class="s1">axis</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">int</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array_equal</span><span class="s3">(</span><span class="s1">axis_int</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">AxisError</span><span class="s3">(</span><span class="s4">'`axis` must be an integer, a '</span>
+                            <span class="s4">'tuple of integers, or `None`.'</span><span class="s3">)</span>
+        <span class="s1">axis </span><span class="s3">= </span><span class="s1">axis_int</span>
+
+    <span class="s0"># First, ensure all shapes have same number of dimensions by prepending 1s.</span>
+    <span class="s1">n_dims </span><span class="s3">= </span><span class="s1">max</span><span class="s3">([</span><span class="s1">len</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">) </span><span class="s2">for </span><span class="s1">shape </span><span class="s2">in </span><span class="s1">shapes</span><span class="s3">])</span>
+    <span class="s1">new_shapes </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s1">len</span><span class="s3">(</span><span class="s1">shapes</span><span class="s3">), </span><span class="s1">n_dims</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">int</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">row</span><span class="s3">, </span><span class="s1">shape </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">new_shapes</span><span class="s3">, </span><span class="s1">shapes</span><span class="s3">):</span>
+        <span class="s1">row</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">row</span><span class="s3">)-</span><span class="s1">len</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">):] = </span><span class="s1">shape  </span><span class="s0"># can't use negative indices (-0:)</span>
+
+    <span class="s0"># Remove the shape elements of the axes to be ignored, but remember them.</span>
+    <span class="s2">if </span><span class="s1">axis </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">axis</span><span class="s3">[</span><span class="s1">axis </span><span class="s3">&lt; </span><span class="s6">0</span><span class="s3">] = </span><span class="s1">n_dims </span><span class="s3">+ </span><span class="s1">axis</span><span class="s3">[</span><span class="s1">axis </span><span class="s3">&lt; </span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s1">axis </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">axis</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">] &gt;= </span><span class="s1">n_dims </span><span class="s2">or </span><span class="s1">axis</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] &lt; </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s1">message </span><span class="s3">= (</span><span class="s4">f&quot;`axis` is out of bounds &quot;</span>
+                       <span class="s4">f&quot;for array of dimension </span><span class="s2">{</span><span class="s1">n_dims</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">AxisError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">unique</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)) != </span><span class="s1">len</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">AxisError</span><span class="s3">(</span><span class="s4">&quot;`axis` must contain only distinct elements&quot;</span><span class="s3">)</span>
+
+        <span class="s1">removed_shapes </span><span class="s3">= </span><span class="s1">new_shapes</span><span class="s3">[:, </span><span class="s1">axis</span><span class="s3">]</span>
+        <span class="s1">new_shapes </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">delete</span><span class="s3">(</span><span class="s1">new_shapes</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s0"># If arrays are broadcastable, shape elements that are 1 may be replaced</span>
+    <span class="s0"># with a corresponding non-1 shape element. Assuming arrays are</span>
+    <span class="s0"># broadcastable, that final shape element can be found with:</span>
+    <span class="s1">new_shape </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">new_shapes</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s6">0</span><span class="s3">)</span>
+    <span class="s0"># except in case of an empty array:</span>
+    <span class="s1">new_shape </span><span class="s3">*= </span><span class="s1">new_shapes</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s6">0</span><span class="s3">)</span>
+
+    <span class="s0"># Among all arrays, there can only be one unique non-1 shape element.</span>
+    <span class="s0"># Therefore, if any non-1 shape element does not match what we found</span>
+    <span class="s0"># above, the arrays must not be broadcastable after all.</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(~((</span><span class="s1">new_shapes </span><span class="s3">== </span><span class="s6">1</span><span class="s3">) | (</span><span class="s1">new_shapes </span><span class="s3">== </span><span class="s1">new_shape</span><span class="s3">))):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Array shapes are incompatible for broadcasting.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">axis </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s0"># Add back the shape elements that were ignored</span>
+        <span class="s1">new_axis </span><span class="s3">= </span><span class="s1">axis </span><span class="s3">- </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">))</span>
+        <span class="s1">new_shapes </span><span class="s3">= [</span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">insert</span><span class="s3">(</span><span class="s1">new_shape</span><span class="s3">, </span><span class="s1">new_axis</span><span class="s3">, </span><span class="s1">removed_shape</span><span class="s3">))</span>
+                      <span class="s2">for </span><span class="s1">removed_shape </span><span class="s2">in </span><span class="s1">removed_shapes</span><span class="s3">]</span>
+        <span class="s2">return </span><span class="s1">new_shapes</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">new_shape</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_broadcast_array_shapes_remove_axis</span><span class="s3">(</span><span class="s1">arrays</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Broadcast shapes of arrays, dropping specified axes 
+ 
+    Given a sequence of arrays `arrays` and an integer or tuple `axis`, find 
+    the shape of the broadcast result after consuming/dropping `axis`. 
+    In other words, return output shape of a typical hypothesis test on 
+    `arrays` vectorized along `axis`. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.stats._axis_nan_policy import _broadcast_array_shapes_remove_axis 
+    &gt;&gt;&gt; a = np.zeros((5, 2, 1)) 
+    &gt;&gt;&gt; b = np.zeros((9, 3)) 
+    &gt;&gt;&gt; _broadcast_array_shapes_remove_axis((a, b), 1) 
+    (5, 3) 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Note that here, `axis=None` means do not consume/drop any axes - _not_</span>
+    <span class="s0"># ravel arrays before broadcasting.</span>
+    <span class="s1">shapes </span><span class="s3">= [</span><span class="s1">arr</span><span class="s3">.</span><span class="s1">shape </span><span class="s2">for </span><span class="s1">arr </span><span class="s2">in </span><span class="s1">arrays</span><span class="s3">]</span>
+    <span class="s2">return </span><span class="s1">_broadcast_shapes_remove_axis</span><span class="s3">(</span><span class="s1">shapes</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_broadcast_shapes_remove_axis</span><span class="s3">(</span><span class="s1">shapes</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Broadcast shapes, dropping specified axes 
+ 
+    Same as _broadcast_array_shapes_remove_axis, but given a sequence 
+    of array shapes `shapes` instead of the arrays themselves. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">shapes </span><span class="s3">= </span><span class="s1">_broadcast_shapes</span><span class="s3">(</span><span class="s1">shapes</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+    <span class="s1">shape </span><span class="s3">= </span><span class="s1">shapes</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">axis </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">shape </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">delete</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_broadcast_concatenate</span><span class="s3">(</span><span class="s1">arrays</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;Concatenate arrays along an axis with broadcasting.&quot;&quot;&quot;</span>
+    <span class="s1">arrays </span><span class="s3">= </span><span class="s1">_broadcast_arrays</span><span class="s3">(</span><span class="s1">arrays</span><span class="s3">, </span><span class="s1">axis </span><span class="s2">if not </span><span class="s1">paired </span><span class="s2">else None</span><span class="s3">)</span>
+    <span class="s1">res </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">(</span><span class="s1">arrays</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">res</span>
+
+
+<span class="s0"># TODO: add support for `axis` tuples</span>
+<span class="s2">def </span><span class="s1">_remove_nans</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">):</span>
+    <span class="s5">&quot;Remove nans from paired or unpaired 1D samples&quot;</span>
+    <span class="s0"># potential optimization: don't copy arrays that don't contain nans</span>
+    <span class="s2">if not </span><span class="s1">paired</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">[</span><span class="s1">sample</span><span class="s3">[~</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">)] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+
+    <span class="s0"># for paired samples, we need to remove the whole pair when any part</span>
+    <span class="s0"># has a nan</span>
+    <span class="s1">nans </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">[</span><span class="s6">0</span><span class="s3">])</span>
+    <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]:</span>
+        <span class="s1">nans </span><span class="s3">= </span><span class="s1">nans </span><span class="s3">| </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">)</span>
+    <span class="s1">not_nans </span><span class="s3">= ~</span><span class="s1">nans</span>
+    <span class="s2">return </span><span class="s3">[</span><span class="s1">sample</span><span class="s3">[</span><span class="s1">not_nans</span><span class="s3">] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+
+
+<span class="s2">def </span><span class="s1">_remove_sentinel</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">, </span><span class="s1">sentinel</span><span class="s3">):</span>
+    <span class="s5">&quot;Remove sentinel values from paired or unpaired 1D samples&quot;</span>
+    <span class="s0"># could consolidate with `_remove_nans`, but it's not quite as simple as</span>
+    <span class="s0"># passing `sentinel=np.nan` because `(np.nan == np.nan) is False`</span>
+
+    <span class="s0"># potential optimization: don't copy arrays that don't contain sentinel</span>
+    <span class="s2">if not </span><span class="s1">paired</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">[</span><span class="s1">sample</span><span class="s3">[</span><span class="s1">sample </span><span class="s3">!= </span><span class="s1">sentinel</span><span class="s3">] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+
+    <span class="s0"># for paired samples, we need to remove the whole pair when any part</span>
+    <span class="s0"># has a nan</span>
+    <span class="s1">sentinels </span><span class="s3">= (</span><span class="s1">samples</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] == </span><span class="s1">sentinel</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]:</span>
+        <span class="s1">sentinels </span><span class="s3">= </span><span class="s1">sentinels </span><span class="s3">| (</span><span class="s1">sample </span><span class="s3">== </span><span class="s1">sentinel</span><span class="s3">)</span>
+    <span class="s1">not_sentinels </span><span class="s3">= ~</span><span class="s1">sentinels</span>
+    <span class="s2">return </span><span class="s3">[</span><span class="s1">sample</span><span class="s3">[</span><span class="s1">not_sentinels</span><span class="s3">] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+
+
+<span class="s2">def </span><span class="s1">_masked_arrays_2_sentinel_arrays</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">):</span>
+    <span class="s0"># masked arrays in `samples` are converted to regular arrays, and values</span>
+    <span class="s0"># corresponding with masked elements are replaced with a sentinel value</span>
+
+    <span class="s0"># return without modifying arrays if none have a mask</span>
+    <span class="s1">has_mask </span><span class="s3">= </span><span class="s2">False</span>
+    <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">:</span>
+        <span class="s1">mask </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">, </span><span class="s4">'mask'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s1">has_mask </span><span class="s3">= </span><span class="s1">has_mask </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">mask</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s1">has_mask</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">samples</span><span class="s3">, </span><span class="s2">None  </span><span class="s0"># None means there is no sentinel value</span>
+
+    <span class="s0"># Choose a sentinel value. We can't use `np.nan`, because sentinel (masked)</span>
+    <span class="s0"># values are always omitted, but there are different nan policies.</span>
+    <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">result_type</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">)</span>
+    <span class="s1">dtype </span><span class="s3">= </span><span class="s1">dtype </span><span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">number</span><span class="s3">) </span><span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span>
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">)):</span>
+        <span class="s0"># Things get more complicated if the arrays are of different types.</span>
+        <span class="s0"># We could have different sentinel values for each array, but</span>
+        <span class="s0"># the purpose of this code is convenience, not efficiency.</span>
+        <span class="s1">samples</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">samples</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+
+    <span class="s1">inexact </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inexact</span><span class="s3">)</span>
+    <span class="s1">info </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo </span><span class="s2">if </span><span class="s1">inexact </span><span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">iinfo</span>
+    <span class="s1">max_possible</span><span class="s3">, </span><span class="s1">min_possible </span><span class="s3">= </span><span class="s1">info</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">max</span><span class="s3">, </span><span class="s1">info</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">min</span>
+    <span class="s1">nextafter </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nextafter </span><span class="s2">if </span><span class="s1">inexact </span><span class="s2">else </span><span class="s3">(</span><span class="s2">lambda </span><span class="s1">x</span><span class="s3">, </span><span class="s1">_</span><span class="s3">: </span><span class="s1">x </span><span class="s3">- </span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s1">sentinel </span><span class="s3">= </span><span class="s1">max_possible</span>
+    <span class="s0"># For simplicity, min_possible/np.infs are not candidate sentinel values</span>
+    <span class="s2">while </span><span class="s1">sentinel </span><span class="s3">&gt; </span><span class="s1">min_possible</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">sample </span><span class="s3">== </span><span class="s1">sentinel</span><span class="s3">):  </span><span class="s0"># choose a new sentinel value</span>
+                <span class="s1">sentinel </span><span class="s3">= </span><span class="s1">nextafter</span><span class="s3">(</span><span class="s1">sentinel</span><span class="s3">, -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+                <span class="s2">break</span>
+        <span class="s2">else</span><span class="s3">:  </span><span class="s0"># when sentinel value is OK, break the while loop</span>
+            <span class="s2">break</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">message </span><span class="s3">= (</span><span class="s4">&quot;This function replaces masked elements with sentinel &quot;</span>
+                   <span class="s4">&quot;values, but the data contains all distinct values of this &quot;</span>
+                   <span class="s4">&quot;data type. Consider promoting the dtype to `np.float64`.&quot;</span><span class="s3">)</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s0"># replace masked elements with sentinel value</span>
+    <span class="s1">out_samples </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">:</span>
+        <span class="s1">mask </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">, </span><span class="s4">'mask'</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">mask </span><span class="s2">is not None</span><span class="s3">:  </span><span class="s0"># turn all masked arrays into sentinel arrays</span>
+            <span class="s1">mask </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">mask</span><span class="s3">, </span><span class="s1">sample</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+            <span class="s1">sample </span><span class="s3">= </span><span class="s1">sample</span><span class="s3">.</span><span class="s1">data</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">() </span><span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">mask</span><span class="s3">) </span><span class="s2">else </span><span class="s1">sample</span><span class="s3">.</span><span class="s1">data</span>
+            <span class="s1">sample </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">)  </span><span class="s0"># `sample.data` could be a memoryview?</span>
+            <span class="s1">sample</span><span class="s3">[</span><span class="s1">mask</span><span class="s3">] = </span><span class="s1">sentinel</span>
+        <span class="s1">out_samples</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">out_samples</span><span class="s3">, </span><span class="s1">sentinel</span>
+
+
+<span class="s2">def </span><span class="s1">_check_empty_inputs</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Check for empty sample; return appropriate output for a vectorized hypotest 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># if none of the samples are empty, we need to perform the test</span>
+    <span class="s2">if not </span><span class="s1">any</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s6">0 </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">):</span>
+        <span class="s2">return None</span>
+    <span class="s0"># otherwise, the statistic and p-value will be either empty arrays or</span>
+    <span class="s0"># arrays with NaNs. Produce the appropriate array and return it.</span>
+    <span class="s1">output_shape </span><span class="s3">= </span><span class="s1">_broadcast_array_shapes_remove_axis</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+    <span class="s1">output </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">output_shape</span><span class="s3">) * </span><span class="s1">_get_nan</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">output</span>
+
+
+<span class="s2">def </span><span class="s1">_add_reduced_axes</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot; 
+    Add reduced axes back to all the arrays in the result object 
+    if keepdims = True. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s3">([</span><span class="s1">np</span><span class="s3">.</span><span class="s1">expand_dims</span><span class="s3">(</span><span class="s1">output</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">) </span>
+             <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">output</span><span class="s3">, </span><span class="s1">int</span><span class="s3">) </span><span class="s2">else </span><span class="s1">output </span><span class="s2">for </span><span class="s1">output </span><span class="s2">in </span><span class="s1">res</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">keepdims </span><span class="s2">else </span><span class="s1">res</span><span class="s3">)</span>
+
+
+<span class="s0"># Standard docstring / signature entries for `axis`, `nan_policy`, `keepdims`</span>
+<span class="s1">_name </span><span class="s3">= </span><span class="s4">'axis'</span>
+<span class="s1">_desc </span><span class="s3">= (</span>
+    <span class="s4">&quot;&quot;&quot;If an int, the axis of the input along which to compute the statistic. 
+The statistic of each axis-slice (e.g. row) of the input will appear in a 
+corresponding element of the output. 
+If ``None``, the input will be raveled before computing the statistic.&quot;&quot;&quot;</span>
+    <span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">))</span>
+
+
+<span class="s2">def </span><span class="s1">_get_axis_params</span><span class="s3">(</span><span class="s1">default_axis</span><span class="s3">=</span><span class="s6">0</span><span class="s3">, </span><span class="s1">_name</span><span class="s3">=</span><span class="s1">_name</span><span class="s3">, </span><span class="s1">_desc</span><span class="s3">=</span><span class="s1">_desc</span><span class="s3">):  </span><span class="s0"># bind NOW</span>
+    <span class="s1">_type </span><span class="s3">= </span><span class="s4">f&quot;int or None, default: </span><span class="s2">{</span><span class="s1">default_axis</span><span class="s2">}</span><span class="s4">&quot;</span>
+    <span class="s1">_axis_parameter_doc </span><span class="s3">= </span><span class="s1">Parameter</span><span class="s3">(</span><span class="s1">_name</span><span class="s3">, </span><span class="s1">_type</span><span class="s3">, </span><span class="s1">_desc</span><span class="s3">)</span>
+    <span class="s1">_axis_parameter </span><span class="s3">= </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">Parameter</span><span class="s3">(</span><span class="s1">_name</span><span class="s3">,</span>
+                                        <span class="s1">inspect</span><span class="s3">.</span><span class="s1">Parameter</span><span class="s3">.</span><span class="s1">KEYWORD_ONLY</span><span class="s3">,</span>
+                                        <span class="s1">default</span><span class="s3">=</span><span class="s1">default_axis</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">_axis_parameter_doc</span><span class="s3">, </span><span class="s1">_axis_parameter</span>
+
+
+<span class="s1">_name </span><span class="s3">= </span><span class="s4">'nan_policy'</span>
+<span class="s1">_type </span><span class="s3">= </span><span class="s4">&quot;{'propagate', 'omit', 'raise'}&quot;</span>
+<span class="s1">_desc </span><span class="s3">= (</span>
+    <span class="s4">&quot;&quot;&quot;Defines how to handle input NaNs. 
+ 
+- ``propagate``: if a NaN is present in the axis slice (e.g. row) along 
+  which the  statistic is computed, the corresponding entry of the output 
+  will be NaN. 
+- ``omit``: NaNs will be omitted when performing the calculation. 
+  If insufficient data remains in the axis slice along which the 
+  statistic is computed, the corresponding entry of the output will be 
+  NaN. 
+- ``raise``: if a NaN is present, a ``ValueError`` will be raised.&quot;&quot;&quot;</span>
+    <span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">))</span>
+<span class="s1">_nan_policy_parameter_doc </span><span class="s3">= </span><span class="s1">Parameter</span><span class="s3">(</span><span class="s1">_name</span><span class="s3">, </span><span class="s1">_type</span><span class="s3">, </span><span class="s1">_desc</span><span class="s3">)</span>
+<span class="s1">_nan_policy_parameter </span><span class="s3">= </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">Parameter</span><span class="s3">(</span><span class="s1">_name</span><span class="s3">,</span>
+                                          <span class="s1">inspect</span><span class="s3">.</span><span class="s1">Parameter</span><span class="s3">.</span><span class="s1">KEYWORD_ONLY</span><span class="s3">,</span>
+                                          <span class="s1">default</span><span class="s3">=</span><span class="s4">'propagate'</span><span class="s3">)</span>
+
+<span class="s1">_name </span><span class="s3">= </span><span class="s4">'keepdims'</span>
+<span class="s1">_type </span><span class="s3">= </span><span class="s4">&quot;bool, default: False&quot;</span>
+<span class="s1">_desc </span><span class="s3">= (</span>
+    <span class="s4">&quot;&quot;&quot;If this is set to True, the axes which are reduced are left 
+in the result as dimensions with size one. With this option, 
+the result will broadcast correctly against the input array.&quot;&quot;&quot;</span>
+    <span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">))</span>
+<span class="s1">_keepdims_parameter_doc </span><span class="s3">= </span><span class="s1">Parameter</span><span class="s3">(</span><span class="s1">_name</span><span class="s3">, </span><span class="s1">_type</span><span class="s3">, </span><span class="s1">_desc</span><span class="s3">)</span>
+<span class="s1">_keepdims_parameter </span><span class="s3">= </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">Parameter</span><span class="s3">(</span><span class="s1">_name</span><span class="s3">,</span>
+                                        <span class="s1">inspect</span><span class="s3">.</span><span class="s1">Parameter</span><span class="s3">.</span><span class="s1">KEYWORD_ONLY</span><span class="s3">,</span>
+                                        <span class="s1">default</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+
+<span class="s1">_standard_note_addition </span><span class="s3">= (</span>
+    <span class="s4">&quot;&quot;&quot;</span><span class="s2">\n</span><span class="s4">Beginning in SciPy 1.9, ``np.matrix`` inputs (not recommended for new 
+code) are converted to ``np.ndarray`` before the calculation is performed. In 
+this case, the output will be a scalar or ``np.ndarray`` of appropriate shape 
+rather than a 2D ``np.matrix``. Similarly, while masked elements of masked 
+arrays are ignored, the output will be a scalar or ``np.ndarray`` rather than a 
+masked array with ``mask=False``.&quot;&quot;&quot;</span><span class="s3">).</span><span class="s1">split</span><span class="s3">(</span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_axis_nan_policy_factory</span><span class="s3">(</span><span class="s1">tuple_to_result</span><span class="s3">, </span><span class="s1">default_axis</span><span class="s3">=</span><span class="s6">0</span><span class="s3">,</span>
+                             <span class="s1">n_samples</span><span class="s3">=</span><span class="s6">1</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+                             <span class="s1">result_to_tuple</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">too_small</span><span class="s3">=</span><span class="s6">0</span><span class="s3">,</span>
+                             <span class="s1">n_outputs</span><span class="s3">=</span><span class="s6">2</span><span class="s3">, </span><span class="s1">kwd_samples</span><span class="s3">=[], </span><span class="s1">override</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;Factory for a wrapper that adds axis/nan_policy params to a function. 
+ 
+    Parameters 
+    ---------- 
+    tuple_to_result : callable 
+        Callable that returns an object of the type returned by the function 
+        being wrapped (e.g. the namedtuple or dataclass returned by a 
+        statistical test) provided the separate components (e.g. statistic, 
+        pvalue). 
+    default_axis : int, default: 0 
+        The default value of the axis argument. Standard is 0 except when 
+        backwards compatibility demands otherwise (e.g. `None`). 
+    n_samples : int or callable, default: 1 
+        The number of data samples accepted by the function 
+        (e.g. `mannwhitneyu`), a callable that accepts a dictionary of 
+        parameters passed into the function and returns the number of data 
+        samples (e.g. `wilcoxon`), or `None` to indicate an arbitrary number 
+        of samples (e.g. `kruskal`). 
+    paired : {False, True} 
+        Whether the function being wrapped treats the samples as paired (i.e. 
+        corresponding elements of each sample should be considered as different 
+        components of the same sample.) 
+    result_to_tuple : callable, optional 
+        Function that unpacks the results of the function being wrapped into 
+        a tuple. This is essentially the inverse of `tuple_to_result`. Default 
+        is `None`, which is appropriate for statistical tests that return a 
+        statistic, pvalue tuple (rather than, e.g., a non-iterable datalass). 
+    too_small : int or callable, default: 0 
+        The largest unnacceptably small sample for the function being wrapped. 
+        For example, some functions require samples of size two or more or they 
+        raise an error. This argument prevents the error from being raised when 
+        input is not 1D and instead places a NaN in the corresponding element 
+        of the result. If callable, it must accept a list of samples, axis, 
+        and a dictionary of keyword arguments passed to the wrapper function as 
+        arguments and return a bool indicating weather the samples passed are 
+        too small. 
+    n_outputs : int or callable, default: 2 
+        The number of outputs produced by the function given 1d sample(s). For 
+        example, hypothesis tests that return a namedtuple or result object 
+        with attributes ``statistic`` and ``pvalue`` use the default 
+        ``n_outputs=2``; summary statistics with scalar output use 
+        ``n_outputs=1``. Alternatively, may be a callable that accepts a 
+        dictionary of arguments passed into the wrapped function and returns 
+        the number of outputs corresponding with those arguments. 
+    kwd_samples : sequence, default: [] 
+        The names of keyword parameters that should be treated as samples. For 
+        example, `gmean` accepts as its first argument a sample `a` but 
+        also `weights` as a fourth, optional keyword argument. In this case, we 
+        use `n_samples=1` and kwd_samples=['weights']. 
+    override : dict, default: {'vectorization': False, 'nan_propagation': True} 
+        Pass a dictionary with ``'vectorization': True`` to ensure that the 
+        decorator overrides the function's behavior for multimensional input. 
+        Use ``'nan_propagation': False`` to ensure that the decorator does not 
+        override the function's behavior for ``nan_policy='propagate'``. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># Specify which existing behaviors the decorator must override</span>
+    <span class="s1">temp </span><span class="s3">= </span><span class="s1">override </span><span class="s2">or </span><span class="s3">{}</span>
+    <span class="s1">override </span><span class="s3">= {</span><span class="s4">'vectorization'</span><span class="s3">: </span><span class="s2">False</span><span class="s3">,</span>
+                <span class="s4">'nan_propagation'</span><span class="s3">: </span><span class="s2">True</span><span class="s3">}</span>
+    <span class="s1">override</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">temp</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">result_to_tuple </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">def </span><span class="s1">result_to_tuple</span><span class="s3">(</span><span class="s1">res</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">res</span>
+
+    <span class="s2">if not </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">too_small</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">is_too_small</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, *</span><span class="s1">ts_args</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s6">1</span><span class="s3">, **</span><span class="s1">ts_kwargs</span><span class="s3">):</span>
+            <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">sample</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">] &lt;= </span><span class="s1">too_small</span><span class="s3">:</span>
+                    <span class="s2">return True</span>
+            <span class="s2">return False</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">is_too_small </span><span class="s3">= </span><span class="s1">too_small</span>
+
+    <span class="s2">def </span><span class="s1">axis_nan_policy_decorator</span><span class="s3">(</span><span class="s1">hypotest_fun_in</span><span class="s3">):</span>
+        <span class="s3">@</span><span class="s1">wraps</span><span class="s3">(</span><span class="s1">hypotest_fun_in</span><span class="s3">)</span>
+        <span class="s2">def </span><span class="s1">axis_nan_policy_wrapper</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, </span><span class="s1">_no_deco</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">):</span>
+
+            <span class="s2">if </span><span class="s1">_no_deco</span><span class="s3">:  </span><span class="s0"># for testing, decorator does nothing</span>
+                <span class="s2">return </span><span class="s1">hypotest_fun_in</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">)</span>
+
+            <span class="s0"># For now, skip the decorator entirely if using array API. In the future,</span>
+            <span class="s0"># we'll probably want to use it for `keepdims`, `axis` tuples, etc.</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">args</span><span class="s3">) == </span><span class="s6">0</span><span class="s3">:  </span><span class="s0"># extract sample from `kwds` if there are no `args`</span>
+                <span class="s1">used_kwd_samples </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">set</span><span class="s3">(</span><span class="s1">kwds</span><span class="s3">).</span><span class="s1">intersection</span><span class="s3">(</span><span class="s1">set</span><span class="s3">(</span><span class="s1">kwd_samples</span><span class="s3">)))</span>
+                <span class="s1">temp </span><span class="s3">= </span><span class="s1">used_kwd_samples</span><span class="s3">[:</span><span class="s6">1</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">temp </span><span class="s3">= </span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+
+            <span class="s2">if not </span><span class="s1">is_numpy</span><span class="s3">(</span><span class="s1">array_namespace</span><span class="s3">(</span><span class="s1">temp</span><span class="s3">)):</span>
+                <span class="s1">msg </span><span class="s3">= (</span><span class="s4">&quot;Use of `nan_policy` and `keepdims` &quot;</span>
+                       <span class="s4">&quot;is incompatible with non-NumPy arrays.&quot;</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s4">'nan_policy' </span><span class="s2">in </span><span class="s1">kwds </span><span class="s2">or </span><span class="s4">'keepdims' </span><span class="s2">in </span><span class="s1">kwds</span><span class="s3">:</span>
+                    <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s1">hypotest_fun_in</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">)</span>
+
+            <span class="s0"># We need to be flexible about whether position or keyword</span>
+            <span class="s0"># arguments are used, but we need to make sure users don't pass</span>
+            <span class="s0"># both for the same parameter. To complicate matters, some</span>
+            <span class="s0"># functions accept samples with *args, and some functions already</span>
+            <span class="s0"># accept `axis` and `nan_policy` as positional arguments.</span>
+            <span class="s0"># The strategy is to make sure that there is no duplication</span>
+            <span class="s0"># between `args` and `kwds`, combine the two into `kwds`, then</span>
+            <span class="s0"># the samples, `nan_policy`, and `axis` from `kwds`, as they are</span>
+            <span class="s0"># dealt with separately.</span>
+
+            <span class="s0"># Check for intersection between positional and keyword args</span>
+            <span class="s1">params </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">signature</span><span class="s3">(</span><span class="s1">hypotest_fun_in</span><span class="s3">).</span><span class="s1">parameters</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">n_samples </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s0"># Give unique names to each positional sample argument</span>
+                <span class="s0"># Note that *args can't be provided as a keyword argument</span>
+                <span class="s1">params </span><span class="s3">= [</span><span class="s4">f&quot;arg</span><span class="s2">{</span><span class="s1">i</span><span class="s2">}</span><span class="s4">&quot; </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">args</span><span class="s3">))] + </span><span class="s1">params</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+
+            <span class="s0"># raise if there are too many positional args</span>
+            <span class="s1">maxarg </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf </span><span class="s2">if </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">getfullargspec</span><span class="s3">(</span><span class="s1">hypotest_fun_in</span><span class="s3">).</span><span class="s1">varargs</span>
+                      <span class="s2">else </span><span class="s1">len</span><span class="s3">(</span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">getfullargspec</span><span class="s3">(</span><span class="s1">hypotest_fun_in</span><span class="s3">).</span><span class="s1">args</span><span class="s3">))</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">args</span><span class="s3">) &gt; </span><span class="s1">maxarg</span><span class="s3">:  </span><span class="s0"># let the function raise the right error</span>
+                <span class="s1">hypotest_fun_in</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">)</span>
+
+            <span class="s0"># raise if multiple values passed for same parameter</span>
+            <span class="s1">d_args </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">params</span><span class="s3">, </span><span class="s1">args</span><span class="s3">))</span>
+            <span class="s1">intersection </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">d_args</span><span class="s3">) &amp; </span><span class="s1">set</span><span class="s3">(</span><span class="s1">kwds</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">intersection</span><span class="s3">:  </span><span class="s0"># let the function raise the right error</span>
+                <span class="s1">hypotest_fun_in</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">)</span>
+
+            <span class="s0"># Consolidate other positional and keyword args into `kwds`</span>
+            <span class="s1">kwds</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">d_args</span><span class="s3">)</span>
+
+            <span class="s0"># rename avoids UnboundLocalError</span>
+            <span class="s2">if </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+                <span class="s0"># Future refactoring idea: no need for callable n_samples.</span>
+                <span class="s0"># Just replace `n_samples` and `kwd_samples` with a single</span>
+                <span class="s0"># list of the names of all samples, and treat all of them</span>
+                <span class="s0"># as `kwd_samples` are treated below.</span>
+                <span class="s1">n_samp </span><span class="s3">= </span><span class="s1">n_samples</span><span class="s3">(</span><span class="s1">kwds</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">n_samp </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s2">or </span><span class="s1">len</span><span class="s3">(</span><span class="s1">args</span><span class="s3">)</span>
+
+            <span class="s0"># get the number of outputs</span>
+            <span class="s1">n_out </span><span class="s3">= </span><span class="s1">n_outputs  </span><span class="s0"># rename to avoid UnboundLocalError</span>
+            <span class="s2">if </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">):</span>
+                <span class="s1">n_out </span><span class="s3">= </span><span class="s1">n_out</span><span class="s3">(</span><span class="s1">kwds</span><span class="s3">)</span>
+
+            <span class="s0"># If necessary, rearrange function signature: accept other samples</span>
+            <span class="s0"># as positional args right after the first n_samp args</span>
+            <span class="s1">kwd_samp </span><span class="s3">= [</span><span class="s1">name </span><span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">kwd_samples</span>
+                        <span class="s2">if </span><span class="s1">kwds</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s2">None</span><span class="s3">) </span><span class="s2">is not None</span><span class="s3">]</span>
+            <span class="s1">n_kwd_samp </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">kwd_samp</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">kwd_samp</span><span class="s3">:</span>
+                <span class="s1">hypotest_fun_out </span><span class="s3">= </span><span class="s1">hypotest_fun_in</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">def </span><span class="s1">hypotest_fun_out</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">):</span>
+                    <span class="s1">new_kwds </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">kwd_samp</span><span class="s3">, </span><span class="s1">samples</span><span class="s3">[</span><span class="s1">n_samp</span><span class="s3">:]))</span>
+                    <span class="s1">kwds</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">new_kwds</span><span class="s3">)</span>
+                    <span class="s2">return </span><span class="s1">hypotest_fun_in</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">[:</span><span class="s1">n_samp</span><span class="s3">], **</span><span class="s1">kwds</span><span class="s3">)</span>
+
+            <span class="s0"># Extract the things we need here</span>
+            <span class="s2">try</span><span class="s3">:  </span><span class="s0"># if something is missing</span>
+                <span class="s1">samples </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_1d</span><span class="s3">(</span><span class="s1">kwds</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">param</span><span class="s3">))</span>
+                           <span class="s2">for </span><span class="s1">param </span><span class="s2">in </span><span class="s3">(</span><span class="s1">params</span><span class="s3">[:</span><span class="s1">n_samp</span><span class="s3">] + </span><span class="s1">kwd_samp</span><span class="s3">)]</span>
+            <span class="s2">except </span><span class="s1">KeyError</span><span class="s3">:  </span><span class="s0"># let the function raise the right error</span>
+                <span class="s0"># might need to revisit this if required arg is not a &quot;sample&quot;</span>
+                <span class="s1">hypotest_fun_in</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">)</span>
+            <span class="s1">vectorized </span><span class="s3">= </span><span class="s2">True if </span><span class="s4">'axis' </span><span class="s2">in </span><span class="s1">params </span><span class="s2">else False</span>
+            <span class="s1">vectorized </span><span class="s3">= </span><span class="s1">vectorized </span><span class="s2">and not </span><span class="s1">override</span><span class="s3">[</span><span class="s4">'vectorization'</span><span class="s3">]</span>
+            <span class="s1">axis </span><span class="s3">= </span><span class="s1">kwds</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s4">'axis'</span><span class="s3">, </span><span class="s1">default_axis</span><span class="s3">)</span>
+            <span class="s1">nan_policy </span><span class="s3">= </span><span class="s1">kwds</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s4">'nan_policy'</span><span class="s3">, </span><span class="s4">'propagate'</span><span class="s3">)</span>
+            <span class="s1">keepdims </span><span class="s3">= </span><span class="s1">kwds</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s4">&quot;keepdims&quot;</span><span class="s3">, </span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s2">del </span><span class="s1">args  </span><span class="s0"># avoid the possibility of passing both `args` and `kwds`</span>
+
+            <span class="s0"># convert masked arrays to regular arrays with sentinel values</span>
+            <span class="s1">samples</span><span class="s3">, </span><span class="s1">sentinel </span><span class="s3">= </span><span class="s1">_masked_arrays_2_sentinel_arrays</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">)</span>
+
+            <span class="s0"># standardize to always work along last axis</span>
+            <span class="s1">reduced_axes </span><span class="s3">= </span><span class="s1">axis</span>
+            <span class="s2">if </span><span class="s1">axis </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">samples</span><span class="s3">:</span>
+                    <span class="s0"># when axis=None, take the maximum of all dimensions since</span>
+                    <span class="s0"># all the dimensions are reduced.</span>
+                    <span class="s1">n_dims </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">([</span><span class="s1">sample</span><span class="s3">.</span><span class="s1">ndim </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">])</span>
+                    <span class="s1">reduced_axes </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_dims</span><span class="s3">))</span>
+                <span class="s1">samples </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">()) </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">samples </span><span class="s3">= </span><span class="s1">_broadcast_arrays</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">)</span>
+                <span class="s1">axis </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_1d</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+                <span class="s1">n_axes </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+                <span class="s0"># move all axes in `axis` to the end to be raveled</span>
+                <span class="s1">samples </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">moveaxis</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">, </span><span class="s1">range</span><span class="s3">(-</span><span class="s1">len</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">), </span><span class="s6">0</span><span class="s3">))</span>
+                           <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+                <span class="s1">shapes </span><span class="s3">= [</span><span class="s1">sample</span><span class="s3">.</span><span class="s1">shape </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+                <span class="s0"># New shape is unchanged for all axes _not_ in `axis`</span>
+                <span class="s0"># At the end, we append the product of the shapes of the axes</span>
+                <span class="s0"># in `axis`. Appending -1 doesn't work for zero-size arrays!</span>
+                <span class="s1">new_shapes </span><span class="s3">= [</span><span class="s1">shape</span><span class="s3">[:-</span><span class="s1">n_axes</span><span class="s3">] + (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">prod</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">[-</span><span class="s1">n_axes</span><span class="s3">:]),)</span>
+                              <span class="s2">for </span><span class="s1">shape </span><span class="s2">in </span><span class="s1">shapes</span><span class="s3">]</span>
+                <span class="s1">samples </span><span class="s3">= [</span><span class="s1">sample</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">new_shape</span><span class="s3">)</span>
+                           <span class="s2">for </span><span class="s1">sample</span><span class="s3">, </span><span class="s1">new_shape </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">new_shapes</span><span class="s3">)]</span>
+            <span class="s1">axis </span><span class="s3">= -</span><span class="s6">1  </span><span class="s0"># work over the last axis</span>
+            <span class="s1">NaN </span><span class="s3">= </span><span class="s1">_get_nan</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">) </span><span class="s2">if </span><span class="s1">samples </span><span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+
+            <span class="s0"># if axis is not needed, just handle nan_policy and return</span>
+            <span class="s1">ndims </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s1">sample</span><span class="s3">.</span><span class="s1">ndim </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">])</span>
+            <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">ndims </span><span class="s3">&lt;= </span><span class="s6">1</span><span class="s3">):</span>
+                <span class="s0"># Addresses nan_policy == &quot;raise&quot;</span>
+                <span class="s2">if </span><span class="s1">nan_policy </span><span class="s3">!= </span><span class="s4">'propagate' </span><span class="s2">or </span><span class="s1">override</span><span class="s3">[</span><span class="s4">'nan_propagation'</span><span class="s3">]:</span>
+                    <span class="s1">contains_nan </span><span class="s3">= [</span><span class="s1">_contains_nan</span><span class="s3">(</span><span class="s1">sample</span><span class="s3">, </span><span class="s1">nan_policy</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+                                    <span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">]</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s0"># Behave as though there are no NaNs (even if there are)</span>
+                    <span class="s1">contains_nan </span><span class="s3">= [</span><span class="s2">False</span><span class="s3">]*</span><span class="s1">len</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">)</span>
+
+                <span class="s0"># Addresses nan_policy == &quot;propagate&quot;</span>
+                <span class="s2">if </span><span class="s1">any</span><span class="s3">(</span><span class="s1">contains_nan</span><span class="s3">) </span><span class="s2">and </span><span class="s3">(</span><span class="s1">nan_policy </span><span class="s3">== </span><span class="s4">'propagate'</span>
+                                          <span class="s2">and </span><span class="s1">override</span><span class="s3">[</span><span class="s4">'nan_propagation'</span><span class="s3">]):</span>
+                    <span class="s1">res </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">, </span><span class="s1">NaN</span><span class="s3">)</span>
+                    <span class="s1">res </span><span class="s3">= </span><span class="s1">_add_reduced_axes</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">)</span>
+                    <span class="s2">return </span><span class="s1">tuple_to_result</span><span class="s3">(*</span><span class="s1">res</span><span class="s3">)</span>
+
+                <span class="s0"># Addresses nan_policy == &quot;omit&quot;</span>
+                <span class="s1">too_small_msg </span><span class="s3">= </span><span class="s1">too_small_1d_not_omit</span>
+                <span class="s2">if </span><span class="s1">any</span><span class="s3">(</span><span class="s1">contains_nan</span><span class="s3">) </span><span class="s2">and </span><span class="s1">nan_policy </span><span class="s3">== </span><span class="s4">'omit'</span><span class="s3">:</span>
+                    <span class="s0"># consider passing in contains_nan</span>
+                    <span class="s1">samples </span><span class="s3">= </span><span class="s1">_remove_nans</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">)</span>
+                    <span class="s1">too_small_msg </span><span class="s3">= </span><span class="s1">too_small_1d_omit</span>
+
+                <span class="s2">if </span><span class="s1">sentinel</span><span class="s3">:</span>
+                    <span class="s1">samples </span><span class="s3">= </span><span class="s1">_remove_sentinel</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">, </span><span class="s1">sentinel</span><span class="s3">)</span>
+
+                <span class="s2">if </span><span class="s1">is_too_small</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">kwds</span><span class="s3">):</span>
+                    <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">too_small_msg</span><span class="s3">, </span><span class="s1">SmallSampleWarning</span><span class="s3">, </span><span class="s1">stacklevel</span><span class="s3">=</span><span class="s6">2</span><span class="s3">)</span>
+                    <span class="s1">res </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">, </span><span class="s1">NaN</span><span class="s3">)</span>
+                    <span class="s1">res </span><span class="s3">= </span><span class="s1">_add_reduced_axes</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">)</span>
+                    <span class="s2">return </span><span class="s1">tuple_to_result</span><span class="s3">(*</span><span class="s1">res</span><span class="s3">)</span>
+
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">hypotest_fun_out</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">)</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">result_to_tuple</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">_add_reduced_axes</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s1">tuple_to_result</span><span class="s3">(*</span><span class="s1">res</span><span class="s3">)</span>
+
+            <span class="s0"># check for empty input</span>
+            <span class="s1">empty_output </span><span class="s3">= </span><span class="s1">_check_empty_inputs</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+            <span class="s0"># only return empty output if zero sized input is too small.</span>
+            <span class="s2">if </span><span class="s3">(</span>
+                <span class="s1">empty_output </span><span class="s2">is not None</span>
+                <span class="s2">and </span><span class="s3">(</span><span class="s1">is_too_small</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">kwds</span><span class="s3">) </span><span class="s2">or </span><span class="s1">empty_output</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">is_too_small</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">kwds</span><span class="s3">) </span><span class="s2">and </span><span class="s1">empty_output</span><span class="s3">.</span><span class="s1">size </span><span class="s3">!= </span><span class="s6">0</span><span class="s3">:</span>
+                    <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">too_small_nd_not_omit</span><span class="s3">, </span><span class="s1">SmallSampleWarning</span><span class="s3">,</span>
+                                  <span class="s1">stacklevel</span><span class="s3">=</span><span class="s6">2</span><span class="s3">)</span>
+                <span class="s1">res </span><span class="s3">= [</span><span class="s1">empty_output</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">() </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">)]</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">_add_reduced_axes</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s1">tuple_to_result</span><span class="s3">(*</span><span class="s1">res</span><span class="s3">)</span>
+
+            <span class="s0"># otherwise, concatenate all samples along axis, remembering where</span>
+            <span class="s0"># each separate sample begins</span>
+            <span class="s1">lengths </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s1">sample</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">] </span><span class="s2">for </span><span class="s1">sample </span><span class="s2">in </span><span class="s1">samples</span><span class="s3">])</span>
+            <span class="s1">split_indices </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">cumsum</span><span class="s3">(</span><span class="s1">lengths</span><span class="s3">)</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">_broadcast_concatenate</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+
+            <span class="s0"># Addresses nan_policy == &quot;raise&quot;</span>
+            <span class="s2">if </span><span class="s1">nan_policy </span><span class="s3">!= </span><span class="s4">'propagate' </span><span class="s2">or </span><span class="s1">override</span><span class="s3">[</span><span class="s4">'nan_propagation'</span><span class="s3">]:</span>
+                <span class="s1">contains_nan</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">_contains_nan</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">nan_policy</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">contains_nan </span><span class="s3">= </span><span class="s2">False  </span><span class="s0"># behave like there are no NaNs</span>
+
+            <span class="s2">if </span><span class="s1">vectorized </span><span class="s2">and not </span><span class="s1">contains_nan </span><span class="s2">and not </span><span class="s1">sentinel</span><span class="s3">:</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">hypotest_fun_out</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">)</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">result_to_tuple</span><span class="s3">(</span><span class="s1">res</span><span class="s3">)</span>
+                <span class="s1">res </span><span class="s3">= </span><span class="s1">_add_reduced_axes</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">)</span>
+                <span class="s2">return </span><span class="s1">tuple_to_result</span><span class="s3">(*</span><span class="s1">res</span><span class="s3">)</span>
+
+            <span class="s0"># Addresses nan_policy == &quot;omit&quot;</span>
+            <span class="s2">if </span><span class="s1">contains_nan </span><span class="s2">and </span><span class="s1">nan_policy </span><span class="s3">== </span><span class="s4">'omit'</span><span class="s3">:</span>
+                <span class="s2">def </span><span class="s1">hypotest_fun</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s1">samples </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">split_indices</span><span class="s3">)[:</span><span class="s1">n_samp</span><span class="s3">+</span><span class="s1">n_kwd_samp</span><span class="s3">]</span>
+                    <span class="s1">samples </span><span class="s3">= </span><span class="s1">_remove_nans</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">sentinel</span><span class="s3">:</span>
+                        <span class="s1">samples </span><span class="s3">= </span><span class="s1">_remove_sentinel</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">, </span><span class="s1">sentinel</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">is_too_small</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">kwds</span><span class="s3">):</span>
+                        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">too_small_nd_omit</span><span class="s3">, </span><span class="s1">SmallSampleWarning</span><span class="s3">,</span>
+                                      <span class="s1">stacklevel</span><span class="s3">=</span><span class="s6">4</span><span class="s3">)</span>
+                        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">, </span><span class="s1">NaN</span><span class="s3">)</span>
+                    <span class="s2">return </span><span class="s1">result_to_tuple</span><span class="s3">(</span><span class="s1">hypotest_fun_out</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">))</span>
+
+            <span class="s0"># Addresses nan_policy == &quot;propagate&quot;</span>
+            <span class="s2">elif </span><span class="s3">(</span><span class="s1">contains_nan </span><span class="s2">and </span><span class="s1">nan_policy </span><span class="s3">== </span><span class="s4">'propagate'</span>
+                  <span class="s2">and </span><span class="s1">override</span><span class="s3">[</span><span class="s4">'nan_propagation'</span><span class="s3">]):</span>
+                <span class="s2">def </span><span class="s1">hypotest_fun</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">x</span><span class="s3">).</span><span class="s1">any</span><span class="s3">():</span>
+                        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">, </span><span class="s1">NaN</span><span class="s3">)</span>
+
+                    <span class="s1">samples </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">split_indices</span><span class="s3">)[:</span><span class="s1">n_samp</span><span class="s3">+</span><span class="s1">n_kwd_samp</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">sentinel</span><span class="s3">:</span>
+                        <span class="s1">samples </span><span class="s3">= </span><span class="s1">_remove_sentinel</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">, </span><span class="s1">sentinel</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">is_too_small</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">kwds</span><span class="s3">):</span>
+                        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">, </span><span class="s1">NaN</span><span class="s3">)</span>
+                    <span class="s2">return </span><span class="s1">result_to_tuple</span><span class="s3">(</span><span class="s1">hypotest_fun_out</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">))</span>
+
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">def </span><span class="s1">hypotest_fun</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+                    <span class="s1">samples </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">split_indices</span><span class="s3">)[:</span><span class="s1">n_samp</span><span class="s3">+</span><span class="s1">n_kwd_samp</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">sentinel</span><span class="s3">:</span>
+                        <span class="s1">samples </span><span class="s3">= </span><span class="s1">_remove_sentinel</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">paired</span><span class="s3">, </span><span class="s1">sentinel</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">is_too_small</span><span class="s3">(</span><span class="s1">samples</span><span class="s3">, </span><span class="s1">kwds</span><span class="s3">):</span>
+                        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">n_out</span><span class="s3">, </span><span class="s1">NaN</span><span class="s3">)</span>
+                    <span class="s2">return </span><span class="s1">result_to_tuple</span><span class="s3">(</span><span class="s1">hypotest_fun_out</span><span class="s3">(*</span><span class="s1">samples</span><span class="s3">, **</span><span class="s1">kwds</span><span class="s3">))</span>
+
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">moveaxis</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">apply_along_axis</span><span class="s3">(</span><span class="s1">hypotest_fun</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s6">0</span><span class="s3">, </span><span class="s1">arr</span><span class="s3">=</span><span class="s1">x</span><span class="s3">)</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">_add_reduced_axes</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">reduced_axes</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">tuple_to_result</span><span class="s3">(*</span><span class="s1">res</span><span class="s3">)</span>
+
+        <span class="s1">_axis_parameter_doc</span><span class="s3">, </span><span class="s1">_axis_parameter </span><span class="s3">= </span><span class="s1">_get_axis_params</span><span class="s3">(</span><span class="s1">default_axis</span><span class="s3">)</span>
+        <span class="s1">doc </span><span class="s3">= </span><span class="s1">FunctionDoc</span><span class="s3">(</span><span class="s1">axis_nan_policy_wrapper</span><span class="s3">)</span>
+        <span class="s1">parameter_names </span><span class="s3">= [</span><span class="s1">param</span><span class="s3">.</span><span class="s1">name </span><span class="s2">for </span><span class="s1">param </span><span class="s2">in </span><span class="s1">doc</span><span class="s3">[</span><span class="s4">'Parameters'</span><span class="s3">]]</span>
+        <span class="s2">if </span><span class="s4">'axis' </span><span class="s2">in </span><span class="s1">parameter_names</span><span class="s3">:</span>
+            <span class="s1">doc</span><span class="s3">[</span><span class="s4">'Parameters'</span><span class="s3">][</span><span class="s1">parameter_names</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s4">'axis'</span><span class="s3">)] = (</span>
+                <span class="s1">_axis_parameter_doc</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">doc</span><span class="s3">[</span><span class="s4">'Parameters'</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_axis_parameter_doc</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s4">'nan_policy' </span><span class="s2">in </span><span class="s1">parameter_names</span><span class="s3">:</span>
+            <span class="s1">doc</span><span class="s3">[</span><span class="s4">'Parameters'</span><span class="s3">][</span><span class="s1">parameter_names</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s4">'nan_policy'</span><span class="s3">)] = (</span>
+                <span class="s1">_nan_policy_parameter_doc</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">doc</span><span class="s3">[</span><span class="s4">'Parameters'</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_nan_policy_parameter_doc</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s4">'keepdims' </span><span class="s2">in </span><span class="s1">parameter_names</span><span class="s3">:</span>
+            <span class="s1">doc</span><span class="s3">[</span><span class="s4">'Parameters'</span><span class="s3">][</span><span class="s1">parameter_names</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s4">'keepdims'</span><span class="s3">)] = (</span>
+                <span class="s1">_keepdims_parameter_doc</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">doc</span><span class="s3">[</span><span class="s4">'Parameters'</span><span class="s3">].</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_keepdims_parameter_doc</span><span class="s3">)</span>
+        <span class="s1">doc</span><span class="s3">[</span><span class="s4">'Notes'</span><span class="s3">] += </span><span class="s1">_standard_note_addition</span>
+        <span class="s1">doc </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">doc</span><span class="s3">).</span><span class="s1">split</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot;</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)[</span><span class="s6">1</span><span class="s3">]  </span><span class="s0"># remove signature</span>
+        <span class="s1">axis_nan_policy_wrapper</span><span class="s3">.</span><span class="s1">__doc__ </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s1">doc</span><span class="s3">)</span>
+
+        <span class="s1">sig </span><span class="s3">= </span><span class="s1">inspect</span><span class="s3">.</span><span class="s1">signature</span><span class="s3">(</span><span class="s1">axis_nan_policy_wrapper</span><span class="s3">)</span>
+        <span class="s1">parameters </span><span class="s3">= </span><span class="s1">sig</span><span class="s3">.</span><span class="s1">parameters</span>
+        <span class="s1">parameter_list </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">parameters</span><span class="s3">.</span><span class="s1">values</span><span class="s3">())</span>
+        <span class="s2">if </span><span class="s4">'axis' </span><span class="s2">not in </span><span class="s1">parameters</span><span class="s3">:</span>
+            <span class="s1">parameter_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_axis_parameter</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s4">'nan_policy' </span><span class="s2">not in </span><span class="s1">parameters</span><span class="s3">:</span>
+            <span class="s1">parameter_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_nan_policy_parameter</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s4">'keepdims' </span><span class="s2">not in </span><span class="s1">parameters</span><span class="s3">:</span>
+            <span class="s1">parameter_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_keepdims_parameter</span><span class="s3">)</span>
+        <span class="s1">sig </span><span class="s3">= </span><span class="s1">sig</span><span class="s3">.</span><span class="s1">replace</span><span class="s3">(</span><span class="s1">parameters</span><span class="s3">=</span><span class="s1">parameter_list</span><span class="s3">)</span>
+        <span class="s1">axis_nan_policy_wrapper</span><span class="s3">.</span><span class="s1">__signature__ </span><span class="s3">= </span><span class="s1">sig</span>
+
+        <span class="s2">return </span><span class="s1">axis_nan_policy_wrapper</span>
+    <span class="s2">return </span><span class="s1">axis_nan_policy_decorator</span>
+</pre>
+</body>
+</html>

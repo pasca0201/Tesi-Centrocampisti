@@ -1,0 +1,1214 @@
+<html>
+<head>
+<title>splitting.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+splitting.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;This module contains routines and data structures to: 
+ 
+- Find the best possible split of a node. For a given node, a split is 
+  characterized by a feature and a bin. 
+- Apply a split to a node, i.e. split the indices of the samples at the node 
+  into the newly created left and right children. 
+&quot;&quot;&quot;</span>
+<span class="s2"># Author: Nicolas Hug</span>
+
+<span class="s3">cimport </span><span class="s1">cython</span>
+<span class="s3">from </span><span class="s1">cython</span><span class="s4">.</span><span class="s1">parallel </span><span class="s3">import </span><span class="s1">prange</span>
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">libc</span><span class="s4">.</span><span class="s1">math </span><span class="s3">cimport </span><span class="s1">INFINITY</span><span class="s4">, </span><span class="s1">ceil</span>
+<span class="s3">from </span><span class="s1">libc</span><span class="s4">.</span><span class="s1">stdlib </span><span class="s3">cimport </span><span class="s1">malloc</span><span class="s4">, </span><span class="s1">free</span><span class="s4">, </span><span class="s1">qsort</span>
+<span class="s3">from </span><span class="s1">libc</span><span class="s4">.</span><span class="s1">string </span><span class="s3">cimport </span><span class="s1">memcpy</span>
+
+<span class="s3">from </span><span class="s4">...</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_typedefs </span><span class="s3">cimport </span><span class="s1">uint8_t</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">X_BINNED_DTYPE_C</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">Y_DTYPE_C</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">hist_struct</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">BITSET_INNER_DTYPE_C</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">BITSET_DTYPE_C</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">MonotonicConstraint</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_bitset </span><span class="s3">cimport </span><span class="s1">init_bitset</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_bitset </span><span class="s3">cimport </span><span class="s1">set_bitset</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_bitset </span><span class="s3">cimport </span><span class="s1">in_bitset</span>
+
+
+<span class="s3">cdef </span><span class="s1">struct split_info_struct</span><span class="s4">:</span>
+    <span class="s2"># Same as the SplitInfo class, but we need a C struct to use it in the</span>
+    <span class="s2"># nogil sections and to use in arrays.</span>
+    <span class="s1">Y_DTYPE_C gain</span>
+    <span class="s1">int feature_idx</span>
+    <span class="s1">unsigned int bin_idx</span>
+    <span class="s1">unsigned char missing_go_to_left</span>
+    <span class="s1">Y_DTYPE_C sum_gradient_left</span>
+    <span class="s1">Y_DTYPE_C sum_gradient_right</span>
+    <span class="s1">Y_DTYPE_C sum_hessian_left</span>
+    <span class="s1">Y_DTYPE_C sum_hessian_right</span>
+    <span class="s1">unsigned int n_samples_left</span>
+    <span class="s1">unsigned int n_samples_right</span>
+    <span class="s1">Y_DTYPE_C value_left</span>
+    <span class="s1">Y_DTYPE_C value_right</span>
+    <span class="s1">unsigned char is_categorical</span>
+    <span class="s1">BITSET_DTYPE_C left_cat_bitset</span>
+
+
+<span class="s2"># used in categorical splits for sorting categories by increasing values of</span>
+<span class="s2"># sum_gradients / sum_hessians</span>
+<span class="s3">cdef </span><span class="s1">struct categorical_info</span><span class="s4">:</span>
+    <span class="s1">X_BINNED_DTYPE_C bin_idx</span>
+    <span class="s1">Y_DTYPE_C value</span>
+
+
+<span class="s3">class </span><span class="s1">SplitInfo</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Pure data class to store information about a potential split. 
+ 
+    Parameters 
+    ---------- 
+    gain : float 
+        The gain of the split. 
+    feature_idx : int 
+        The index of the feature to be split. 
+    bin_idx : int 
+        The index of the bin on which the split is made. Should be ignored if 
+        `is_categorical` is True: `left_cat_bitset` will be used to determine 
+        the split. 
+    missing_go_to_left : bool 
+        Whether missing values should go to the left child. This is used 
+        whether the split is categorical or not. 
+    sum_gradient_left : float 
+        The sum of the gradients of all the samples in the left child. 
+    sum_hessian_left : float 
+        The sum of the hessians of all the samples in the left child. 
+    sum_gradient_right : float 
+        The sum of the gradients of all the samples in the right child. 
+    sum_hessian_right : float 
+        The sum of the hessians of all the samples in the right child. 
+    n_samples_left : int, default=0 
+        The number of samples in the left child. 
+    n_samples_right : int 
+        The number of samples in the right child. 
+    is_categorical : bool 
+        Whether the split is done on a categorical feature. 
+    left_cat_bitset : ndarray of shape=(8,), dtype=uint32 or None 
+        Bitset representing the categories that go to the left. This is used 
+        only when `is_categorical` is True. 
+        Note that missing values are part of that bitset if there are missing 
+        values in the training data. For missing values, we rely on that 
+        bitset for splitting, but at prediction time, we rely on 
+        missing_go_to_left. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">gain</span><span class="s4">, </span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">,</span>
+                 <span class="s1">missing_go_to_left</span><span class="s4">, </span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                 <span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">sum_hessian_right</span><span class="s4">, </span><span class="s1">n_samples_left</span><span class="s4">,</span>
+                 <span class="s1">n_samples_right</span><span class="s4">, </span><span class="s1">value_left</span><span class="s4">, </span><span class="s1">value_right</span><span class="s4">,</span>
+                 <span class="s1">is_categorical</span><span class="s4">, </span><span class="s1">left_cat_bitset</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">gain </span><span class="s4">= </span><span class="s1">gain</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">feature_idx</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">bin_idx</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">missing_go_to_left </span><span class="s4">= </span><span class="s1">missing_go_to_left</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">sum_gradient_left </span><span class="s4">= </span><span class="s1">sum_gradient_left</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">sum_hessian_left </span><span class="s4">= </span><span class="s1">sum_hessian_left</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">sum_gradient_right </span><span class="s4">= </span><span class="s1">sum_gradient_right</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">sum_hessian_right </span><span class="s4">= </span><span class="s1">sum_hessian_right</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_samples_left </span><span class="s4">= </span><span class="s1">n_samples_left</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_samples_right </span><span class="s4">= </span><span class="s1">n_samples_right</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">value_left </span><span class="s4">= </span><span class="s1">value_left</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">value_right </span><span class="s4">= </span><span class="s1">value_right</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">is_categorical </span><span class="s4">= </span><span class="s1">is_categorical</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">left_cat_bitset </span><span class="s4">= </span><span class="s1">left_cat_bitset</span>
+
+
+<span class="s4">@</span><span class="s1">cython</span><span class="s4">.</span><span class="s1">final</span>
+<span class="s3">cdef class </span><span class="s1">Splitter</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Splitter used to find the best possible split at each node. 
+ 
+    A split (see SplitInfo) is characterized by a feature and a bin. 
+ 
+    The Splitter is also responsible for partitioning the samples among the 
+    leaves of the tree (see split_indices() and the partition attribute). 
+ 
+    Parameters 
+    ---------- 
+    X_binned : ndarray of int, shape (n_samples, n_features) 
+        The binned input samples. Must be Fortran-aligned. 
+    n_bins_non_missing : ndarray, shape (n_features,) 
+        For each feature, gives the number of bins actually used for 
+        non-missing values. 
+    missing_values_bin_idx : uint8 
+        Index of the bin that is used for missing values. This is the index of 
+        the last bin and is always equal to max_bins (as passed to the GBDT 
+        classes), or equivalently to n_bins - 1. 
+    has_missing_values : ndarray, shape (n_features,) 
+        Whether missing values were observed in the training data, for each 
+        feature. 
+    is_categorical : ndarray of bool of shape (n_features,) 
+        Indicates categorical features. 
+    monotonic_cst : ndarray of int of shape (n_features,), dtype=int 
+        Indicates the monotonic constraint to enforce on each feature. 
+          - 1: monotonic increase 
+          - 0: no constraint 
+          - -1: monotonic decrease 
+ 
+        Read more in the :ref:`User Guide &lt;monotonic_cst_gbdt&gt;`. 
+    l2_regularization : float 
+        The L2 regularization parameter. 
+    min_hessian_to_split : float, default=1e-3 
+        The minimum sum of hessians needed in each node. Splits that result in 
+        at least one child having a sum of hessians less than 
+        min_hessian_to_split are discarded. 
+    min_samples_leaf : int, default=20 
+        The minimum number of samples per leaf. 
+    min_gain_to_split : float, default=0.0 
+        The minimum gain needed to split a node. Splits with lower gain will 
+        be ignored. 
+    hessians_are_constant: bool, default is False 
+        Whether hessians are constant. 
+    feature_fraction_per_split : float, default=1 
+        Proportion of randomly chosen features in each and every node split. 
+        This is a form of regularization, smaller values make the trees weaker 
+        learners and might prevent overfitting. 
+    rng : Generator 
+    n_threads : int, default=1 
+        Number of OpenMP threads to use. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">cdef </span><span class="s1">public</span><span class="s4">:</span>
+        <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">, :] </span><span class="s1">X_binned</span>
+        <span class="s1">unsigned int n_features</span>
+        <span class="s1">const unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">n_bins_non_missing</span>
+        <span class="s1">unsigned char missing_values_bin_idx</span>
+        <span class="s1">const unsigned char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">has_missing_values</span>
+        <span class="s1">const unsigned char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">is_categorical</span>
+        <span class="s1">const signed char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">monotonic_cst</span>
+        <span class="s1">unsigned char hessians_are_constant</span>
+        <span class="s1">Y_DTYPE_C l2_regularization</span>
+        <span class="s1">Y_DTYPE_C min_hessian_to_split</span>
+        <span class="s1">unsigned int min_samples_leaf</span>
+        <span class="s1">Y_DTYPE_C min_gain_to_split</span>
+        <span class="s1">Y_DTYPE_C feature_fraction_per_split</span>
+        <span class="s1">rng</span>
+
+        <span class="s1">unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">partition</span>
+        <span class="s1">unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">left_indices_buffer</span>
+        <span class="s1">unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">right_indices_buffer</span>
+        <span class="s1">int n_threads</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">,</span>
+                 <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">, :] </span><span class="s1">X_binned</span><span class="s4">,</span>
+                 <span class="s1">const unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">n_bins_non_missing</span><span class="s4">,</span>
+                 <span class="s1">const unsigned char missing_values_bin_idx</span><span class="s4">,</span>
+                 <span class="s1">const unsigned char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">has_missing_values</span><span class="s4">,</span>
+                 <span class="s1">const unsigned char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">is_categorical</span><span class="s4">,</span>
+                 <span class="s1">const signed char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">monotonic_cst</span><span class="s4">,</span>
+                 <span class="s1">Y_DTYPE_C l2_regularization</span><span class="s4">,</span>
+                 <span class="s1">Y_DTYPE_C min_hessian_to_split</span><span class="s4">=</span><span class="s5">1e-3</span><span class="s4">,</span>
+                 <span class="s1">unsigned int min_samples_leaf</span><span class="s4">=</span><span class="s5">20</span><span class="s4">,</span>
+                 <span class="s1">Y_DTYPE_C min_gain_to_split</span><span class="s4">=</span><span class="s5">0.</span><span class="s4">,</span>
+                 <span class="s1">unsigned char hessians_are_constant</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+                 <span class="s1">Y_DTYPE_C feature_fraction_per_split</span><span class="s4">=</span><span class="s5">1.0</span><span class="s4">,</span>
+                 <span class="s1">rng</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">random</span><span class="s4">.</span><span class="s1">RandomState</span><span class="s4">(),</span>
+                 <span class="s1">unsigned int n_threads</span><span class="s4">=</span><span class="s5">1</span><span class="s4">):</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">X_binned </span><span class="s4">= </span><span class="s1">X_binned</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_features </span><span class="s4">= </span><span class="s1">X_binned</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins_non_missing </span><span class="s4">= </span><span class="s1">n_bins_non_missing</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">missing_values_bin_idx </span><span class="s4">= </span><span class="s1">missing_values_bin_idx</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">has_missing_values </span><span class="s4">= </span><span class="s1">has_missing_values</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">is_categorical </span><span class="s4">= </span><span class="s1">is_categorical</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">monotonic_cst </span><span class="s4">= </span><span class="s1">monotonic_cst</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization </span><span class="s4">= </span><span class="s1">l2_regularization</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">min_hessian_to_split </span><span class="s4">= </span><span class="s1">min_hessian_to_split</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">min_samples_leaf </span><span class="s4">= </span><span class="s1">min_samples_leaf</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">min_gain_to_split </span><span class="s4">= </span><span class="s1">min_gain_to_split</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant </span><span class="s4">= </span><span class="s1">hessians_are_constant</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">feature_fraction_per_split </span><span class="s4">= </span><span class="s1">feature_fraction_per_split</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">rng </span><span class="s4">= </span><span class="s1">rng</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_threads </span><span class="s4">= </span><span class="s1">n_threads</span>
+
+        <span class="s2"># The partition array maps each sample index into the leaves of the</span>
+        <span class="s2"># tree (a leaf in this context is a node that isn't split yet, not</span>
+        <span class="s2"># necessarily a 'finalized' leaf). Initially, the root contains all</span>
+        <span class="s2"># the indices, e.g.:</span>
+        <span class="s2"># partition = [abcdefghijkl]</span>
+        <span class="s2"># After a call to split_indices, it may look e.g. like this:</span>
+        <span class="s2"># partition = [cef|abdghijkl]</span>
+        <span class="s2"># we have 2 leaves, the left one is at position 0 and the second one at</span>
+        <span class="s2"># position 3. The order of the samples is irrelevant.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">partition </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">arange</span><span class="s4">(</span><span class="s1">X_binned</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint32</span><span class="s4">)</span>
+        <span class="s2"># buffers used in split_indices to support parallel splitting.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">left_indices_buffer </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty_like</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">partition</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">right_indices_buffer </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty_like</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">partition</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">split_indices</span><span class="s4">(</span><span class="s1">Splitter self</span><span class="s4">, </span><span class="s1">split_info</span><span class="s4">, </span><span class="s1">unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">]</span>
+                      <span class="s1">sample_indices</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Split samples into left and right arrays. 
+ 
+        The split is performed according to the best possible split 
+        (split_info). 
+ 
+        Ultimately, this is nothing but a partition of the sample_indices 
+        array with a given pivot, exactly like a quicksort subroutine. 
+ 
+        Parameters 
+        ---------- 
+        split_info : SplitInfo 
+            The SplitInfo of the node to split. 
+        sample_indices : ndarray of unsigned int, shape (n_samples_at_node,) 
+            The indices of the samples at the node to split. This is a view 
+            on self.partition, and it is modified inplace by placing the 
+            indices of the left child at the beginning, and the indices of 
+            the right child at the end. 
+ 
+        Returns 
+        ------- 
+        left_indices : ndarray of int, shape (n_left_samples,) 
+            The indices of the samples in the left child. This is a view on 
+            self.partition. 
+        right_indices : ndarray of int, shape (n_right_samples,) 
+            The indices of the samples in the right child. This is a view on 
+            self.partition. 
+        right_child_position : int 
+            The position of the right child in ``sample_indices``. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># This is a multi-threaded implementation inspired by lightgbm. Here</span>
+        <span class="s2"># is a quick break down. Let's suppose we want to split a node with 24</span>
+        <span class="s2"># samples named from a to x. self.partition looks like this (the * are</span>
+        <span class="s2"># indices in other leaves that we don't care about):</span>
+        <span class="s2"># partition = [*************abcdefghijklmnopqrstuvwx****************]</span>
+        <span class="s2">#                           ^                       ^</span>
+        <span class="s2">#                     node_position     node_position + node.n_samples</span>
+
+        <span class="s2"># Ultimately, we want to reorder the samples inside the boundaries of</span>
+        <span class="s2"># the leaf (which becomes a node) to now represent the samples in its</span>
+        <span class="s2"># left and right child. For example:</span>
+        <span class="s2"># partition = [*************abefilmnopqrtuxcdghjksvw*****************]</span>
+        <span class="s2">#                           ^              ^</span>
+        <span class="s2">#                   left_child_pos     right_child_pos</span>
+        <span class="s2"># Note that left_child_pos always takes the value of node_position,</span>
+        <span class="s2"># and right_child_pos = left_child_pos + left_child.n_samples. The</span>
+        <span class="s2"># order of the samples inside a leaf is irrelevant.</span>
+
+        <span class="s2"># 1. sample_indices is a view on this region a..x. We conceptually</span>
+        <span class="s2">#    divide it into n_threads regions. Each thread will be responsible</span>
+        <span class="s2">#    for its own region. Here is an example with 4 threads:</span>
+        <span class="s2">#    sample_indices = [abcdef|ghijkl|mnopqr|stuvwx]</span>
+        <span class="s2"># 2. Each thread processes 6 = 24 // 4 entries and maps them into</span>
+        <span class="s2">#    left_indices_buffer or right_indices_buffer. For example, we could</span>
+        <span class="s2">#    have the following mapping ('.' denotes an undefined entry):</span>
+        <span class="s2">#    - left_indices_buffer =  [abef..|il....|mnopqr|tux...]</span>
+        <span class="s2">#    - right_indices_buffer = [cd....|ghjk..|......|svw...]</span>
+        <span class="s2"># 3. We keep track of the start positions of the regions (the '|') in</span>
+        <span class="s2">#    ``offset_in_buffers`` as well as the size of each region. We also</span>
+        <span class="s2">#    keep track of the number of samples put into the left/right child</span>
+        <span class="s2">#    by each thread. Concretely:</span>
+        <span class="s2">#    - left_counts =  [4, 2, 6, 3]</span>
+        <span class="s2">#    - right_counts = [2, 4, 0, 3]</span>
+        <span class="s2"># 4. Finally, we put left/right_indices_buffer back into the</span>
+        <span class="s2">#    sample_indices, without any undefined entries and the partition</span>
+        <span class="s2">#    looks as expected</span>
+        <span class="s2">#    partition = [*************abefilmnopqrtuxcdghjksvw***************]</span>
+
+        <span class="s2"># Note: We here show left/right_indices_buffer as being the same size</span>
+        <span class="s2"># as sample_indices for simplicity, but in reality they are of the</span>
+        <span class="s2"># same size as partition.</span>
+
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">int n_samples </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+            <span class="s1">X_BINNED_DTYPE_C bin_idx </span><span class="s4">= </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">bin_idx</span>
+            <span class="s1">unsigned char missing_go_to_left </span><span class="s4">= </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">missing_go_to_left</span>
+            <span class="s1">unsigned char missing_values_bin_idx </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">missing_values_bin_idx</span>
+            <span class="s1">int feature_idx </span><span class="s4">= </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">feature_idx</span>
+            <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">X_binned </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">X_binned</span><span class="s4">[:, </span><span class="s1">feature_idx</span><span class="s4">]</span>
+            <span class="s1">unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">left_indices_buffer </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">left_indices_buffer</span>
+            <span class="s1">unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">right_indices_buffer </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">right_indices_buffer</span>
+            <span class="s1">unsigned char is_categorical </span><span class="s4">= </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">is_categorical</span>
+            <span class="s2"># Cython is unhappy if we set left_cat_bitset to</span>
+            <span class="s2"># split_info.left_cat_bitset directly, so we need a tmp var</span>
+            <span class="s1">BITSET_INNER_DTYPE_C </span><span class="s4">[:] </span><span class="s1">cat_bitset_tmp </span><span class="s4">= </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">left_cat_bitset</span>
+            <span class="s1">BITSET_DTYPE_C left_cat_bitset</span>
+            <span class="s1">int n_threads </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_threads</span>
+
+            <span class="s1">int </span><span class="s4">[:] </span><span class="s1">sizes </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">n_samples </span><span class="s4">// </span><span class="s1">n_threads</span><span class="s4">,</span>
+                                    <span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+            <span class="s1">int </span><span class="s4">[:] </span><span class="s1">offset_in_buffers </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+            <span class="s1">int </span><span class="s4">[:] </span><span class="s1">left_counts </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+            <span class="s1">int </span><span class="s4">[:] </span><span class="s1">right_counts </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+            <span class="s1">int left_count</span>
+            <span class="s1">int right_count</span>
+            <span class="s1">int start</span>
+            <span class="s1">int stop</span>
+            <span class="s1">int i</span>
+            <span class="s1">int thread_idx</span>
+            <span class="s1">int sample_idx</span>
+            <span class="s1">int right_child_position</span>
+            <span class="s1">unsigned char turn_left</span>
+            <span class="s1">int </span><span class="s4">[:] </span><span class="s1">left_offset </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+            <span class="s1">int </span><span class="s4">[:] </span><span class="s1">right_offset </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+
+        <span class="s2"># only set left_cat_bitset when is_categorical is True</span>
+        <span class="s3">if </span><span class="s1">is_categorical</span><span class="s4">:</span>
+            <span class="s1">left_cat_bitset </span><span class="s4">= &amp;</span><span class="s1">cat_bitset_tmp</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+
+        <span class="s3">with </span><span class="s1">nogil</span><span class="s4">:</span>
+            <span class="s3">for </span><span class="s1">thread_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_samples </span><span class="s4">% </span><span class="s1">n_threads</span><span class="s4">):</span>
+                <span class="s1">sizes</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">] += </span><span class="s5">1</span>
+
+            <span class="s3">for </span><span class="s1">thread_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">n_threads</span><span class="s4">):</span>
+                <span class="s1">offset_in_buffers</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">] = </span><span class="s1">\</span>
+                    <span class="s1">offset_in_buffers</span><span class="s4">[</span><span class="s1">thread_idx </span><span class="s4">- </span><span class="s5">1</span><span class="s4">] + </span><span class="s1">sizes</span><span class="s4">[</span><span class="s1">thread_idx </span><span class="s4">- </span><span class="s5">1</span><span class="s4">]</span>
+
+            <span class="s2"># map indices from sample_indices to left/right_indices_buffer</span>
+            <span class="s3">for </span><span class="s1">thread_idx </span><span class="s3">in </span><span class="s1">prange</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">schedule</span><span class="s4">=</span><span class="s6">'static'</span><span class="s4">,</span>
+                                     <span class="s1">chunksize</span><span class="s4">=</span><span class="s5">1</span><span class="s4">, </span><span class="s1">num_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">):</span>
+                <span class="s1">left_count </span><span class="s4">= </span><span class="s5">0</span>
+                <span class="s1">right_count </span><span class="s4">= </span><span class="s5">0</span>
+
+                <span class="s1">start </span><span class="s4">= </span><span class="s1">offset_in_buffers</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]</span>
+                <span class="s1">stop </span><span class="s4">= </span><span class="s1">start </span><span class="s4">+ </span><span class="s1">sizes</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]</span>
+                <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">start</span><span class="s4">, </span><span class="s1">stop</span><span class="s4">):</span>
+                    <span class="s1">sample_idx </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+                    <span class="s1">turn_left </span><span class="s4">= </span><span class="s1">sample_goes_left</span><span class="s4">(</span>
+                        <span class="s1">missing_go_to_left</span><span class="s4">,</span>
+                        <span class="s1">missing_values_bin_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">,</span>
+                        <span class="s1">X_binned</span><span class="s4">[</span><span class="s1">sample_idx</span><span class="s4">], </span><span class="s1">is_categorical</span><span class="s4">,</span>
+                        <span class="s1">left_cat_bitset</span><span class="s4">)</span>
+
+                    <span class="s3">if </span><span class="s1">turn_left</span><span class="s4">:</span>
+                        <span class="s1">left_indices_buffer</span><span class="s4">[</span><span class="s1">start </span><span class="s4">+ </span><span class="s1">left_count</span><span class="s4">] = </span><span class="s1">sample_idx</span>
+                        <span class="s1">left_count </span><span class="s4">= </span><span class="s1">left_count </span><span class="s4">+ </span><span class="s5">1</span>
+                    <span class="s3">else</span><span class="s4">:</span>
+                        <span class="s1">right_indices_buffer</span><span class="s4">[</span><span class="s1">start </span><span class="s4">+ </span><span class="s1">right_count</span><span class="s4">] = </span><span class="s1">sample_idx</span>
+                        <span class="s1">right_count </span><span class="s4">= </span><span class="s1">right_count </span><span class="s4">+ </span><span class="s5">1</span>
+
+                <span class="s1">left_counts</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">] = </span><span class="s1">left_count</span>
+                <span class="s1">right_counts</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">] = </span><span class="s1">right_count</span>
+
+            <span class="s2"># position of right child = just after the left child</span>
+            <span class="s1">right_child_position </span><span class="s4">= </span><span class="s5">0</span>
+            <span class="s3">for </span><span class="s1">thread_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">):</span>
+                <span class="s1">right_child_position </span><span class="s4">+= </span><span class="s1">left_counts</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]</span>
+
+            <span class="s2"># offset of each thread in sample_indices for left and right</span>
+            <span class="s2"># child, i.e. where each thread will start to write.</span>
+            <span class="s1">right_offset</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] = </span><span class="s1">right_child_position</span>
+            <span class="s3">for </span><span class="s1">thread_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">n_threads</span><span class="s4">):</span>
+                <span class="s1">left_offset</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">] = </span><span class="s1">\</span>
+                    <span class="s1">left_offset</span><span class="s4">[</span><span class="s1">thread_idx </span><span class="s4">- </span><span class="s5">1</span><span class="s4">] + </span><span class="s1">left_counts</span><span class="s4">[</span><span class="s1">thread_idx </span><span class="s4">- </span><span class="s5">1</span><span class="s4">]</span>
+                <span class="s1">right_offset</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">] = </span><span class="s1">\</span>
+                    <span class="s1">right_offset</span><span class="s4">[</span><span class="s1">thread_idx </span><span class="s4">- </span><span class="s5">1</span><span class="s4">] + </span><span class="s1">right_counts</span><span class="s4">[</span><span class="s1">thread_idx </span><span class="s4">- </span><span class="s5">1</span><span class="s4">]</span>
+
+            <span class="s2"># map indices in left/right_indices_buffer back into</span>
+            <span class="s2"># sample_indices. This also updates self.partition since</span>
+            <span class="s2"># sample_indices is a view.</span>
+            <span class="s3">for </span><span class="s1">thread_idx </span><span class="s3">in </span><span class="s1">prange</span><span class="s4">(</span><span class="s1">n_threads</span><span class="s4">, </span><span class="s1">schedule</span><span class="s4">=</span><span class="s6">'static'</span><span class="s4">,</span>
+                                     <span class="s1">chunksize</span><span class="s4">=</span><span class="s5">1</span><span class="s4">, </span><span class="s1">num_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">):</span>
+                <span class="s1">memcpy</span><span class="s4">(</span>
+                    <span class="s4">&amp;</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">left_offset</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]],</span>
+                    <span class="s4">&amp;</span><span class="s1">left_indices_buffer</span><span class="s4">[</span><span class="s1">offset_in_buffers</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]],</span>
+                    <span class="s1">sizeof</span><span class="s4">(</span><span class="s1">unsigned int</span><span class="s4">) * </span><span class="s1">left_counts</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]</span>
+                <span class="s4">)</span>
+                <span class="s3">if </span><span class="s1">right_counts</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">] &gt; </span><span class="s5">0</span><span class="s4">:</span>
+                    <span class="s2"># If we're splitting the rightmost node of the tree, i.e. the</span>
+                    <span class="s2"># rightmost node in the partition array, and if n_threads &gt;= 2, one</span>
+                    <span class="s2"># might have right_counts[-1] = 0 and right_offset[-1] = len(sample_indices)</span>
+                    <span class="s2"># leading to evaluating</span>
+                    <span class="s2">#</span>
+                    <span class="s2">#    &amp;sample_indices[right_offset[-1]] = &amp;samples_indices[n_samples_at_node]</span>
+                    <span class="s2">#                                      = &amp;partition[n_samples_in_tree]</span>
+                    <span class="s2">#</span>
+                    <span class="s2"># which is an out-of-bounds read access that can cause a segmentation fault.</span>
+                    <span class="s2"># When boundscheck=True, removing this check produces this exception:</span>
+                    <span class="s2">#</span>
+                    <span class="s2">#    IndexError: Out of bounds on buffer access</span>
+                    <span class="s2">#</span>
+                    <span class="s1">memcpy</span><span class="s4">(</span>
+                        <span class="s4">&amp;</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">right_offset</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]],</span>
+                        <span class="s4">&amp;</span><span class="s1">right_indices_buffer</span><span class="s4">[</span><span class="s1">offset_in_buffers</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]],</span>
+                        <span class="s1">sizeof</span><span class="s4">(</span><span class="s1">unsigned int</span><span class="s4">) * </span><span class="s1">right_counts</span><span class="s4">[</span><span class="s1">thread_idx</span><span class="s4">]</span>
+                    <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s4">(</span><span class="s1">sample_indices</span><span class="s4">[:</span><span class="s1">right_child_position</span><span class="s4">],</span>
+                <span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">right_child_position</span><span class="s4">:],</span>
+                <span class="s1">right_child_position</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">find_node_split</span><span class="s4">(</span>
+            <span class="s1">Splitter self</span><span class="s4">,</span>
+            <span class="s1">unsigned int n_samples</span><span class="s4">,</span>
+            <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">histograms</span><span class="s4">,  </span><span class="s2"># IN</span>
+            <span class="s1">const Y_DTYPE_C sum_gradients</span><span class="s4">,</span>
+            <span class="s1">const Y_DTYPE_C sum_hessians</span><span class="s4">,</span>
+            <span class="s1">const Y_DTYPE_C value</span><span class="s4">,</span>
+            <span class="s1">const Y_DTYPE_C lower_bound</span><span class="s4">=-</span><span class="s1">INFINITY</span><span class="s4">,</span>
+            <span class="s1">const Y_DTYPE_C upper_bound</span><span class="s4">=</span><span class="s1">INFINITY</span><span class="s4">,</span>
+            <span class="s1">const unsigned int </span><span class="s4">[:] </span><span class="s1">allowed_features</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+            <span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;For each feature, find the best bin to split on at a given node. 
+ 
+        Return the best split info among all features. 
+ 
+        Parameters 
+        ---------- 
+        n_samples : int 
+            The number of samples at the node. 
+        histograms : ndarray of HISTOGRAM_DTYPE of \ 
+                shape (n_features, max_bins) 
+            The histograms of the current node. 
+        sum_gradients : float 
+            The sum of the gradients for each sample at the node. 
+        sum_hessians : float 
+            The sum of the hessians for each sample at the node. 
+        value : float 
+            The bounded value of the current node. We directly pass the value 
+            instead of re-computing it from sum_gradients and sum_hessians, 
+            because we need to compute the loss and the gain based on the 
+            *bounded* value: computing the value from 
+            sum_gradients / sum_hessians would give the unbounded value, and 
+            the interaction with min_gain_to_split would not be correct 
+            anymore. Side note: we can't use the lower_bound / upper_bound 
+            parameters either because these refer to the bounds of the 
+            children, not the bounds of the current node. 
+        lower_bound : float 
+            Lower bound for the children values for respecting the monotonic 
+            constraints. 
+        upper_bound : float 
+            Upper bound for the children values for respecting the monotonic 
+            constraints. 
+        allowed_features : None or ndarray, dtype=np.uint32 
+            Indices of the features that are allowed by interaction constraints to be 
+            split. 
+ 
+        Returns 
+        ------- 
+        best_split_info : SplitInfo 
+            The info about the best possible split among all features. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">int feature_idx</span>
+            <span class="s1">int split_info_idx</span>
+            <span class="s1">int best_split_info_idx</span>
+            <span class="s1">int n_allowed_features</span>
+            <span class="s1">split_info_struct split_info</span>
+            <span class="s1">split_info_struct </span><span class="s4">* </span><span class="s1">split_infos</span>
+            <span class="s1">const unsigned char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">has_missing_values </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">has_missing_values</span>
+            <span class="s1">const unsigned char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">is_categorical </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">is_categorical</span>
+            <span class="s1">const signed char </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">monotonic_cst </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">monotonic_cst</span>
+            <span class="s1">int n_threads </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_threads</span>
+            <span class="s1">bint has_interaction_cst </span><span class="s4">= </span><span class="s3">False</span>
+            <span class="s1">Y_DTYPE_C feature_fraction_per_split </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">feature_fraction_per_split</span>
+            <span class="s1">uint8_t </span><span class="s4">[:] </span><span class="s1">subsample_mask  </span><span class="s2"># same as npy_bool</span>
+            <span class="s1">int n_subsampled_features</span>
+
+        <span class="s1">has_interaction_cst </span><span class="s4">= </span><span class="s1">allowed_features </span><span class="s3">is not None</span>
+        <span class="s3">if </span><span class="s1">has_interaction_cst</span><span class="s4">:</span>
+            <span class="s1">n_allowed_features </span><span class="s4">= </span><span class="s1">allowed_features</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">n_allowed_features </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_features</span>
+
+        <span class="s3">if </span><span class="s1">feature_fraction_per_split </span><span class="s4">&lt; </span><span class="s5">1.0</span><span class="s4">:</span>
+            <span class="s2"># We do all random sampling before the nogil and make sure that we sample</span>
+            <span class="s2"># exactly n_subsampled_features &gt;= 1 features.</span>
+            <span class="s1">n_subsampled_features </span><span class="s4">= </span><span class="s1">max</span><span class="s4">(</span>
+                <span class="s5">1</span><span class="s4">,</span>
+                <span class="s1">int</span><span class="s4">(</span><span class="s1">ceil</span><span class="s4">(</span><span class="s1">feature_fraction_per_split </span><span class="s4">* </span><span class="s1">n_allowed_features</span><span class="s4">)),</span>
+            <span class="s4">)</span>
+            <span class="s1">subsample_mask_arr </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span><span class="s1">n_allowed_features</span><span class="s4">, </span><span class="s3">False</span><span class="s4">)</span>
+            <span class="s1">subsample_mask_arr</span><span class="s4">[:</span><span class="s1">n_subsampled_features</span><span class="s4">] = </span><span class="s3">True</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">rng</span><span class="s4">.</span><span class="s1">shuffle</span><span class="s4">(</span><span class="s1">subsample_mask_arr</span><span class="s4">)</span>
+            <span class="s2"># https://github.com/numpy/numpy/issues/18273</span>
+            <span class="s1">subsample_mask </span><span class="s4">= </span><span class="s1">subsample_mask_arr</span>
+
+        <span class="s3">with </span><span class="s1">nogil</span><span class="s4">:</span>
+
+            <span class="s1">split_infos </span><span class="s4">= &lt;</span><span class="s1">split_info_struct </span><span class="s4">*&gt; </span><span class="s1">malloc</span><span class="s4">(</span>
+                <span class="s1">n_allowed_features </span><span class="s4">* </span><span class="s1">sizeof</span><span class="s4">(</span><span class="s1">split_info_struct</span><span class="s4">))</span>
+
+            <span class="s2"># split_info_idx is index of split_infos of size n_allowed_features.</span>
+            <span class="s2"># features_idx is the index of the feature column in X.</span>
+            <span class="s3">for </span><span class="s1">split_info_idx </span><span class="s3">in </span><span class="s1">prange</span><span class="s4">(</span><span class="s1">n_allowed_features</span><span class="s4">, </span><span class="s1">schedule</span><span class="s4">=</span><span class="s6">'static'</span><span class="s4">,</span>
+                                         <span class="s1">num_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">):</span>
+                <span class="s3">if </span><span class="s1">has_interaction_cst</span><span class="s4">:</span>
+                    <span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">allowed_features</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">]</span>
+                <span class="s3">else</span><span class="s4">:</span>
+                    <span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">split_info_idx</span>
+
+                <span class="s1">split_infos</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">].</span><span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">feature_idx</span>
+
+                <span class="s2"># For each feature, find best bin to split on</span>
+                <span class="s2"># Start with a gain of -1 if no better split is found, that</span>
+                <span class="s2"># means one of the constraints isn't respected</span>
+                <span class="s2"># (min_samples_leaf, etc.) and the grower will later turn the</span>
+                <span class="s2"># node into a leaf.</span>
+                <span class="s1">split_infos</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">].</span><span class="s1">gain </span><span class="s4">= -</span><span class="s5">1</span>
+                <span class="s1">split_infos</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">].</span><span class="s1">is_categorical </span><span class="s4">= </span><span class="s1">is_categorical</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+
+                <span class="s2"># Note that subsample_mask is indexed by split_info_idx and not by</span>
+                <span class="s2"># feature_idx because we only need to exclude the same features again</span>
+                <span class="s2"># and again. We do NOT need to access the features directly by using</span>
+                <span class="s2"># allowed_features.</span>
+                <span class="s3">if </span><span class="s1">feature_fraction_per_split </span><span class="s4">&lt; </span><span class="s5">1.0 </span><span class="s3">and not </span><span class="s1">subsample_mask</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">]:</span>
+                    <span class="s3">continue</span>
+
+                <span class="s3">if </span><span class="s1">is_categorical</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]:</span>
+                    <span class="s1">self</span><span class="s4">.</span><span class="s1">_find_best_bin_to_split_category</span><span class="s4">(</span>
+                        <span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">has_missing_values</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">],</span>
+                        <span class="s1">histograms</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">sum_gradients</span><span class="s4">, </span><span class="s1">sum_hessians</span><span class="s4">,</span>
+                        <span class="s1">value</span><span class="s4">, </span><span class="s1">monotonic_cst</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">], </span><span class="s1">lower_bound</span><span class="s4">,</span>
+                        <span class="s1">upper_bound</span><span class="s4">, &amp;</span><span class="s1">split_infos</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">])</span>
+                <span class="s3">else</span><span class="s4">:</span>
+                    <span class="s2"># We will scan bins from left to right (in all cases), and</span>
+                    <span class="s2"># if there are any missing values, we will also scan bins</span>
+                    <span class="s2"># from right to left. This way, we can consider whichever</span>
+                    <span class="s2"># case yields the best gain: either missing values go to</span>
+                    <span class="s2"># the right (left to right scan) or to the left (right to</span>
+                    <span class="s2"># left case). See algo 3 from the XGBoost paper</span>
+                    <span class="s2"># https://arxiv.org/abs/1603.02754</span>
+                    <span class="s2"># Note: for the categorical features above, this isn't</span>
+                    <span class="s2"># needed since missing values are considered a native</span>
+                    <span class="s2"># category.</span>
+                    <span class="s1">self</span><span class="s4">.</span><span class="s1">_find_best_bin_to_split_left_to_right</span><span class="s4">(</span>
+                        <span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">has_missing_values</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">],</span>
+                        <span class="s1">histograms</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">sum_gradients</span><span class="s4">, </span><span class="s1">sum_hessians</span><span class="s4">,</span>
+                        <span class="s1">value</span><span class="s4">, </span><span class="s1">monotonic_cst</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">],</span>
+                        <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, &amp;</span><span class="s1">split_infos</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">])</span>
+
+                    <span class="s3">if </span><span class="s1">has_missing_values</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]:</span>
+                        <span class="s2"># We need to explore both directions to check whether</span>
+                        <span class="s2"># sending the nans to the left child would lead to a higher</span>
+                        <span class="s2"># gain</span>
+                        <span class="s1">self</span><span class="s4">.</span><span class="s1">_find_best_bin_to_split_right_to_left</span><span class="s4">(</span>
+                            <span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">histograms</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">,</span>
+                            <span class="s1">sum_gradients</span><span class="s4">, </span><span class="s1">sum_hessians</span><span class="s4">,</span>
+                            <span class="s1">value</span><span class="s4">, </span><span class="s1">monotonic_cst</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">],</span>
+                            <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, &amp;</span><span class="s1">split_infos</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">])</span>
+
+            <span class="s2"># then compute best possible split among all features</span>
+            <span class="s2"># split_info is set to the best of split_infos</span>
+            <span class="s1">best_split_info_idx </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_find_best_feature_to_split_helper</span><span class="s4">(</span>
+                <span class="s1">split_infos</span><span class="s4">, </span><span class="s1">n_allowed_features</span>
+            <span class="s4">)</span>
+            <span class="s1">split_info </span><span class="s4">= </span><span class="s1">split_infos</span><span class="s4">[</span><span class="s1">best_split_info_idx</span><span class="s4">]</span>
+
+        <span class="s1">out </span><span class="s4">= </span><span class="s1">SplitInfo</span><span class="s4">(</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">gain</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">feature_idx</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">bin_idx</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">missing_go_to_left</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_left</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_right</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_left</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_right</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_left</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_right</span><span class="s4">,</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">is_categorical</span><span class="s4">,</span>
+            <span class="s3">None</span><span class="s4">,  </span><span class="s2"># left_cat_bitset will only be set if the split is categorical</span>
+        <span class="s4">)</span>
+        <span class="s2"># Only set bitset if the split is categorical</span>
+        <span class="s3">if </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">is_categorical</span><span class="s4">:</span>
+            <span class="s1">out</span><span class="s4">.</span><span class="s1">left_cat_bitset </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">left_cat_bitset</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">uint32</span><span class="s4">)</span>
+
+        <span class="s1">free</span><span class="s4">(</span><span class="s1">split_infos</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">out</span>
+
+    <span class="s3">cdef </span><span class="s1">int _find_best_feature_to_split_helper</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">split_info_struct </span><span class="s4">* </span><span class="s1">split_infos</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">int n_allowed_features</span><span class="s4">,</span>
+    <span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:</span>
+        <span class="s6">&quot;&quot;&quot;Return the index of split_infos with the best feature split.&quot;&quot;&quot;</span>
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">int split_info_idx</span>
+            <span class="s1">int best_split_info_idx </span><span class="s4">= </span><span class="s5">0</span>
+
+        <span class="s3">for </span><span class="s1">split_info_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">1</span><span class="s4">, </span><span class="s1">n_allowed_features</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s4">(</span><span class="s1">split_infos</span><span class="s4">[</span><span class="s1">split_info_idx</span><span class="s4">].</span><span class="s1">gain </span><span class="s4">&gt; </span><span class="s1">split_infos</span><span class="s4">[</span><span class="s1">best_split_info_idx</span><span class="s4">].</span><span class="s1">gain</span><span class="s4">):</span>
+                <span class="s1">best_split_info_idx </span><span class="s4">= </span><span class="s1">split_info_idx</span>
+        <span class="s3">return </span><span class="s1">best_split_info_idx</span>
+
+    <span class="s3">cdef </span><span class="s1">void _find_best_bin_to_split_left_to_right</span><span class="s4">(</span>
+            <span class="s1">Splitter self</span><span class="s4">,</span>
+            <span class="s1">unsigned int feature_idx</span><span class="s4">,</span>
+            <span class="s1">unsigned char has_missing_values</span><span class="s4">,</span>
+            <span class="s1">const hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">histograms</span><span class="s4">,  </span><span class="s2"># IN</span>
+            <span class="s1">unsigned int n_samples</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C sum_gradients</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C sum_hessians</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C value</span><span class="s4">,</span>
+            <span class="s1">signed char monotonic_cst</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C lower_bound</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C upper_bound</span><span class="s4">,</span>
+            <span class="s1">split_info_struct </span><span class="s4">* </span><span class="s1">split_info</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+        <span class="s6">&quot;&quot;&quot;Find best bin to split on for a given feature. 
+ 
+        Splits that do not satisfy the splitting constraints 
+        (min_gain_to_split, etc.) are discarded here. 
+ 
+        We scan node from left to right. This version is called whether there 
+        are missing values or not. If any, missing values are assigned to the 
+        right node. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">unsigned int bin_idx</span>
+            <span class="s1">unsigned int n_samples_left</span>
+            <span class="s1">unsigned int n_samples_right</span>
+            <span class="s1">unsigned int n_samples_ </span><span class="s4">= </span><span class="s1">n_samples</span>
+            <span class="s2"># We set the 'end' variable such that the last non-missing-values</span>
+            <span class="s2"># bin never goes to the left child (which would result in and</span>
+            <span class="s2"># empty right child), unless there are missing values, since these</span>
+            <span class="s2"># would go to the right child.</span>
+            <span class="s1">unsigned int end </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins_non_missing</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s5">1 </span><span class="s4">+ </span><span class="s1">has_missing_values</span>
+            <span class="s1">Y_DTYPE_C sum_hessian_left</span>
+            <span class="s1">Y_DTYPE_C sum_hessian_right</span>
+            <span class="s1">Y_DTYPE_C sum_gradient_left</span>
+            <span class="s1">Y_DTYPE_C sum_gradient_right</span>
+            <span class="s1">Y_DTYPE_C loss_current_node</span>
+            <span class="s1">Y_DTYPE_C gain</span>
+            <span class="s1">unsigned char found_better_split </span><span class="s4">= </span><span class="s3">False</span>
+
+            <span class="s1">Y_DTYPE_C best_sum_hessian_left</span>
+            <span class="s1">Y_DTYPE_C best_sum_gradient_left</span>
+            <span class="s1">unsigned int best_bin_idx</span>
+            <span class="s1">unsigned int best_n_samples_left</span>
+            <span class="s1">Y_DTYPE_C best_gain </span><span class="s4">= -</span><span class="s5">1</span>
+
+        <span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left </span><span class="s4">= </span><span class="s5">0.</span><span class="s4">, </span><span class="s5">0.</span>
+        <span class="s1">n_samples_left </span><span class="s4">= </span><span class="s5">0</span>
+
+        <span class="s1">loss_current_node </span><span class="s4">= </span><span class="s1">_loss_from_value</span><span class="s4">(</span><span class="s1">value</span><span class="s4">, </span><span class="s1">sum_gradients</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">bin_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">end</span><span class="s4">):</span>
+            <span class="s1">n_samples_left </span><span class="s4">+= </span><span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count</span>
+            <span class="s1">n_samples_right </span><span class="s4">= </span><span class="s1">n_samples_ </span><span class="s4">- </span><span class="s1">n_samples_left</span>
+
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                <span class="s1">sum_hessian_left </span><span class="s4">+= </span><span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">sum_hessian_left </span><span class="s4">+= </span><span class="s1">\</span>
+                    <span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_hessians</span>
+            <span class="s1">sum_hessian_right </span><span class="s4">= </span><span class="s1">sum_hessians </span><span class="s4">- </span><span class="s1">sum_hessian_left</span>
+
+            <span class="s1">sum_gradient_left </span><span class="s4">+= </span><span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients</span>
+            <span class="s1">sum_gradient_right </span><span class="s4">= </span><span class="s1">sum_gradients </span><span class="s4">- </span><span class="s1">sum_gradient_left</span>
+
+            <span class="s3">if </span><span class="s1">n_samples_left </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_samples_leaf</span><span class="s4">:</span>
+                <span class="s3">continue</span>
+            <span class="s3">if </span><span class="s1">n_samples_right </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_samples_leaf</span><span class="s4">:</span>
+                <span class="s2"># won't get any better</span>
+                <span class="s3">break</span>
+
+            <span class="s3">if </span><span class="s1">sum_hessian_left </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_hessian_to_split</span><span class="s4">:</span>
+                <span class="s3">continue</span>
+            <span class="s3">if </span><span class="s1">sum_hessian_right </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_hessian_to_split</span><span class="s4">:</span>
+                <span class="s2"># won't get any better (hessians are &gt; 0 since loss is convex)</span>
+                <span class="s3">break</span>
+
+            <span class="s1">gain </span><span class="s4">= </span><span class="s1">_split_gain</span><span class="s4">(</span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                               <span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+                               <span class="s1">loss_current_node</span><span class="s4">,</span>
+                               <span class="s1">monotonic_cst</span><span class="s4">,</span>
+                               <span class="s1">lower_bound</span><span class="s4">,</span>
+                               <span class="s1">upper_bound</span><span class="s4">,</span>
+                               <span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">gain </span><span class="s4">&gt; </span><span class="s1">best_gain </span><span class="s3">and </span><span class="s1">gain </span><span class="s4">&gt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_gain_to_split</span><span class="s4">:</span>
+                <span class="s1">found_better_split </span><span class="s4">= </span><span class="s3">True</span>
+                <span class="s1">best_gain </span><span class="s4">= </span><span class="s1">gain</span>
+                <span class="s1">best_bin_idx </span><span class="s4">= </span><span class="s1">bin_idx</span>
+                <span class="s1">best_sum_gradient_left </span><span class="s4">= </span><span class="s1">sum_gradient_left</span>
+                <span class="s1">best_sum_hessian_left </span><span class="s4">= </span><span class="s1">sum_hessian_left</span>
+                <span class="s1">best_n_samples_left </span><span class="s4">= </span><span class="s1">n_samples_left</span>
+
+        <span class="s3">if </span><span class="s1">found_better_split</span><span class="s4">:</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">gain </span><span class="s4">= </span><span class="s1">best_gain</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">best_bin_idx</span>
+            <span class="s2"># we scan from left to right so missing values go to the right</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">missing_go_to_left </span><span class="s4">= </span><span class="s3">False</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_left </span><span class="s4">= </span><span class="s1">best_sum_gradient_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_right </span><span class="s4">= </span><span class="s1">sum_gradients </span><span class="s4">- </span><span class="s1">best_sum_gradient_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_left </span><span class="s4">= </span><span class="s1">best_sum_hessian_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_right </span><span class="s4">= </span><span class="s1">sum_hessians </span><span class="s4">- </span><span class="s1">best_sum_hessian_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_left </span><span class="s4">= </span><span class="s1">best_n_samples_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_right </span><span class="s4">= </span><span class="s1">n_samples </span><span class="s4">- </span><span class="s1">best_n_samples_left</span>
+
+            <span class="s2"># We recompute best values here but it's cheap</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_left </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span>
+                <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_right </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span>
+                <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+                <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+    <span class="s3">cdef </span><span class="s1">void _find_best_bin_to_split_right_to_left</span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">,</span>
+            <span class="s1">unsigned int feature_idx</span><span class="s4">,</span>
+            <span class="s1">const hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">histograms</span><span class="s4">,  </span><span class="s2"># IN</span>
+            <span class="s1">unsigned int n_samples</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C sum_gradients</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C sum_hessians</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C value</span><span class="s4">,</span>
+            <span class="s1">signed char monotonic_cst</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C lower_bound</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C upper_bound</span><span class="s4">,</span>
+            <span class="s1">split_info_struct </span><span class="s4">* </span><span class="s1">split_info</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+        <span class="s6">&quot;&quot;&quot;Find best bin to split on for a given feature. 
+ 
+        Splits that do not satisfy the splitting constraints 
+        (min_gain_to_split, etc.) are discarded here. 
+ 
+        We scan node from right to left. This version is only called when 
+        there are missing values. Missing values are assigned to the left 
+        child. 
+ 
+        If no missing value are present in the data this method isn't called 
+        since only calling _find_best_bin_to_split_left_to_right is enough. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">unsigned int bin_idx</span>
+            <span class="s1">unsigned int n_samples_left</span>
+            <span class="s1">unsigned int n_samples_right</span>
+            <span class="s1">unsigned int n_samples_ </span><span class="s4">= </span><span class="s1">n_samples</span>
+            <span class="s1">Y_DTYPE_C sum_hessian_left</span>
+            <span class="s1">Y_DTYPE_C sum_hessian_right</span>
+            <span class="s1">Y_DTYPE_C sum_gradient_left</span>
+            <span class="s1">Y_DTYPE_C sum_gradient_right</span>
+            <span class="s1">Y_DTYPE_C loss_current_node</span>
+            <span class="s1">Y_DTYPE_C gain</span>
+            <span class="s1">unsigned int start </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins_non_missing</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">] - </span><span class="s5">2</span>
+            <span class="s1">unsigned char found_better_split </span><span class="s4">= </span><span class="s3">False</span>
+
+            <span class="s1">Y_DTYPE_C best_sum_hessian_left</span>
+            <span class="s1">Y_DTYPE_C best_sum_gradient_left</span>
+            <span class="s1">unsigned int best_bin_idx</span>
+            <span class="s1">unsigned int best_n_samples_left</span>
+            <span class="s1">Y_DTYPE_C best_gain </span><span class="s4">= </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">gain  </span><span class="s2"># computed during previous scan</span>
+
+        <span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">sum_hessian_right </span><span class="s4">= </span><span class="s5">0.</span><span class="s4">, </span><span class="s5">0.</span>
+        <span class="s1">n_samples_right </span><span class="s4">= </span><span class="s5">0</span>
+
+        <span class="s1">loss_current_node </span><span class="s4">= </span><span class="s1">_loss_from_value</span><span class="s4">(</span><span class="s1">value</span><span class="s4">, </span><span class="s1">sum_gradients</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">bin_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">start</span><span class="s4">, -</span><span class="s5">1</span><span class="s4">, -</span><span class="s5">1</span><span class="s4">):</span>
+            <span class="s1">n_samples_right </span><span class="s4">+= </span><span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">].</span><span class="s1">count</span>
+            <span class="s1">n_samples_left </span><span class="s4">= </span><span class="s1">n_samples_ </span><span class="s4">- </span><span class="s1">n_samples_right</span>
+
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                <span class="s1">sum_hessian_right </span><span class="s4">+= </span><span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">].</span><span class="s1">count</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">sum_hessian_right </span><span class="s4">+= </span><span class="s1">\</span>
+                    <span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">].</span><span class="s1">sum_hessians</span>
+            <span class="s1">sum_hessian_left </span><span class="s4">= </span><span class="s1">sum_hessians </span><span class="s4">- </span><span class="s1">sum_hessian_right</span>
+
+            <span class="s1">sum_gradient_right </span><span class="s4">+= </span><span class="s1">\</span>
+                <span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">].</span><span class="s1">sum_gradients</span>
+            <span class="s1">sum_gradient_left </span><span class="s4">= </span><span class="s1">sum_gradients </span><span class="s4">- </span><span class="s1">sum_gradient_right</span>
+
+            <span class="s3">if </span><span class="s1">n_samples_right </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_samples_leaf</span><span class="s4">:</span>
+                <span class="s3">continue</span>
+            <span class="s3">if </span><span class="s1">n_samples_left </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_samples_leaf</span><span class="s4">:</span>
+                <span class="s2"># won't get any better</span>
+                <span class="s3">break</span>
+
+            <span class="s3">if </span><span class="s1">sum_hessian_right </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_hessian_to_split</span><span class="s4">:</span>
+                <span class="s3">continue</span>
+            <span class="s3">if </span><span class="s1">sum_hessian_left </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_hessian_to_split</span><span class="s4">:</span>
+                <span class="s2"># won't get any better (hessians are &gt; 0 since loss is convex)</span>
+                <span class="s3">break</span>
+
+            <span class="s1">gain </span><span class="s4">= </span><span class="s1">_split_gain</span><span class="s4">(</span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                               <span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+                               <span class="s1">loss_current_node</span><span class="s4">,</span>
+                               <span class="s1">monotonic_cst</span><span class="s4">,</span>
+                               <span class="s1">lower_bound</span><span class="s4">,</span>
+                               <span class="s1">upper_bound</span><span class="s4">,</span>
+                               <span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">gain </span><span class="s4">&gt; </span><span class="s1">best_gain </span><span class="s3">and </span><span class="s1">gain </span><span class="s4">&gt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_gain_to_split</span><span class="s4">:</span>
+                <span class="s1">found_better_split </span><span class="s4">= </span><span class="s3">True</span>
+                <span class="s1">best_gain </span><span class="s4">= </span><span class="s1">gain</span>
+                <span class="s1">best_bin_idx </span><span class="s4">= </span><span class="s1">bin_idx</span>
+                <span class="s1">best_sum_gradient_left </span><span class="s4">= </span><span class="s1">sum_gradient_left</span>
+                <span class="s1">best_sum_hessian_left </span><span class="s4">= </span><span class="s1">sum_hessian_left</span>
+                <span class="s1">best_n_samples_left </span><span class="s4">= </span><span class="s1">n_samples_left</span>
+
+        <span class="s3">if </span><span class="s1">found_better_split</span><span class="s4">:</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">gain </span><span class="s4">= </span><span class="s1">best_gain</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">best_bin_idx</span>
+            <span class="s2"># we scan from right to left so missing values go to the left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">missing_go_to_left </span><span class="s4">= </span><span class="s3">True</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_left </span><span class="s4">= </span><span class="s1">best_sum_gradient_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_right </span><span class="s4">= </span><span class="s1">sum_gradients </span><span class="s4">- </span><span class="s1">best_sum_gradient_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_left </span><span class="s4">= </span><span class="s1">best_sum_hessian_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_right </span><span class="s4">= </span><span class="s1">sum_hessians </span><span class="s4">- </span><span class="s1">best_sum_hessian_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_left </span><span class="s4">= </span><span class="s1">best_n_samples_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_right </span><span class="s4">= </span><span class="s1">n_samples </span><span class="s4">- </span><span class="s1">best_n_samples_left</span>
+
+            <span class="s2"># We recompute best values here but it's cheap</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_left </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span>
+                <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_right </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span>
+                <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+                <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+    <span class="s3">cdef </span><span class="s1">void _find_best_bin_to_split_category</span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">,</span>
+            <span class="s1">unsigned int feature_idx</span><span class="s4">,</span>
+            <span class="s1">unsigned char has_missing_values</span><span class="s4">,</span>
+            <span class="s1">const hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">histograms</span><span class="s4">,  </span><span class="s2"># IN</span>
+            <span class="s1">unsigned int n_samples</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C sum_gradients</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C sum_hessians</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C value</span><span class="s4">,</span>
+            <span class="s1">char monotonic_cst</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C lower_bound</span><span class="s4">,</span>
+            <span class="s1">Y_DTYPE_C upper_bound</span><span class="s4">,</span>
+            <span class="s1">split_info_struct </span><span class="s4">* </span><span class="s1">split_info</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+        <span class="s6">&quot;&quot;&quot;Find best split for categorical features. 
+ 
+        Categories are first sorted according to their variance, and then 
+        a scan is performed as if categories were ordered quantities. 
+ 
+        Ref: &quot;On Grouping for Maximum Homogeneity&quot;, Walter D. Fisher 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">unsigned int bin_idx</span>
+            <span class="s1">unsigned int n_bins_non_missing </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins_non_missing</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">]</span>
+            <span class="s1">unsigned int missing_values_bin_idx </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">missing_values_bin_idx</span>
+            <span class="s1">categorical_info </span><span class="s4">* </span><span class="s1">cat_infos</span>
+            <span class="s1">unsigned int sorted_cat_idx</span>
+            <span class="s1">unsigned int n_used_bins </span><span class="s4">= </span><span class="s5">0</span>
+            <span class="s1">int </span><span class="s4">[</span><span class="s5">2</span><span class="s4">] </span><span class="s1">scan_direction</span>
+            <span class="s1">int direction </span><span class="s4">= </span><span class="s5">0</span>
+            <span class="s1">int best_direction </span><span class="s4">= </span><span class="s5">0</span>
+            <span class="s1">unsigned int middle</span>
+            <span class="s1">unsigned int i</span>
+            <span class="s1">const hist_struct</span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">feature_hist </span><span class="s4">= </span><span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, :]</span>
+            <span class="s1">Y_DTYPE_C sum_gradients_bin</span>
+            <span class="s1">Y_DTYPE_C sum_hessians_bin</span>
+            <span class="s1">Y_DTYPE_C loss_current_node</span>
+            <span class="s1">Y_DTYPE_C sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left</span>
+            <span class="s1">Y_DTYPE_C sum_gradient_right</span><span class="s4">, </span><span class="s1">sum_hessian_right</span>
+            <span class="s1">unsigned int n_samples_left</span><span class="s4">, </span><span class="s1">n_samples_right</span>
+            <span class="s1">Y_DTYPE_C gain</span>
+            <span class="s1">Y_DTYPE_C best_gain </span><span class="s4">= -</span><span class="s5">1.0</span>
+            <span class="s1">unsigned char found_better_split </span><span class="s4">= </span><span class="s3">False</span>
+            <span class="s1">Y_DTYPE_C best_sum_hessian_left</span>
+            <span class="s1">Y_DTYPE_C best_sum_gradient_left</span>
+            <span class="s1">unsigned int best_n_samples_left</span>
+            <span class="s1">unsigned int best_cat_infos_thresh</span>
+            <span class="s2"># Reduces the effect of noises in categorical features,</span>
+            <span class="s2"># especially for categories with few data. Called cat_smooth in</span>
+            <span class="s2"># LightGBM. TODO: Make this user adjustable?</span>
+            <span class="s1">Y_DTYPE_C MIN_CAT_SUPPORT </span><span class="s4">= </span><span class="s5">10.</span>
+            <span class="s2"># this is equal to 1 for losses where hessians are constant</span>
+            <span class="s1">Y_DTYPE_C support_factor </span><span class="s4">= </span><span class="s1">n_samples </span><span class="s4">/ </span><span class="s1">sum_hessians</span>
+
+        <span class="s2"># Details on the split finding:</span>
+        <span class="s2"># We first order categories by their sum_gradients / sum_hessians</span>
+        <span class="s2"># values, and we exclude categories that don't respect MIN_CAT_SUPPORT</span>
+        <span class="s2"># from this sorted array. Missing values are treated just like any</span>
+        <span class="s2"># other category. The low-support categories will always be mapped to</span>
+        <span class="s2"># the right child. We scan the sorted categories array from left to</span>
+        <span class="s2"># right and from right to left, and we stop at the middle.</span>
+
+        <span class="s2"># Considering ordered categories A B C D, with E being a low-support</span>
+        <span class="s2"># category: A B C D</span>
+        <span class="s2">#              ^</span>
+        <span class="s2">#           midpoint</span>
+        <span class="s2"># The scans will consider the following split-points:</span>
+        <span class="s2"># * left to right:</span>
+        <span class="s2">#   A - B C D E</span>
+        <span class="s2">#   A B - C D E</span>
+        <span class="s2"># * right to left:</span>
+        <span class="s2">#   D - A B C E</span>
+        <span class="s2">#   C D - A B E</span>
+
+        <span class="s2"># Note that since we stop at the middle and since low-support</span>
+        <span class="s2"># categories (E) are always mapped to the right, the following splits</span>
+        <span class="s2"># aren't considered:</span>
+        <span class="s2"># A E - B C D</span>
+        <span class="s2"># D E - A B C</span>
+        <span class="s2"># Basically, we're forcing E to always be mapped to the child that has</span>
+        <span class="s2"># *at least half of the categories* (and this child is always the right</span>
+        <span class="s2"># child, by convention).</span>
+
+        <span class="s2"># Also note that if we scanned in only one direction (e.g. left to</span>
+        <span class="s2"># right), we would only consider the following splits:</span>
+        <span class="s2"># A - B C D E</span>
+        <span class="s2"># A B - C D E</span>
+        <span class="s2"># A B C - D E</span>
+        <span class="s2"># and thus we would be missing on D - A B C E and on C D - A B E</span>
+
+        <span class="s1">cat_infos </span><span class="s4">= &lt;</span><span class="s1">categorical_info </span><span class="s4">*&gt; </span><span class="s1">malloc</span><span class="s4">(</span>
+            <span class="s4">(</span><span class="s1">n_bins_non_missing </span><span class="s4">+ </span><span class="s1">has_missing_values</span><span class="s4">) * </span><span class="s1">sizeof</span><span class="s4">(</span><span class="s1">categorical_info</span><span class="s4">))</span>
+
+        <span class="s2"># fill cat_infos while filtering out categories based on MIN_CAT_SUPPORT</span>
+        <span class="s3">for </span><span class="s1">bin_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_bins_non_missing</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                <span class="s1">sum_hessians_bin </span><span class="s4">= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">sum_hessians_bin </span><span class="s4">= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_hessians</span>
+            <span class="s3">if </span><span class="s1">sum_hessians_bin </span><span class="s4">* </span><span class="s1">support_factor </span><span class="s4">&gt;= </span><span class="s1">MIN_CAT_SUPPORT</span><span class="s4">:</span>
+                <span class="s1">cat_infos</span><span class="s4">[</span><span class="s1">n_used_bins</span><span class="s4">].</span><span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">bin_idx</span>
+                <span class="s1">sum_gradients_bin </span><span class="s4">= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients</span>
+
+                <span class="s1">cat_infos</span><span class="s4">[</span><span class="s1">n_used_bins</span><span class="s4">].</span><span class="s1">value </span><span class="s4">= (</span>
+                    <span class="s1">sum_gradients_bin </span><span class="s4">/ (</span><span class="s1">sum_hessians_bin </span><span class="s4">+ </span><span class="s1">MIN_CAT_SUPPORT</span><span class="s4">)</span>
+                <span class="s4">)</span>
+                <span class="s1">n_used_bins </span><span class="s4">+= </span><span class="s5">1</span>
+
+        <span class="s2"># Also add missing values bin so that nans are considered as a category</span>
+        <span class="s3">if </span><span class="s1">has_missing_values</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                <span class="s1">sum_hessians_bin </span><span class="s4">= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">missing_values_bin_idx</span><span class="s4">].</span><span class="s1">count</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">sum_hessians_bin </span><span class="s4">= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">missing_values_bin_idx</span><span class="s4">].</span><span class="s1">sum_hessians</span>
+            <span class="s3">if </span><span class="s1">sum_hessians_bin </span><span class="s4">* </span><span class="s1">support_factor </span><span class="s4">&gt;= </span><span class="s1">MIN_CAT_SUPPORT</span><span class="s4">:</span>
+                <span class="s1">cat_infos</span><span class="s4">[</span><span class="s1">n_used_bins</span><span class="s4">].</span><span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">missing_values_bin_idx</span>
+                <span class="s1">sum_gradients_bin </span><span class="s4">= (</span>
+                    <span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">missing_values_bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients</span>
+                <span class="s4">)</span>
+
+                <span class="s1">cat_infos</span><span class="s4">[</span><span class="s1">n_used_bins</span><span class="s4">].</span><span class="s1">value </span><span class="s4">= (</span>
+                    <span class="s1">sum_gradients_bin </span><span class="s4">/ (</span><span class="s1">sum_hessians_bin </span><span class="s4">+ </span><span class="s1">MIN_CAT_SUPPORT</span><span class="s4">)</span>
+                <span class="s4">)</span>
+                <span class="s1">n_used_bins </span><span class="s4">+= </span><span class="s5">1</span>
+
+        <span class="s2"># not enough categories to form a split</span>
+        <span class="s3">if </span><span class="s1">n_used_bins </span><span class="s4">&lt;= </span><span class="s5">1</span><span class="s4">:</span>
+            <span class="s1">free</span><span class="s4">(</span><span class="s1">cat_infos</span><span class="s4">)</span>
+            <span class="s3">return</span>
+
+        <span class="s1">qsort</span><span class="s4">(</span><span class="s1">cat_infos</span><span class="s4">, </span><span class="s1">n_used_bins</span><span class="s4">, </span><span class="s1">sizeof</span><span class="s4">(</span><span class="s1">categorical_info</span><span class="s4">),</span>
+              <span class="s1">compare_cat_infos</span><span class="s4">)</span>
+
+        <span class="s1">loss_current_node </span><span class="s4">= </span><span class="s1">_loss_from_value</span><span class="s4">(</span><span class="s1">value</span><span class="s4">, </span><span class="s1">sum_gradients</span><span class="s4">)</span>
+
+        <span class="s1">scan_direction</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">scan_direction</span><span class="s4">[</span><span class="s5">1</span><span class="s4">] = </span><span class="s5">1</span><span class="s4">, -</span><span class="s5">1</span>
+        <span class="s3">for </span><span class="s1">direction </span><span class="s3">in </span><span class="s1">scan_direction</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">direction </span><span class="s4">== </span><span class="s5">1</span><span class="s4">:</span>
+                <span class="s1">middle </span><span class="s4">= (</span><span class="s1">n_used_bins </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">) // </span><span class="s5">2</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">middle </span><span class="s4">= (</span><span class="s1">n_used_bins </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">) // </span><span class="s5">2 </span><span class="s4">- </span><span class="s5">1</span>
+
+            <span class="s2"># The categories we'll consider will go to the left child</span>
+            <span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left </span><span class="s4">= </span><span class="s5">0.</span><span class="s4">, </span><span class="s5">0.</span>
+            <span class="s1">n_samples_left </span><span class="s4">= </span><span class="s5">0</span>
+
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">middle</span><span class="s4">):</span>
+                <span class="s1">sorted_cat_idx </span><span class="s4">= </span><span class="s1">i </span><span class="s3">if </span><span class="s1">direction </span><span class="s4">== </span><span class="s5">1 </span><span class="s3">else </span><span class="s1">n_used_bins </span><span class="s4">- </span><span class="s5">1 </span><span class="s4">- </span><span class="s1">i</span>
+                <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">cat_infos</span><span class="s4">[</span><span class="s1">sorted_cat_idx</span><span class="s4">].</span><span class="s1">bin_idx</span>
+
+                <span class="s1">n_samples_left </span><span class="s4">+= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count</span>
+                <span class="s1">n_samples_right </span><span class="s4">= </span><span class="s1">n_samples </span><span class="s4">- </span><span class="s1">n_samples_left</span>
+
+                <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                    <span class="s1">sum_hessian_left </span><span class="s4">+= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count</span>
+                <span class="s3">else</span><span class="s4">:</span>
+                    <span class="s1">sum_hessian_left </span><span class="s4">+= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_hessians</span>
+                <span class="s1">sum_hessian_right </span><span class="s4">= </span><span class="s1">sum_hessians </span><span class="s4">- </span><span class="s1">sum_hessian_left</span>
+
+                <span class="s1">sum_gradient_left </span><span class="s4">+= </span><span class="s1">feature_hist</span><span class="s4">[</span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients</span>
+                <span class="s1">sum_gradient_right </span><span class="s4">= </span><span class="s1">sum_gradients </span><span class="s4">- </span><span class="s1">sum_gradient_left</span>
+
+                <span class="s3">if </span><span class="s4">(</span>
+                    <span class="s1">n_samples_left </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_samples_leaf </span><span class="s3">or</span>
+                    <span class="s1">sum_hessian_left </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_hessian_to_split</span>
+                <span class="s4">):</span>
+                    <span class="s3">continue</span>
+                <span class="s3">if </span><span class="s4">(</span>
+                    <span class="s1">n_samples_right </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_samples_leaf </span><span class="s3">or</span>
+                    <span class="s1">sum_hessian_right </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_hessian_to_split</span>
+                <span class="s4">):</span>
+                    <span class="s3">break</span>
+
+                <span class="s1">gain </span><span class="s4">= </span><span class="s1">_split_gain</span><span class="s4">(</span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                                   <span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+                                   <span class="s1">loss_current_node</span><span class="s4">, </span><span class="s1">monotonic_cst</span><span class="s4">,</span>
+                                   <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">,</span>
+                                   <span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+                <span class="s3">if </span><span class="s1">gain </span><span class="s4">&gt; </span><span class="s1">best_gain </span><span class="s3">and </span><span class="s1">gain </span><span class="s4">&gt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">min_gain_to_split</span><span class="s4">:</span>
+                    <span class="s1">found_better_split </span><span class="s4">= </span><span class="s3">True</span>
+                    <span class="s1">best_gain </span><span class="s4">= </span><span class="s1">gain</span>
+                    <span class="s1">best_cat_infos_thresh </span><span class="s4">= </span><span class="s1">sorted_cat_idx</span>
+                    <span class="s1">best_sum_gradient_left </span><span class="s4">= </span><span class="s1">sum_gradient_left</span>
+                    <span class="s1">best_sum_hessian_left </span><span class="s4">= </span><span class="s1">sum_hessian_left</span>
+                    <span class="s1">best_n_samples_left </span><span class="s4">= </span><span class="s1">n_samples_left</span>
+                    <span class="s1">best_direction </span><span class="s4">= </span><span class="s1">direction</span>
+
+        <span class="s3">if </span><span class="s1">found_better_split</span><span class="s4">:</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">gain </span><span class="s4">= </span><span class="s1">best_gain</span>
+
+            <span class="s2"># split_info.bin_idx is unused for categorical splits: left_cat_bitset</span>
+            <span class="s2"># is used instead and set below</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">bin_idx </span><span class="s4">= </span><span class="s5">0</span>
+
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_left </span><span class="s4">= </span><span class="s1">best_sum_gradient_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_right </span><span class="s4">= </span><span class="s1">sum_gradients </span><span class="s4">- </span><span class="s1">best_sum_gradient_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_left </span><span class="s4">= </span><span class="s1">best_sum_hessian_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_right </span><span class="s4">= </span><span class="s1">sum_hessians </span><span class="s4">- </span><span class="s1">best_sum_hessian_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_left </span><span class="s4">= </span><span class="s1">best_n_samples_left</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">n_samples_right </span><span class="s4">= </span><span class="s1">n_samples </span><span class="s4">- </span><span class="s1">best_n_samples_left</span>
+
+            <span class="s2"># We recompute best values here but it's cheap</span>
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_left </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span>
+                <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+            <span class="s1">split_info</span><span class="s4">.</span><span class="s1">value_right </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span>
+                <span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+                <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">l2_regularization</span><span class="s4">)</span>
+
+            <span class="s2"># create bitset with values from best_cat_infos_thresh</span>
+            <span class="s1">init_bitset</span><span class="s4">(</span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">left_cat_bitset</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">best_direction </span><span class="s4">== </span><span class="s5">1</span><span class="s4">:</span>
+                <span class="s3">for </span><span class="s1">sorted_cat_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">best_cat_infos_thresh </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">):</span>
+                    <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">cat_infos</span><span class="s4">[</span><span class="s1">sorted_cat_idx</span><span class="s4">].</span><span class="s1">bin_idx</span>
+                    <span class="s1">set_bitset</span><span class="s4">(</span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">left_cat_bitset</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">for </span><span class="s1">sorted_cat_idx </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_used_bins </span><span class="s4">- </span><span class="s5">1</span><span class="s4">, </span><span class="s1">best_cat_infos_thresh </span><span class="s4">- </span><span class="s5">1</span><span class="s4">, -</span><span class="s5">1</span><span class="s4">):</span>
+                    <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">cat_infos</span><span class="s4">[</span><span class="s1">sorted_cat_idx</span><span class="s4">].</span><span class="s1">bin_idx</span>
+                    <span class="s1">set_bitset</span><span class="s4">(</span><span class="s1">split_info</span><span class="s4">.</span><span class="s1">left_cat_bitset</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">has_missing_values</span><span class="s4">:</span>
+                <span class="s1">split_info</span><span class="s4">.</span><span class="s1">missing_go_to_left </span><span class="s4">= </span><span class="s1">in_bitset</span><span class="s4">(</span>
+                    <span class="s1">split_info</span><span class="s4">.</span><span class="s1">left_cat_bitset</span><span class="s4">, </span><span class="s1">missing_values_bin_idx</span><span class="s4">)</span>
+
+        <span class="s1">free</span><span class="s4">(</span><span class="s1">cat_infos</span><span class="s4">)</span>
+
+
+<span class="s3">cdef </span><span class="s1">int compare_cat_infos</span><span class="s4">(</span><span class="s1">const void </span><span class="s4">* </span><span class="s1">a</span><span class="s4">, </span><span class="s1">const void </span><span class="s4">* </span><span class="s1">b</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:</span>
+    <span class="s3">return </span><span class="s4">-</span><span class="s5">1 </span><span class="s3">if </span><span class="s4">(&lt;</span><span class="s1">categorical_info </span><span class="s4">*&gt;</span><span class="s1">a</span><span class="s4">).</span><span class="s1">value </span><span class="s4">&lt; (&lt;</span><span class="s1">categorical_info </span><span class="s4">*&gt;</span><span class="s1">b</span><span class="s4">).</span><span class="s1">value </span><span class="s3">else </span><span class="s5">1</span>
+
+<span class="s3">cdef </span><span class="s1">inline Y_DTYPE_C _split_gain</span><span class="s4">(</span>
+        <span class="s1">Y_DTYPE_C sum_gradient_left</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C sum_hessian_left</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C sum_gradient_right</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C sum_hessian_right</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C loss_current_node</span><span class="s4">,</span>
+        <span class="s1">signed char monotonic_cst</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C lower_bound</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C upper_bound</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C l2_regularization</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:</span>
+    <span class="s6">&quot;&quot;&quot;Loss reduction 
+ 
+    Compute the reduction in loss after taking a split, compared to keeping 
+    the node a leaf of the tree. 
+ 
+    See Equation 7 of: 
+    :arxiv:`T. Chen, C. Guestrin, (2016) XGBoost: A Scalable Tree Boosting System, 
+    &lt;1603.02754&gt;.` 
+    &quot;&quot;&quot;</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">Y_DTYPE_C gain</span>
+        <span class="s1">Y_DTYPE_C value_left</span>
+        <span class="s1">Y_DTYPE_C value_right</span>
+
+    <span class="s2"># Compute values of potential left and right children</span>
+    <span class="s1">value_left </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span><span class="s1">sum_gradient_left</span><span class="s4">, </span><span class="s1">sum_hessian_left</span><span class="s4">,</span>
+                                    <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">,</span>
+                                    <span class="s1">l2_regularization</span><span class="s4">)</span>
+    <span class="s1">value_right </span><span class="s4">= </span><span class="s1">compute_node_value</span><span class="s4">(</span><span class="s1">sum_gradient_right</span><span class="s4">, </span><span class="s1">sum_hessian_right</span><span class="s4">,</span>
+                                     <span class="s1">lower_bound</span><span class="s4">, </span><span class="s1">upper_bound</span><span class="s4">,</span>
+                                     <span class="s1">l2_regularization</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s4">((</span><span class="s1">monotonic_cst </span><span class="s4">== </span><span class="s1">MonotonicConstraint</span><span class="s4">.</span><span class="s1">POS </span><span class="s3">and </span><span class="s1">value_left </span><span class="s4">&gt; </span><span class="s1">value_right</span><span class="s4">) </span><span class="s3">or</span>
+            <span class="s4">(</span><span class="s1">monotonic_cst </span><span class="s4">== </span><span class="s1">MonotonicConstraint</span><span class="s4">.</span><span class="s1">NEG </span><span class="s3">and </span><span class="s1">value_left </span><span class="s4">&lt; </span><span class="s1">value_right</span><span class="s4">)):</span>
+        <span class="s2"># don't consider this split since it does not respect the monotonic</span>
+        <span class="s2"># constraints. Note that these comparisons need to be done on values</span>
+        <span class="s2"># that have already been clipped to take the monotonic constraints into</span>
+        <span class="s2"># account (if any).</span>
+        <span class="s3">return </span><span class="s4">-</span><span class="s5">1</span>
+
+    <span class="s1">gain </span><span class="s4">= </span><span class="s1">loss_current_node</span>
+    <span class="s1">gain </span><span class="s4">-= </span><span class="s1">_loss_from_value</span><span class="s4">(</span><span class="s1">value_left</span><span class="s4">, </span><span class="s1">sum_gradient_left</span><span class="s4">)</span>
+    <span class="s1">gain </span><span class="s4">-= </span><span class="s1">_loss_from_value</span><span class="s4">(</span><span class="s1">value_right</span><span class="s4">, </span><span class="s1">sum_gradient_right</span><span class="s4">)</span>
+    <span class="s2"># Note that for the gain to be correct (and for min_gain_to_split to work</span>
+    <span class="s2"># as expected), we need all values to be bounded (current node, left child</span>
+    <span class="s2"># and right child).</span>
+
+    <span class="s3">return </span><span class="s1">gain</span>
+
+<span class="s3">cdef </span><span class="s1">inline Y_DTYPE_C _loss_from_value</span><span class="s4">(</span>
+        <span class="s1">Y_DTYPE_C value</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C sum_gradient</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:</span>
+    <span class="s6">&quot;&quot;&quot;Return loss of a node from its (bounded) value 
+ 
+    See Equation 6 of: 
+    :arxiv:`T. Chen, C. Guestrin, (2016) XGBoost: A Scalable Tree Boosting System, 
+    &lt;1603.02754&gt;.` 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">sum_gradient </span><span class="s4">* </span><span class="s1">value</span>
+
+<span class="s3">cdef </span><span class="s1">inline unsigned char sample_goes_left</span><span class="s4">(</span>
+        <span class="s1">unsigned char missing_go_to_left</span><span class="s4">,</span>
+        <span class="s1">unsigned char missing_values_bin_idx</span><span class="s4">,</span>
+        <span class="s1">X_BINNED_DTYPE_C split_bin_idx</span><span class="s4">,</span>
+        <span class="s1">X_BINNED_DTYPE_C bin_value</span><span class="s4">,</span>
+        <span class="s1">unsigned char is_categorical</span><span class="s4">,</span>
+        <span class="s1">BITSET_DTYPE_C left_cat_bitset</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:</span>
+    <span class="s6">&quot;&quot;&quot;Helper to decide whether sample should go to left or right child.&quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">is_categorical</span><span class="s4">:</span>
+        <span class="s2"># note: if any, missing values are encoded in left_cat_bitset</span>
+        <span class="s3">return </span><span class="s1">in_bitset</span><span class="s4">(</span><span class="s1">left_cat_bitset</span><span class="s4">, </span><span class="s1">bin_value</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s3">return </span><span class="s4">(</span>
+            <span class="s4">(</span>
+                <span class="s1">missing_go_to_left </span><span class="s3">and</span>
+                <span class="s1">bin_value </span><span class="s4">== </span><span class="s1">missing_values_bin_idx</span>
+            <span class="s4">)</span>
+            <span class="s3">or </span><span class="s4">(</span>
+                <span class="s1">bin_value </span><span class="s4">&lt;= </span><span class="s1">split_bin_idx</span>
+            <span class="s4">))</span>
+
+
+<span class="s3">cpdef </span><span class="s1">inline Y_DTYPE_C compute_node_value</span><span class="s4">(</span>
+        <span class="s1">Y_DTYPE_C sum_gradient</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C sum_hessian</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C lower_bound</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C upper_bound</span><span class="s4">,</span>
+        <span class="s1">Y_DTYPE_C l2_regularization</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:</span>
+    <span class="s6">&quot;&quot;&quot;Compute a node's value. 
+ 
+    The value is capped in the [lower_bound, upper_bound] interval to respect 
+    monotonic constraints. Shrinkage is ignored. 
+ 
+    See Equation 5 of: 
+    :arxiv:`T. Chen, C. Guestrin, (2016) XGBoost: A Scalable Tree Boosting System, 
+    &lt;1603.02754&gt;.` 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">Y_DTYPE_C value</span>
+
+    <span class="s1">value </span><span class="s4">= -</span><span class="s1">sum_gradient </span><span class="s4">/ (</span><span class="s1">sum_hessian </span><span class="s4">+ </span><span class="s1">l2_regularization </span><span class="s4">+ </span><span class="s5">1e-15</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">value </span><span class="s4">&lt; </span><span class="s1">lower_bound</span><span class="s4">:</span>
+        <span class="s1">value </span><span class="s4">= </span><span class="s1">lower_bound</span>
+    <span class="s3">elif </span><span class="s1">value </span><span class="s4">&gt; </span><span class="s1">upper_bound</span><span class="s4">:</span>
+        <span class="s1">value </span><span class="s4">= </span><span class="s1">upper_bound</span>
+
+    <span class="s3">return </span><span class="s1">value</span>
+</pre>
+</body>
+</html>

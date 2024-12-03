@@ -1,0 +1,928 @@
+<html>
+<head>
+<title>_param_validation.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_param_validation.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">math</span>
+<span class="s0">import </span><span class="s1">operator</span>
+<span class="s0">import </span><span class="s1">re</span>
+<span class="s0">from </span><span class="s1">abc </span><span class="s0">import </span><span class="s1">ABC</span><span class="s2">, </span><span class="s1">abstractmethod</span>
+<span class="s0">from </span><span class="s1">collections</span><span class="s2">.</span><span class="s1">abc </span><span class="s0">import </span><span class="s1">Iterable</span>
+<span class="s0">from </span><span class="s1">inspect </span><span class="s0">import </span><span class="s1">signature</span>
+<span class="s0">from </span><span class="s1">numbers </span><span class="s0">import </span><span class="s1">Integral</span><span class="s2">, </span><span class="s1">Real</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">scipy</span><span class="s2">.</span><span class="s1">sparse </span><span class="s0">import </span><span class="s1">csr_matrix</span><span class="s2">, </span><span class="s1">issparse</span>
+
+<span class="s0">from </span><span class="s2">..</span><span class="s1">_config </span><span class="s0">import </span><span class="s1">config_context</span><span class="s2">, </span><span class="s1">get_config</span>
+<span class="s0">from </span><span class="s2">.</span><span class="s1">validation </span><span class="s0">import </span><span class="s1">_is_arraylike_not_scalar</span>
+
+
+<span class="s0">class </span><span class="s1">InvalidParameterError</span><span class="s2">(</span><span class="s1">ValueError</span><span class="s2">, </span><span class="s1">TypeError</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Custom exception to be raised when the parameter of a class/method/function 
+    does not have a valid type or value. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s4"># Inherits from ValueError and TypeError to keep backward compatibility.</span>
+
+
+<span class="s0">def </span><span class="s1">validate_parameter_constraints</span><span class="s2">(</span><span class="s1">parameter_constraints</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">caller_name</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Validate types and values of given parameters. 
+ 
+    Parameters 
+    ---------- 
+    parameter_constraints : dict or {&quot;no_validation&quot;} 
+        If &quot;no_validation&quot;, validation is skipped for this parameter. 
+ 
+        If a dict, it must be a dictionary `param_name: list of constraints`. 
+        A parameter is valid if it satisfies one of the constraints from the list. 
+        Constraints can be: 
+        - an Interval object, representing a continuous or discrete range of numbers 
+        - the string &quot;array-like&quot; 
+        - the string &quot;sparse matrix&quot; 
+        - the string &quot;random_state&quot; 
+        - callable 
+        - None, meaning that None is a valid value for the parameter 
+        - any type, meaning that any instance of this type is valid 
+        - an Options object, representing a set of elements of a given type 
+        - a StrOptions object, representing a set of strings 
+        - the string &quot;boolean&quot; 
+        - the string &quot;verbose&quot; 
+        - the string &quot;cv_object&quot; 
+        - the string &quot;nan&quot; 
+        - a MissingValues object representing markers for missing values 
+        - a HasMethods object, representing method(s) an object must have 
+        - a Hidden object, representing a constraint not meant to be exposed to the user 
+ 
+    params : dict 
+        A dictionary `param_name: param_value`. The parameters to validate against the 
+        constraints. 
+ 
+    caller_name : str 
+        The name of the estimator or function or method that called this function. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">for </span><span class="s1">param_name</span><span class="s2">, </span><span class="s1">param_val </span><span class="s0">in </span><span class="s1">params</span><span class="s2">.</span><span class="s1">items</span><span class="s2">():</span>
+        <span class="s4"># We allow parameters to not have a constraint so that third party estimators</span>
+        <span class="s4"># can inherit from sklearn estimators without having to necessarily use the</span>
+        <span class="s4"># validation tools.</span>
+        <span class="s0">if </span><span class="s1">param_name </span><span class="s0">not in </span><span class="s1">parameter_constraints</span><span class="s2">:</span>
+            <span class="s0">continue</span>
+
+        <span class="s1">constraints </span><span class="s2">= </span><span class="s1">parameter_constraints</span><span class="s2">[</span><span class="s1">param_name</span><span class="s2">]</span>
+
+        <span class="s0">if </span><span class="s1">constraints </span><span class="s2">== </span><span class="s5">&quot;no_validation&quot;</span><span class="s2">:</span>
+            <span class="s0">continue</span>
+
+        <span class="s1">constraints </span><span class="s2">= [</span><span class="s1">make_constraint</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">) </span><span class="s0">for </span><span class="s1">constraint </span><span class="s0">in </span><span class="s1">constraints</span><span class="s2">]</span>
+
+        <span class="s0">for </span><span class="s1">constraint </span><span class="s0">in </span><span class="s1">constraints</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">param_val</span><span class="s2">):</span>
+                <span class="s4"># this constraint is satisfied, no need to check further.</span>
+                <span class="s0">break</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s4"># No constraint is satisfied, raise with an informative message.</span>
+
+            <span class="s4"># Ignore constraints that we don't want to expose in the error message,</span>
+            <span class="s4"># i.e. options that are for internal purpose or not officially supported.</span>
+            <span class="s1">constraints </span><span class="s2">= [</span>
+                <span class="s1">constraint </span><span class="s0">for </span><span class="s1">constraint </span><span class="s0">in </span><span class="s1">constraints </span><span class="s0">if not </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">hidden</span>
+            <span class="s2">]</span>
+
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">constraints</span><span class="s2">) == </span><span class="s6">1</span><span class="s2">:</span>
+                <span class="s1">constraints_str </span><span class="s2">= </span><span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">constraints</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span><span class="s0">}</span><span class="s5">&quot;</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">constraints_str </span><span class="s2">= (</span>
+                    <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">str</span><span class="s2">(</span><span class="s1">c</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">constraints</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">]])</span><span class="s0">} </span><span class="s5">or&quot;</span>
+                    <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">constraints</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span><span class="s0">}</span><span class="s5">&quot;</span>
+                <span class="s2">)</span>
+
+            <span class="s0">raise </span><span class="s1">InvalidParameterError</span><span class="s2">(</span>
+                <span class="s5">f&quot;The </span><span class="s0">{</span><span class="s1">param_name</span><span class="s0">!r} </span><span class="s5">parameter of </span><span class="s0">{</span><span class="s1">caller_name</span><span class="s0">} </span><span class="s5">must be&quot;</span>
+                <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">constraints_str</span><span class="s0">}</span><span class="s5">. Got </span><span class="s0">{</span><span class="s1">param_val</span><span class="s0">!r} </span><span class="s5">instead.&quot;</span>
+            <span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">make_constraint</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Convert the constraint into the appropriate Constraint object. 
+ 
+    Parameters 
+    ---------- 
+    constraint : object 
+        The constraint to convert. 
+ 
+    Returns 
+    ------- 
+    constraint : instance of _Constraint 
+        The converted constraint. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint </span><span class="s2">== </span><span class="s5">&quot;array-like&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_ArrayLikes</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint </span><span class="s2">== </span><span class="s5">&quot;sparse matrix&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_SparseMatrices</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint </span><span class="s2">== </span><span class="s5">&quot;random_state&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_RandomStates</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">constraint </span><span class="s0">is </span><span class="s1">callable</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_Callables</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">constraint </span><span class="s0">is None</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_NoneConstraint</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">type</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span>
+        <span class="s1">constraint</span><span class="s2">, (</span><span class="s1">Interval</span><span class="s2">, </span><span class="s1">StrOptions</span><span class="s2">, </span><span class="s1">Options</span><span class="s2">, </span><span class="s1">HasMethods</span><span class="s2">, </span><span class="s1">MissingValues</span><span class="s2">)</span>
+    <span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">constraint</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint </span><span class="s2">== </span><span class="s5">&quot;boolean&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_Booleans</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint </span><span class="s2">== </span><span class="s5">&quot;verbose&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_VerboseHelper</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint </span><span class="s2">== </span><span class="s5">&quot;cv_object&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_CVObjects</span><span class="s2">()</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">Hidden</span><span class="s2">):</span>
+        <span class="s1">constraint </span><span class="s2">= </span><span class="s1">make_constraint</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">constraint</span><span class="s2">)</span>
+        <span class="s1">constraint</span><span class="s2">.</span><span class="s1">hidden </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s0">return </span><span class="s1">constraint</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">str</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint </span><span class="s2">== </span><span class="s5">&quot;nan&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">_NanConstraint</span><span class="s2">()</span>
+    <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s5">f&quot;Unknown constraint type: </span><span class="s0">{</span><span class="s1">constraint</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">validate_params</span><span class="s2">(</span><span class="s1">parameter_constraints</span><span class="s2">, *, </span><span class="s1">prefer_skip_nested_validation</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Decorator to validate types and values of functions and methods. 
+ 
+    Parameters 
+    ---------- 
+    parameter_constraints : dict 
+        A dictionary `param_name: list of constraints`. See the docstring of 
+        `validate_parameter_constraints` for a description of the accepted constraints. 
+ 
+        Note that the *args and **kwargs parameters are not validated and must not be 
+        present in the parameter_constraints dictionary. 
+ 
+    prefer_skip_nested_validation : bool 
+        If True, the validation of parameters of inner estimators or functions 
+        called by the decorated function will be skipped. 
+ 
+        This is useful to avoid validating many times the parameters passed by the 
+        user from the public facing API. It's also useful to avoid validating 
+        parameters that we pass internally to inner functions that are guaranteed to 
+        be valid by the test suite. 
+ 
+        It should be set to True for most functions, except for those that receive 
+        non-validated objects as parameters or that are just wrappers around classes 
+        because they only perform a partial validation. 
+ 
+    Returns 
+    ------- 
+    decorated_function : function or method 
+        The decorated function. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">decorator</span><span class="s2">(</span><span class="s1">func</span><span class="s2">):</span>
+        <span class="s4"># The dict of parameter constraints is set as an attribute of the function</span>
+        <span class="s4"># to make it possible to dynamically introspect the constraints for</span>
+        <span class="s4"># automatic testing.</span>
+        <span class="s1">setattr</span><span class="s2">(</span><span class="s1">func</span><span class="s2">, </span><span class="s5">&quot;_skl_parameter_constraints&quot;</span><span class="s2">, </span><span class="s1">parameter_constraints</span><span class="s2">)</span>
+
+        <span class="s2">@</span><span class="s1">functools</span><span class="s2">.</span><span class="s1">wraps</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+        <span class="s0">def </span><span class="s1">wrapper</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">):</span>
+            <span class="s1">global_skip_validation </span><span class="s2">= </span><span class="s1">get_config</span><span class="s2">()[</span><span class="s5">&quot;skip_parameter_validation&quot;</span><span class="s2">]</span>
+            <span class="s0">if </span><span class="s1">global_skip_validation</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">func</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+
+            <span class="s1">func_sig </span><span class="s2">= </span><span class="s1">signature</span><span class="s2">(</span><span class="s1">func</span><span class="s2">)</span>
+
+            <span class="s4"># Map *args/**kwargs to the function signature</span>
+            <span class="s1">params </span><span class="s2">= </span><span class="s1">func_sig</span><span class="s2">.</span><span class="s1">bind</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+            <span class="s1">params</span><span class="s2">.</span><span class="s1">apply_defaults</span><span class="s2">()</span>
+
+            <span class="s4"># ignore self/cls and positional/keyword markers</span>
+            <span class="s1">to_ignore </span><span class="s2">= [</span>
+                <span class="s1">p</span><span class="s2">.</span><span class="s1">name</span>
+                <span class="s0">for </span><span class="s1">p </span><span class="s0">in </span><span class="s1">func_sig</span><span class="s2">.</span><span class="s1">parameters</span><span class="s2">.</span><span class="s1">values</span><span class="s2">()</span>
+                <span class="s0">if </span><span class="s1">p</span><span class="s2">.</span><span class="s1">kind </span><span class="s0">in </span><span class="s2">(</span><span class="s1">p</span><span class="s2">.</span><span class="s1">VAR_POSITIONAL</span><span class="s2">, </span><span class="s1">p</span><span class="s2">.</span><span class="s1">VAR_KEYWORD</span><span class="s2">)</span>
+            <span class="s2">]</span>
+            <span class="s1">to_ignore </span><span class="s2">+= [</span><span class="s5">&quot;self&quot;</span><span class="s2">, </span><span class="s5">&quot;cls&quot;</span><span class="s2">]</span>
+            <span class="s1">params </span><span class="s2">= {</span><span class="s1">k</span><span class="s2">: </span><span class="s1">v </span><span class="s0">for </span><span class="s1">k</span><span class="s2">, </span><span class="s1">v </span><span class="s0">in </span><span class="s1">params</span><span class="s2">.</span><span class="s1">arguments</span><span class="s2">.</span><span class="s1">items</span><span class="s2">() </span><span class="s0">if </span><span class="s1">k </span><span class="s0">not in </span><span class="s1">to_ignore</span><span class="s2">}</span>
+
+            <span class="s1">validate_parameter_constraints</span><span class="s2">(</span>
+                <span class="s1">parameter_constraints</span><span class="s2">, </span><span class="s1">params</span><span class="s2">, </span><span class="s1">caller_name</span><span class="s2">=</span><span class="s1">func</span><span class="s2">.</span><span class="s1">__qualname__</span>
+            <span class="s2">)</span>
+
+            <span class="s0">try</span><span class="s2">:</span>
+                <span class="s0">with </span><span class="s1">config_context</span><span class="s2">(</span>
+                    <span class="s1">skip_parameter_validation</span><span class="s2">=(</span>
+                        <span class="s1">prefer_skip_nested_validation </span><span class="s0">or </span><span class="s1">global_skip_validation</span>
+                    <span class="s2">)</span>
+                <span class="s2">):</span>
+                    <span class="s0">return </span><span class="s1">func</span><span class="s2">(*</span><span class="s1">args</span><span class="s2">, **</span><span class="s1">kwargs</span><span class="s2">)</span>
+            <span class="s0">except </span><span class="s1">InvalidParameterError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+                <span class="s4"># When the function is just a wrapper around an estimator, we allow</span>
+                <span class="s4"># the function to delegate validation to the estimator, but we replace</span>
+                <span class="s4"># the name of the estimator by the name of the function in the error</span>
+                <span class="s4"># message to avoid confusion.</span>
+                <span class="s1">msg </span><span class="s2">= </span><span class="s1">re</span><span class="s2">.</span><span class="s1">sub</span><span class="s2">(</span>
+                    <span class="s5">r&quot;parameter of \w+ must be&quot;</span><span class="s2">,</span>
+                    <span class="s5">f&quot;parameter of </span><span class="s0">{</span><span class="s1">func</span><span class="s2">.</span><span class="s1">__qualname__</span><span class="s0">} </span><span class="s5">must be&quot;</span><span class="s2">,</span>
+                    <span class="s1">str</span><span class="s2">(</span><span class="s1">e</span><span class="s2">),</span>
+                <span class="s2">)</span>
+                <span class="s0">raise </span><span class="s1">InvalidParameterError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">) </span><span class="s0">from </span><span class="s1">e</span>
+
+        <span class="s0">return </span><span class="s1">wrapper</span>
+
+    <span class="s0">return </span><span class="s1">decorator</span>
+
+
+<span class="s0">class </span><span class="s1">RealNotInt</span><span class="s2">(</span><span class="s1">Real</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;A type that represents reals that are not instances of int. 
+ 
+    Behaves like float, but also works with values extracted from numpy arrays. 
+    isintance(1, RealNotInt) -&gt; False 
+    isinstance(1.0, RealNotInt) -&gt; True 
+    &quot;&quot;&quot;</span>
+
+
+<span class="s1">RealNotInt</span><span class="s2">.</span><span class="s1">register</span><span class="s2">(</span><span class="s1">float</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">_type_name</span><span class="s2">(</span><span class="s1">t</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Convert type into human readable string.&quot;&quot;&quot;</span>
+    <span class="s1">module </span><span class="s2">= </span><span class="s1">t</span><span class="s2">.</span><span class="s1">__module__</span>
+    <span class="s1">qualname </span><span class="s2">= </span><span class="s1">t</span><span class="s2">.</span><span class="s1">__qualname__</span>
+    <span class="s0">if </span><span class="s1">module </span><span class="s2">== </span><span class="s5">&quot;builtins&quot;</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">qualname</span>
+    <span class="s0">elif </span><span class="s1">t </span><span class="s2">== </span><span class="s1">Real</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s5">&quot;float&quot;</span>
+    <span class="s0">elif </span><span class="s1">t </span><span class="s2">== </span><span class="s1">Integral</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s5">&quot;int&quot;</span>
+    <span class="s0">return </span><span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">module</span><span class="s0">}</span><span class="s5">.</span><span class="s0">{</span><span class="s1">qualname</span><span class="s0">}</span><span class="s5">&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_Constraint</span><span class="s2">(</span><span class="s1">ABC</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Base class for the constraint objects.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">hidden </span><span class="s2">= </span><span class="s0">False</span>
+
+    <span class="s2">@</span><span class="s1">abstractmethod</span>
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Whether or not a value satisfies the constraint. 
+ 
+        Parameters 
+        ---------- 
+        val : object 
+            The value to check. 
+ 
+        Returns 
+        ------- 
+        is_satisfied : bool 
+            Whether or not the constraint is satisfied by this value. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s2">@</span><span class="s1">abstractmethod</span>
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;A human readable representational string of the constraint.&quot;&quot;&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing instances of a given type. 
+ 
+    Parameters 
+    ---------- 
+    type : type 
+        The valid type. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">type</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s2">= </span><span class="s1">type</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">f&quot;an instance of </span><span class="s0">{</span><span class="s1">_type_name</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">type</span><span class="s2">)</span><span class="s0">!r}</span><span class="s5">&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_NoneConstraint</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing the None singleton.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">val </span><span class="s0">is None</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;None&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_NanConstraint</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing the indicator `np.nan`.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(</span>
+            <span class="s0">not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">Integral</span><span class="s2">) </span><span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">Real</span><span class="s2">) </span><span class="s0">and </span><span class="s1">math</span><span class="s2">.</span><span class="s1">isnan</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+        <span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;numpy.nan&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_PandasNAConstraint</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing the indicator `pd.NA`.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s0">import </span><span class="s1">pandas </span><span class="s0">as </span><span class="s1">pd</span>
+
+            <span class="s0">return </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">type</span><span class="s2">(</span><span class="s1">pd</span><span class="s2">.</span><span class="s1">NA</span><span class="s2">)) </span><span class="s0">and </span><span class="s1">pd</span><span class="s2">.</span><span class="s1">isna</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">ImportError</span><span class="s2">:</span>
+            <span class="s0">return False</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;pandas.NA&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">Options</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing a finite set of instances of a given type. 
+ 
+    Parameters 
+    ---------- 
+    type : type 
+ 
+    options : set 
+        The set of valid scalars. 
+ 
+    deprecated : set or None, default=None 
+        A subset of the `options` to mark as deprecated in the string 
+        representation of the constraint. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">type</span><span class="s2">, </span><span class="s1">options</span><span class="s2">, *, </span><span class="s1">deprecated</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s2">= </span><span class="s1">type</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">options </span><span class="s2">= </span><span class="s1">options</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">deprecated </span><span class="s2">= </span><span class="s1">deprecated </span><span class="s0">or </span><span class="s1">set</span><span class="s2">()</span>
+
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">deprecated </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">options</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s5">&quot;The deprecated options must be a subset of the options.&quot;</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type</span><span class="s2">) </span><span class="s0">and </span><span class="s1">val </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">options</span>
+
+    <span class="s0">def </span><span class="s1">_mark_if_deprecated</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">option</span><span class="s2">):</span>
+        <span class="s3">&quot;&quot;&quot;Add a deprecated mark to an option if needed.&quot;&quot;&quot;</span>
+        <span class="s1">option_str </span><span class="s2">= </span><span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">option</span><span class="s0">!r}</span><span class="s5">&quot;</span>
+        <span class="s0">if </span><span class="s1">option </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">deprecated</span><span class="s2">:</span>
+            <span class="s1">option_str </span><span class="s2">= </span><span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">option_str</span><span class="s0">} </span><span class="s5">(deprecated)&quot;</span>
+        <span class="s0">return </span><span class="s1">option_str</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">options_str </span><span class="s2">= (</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_mark_if_deprecated</span><span class="s2">(</span><span class="s1">o</span><span class="s2">) </span><span class="s0">for </span><span class="s1">o </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">options</span><span class="s2">])</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s2">)</span>
+        <span class="s0">return </span><span class="s5">f&quot;a </span><span class="s0">{</span><span class="s1">_type_name</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">type</span><span class="s2">)</span><span class="s0">} </span><span class="s5">among </span><span class="s0">{{{</span><span class="s1">options_str</span><span class="s0">}}}</span><span class="s5">&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">StrOptions</span><span class="s2">(</span><span class="s1">Options</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing a finite set of strings. 
+ 
+    Parameters 
+    ---------- 
+    options : set of str 
+        The set of valid strings. 
+ 
+    deprecated : set of str or None, default=None 
+        A subset of the `options` to mark as deprecated in the string 
+        representation of the constraint. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">options</span><span class="s2">, *, </span><span class="s1">deprecated</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">type</span><span class="s2">=</span><span class="s1">str</span><span class="s2">, </span><span class="s1">options</span><span class="s2">=</span><span class="s1">options</span><span class="s2">, </span><span class="s1">deprecated</span><span class="s2">=</span><span class="s1">deprecated</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">Interval</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing a typed interval. 
+ 
+    Parameters 
+    ---------- 
+    type : {numbers.Integral, numbers.Real, RealNotInt} 
+        The set of numbers in which to set the interval. 
+ 
+        If RealNotInt, only reals that don't have the integer type 
+        are allowed. For example 1.0 is allowed but 1 is not. 
+ 
+    left : float or int or None 
+        The left bound of the interval. None means left bound is -∞. 
+ 
+    right : float, int or None 
+        The right bound of the interval. None means right bound is +∞. 
+ 
+    closed : {&quot;left&quot;, &quot;right&quot;, &quot;both&quot;, &quot;neither&quot;} 
+        Whether the interval is open or closed. Possible choices are: 
+ 
+        - `&quot;left&quot;`: the interval is closed on the left and open on the right. 
+          It is equivalent to the interval `[ left, right )`. 
+        - `&quot;right&quot;`: the interval is closed on the right and open on the left. 
+          It is equivalent to the interval `( left, right ]`. 
+        - `&quot;both&quot;`: the interval is closed. 
+          It is equivalent to the interval `[ left, right ]`. 
+        - `&quot;neither&quot;`: the interval is open. 
+          It is equivalent to the interval `( left, right )`. 
+ 
+    Notes 
+    ----- 
+    Setting a bound to `None` and setting the interval closed is valid. For instance, 
+    strictly speaking, `Interval(Real, 0, None, closed=&quot;both&quot;)` corresponds to 
+    `[0, +∞) U {+∞}`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">type</span><span class="s2">, </span><span class="s1">left</span><span class="s2">, </span><span class="s1">right</span><span class="s2">, *, </span><span class="s1">closed</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s2">= </span><span class="s1">type</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">left </span><span class="s2">= </span><span class="s1">left</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s2">= </span><span class="s1">right</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s2">= </span><span class="s1">closed</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_check_params</span><span class="s2">()</span>
+
+    <span class="s0">def </span><span class="s1">_check_params</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s0">not in </span><span class="s2">(</span><span class="s1">Integral</span><span class="s2">, </span><span class="s1">Real</span><span class="s2">, </span><span class="s1">RealNotInt</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                <span class="s5">&quot;type must be either numbers.Integral, numbers.Real or RealNotInt.&quot;</span>
+                <span class="s5">f&quot; Got </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">type</span><span class="s0">} </span><span class="s5">instead.&quot;</span>
+            <span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">not in </span><span class="s2">(</span><span class="s5">&quot;left&quot;</span><span class="s2">, </span><span class="s5">&quot;right&quot;</span><span class="s2">, </span><span class="s5">&quot;both&quot;</span><span class="s2">, </span><span class="s5">&quot;neither&quot;</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                <span class="s5">&quot;closed must be either 'left', 'right', 'both' or 'neither'. &quot;</span>
+                <span class="s5">f&quot;Got </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed</span><span class="s0">} </span><span class="s5">instead.&quot;</span>
+            <span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s0">is </span><span class="s1">Integral</span><span class="s2">:</span>
+            <span class="s1">suffix </span><span class="s2">= </span><span class="s5">&quot;for an interval over the integers.&quot;</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is not None and not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">left</span><span class="s2">, </span><span class="s1">Integral</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s5">f&quot;Expecting left to be an int </span><span class="s0">{</span><span class="s1">suffix</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is not None and not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">right</span><span class="s2">, </span><span class="s1">Integral</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s5">f&quot;Expecting right to be an int </span><span class="s0">{</span><span class="s1">suffix</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is None and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;left&quot;</span><span class="s2">, </span><span class="s5">&quot;both&quot;</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                    <span class="s5">f&quot;left can't be None when closed == </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed</span><span class="s0">} {</span><span class="s1">suffix</span><span class="s0">}</span><span class="s5">&quot;</span>
+                <span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is None and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;right&quot;</span><span class="s2">, </span><span class="s5">&quot;both&quot;</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                    <span class="s5">f&quot;right can't be None when closed == </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed</span><span class="s0">} {</span><span class="s1">suffix</span><span class="s0">}</span><span class="s5">&quot;</span>
+                <span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is not None and not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">left</span><span class="s2">, </span><span class="s1">Real</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s5">&quot;Expecting left to be a real number.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is not None and not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">right</span><span class="s2">, </span><span class="s1">Real</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">TypeError</span><span class="s2">(</span><span class="s5">&quot;Expecting right to be a real number.&quot;</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is not None and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is not None and </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s2">&lt;= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                <span class="s5">f&quot;right can't be less than left. Got left=</span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">left</span><span class="s0">} </span><span class="s5">and &quot;</span>
+                <span class="s5">f&quot;right=</span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">right</span><span class="s0">}</span><span class="s5">&quot;</span>
+            <span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__contains__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">Integral</span><span class="s2">) </span><span class="s0">and </span><span class="s1">np</span><span class="s2">.</span><span class="s1">isnan</span><span class="s2">(</span><span class="s1">val</span><span class="s2">):</span>
+            <span class="s0">return False</span>
+
+        <span class="s1">left_cmp </span><span class="s2">= </span><span class="s1">operator</span><span class="s2">.</span><span class="s1">lt </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;left&quot;</span><span class="s2">, </span><span class="s5">&quot;both&quot;</span><span class="s2">) </span><span class="s0">else </span><span class="s1">operator</span><span class="s2">.</span><span class="s1">le</span>
+        <span class="s1">right_cmp </span><span class="s2">= </span><span class="s1">operator</span><span class="s2">.</span><span class="s1">gt </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;right&quot;</span><span class="s2">, </span><span class="s5">&quot;both&quot;</span><span class="s2">) </span><span class="s0">else </span><span class="s1">operator</span><span class="s2">.</span><span class="s1">ge</span>
+
+        <span class="s1">left </span><span class="s2">= -</span><span class="s1">np</span><span class="s2">.</span><span class="s1">inf </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is None else </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left</span>
+        <span class="s1">right </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">inf </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is None else </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right</span>
+
+        <span class="s0">if </span><span class="s1">left_cmp</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">left</span><span class="s2">):</span>
+            <span class="s0">return False</span>
+        <span class="s0">if </span><span class="s1">right_cmp</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">right</span><span class="s2">):</span>
+            <span class="s0">return False</span>
+        <span class="s0">return True</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">if not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type</span><span class="s2">):</span>
+            <span class="s0">return False</span>
+
+        <span class="s0">return </span><span class="s1">val </span><span class="s0">in </span><span class="s1">self</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">type_str </span><span class="s2">= </span><span class="s5">&quot;an int&quot; </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s0">is </span><span class="s1">Integral </span><span class="s0">else </span><span class="s5">&quot;a float&quot;</span>
+        <span class="s1">left_bracket </span><span class="s2">= </span><span class="s5">&quot;[&quot; </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;left&quot;</span><span class="s2">, </span><span class="s5">&quot;both&quot;</span><span class="s2">) </span><span class="s0">else </span><span class="s5">&quot;(&quot;</span>
+        <span class="s1">left_bound </span><span class="s2">= </span><span class="s5">&quot;-inf&quot; </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is None else </span><span class="s1">self</span><span class="s2">.</span><span class="s1">left</span>
+        <span class="s1">right_bound </span><span class="s2">= </span><span class="s5">&quot;inf&quot; </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is None else </span><span class="s1">self</span><span class="s2">.</span><span class="s1">right</span>
+        <span class="s1">right_bracket </span><span class="s2">= </span><span class="s5">&quot;]&quot; </span><span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;right&quot;</span><span class="s2">, </span><span class="s5">&quot;both&quot;</span><span class="s2">) </span><span class="s0">else </span><span class="s5">&quot;)&quot;</span>
+
+        <span class="s4"># better repr if the bounds were given as integers</span>
+        <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s2">== </span><span class="s1">Integral </span><span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">left</span><span class="s2">, </span><span class="s1">Real</span><span class="s2">):</span>
+            <span class="s1">left_bound </span><span class="s2">= </span><span class="s1">float</span><span class="s2">(</span><span class="s1">left_bound</span><span class="s2">)</span>
+        <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">type </span><span class="s2">== </span><span class="s1">Integral </span><span class="s0">and </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">right</span><span class="s2">, </span><span class="s1">Real</span><span class="s2">):</span>
+            <span class="s1">right_bound </span><span class="s2">= </span><span class="s1">float</span><span class="s2">(</span><span class="s1">right_bound</span><span class="s2">)</span>
+
+        <span class="s0">return </span><span class="s2">(</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">type_str</span><span class="s0">} </span><span class="s5">in the range &quot;</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">left_bracket</span><span class="s0">}{</span><span class="s1">left_bound</span><span class="s0">}</span><span class="s5">, </span><span class="s0">{</span><span class="s1">right_bound</span><span class="s0">}{</span><span class="s1">right_bracket</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_ArrayLikes</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing array-likes&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">_is_arraylike_not_scalar</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;an array-like&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_SparseMatrices</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing sparse matrices.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;a sparse matrix&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_Callables</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing callables.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">callable</span><span class="s2">(</span><span class="s1">val</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;a callable&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_RandomStates</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing random states. 
+ 
+    Convenience class for 
+    [Interval(Integral, 0, 2**32 - 1, closed=&quot;both&quot;), np.random.RandomState, None] 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints </span><span class="s2">= [</span>
+            <span class="s1">Interval</span><span class="s2">(</span><span class="s1">Integral</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s6">2</span><span class="s2">**</span><span class="s6">32 </span><span class="s2">- </span><span class="s6">1</span><span class="s2">, </span><span class="s1">closed</span><span class="s2">=</span><span class="s5">&quot;both&quot;</span><span class="s2">),</span>
+            <span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">RandomState</span><span class="s2">),</span>
+            <span class="s1">_NoneConstraint</span><span class="s2">(),</span>
+        <span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">any</span><span class="s2">(</span><span class="s1">c</span><span class="s2">.</span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">val</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">str</span><span class="s2">(</span><span class="s1">c</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">]])</span><span class="s0">} </span><span class="s5">or&quot;</span>
+            <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_Booleans</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing boolean likes. 
+ 
+    Convenience class for 
+    [bool, np.bool_] 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints </span><span class="s2">= [</span>
+            <span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">bool</span><span class="s2">),</span>
+            <span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">bool_</span><span class="s2">),</span>
+        <span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">any</span><span class="s2">(</span><span class="s1">c</span><span class="s2">.</span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">val</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">str</span><span class="s2">(</span><span class="s1">c</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">]])</span><span class="s0">} </span><span class="s5">or&quot;</span>
+            <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">_VerboseHelper</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Helper constraint for the verbose parameter. 
+ 
+    Convenience class for 
+    [Interval(Integral, 0, None, closed=&quot;left&quot;), bool, numpy.bool_] 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints </span><span class="s2">= [</span>
+            <span class="s1">Interval</span><span class="s2">(</span><span class="s1">Integral</span><span class="s2">, </span><span class="s6">0</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s1">closed</span><span class="s2">=</span><span class="s5">&quot;left&quot;</span><span class="s2">),</span>
+            <span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">bool</span><span class="s2">),</span>
+            <span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">bool_</span><span class="s2">),</span>
+        <span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">any</span><span class="s2">(</span><span class="s1">c</span><span class="s2">.</span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">val</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">str</span><span class="s2">(</span><span class="s1">c</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">]])</span><span class="s0">} </span><span class="s5">or&quot;</span>
+            <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">MissingValues</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Helper constraint for the `missing_values` parameters. 
+ 
+    Convenience for 
+    [ 
+        Integral, 
+        Interval(Real, None, None, closed=&quot;both&quot;), 
+        str,   # when numeric_only is False 
+        None,  # when numeric_only is False 
+        _NanConstraint(), 
+        _PandasNAConstraint(), 
+    ] 
+ 
+    Parameters 
+    ---------- 
+    numeric_only : bool, default=False 
+        Whether to consider only numeric missing value markers. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">numeric_only</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">numeric_only </span><span class="s2">= </span><span class="s1">numeric_only</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints </span><span class="s2">= [</span>
+            <span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">Integral</span><span class="s2">),</span>
+            <span class="s4"># we use an interval of Real to ignore np.nan that has its own constraint</span>
+            <span class="s1">Interval</span><span class="s2">(</span><span class="s1">Real</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s1">closed</span><span class="s2">=</span><span class="s5">&quot;both&quot;</span><span class="s2">),</span>
+            <span class="s1">_NanConstraint</span><span class="s2">(),</span>
+            <span class="s1">_PandasNAConstraint</span><span class="s2">(),</span>
+        <span class="s2">]</span>
+        <span class="s0">if not </span><span class="s1">self</span><span class="s2">.</span><span class="s1">numeric_only</span><span class="s2">:</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">.</span><span class="s1">extend</span><span class="s2">([</span><span class="s1">_InstancesOf</span><span class="s2">(</span><span class="s1">str</span><span class="s2">), </span><span class="s1">_NoneConstraint</span><span class="s2">()])</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">any</span><span class="s2">(</span><span class="s1">c</span><span class="s2">.</span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">val</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">str</span><span class="s2">(</span><span class="s1">c</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">]])</span><span class="s0">} </span><span class="s5">or&quot;</span>
+            <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">HasMethods</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing objects that expose specific methods. 
+ 
+    It is useful for parameters following a protocol and where we don't want to impose 
+    an affiliation to a specific module or class. 
+ 
+    Parameters 
+    ---------- 
+    methods : str or list of str 
+        The method(s) that the object is expected to expose. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">@</span><span class="s1">validate_params</span><span class="s2">(</span>
+        <span class="s2">{</span><span class="s5">&quot;methods&quot;</span><span class="s2">: [</span><span class="s1">str</span><span class="s2">, </span><span class="s1">list</span><span class="s2">]},</span>
+        <span class="s1">prefer_skip_nested_validation</span><span class="s2">=</span><span class="s0">True</span><span class="s2">,</span>
+    <span class="s2">)</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">methods</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">methods</span><span class="s2">, </span><span class="s1">str</span><span class="s2">):</span>
+            <span class="s1">methods </span><span class="s2">= [</span><span class="s1">methods</span><span class="s2">]</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">methods </span><span class="s2">= </span><span class="s1">methods</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">all</span><span class="s2">(</span><span class="s1">callable</span><span class="s2">(</span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">method</span><span class="s2">, </span><span class="s0">None</span><span class="s2">)) </span><span class="s0">for </span><span class="s1">method </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">methods</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">methods</span><span class="s2">) == </span><span class="s6">1</span><span class="s2">:</span>
+            <span class="s1">methods </span><span class="s2">= </span><span class="s5">f&quot;</span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">methods</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span><span class="s0">!r}</span><span class="s5">&quot;</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">methods </span><span class="s2">= (</span>
+                <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">repr</span><span class="s2">(</span><span class="s1">m</span><span class="s2">) </span><span class="s0">for </span><span class="s1">m </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">methods</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">]])</span><span class="s0">} </span><span class="s5">and&quot;</span>
+                <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">methods</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span><span class="s0">!r}</span><span class="s5">&quot;</span>
+            <span class="s2">)</span>
+        <span class="s0">return </span><span class="s5">f&quot;an object implementing </span><span class="s0">{</span><span class="s1">methods</span><span class="s0">}</span><span class="s5">&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_IterablesNotString</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing iterables that are not strings.&quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">Iterable</span><span class="s2">) </span><span class="s0">and not </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">val</span><span class="s2">, </span><span class="s1">str</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;an iterable&quot;</span>
+
+
+<span class="s0">class </span><span class="s1">_CVObjects</span><span class="s2">(</span><span class="s1">_Constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Constraint representing cv objects. 
+ 
+    Convenient class for 
+    [ 
+        Interval(Integral, 2, None, closed=&quot;left&quot;), 
+        HasMethods([&quot;split&quot;, &quot;get_n_splits&quot;]), 
+        _IterablesNotString(), 
+        None, 
+    ] 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">()</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints </span><span class="s2">= [</span>
+            <span class="s1">Interval</span><span class="s2">(</span><span class="s1">Integral</span><span class="s2">, </span><span class="s6">2</span><span class="s2">, </span><span class="s0">None</span><span class="s2">, </span><span class="s1">closed</span><span class="s2">=</span><span class="s5">&quot;left&quot;</span><span class="s2">),</span>
+            <span class="s1">HasMethods</span><span class="s2">([</span><span class="s5">&quot;split&quot;</span><span class="s2">, </span><span class="s5">&quot;get_n_splits&quot;</span><span class="s2">]),</span>
+            <span class="s1">_IterablesNotString</span><span class="s2">(),</span>
+            <span class="s1">_NoneConstraint</span><span class="s2">(),</span>
+        <span class="s2">]</span>
+
+    <span class="s0">def </span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">val</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">any</span><span class="s2">(</span><span class="s1">c</span><span class="s2">.</span><span class="s1">is_satisfied_by</span><span class="s2">(</span><span class="s1">val</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__str__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">(</span>
+            <span class="s5">f&quot;</span><span class="s0">{</span><span class="s5">', '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">([</span><span class="s1">str</span><span class="s2">(</span><span class="s1">c</span><span class="s2">) </span><span class="s0">for </span><span class="s1">c </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">]])</span><span class="s0">} </span><span class="s5">or&quot;</span>
+            <span class="s5">f&quot; </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">_constraints</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span><span class="s0">}</span><span class="s5">&quot;</span>
+        <span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">Hidden</span><span class="s2">:</span>
+    <span class="s3">&quot;&quot;&quot;Class encapsulating a constraint not meant to be exposed to the user. 
+ 
+    Parameters 
+    ---------- 
+    constraint : str or _Constraint instance 
+        The constraint to be used internally. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">constraint</span><span class="s2">):</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">constraint </span><span class="s2">= </span><span class="s1">constraint</span>
+
+
+<span class="s0">def </span><span class="s1">generate_invalid_param_val</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Return a value that does not satisfy the constraint. 
+ 
+    Raises a NotImplementedError if there exists no invalid value for this constraint. 
+ 
+    This is only useful for testing purpose. 
+ 
+    Parameters 
+    ---------- 
+    constraint : _Constraint instance 
+        The constraint to generate a value for. 
+ 
+    Returns 
+    ------- 
+    val : object 
+        A value that does not satisfy the constraint. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">StrOptions</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">f&quot;not </span><span class="s0">{</span><span class="s5">' or '</span><span class="s2">.</span><span class="s1">join</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">options</span><span class="s2">)</span><span class="s0">}</span><span class="s5">&quot;</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">MissingValues</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">([</span><span class="s6">1</span><span class="s2">, </span><span class="s6">2</span><span class="s2">, </span><span class="s6">3</span><span class="s2">])</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_VerboseHelper</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">-</span><span class="s6">1</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">HasMethods</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">type</span><span class="s2">(</span><span class="s5">&quot;HasNotMethods&quot;</span><span class="s2">, (), {})()</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_IterablesNotString</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;a string&quot;</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_CVObjects</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s5">&quot;not a cv object&quot;</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">Interval</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">type </span><span class="s0">is </span><span class="s1">Integral</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">left </span><span class="s2">- </span><span class="s6">1</span>
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">right </span><span class="s2">+ </span><span class="s6">1</span>
+
+        <span class="s4"># There's no integer outside (-inf, +inf)</span>
+        <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">Interval</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">type </span><span class="s0">in </span><span class="s2">(</span><span class="s1">Real</span><span class="s2">, </span><span class="s1">RealNotInt</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">left </span><span class="s2">- </span><span class="s6">1e-6</span>
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is not None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">right </span><span class="s2">+ </span><span class="s6">1e-6</span>
+
+        <span class="s4"># bounds are -inf, +inf</span>
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;right&quot;</span><span class="s2">, </span><span class="s5">&quot;neither&quot;</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s2">-</span><span class="s1">np</span><span class="s2">.</span><span class="s1">inf</span>
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">closed </span><span class="s0">in </span><span class="s2">(</span><span class="s5">&quot;left&quot;</span><span class="s2">, </span><span class="s5">&quot;neither&quot;</span><span class="s2">):</span>
+            <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">inf</span>
+
+        <span class="s4"># interval is [-inf, +inf]</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">nan</span>
+
+    <span class="s0">raise </span><span class="s1">NotImplementedError</span>
+
+
+<span class="s0">def </span><span class="s1">generate_valid_param</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Return a value that does satisfy a constraint. 
+ 
+    This is only useful for testing purpose. 
+ 
+    Parameters 
+    ---------- 
+    constraint : Constraint instance 
+        The constraint to generate a value for. 
+ 
+    Returns 
+    ------- 
+    val : object 
+        A value that does satisfy the constraint. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_ArrayLikes</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">([</span><span class="s6">1</span><span class="s2">, </span><span class="s6">2</span><span class="s2">, </span><span class="s6">3</span><span class="s2">])</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_SparseMatrices</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">csr_matrix</span><span class="s2">([[</span><span class="s6">0</span><span class="s2">, </span><span class="s6">1</span><span class="s2">], [</span><span class="s6">1</span><span class="s2">, </span><span class="s6">0</span><span class="s2">]])</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_RandomStates</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">random</span><span class="s2">.</span><span class="s1">RandomState</span><span class="s2">(</span><span class="s6">42</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_Callables</span><span class="s2">):</span>
+        <span class="s0">return lambda </span><span class="s1">x</span><span class="s2">: </span><span class="s1">x</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_NoneConstraint</span><span class="s2">):</span>
+        <span class="s0">return None</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_InstancesOf</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">type </span><span class="s0">is </span><span class="s1">np</span><span class="s2">.</span><span class="s1">ndarray</span><span class="s2">:</span>
+            <span class="s4"># special case for ndarray since it can't be instantiated without arguments</span>
+            <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">array</span><span class="s2">([</span><span class="s6">1</span><span class="s2">, </span><span class="s6">2</span><span class="s2">, </span><span class="s6">3</span><span class="s2">])</span>
+
+        <span class="s0">if </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">type </span><span class="s0">in </span><span class="s2">(</span><span class="s1">Integral</span><span class="s2">, </span><span class="s1">Real</span><span class="s2">):</span>
+            <span class="s4"># special case for Integral and Real since they are abstract classes</span>
+            <span class="s0">return </span><span class="s6">1</span>
+
+        <span class="s0">return </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">type</span><span class="s2">()</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_Booleans</span><span class="s2">):</span>
+        <span class="s0">return True</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_VerboseHelper</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s6">1</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">MissingValues</span><span class="s2">) </span><span class="s0">and </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">numeric_only</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">nan</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">MissingValues</span><span class="s2">) </span><span class="s0">and not </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">numeric_only</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s5">&quot;missing&quot;</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">HasMethods</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">type</span><span class="s2">(</span>
+            <span class="s5">&quot;ValidHasMethods&quot;</span><span class="s2">, (), {</span><span class="s1">m</span><span class="s2">: </span><span class="s0">lambda </span><span class="s1">self</span><span class="s2">: </span><span class="s0">None for </span><span class="s1">m </span><span class="s0">in </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">methods</span><span class="s2">}</span>
+        <span class="s2">)()</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_IterablesNotString</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s2">[</span><span class="s6">1</span><span class="s2">, </span><span class="s6">2</span><span class="s2">, </span><span class="s6">3</span><span class="s2">]</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">_CVObjects</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s6">5</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">Options</span><span class="s2">):  </span><span class="s4"># includes StrOptions</span>
+        <span class="s0">for </span><span class="s1">option </span><span class="s0">in </span><span class="s1">constraint</span><span class="s2">.</span><span class="s1">options</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">option</span>
+
+    <span class="s0">if </span><span class="s1">isinstance</span><span class="s2">(</span><span class="s1">constraint</span><span class="s2">, </span><span class="s1">Interval</span><span class="s2">):</span>
+        <span class="s1">interval </span><span class="s2">= </span><span class="s1">constraint</span>
+        <span class="s0">if </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is None and </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s6">0</span>
+        <span class="s0">elif </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">left </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">right </span><span class="s2">- </span><span class="s6">1</span>
+        <span class="s0">elif </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">right </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s0">return </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">left </span><span class="s2">+ </span><span class="s6">1</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">type </span><span class="s0">is </span><span class="s1">Real</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s2">(</span><span class="s1">interval</span><span class="s2">.</span><span class="s1">left </span><span class="s2">+ </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">right</span><span class="s2">) / </span><span class="s6">2</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s0">return </span><span class="s1">interval</span><span class="s2">.</span><span class="s1">left </span><span class="s2">+ </span><span class="s6">1</span>
+
+    <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s5">f&quot;Unknown constraint type: </span><span class="s0">{</span><span class="s1">constraint</span><span class="s0">}</span><span class="s5">&quot;</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

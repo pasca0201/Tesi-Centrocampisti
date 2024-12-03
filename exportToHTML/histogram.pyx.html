@@ -1,0 +1,541 @@
+<html>
+<head>
+<title>histogram.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+histogram.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;This module contains routines for building histograms.&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Nicolas Hug</span>
+
+<span class="s3">cimport </span><span class="s1">cython</span>
+<span class="s3">from </span><span class="s1">cython</span><span class="s4">.</span><span class="s1">parallel </span><span class="s3">import </span><span class="s1">prange</span>
+<span class="s3">from </span><span class="s1">libc</span><span class="s4">.</span><span class="s1">string </span><span class="s3">cimport </span><span class="s1">memset</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">import </span><span class="s1">HISTOGRAM_DTYPE</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">hist_struct</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">X_BINNED_DTYPE_C</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">common </span><span class="s3">cimport </span><span class="s1">G_H_DTYPE_C</span>
+
+
+<span class="s2"># Notes:</span>
+<span class="s2"># - IN views are read-only, OUT views are write-only</span>
+<span class="s2"># - In a lot of functions here, we pass feature_idx and the whole 2d</span>
+<span class="s2">#   histograms arrays instead of just histograms[feature_idx]. This is because</span>
+<span class="s2">#   Cython generated C code will have strange Python interactions (likely</span>
+<span class="s2">#   related to the GIL release and the custom histogram dtype) when using 1d</span>
+<span class="s2">#   histogram arrays that come from 2d arrays.</span>
+<span class="s2"># - The for loops are un-wrapped, for example:</span>
+<span class="s2">#</span>
+<span class="s2">#   for i in range(n):</span>
+<span class="s2">#       array[i] = i</span>
+<span class="s2">#</span>
+<span class="s2">#   will become</span>
+<span class="s2">#</span>
+<span class="s2">#   for i in range(n // 4):</span>
+<span class="s2">#       array[i] = i</span>
+<span class="s2">#       array[i + 1] = i + 1</span>
+<span class="s2">#       array[i + 2] = i + 2</span>
+<span class="s2">#       array[i + 3] = i + 3</span>
+<span class="s2">#</span>
+<span class="s2">#   This is to hint gcc that it can auto-vectorize these 4 operations and</span>
+<span class="s2">#   perform them all at once.</span>
+
+
+<span class="s4">@</span><span class="s1">cython</span><span class="s4">.</span><span class="s1">final</span>
+<span class="s3">cdef class </span><span class="s1">HistogramBuilder</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;A Histogram builder... used to build histograms. 
+ 
+    A histogram is an array with n_bins entries of type HISTOGRAM_DTYPE. Each 
+    feature has its own histogram. A histogram contains the sum of gradients 
+    and hessians of all the samples belonging to each bin. 
+ 
+    There are different ways to build a histogram: 
+    - by subtraction: hist(child) = hist(parent) - hist(sibling) 
+    - from scratch. In this case we have routines that update the hessians 
+      or not (not useful when hessians are constant for some losses e.g. 
+      least squares). Also, there's a special case for the root which 
+      contains all the samples, leading to some possible optimizations. 
+      Overall all the implementations look the same, and are optimized for 
+      cache hit. 
+ 
+    Parameters 
+    ---------- 
+    X_binned : ndarray of int, shape (n_samples, n_features) 
+        The binned input samples. Must be Fortran-aligned. 
+    n_bins : int 
+        The total number of bins, including the bin for missing values. Used 
+        to define the shape of the histograms. 
+    gradients : ndarray, shape (n_samples,) 
+        The gradients of each training sample. Those are the gradients of the 
+        loss w.r.t the predictions, evaluated at iteration i - 1. 
+    hessians : ndarray, shape (n_samples,) 
+        The hessians of each training sample. Those are the hessians of the 
+        loss w.r.t the predictions, evaluated at iteration i - 1. 
+    hessians_are_constant : bool 
+        Whether hessians are constant. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">cdef </span><span class="s1">public</span><span class="s4">:</span>
+        <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">, :] </span><span class="s1">X_binned</span>
+        <span class="s1">unsigned int n_features</span>
+        <span class="s1">unsigned int n_bins</span>
+        <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">gradients</span>
+        <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">hessians</span>
+        <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_gradients</span>
+        <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_hessians</span>
+        <span class="s1">unsigned char hessians_are_constant</span>
+        <span class="s1">int n_threads</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">, :] </span><span class="s1">X_binned</span><span class="s4">,</span>
+                 <span class="s1">unsigned int n_bins</span><span class="s4">, </span><span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">gradients</span><span class="s4">,</span>
+                 <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">hessians</span><span class="s4">,</span>
+                 <span class="s1">unsigned char hessians_are_constant</span><span class="s4">,</span>
+                 <span class="s1">int n_threads</span><span class="s4">):</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">X_binned </span><span class="s4">= </span><span class="s1">X_binned</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_features </span><span class="s4">= </span><span class="s1">X_binned</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s2"># Note: all histograms will have &lt;n_bins&gt; bins, but some of the</span>
+        <span class="s2"># bins may be unused if a feature has a small number of unique values.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins </span><span class="s4">= </span><span class="s1">n_bins</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">gradients </span><span class="s4">= </span><span class="s1">gradients</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">hessians </span><span class="s4">= </span><span class="s1">hessians</span>
+        <span class="s2"># for root node, gradients and hessians are already ordered</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">ordered_gradients </span><span class="s4">= </span><span class="s1">gradients</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">ordered_hessians </span><span class="s4">= </span><span class="s1">hessians</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant </span><span class="s4">= </span><span class="s1">hessians_are_constant</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_threads </span><span class="s4">= </span><span class="s1">n_threads</span>
+
+    <span class="s3">def </span><span class="s1">compute_histograms_brute</span><span class="s4">(</span>
+        <span class="s1">HistogramBuilder self</span><span class="s4">,</span>
+        <span class="s1">const unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sample_indices</span><span class="s4">,       </span><span class="s2"># IN</span>
+        <span class="s1">const unsigned int </span><span class="s4">[:] </span><span class="s1">allowed_features</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,  </span><span class="s2"># IN</span>
+    <span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the histograms of the node by scanning through all the data. 
+ 
+        For a given feature, the complexity is O(n_samples) 
+ 
+        Parameters 
+        ---------- 
+        sample_indices : array of int, shape (n_samples_at_node,) 
+            The indices of the samples at the node to split. 
+ 
+        allowed_features : None or ndarray, dtype=np.uint32 
+            Indices of the features that are allowed by interaction constraints to be 
+            split. 
+ 
+        Returns 
+        ------- 
+        histograms : ndarray of HISTOGRAM_DTYPE, shape (n_features, n_bins) 
+            The computed histograms of the current node. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">int n_samples</span>
+            <span class="s1">int feature_idx</span>
+            <span class="s1">int f_idx</span>
+            <span class="s1">int i</span>
+            <span class="s2"># need local views to avoid python interactions</span>
+            <span class="s1">unsigned char hessians_are_constant </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant</span>
+            <span class="s1">int n_allowed_features </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_features</span>
+            <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_gradients </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ordered_gradients</span>
+            <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">gradients </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">gradients</span>
+            <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_hessians </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">ordered_hessians</span>
+            <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">hessians </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">hessians</span>
+            <span class="s2"># Histograms will be initialized to zero later within a prange</span>
+            <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">histograms </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">(</span>
+                <span class="s1">shape</span><span class="s4">=(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_features</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins</span><span class="s4">),</span>
+                <span class="s1">dtype</span><span class="s4">=</span><span class="s1">HISTOGRAM_DTYPE</span>
+            <span class="s4">)</span>
+            <span class="s1">bint has_interaction_cst </span><span class="s4">= </span><span class="s1">allowed_features </span><span class="s3">is not None</span>
+            <span class="s1">int n_threads </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_threads</span>
+
+        <span class="s3">if </span><span class="s1">has_interaction_cst</span><span class="s4">:</span>
+            <span class="s1">n_allowed_features </span><span class="s4">= </span><span class="s1">allowed_features</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+
+        <span class="s3">with </span><span class="s1">nogil</span><span class="s4">:</span>
+            <span class="s1">n_samples </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+
+            <span class="s2"># Populate ordered_gradients and ordered_hessians. (Already done</span>
+            <span class="s2"># for root) Ordering the gradients and hessians helps to improve</span>
+            <span class="s2"># cache hit.</span>
+            <span class="s3">if </span><span class="s1">sample_indices</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] != </span><span class="s1">gradients</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]:</span>
+                <span class="s3">if </span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">prange</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">schedule</span><span class="s4">=</span><span class="s6">'static'</span><span class="s4">,</span>
+                                    <span class="s1">num_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">):</span>
+                        <span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">gradients</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]]</span>
+                <span class="s3">else</span><span class="s4">:</span>
+                    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">prange</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">schedule</span><span class="s4">=</span><span class="s6">'static'</span><span class="s4">,</span>
+                                    <span class="s1">num_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">):</span>
+                        <span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">gradients</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]]</span>
+                        <span class="s1">ordered_hessians</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">hessians</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]]</span>
+
+            <span class="s2"># Compute histogram of each feature</span>
+            <span class="s3">for </span><span class="s1">f_idx </span><span class="s3">in </span><span class="s1">prange</span><span class="s4">(</span>
+                <span class="s1">n_allowed_features</span><span class="s4">, </span><span class="s1">schedule</span><span class="s4">=</span><span class="s6">'static'</span><span class="s4">, </span><span class="s1">num_threads</span><span class="s4">=</span><span class="s1">n_threads</span>
+            <span class="s4">):</span>
+                <span class="s3">if </span><span class="s1">has_interaction_cst</span><span class="s4">:</span>
+                    <span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">allowed_features</span><span class="s4">[</span><span class="s1">f_idx</span><span class="s4">]</span>
+                <span class="s3">else</span><span class="s4">:</span>
+                    <span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">f_idx</span>
+
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_compute_histogram_brute_single_feature</span><span class="s4">(</span>
+                    <span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">sample_indices</span><span class="s4">, </span><span class="s1">histograms</span>
+                <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">histograms</span>
+
+    <span class="s3">cdef </span><span class="s1">void _compute_histogram_brute_single_feature</span><span class="s4">(</span>
+            <span class="s1">HistogramBuilder self</span><span class="s4">,</span>
+            <span class="s1">const int feature_idx</span><span class="s4">,</span>
+            <span class="s1">const unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sample_indices</span><span class="s4">,  </span><span class="s2"># IN</span>
+            <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">histograms</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+        <span class="s6">&quot;&quot;&quot;Compute the histogram for a given feature.&quot;&quot;&quot;</span>
+
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">unsigned int n_samples </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+            <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">X_binned </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">X_binned</span><span class="s4">[:, </span><span class="s1">feature_idx</span><span class="s4">]</span>
+            <span class="s1">unsigned int root_node </span><span class="s4">= </span><span class="s1">X_binned</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">] == </span><span class="s1">n_samples</span>
+            <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_gradients </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">ordered_gradients</span><span class="s4">[:</span><span class="s1">n_samples</span><span class="s4">]</span>
+            <span class="s1">G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_hessians </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">ordered_hessians</span><span class="s4">[:</span><span class="s1">n_samples</span><span class="s4">]</span>
+            <span class="s1">unsigned char hessians_are_constant </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">hessians_are_constant</span>
+
+        <span class="s2"># Set histograms to zero.</span>
+        <span class="s1">memset</span><span class="s4">(&amp;</span><span class="s1">histograms</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s5">0</span><span class="s4">], </span><span class="s5">0</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins </span><span class="s4">* </span><span class="s1">sizeof</span><span class="s4">(</span><span class="s1">hist_struct</span><span class="s4">))</span>
+
+        <span class="s3">if </span><span class="s1">root_node</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                <span class="s1">_build_histogram_root_no_hessian</span><span class="s4">(</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">X_binned</span><span class="s4">,</span>
+                                                 <span class="s1">ordered_gradients</span><span class="s4">,</span>
+                                                 <span class="s1">histograms</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">_build_histogram_root</span><span class="s4">(</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">X_binned</span><span class="s4">,</span>
+                                      <span class="s1">ordered_gradients</span><span class="s4">, </span><span class="s1">ordered_hessians</span><span class="s4">,</span>
+                                      <span class="s1">histograms</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">hessians_are_constant</span><span class="s4">:</span>
+                <span class="s1">_build_histogram_no_hessian</span><span class="s4">(</span><span class="s1">feature_idx</span><span class="s4">,</span>
+                                            <span class="s1">sample_indices</span><span class="s4">, </span><span class="s1">X_binned</span><span class="s4">,</span>
+                                            <span class="s1">ordered_gradients</span><span class="s4">, </span><span class="s1">histograms</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">_build_histogram</span><span class="s4">(</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">sample_indices</span><span class="s4">,</span>
+                                 <span class="s1">X_binned</span><span class="s4">, </span><span class="s1">ordered_gradients</span><span class="s4">,</span>
+                                 <span class="s1">ordered_hessians</span><span class="s4">, </span><span class="s1">histograms</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">compute_histograms_subtraction</span><span class="s4">(</span>
+        <span class="s1">HistogramBuilder self</span><span class="s4">,</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">parent_histograms</span><span class="s4">,        </span><span class="s2"># IN and OUT</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sibling_histograms</span><span class="s4">,       </span><span class="s2"># IN</span>
+        <span class="s1">const unsigned int </span><span class="s4">[:] </span><span class="s1">allowed_features</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,  </span><span class="s2"># IN</span>
+    <span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the histograms of the node using the subtraction trick. 
+ 
+        hist(parent) = hist(left_child) + hist(right_child) 
+ 
+        For a given feature, the complexity is O(n_bins). This is much more 
+        efficient than compute_histograms_brute, but it's only possible for one 
+        of the siblings. 
+ 
+        Parameters 
+        ---------- 
+        parent_histograms : ndarray of HISTOGRAM_DTYPE, \ 
+                shape (n_features, n_bins) 
+            The histograms of the parent. 
+        sibling_histograms : ndarray of HISTOGRAM_DTYPE, \ 
+                shape (n_features, n_bins) 
+            The histograms of the sibling. 
+        allowed_features : None or ndarray, dtype=np.uint32 
+            Indices of the features that are allowed by interaction constraints to be 
+            split. 
+ 
+        Returns 
+        ------- 
+        histograms : ndarray of HISTOGRAM_DTYPE, shape(n_features, n_bins) 
+            The computed histograms of the current node. 
+            We repurpose parent_histograms for this and don't need to allocate new 
+            memory. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s3">cdef</span><span class="s4">:</span>
+            <span class="s1">int feature_idx</span>
+            <span class="s1">int f_idx</span>
+            <span class="s1">int n_allowed_features </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_features</span>
+            <span class="s1">bint has_interaction_cst </span><span class="s4">= </span><span class="s1">allowed_features </span><span class="s3">is not None</span>
+            <span class="s1">int n_threads </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_threads</span>
+
+        <span class="s3">if </span><span class="s1">has_interaction_cst</span><span class="s4">:</span>
+            <span class="s1">n_allowed_features </span><span class="s4">= </span><span class="s1">allowed_features</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+
+        <span class="s2"># Compute histogram of each feature</span>
+        <span class="s3">for </span><span class="s1">f_idx </span><span class="s3">in </span><span class="s1">prange</span><span class="s4">(</span><span class="s1">n_allowed_features</span><span class="s4">, </span><span class="s1">schedule</span><span class="s4">=</span><span class="s6">'static'</span><span class="s4">, </span><span class="s1">nogil</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+                            <span class="s1">num_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">has_interaction_cst</span><span class="s4">:</span>
+                <span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">allowed_features</span><span class="s4">[</span><span class="s1">f_idx</span><span class="s4">]</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">feature_idx </span><span class="s4">= </span><span class="s1">f_idx</span>
+
+            <span class="s1">_subtract_histograms</span><span class="s4">(</span>
+                <span class="s1">feature_idx</span><span class="s4">,</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">n_bins</span><span class="s4">,</span>
+                <span class="s1">parent_histograms</span><span class="s4">,</span>
+                <span class="s1">sibling_histograms</span><span class="s4">,</span>
+            <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">parent_histograms</span>
+
+
+<span class="s3">cpdef </span><span class="s1">void _build_histogram_naive</span><span class="s4">(</span>
+        <span class="s1">const int feature_idx</span><span class="s4">,</span>
+        <span class="s1">unsigned int </span><span class="s4">[:] </span><span class="s1">sample_indices</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">X_BINNED_DTYPE_C </span><span class="s4">[:] </span><span class="s1">binned_feature</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">G_H_DTYPE_C </span><span class="s4">[:] </span><span class="s1">ordered_gradients</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">G_H_DTYPE_C </span><span class="s4">[:] </span><span class="s1">ordered_hessians</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, :] </span><span class="s1">out</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+    <span class="s6">&quot;&quot;&quot;Build histogram in a naive way, without optimizing for cache hit. 
+ 
+    Used in tests to compare with the optimized version.&quot;&quot;&quot;</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">unsigned int i</span>
+        <span class="s1">unsigned int n_samples </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s1">unsigned int sample_idx</span>
+        <span class="s1">unsigned int bin_idx</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">):</span>
+        <span class="s1">sample_idx </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_idx</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">ordered_hessians</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+
+<span class="s3">cpdef </span><span class="s1">void _subtract_histograms</span><span class="s4">(</span>
+        <span class="s1">const int feature_idx</span><span class="s4">,</span>
+        <span class="s1">unsigned int n_bins</span><span class="s4">,</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">hist_a</span><span class="s4">,  </span><span class="s2"># IN and OUT</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">hist_b</span><span class="s4">,  </span><span class="s2"># IN</span>
+<span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+    <span class="s6">&quot;&quot;&quot;compute hist_a = hist_a - hist_b&quot;&quot;&quot;</span>
+    <span class="s2"># Note that subtraction of large sums of floating point numbers, as we have here,</span>
+    <span class="s2"># can exhibit catastrophic cancallation. This is in particular true for gradients</span>
+    <span class="s2"># as they can be positive and negative, while hessians are non-negative.</span>
+    <span class="s2"># Remember that gradients and hessians are originally computed in</span>
+    <span class="s2"># G_H_DTYPE_C = float32 precision. Therefore, if sum_gradients and sum_hessians are</span>
+    <span class="s2"># float64, we don't loose precision. But if we also used float32 for summation, we</span>
+    <span class="s2"># would need to take care of floating point errors.</span>
+    <span class="s2">#</span>
+    <span class="s2"># Note that we could protect for negative hessians by setting:</span>
+    <span class="s2">#     sum_hessians = max(0, sum_hessians)</span>
+    <span class="s2"># But as we use float64 for summing float32, that's veeeery unlikely.</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">unsigned int i </span><span class="s4">= </span><span class="s5">0</span>
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_bins</span><span class="s4">):</span>
+        <span class="s1">hist_a</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">i</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">-= </span><span class="s1">hist_b</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">i</span><span class="s4">].</span><span class="s1">sum_gradients</span>
+        <span class="s1">hist_a</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">i</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">-= </span><span class="s1">hist_b</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">i</span><span class="s4">].</span><span class="s1">sum_hessians</span>
+        <span class="s1">hist_a</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">i</span><span class="s4">].</span><span class="s1">count </span><span class="s4">-= </span><span class="s1">hist_b</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">i</span><span class="s4">].</span><span class="s1">count</span>
+
+
+<span class="s3">cpdef </span><span class="s1">void _build_histogram</span><span class="s4">(</span>
+        <span class="s1">const int feature_idx</span><span class="s4">,</span>
+        <span class="s1">const unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sample_indices</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">binned_feature</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_gradients</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_hessians</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">out</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+    <span class="s6">&quot;&quot;&quot;Return histogram for a given feature.&quot;&quot;&quot;</span>
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">unsigned int i </span><span class="s4">= </span><span class="s5">0</span>
+        <span class="s1">unsigned int n_node_samples </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s1">unsigned int unrolled_upper </span><span class="s4">= (</span><span class="s1">n_node_samples </span><span class="s4">// </span><span class="s5">4</span><span class="s4">) * </span><span class="s5">4</span>
+
+        <span class="s1">unsigned int bin_0</span>
+        <span class="s1">unsigned int bin_1</span>
+        <span class="s1">unsigned int bin_2</span>
+        <span class="s1">unsigned int bin_3</span>
+        <span class="s1">unsigned int bin_idx</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s5">4</span><span class="s4">):</span>
+        <span class="s1">bin_0 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]]</span>
+        <span class="s1">bin_1 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]]</span>
+        <span class="s1">bin_2 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]]</span>
+        <span class="s1">bin_3 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">ordered_hessians</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">ordered_hessians</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">ordered_hessians</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">ordered_hessians</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s1">n_node_samples</span><span class="s4">):</span>
+        <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">ordered_hessians</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+
+<span class="s3">cpdef </span><span class="s1">void _build_histogram_no_hessian</span><span class="s4">(</span>
+        <span class="s1">const int feature_idx</span><span class="s4">,</span>
+        <span class="s1">const unsigned int </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">sample_indices</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">binned_feature</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">ordered_gradients</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">out</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+    <span class="s6">&quot;&quot;&quot;Return histogram for a given feature, not updating hessians. 
+ 
+    Used when the hessians of the loss are constant (typically LS loss). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">unsigned int i </span><span class="s4">= </span><span class="s5">0</span>
+        <span class="s1">unsigned int n_node_samples </span><span class="s4">= </span><span class="s1">sample_indices</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s1">unsigned int unrolled_upper </span><span class="s4">= (</span><span class="s1">n_node_samples </span><span class="s4">// </span><span class="s5">4</span><span class="s4">) * </span><span class="s5">4</span>
+
+        <span class="s1">unsigned int bin_0</span>
+        <span class="s1">unsigned int bin_1</span>
+        <span class="s1">unsigned int bin_2</span>
+        <span class="s1">unsigned int bin_3</span>
+        <span class="s1">unsigned int bin_idx</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s5">4</span><span class="s4">):</span>
+        <span class="s1">bin_0 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]]</span>
+        <span class="s1">bin_1 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]]</span>
+        <span class="s1">bin_2 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]]</span>
+        <span class="s1">bin_3 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s1">n_node_samples</span><span class="s4">):</span>
+        <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">sample_indices</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">ordered_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+
+<span class="s3">cpdef </span><span class="s1">void _build_histogram_root</span><span class="s4">(</span>
+        <span class="s1">const int feature_idx</span><span class="s4">,</span>
+        <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">binned_feature</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">all_gradients</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">all_hessians</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">out</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+    <span class="s6">&quot;&quot;&quot;Compute histogram of the root node. 
+ 
+    Unlike other nodes, the root node has to find the split among *all* the 
+    samples from the training set. binned_feature and all_gradients / 
+    all_hessians already have a consistent ordering. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">unsigned int i </span><span class="s4">= </span><span class="s5">0</span>
+        <span class="s1">unsigned int n_samples </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s1">unsigned int unrolled_upper </span><span class="s4">= (</span><span class="s1">n_samples </span><span class="s4">// </span><span class="s5">4</span><span class="s4">) * </span><span class="s5">4</span>
+
+        <span class="s1">unsigned int bin_0</span>
+        <span class="s1">unsigned int bin_1</span>
+        <span class="s1">unsigned int bin_2</span>
+        <span class="s1">unsigned int bin_3</span>
+        <span class="s1">unsigned int bin_idx</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s5">4</span><span class="s4">):</span>
+
+        <span class="s1">bin_0 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">bin_1 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">bin_2 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">bin_3 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">all_hessians</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">all_hessians</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">all_hessians</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">all_hessians</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">):</span>
+        <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_hessians </span><span class="s4">+= </span><span class="s1">all_hessians</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+
+<span class="s3">cpdef </span><span class="s1">void _build_histogram_root_no_hessian</span><span class="s4">(</span>
+        <span class="s1">const int feature_idx</span><span class="s4">,</span>
+        <span class="s1">const X_BINNED_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">binned_feature</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">const G_H_DTYPE_C </span><span class="s4">[::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">all_gradients</span><span class="s4">,  </span><span class="s2"># IN</span>
+        <span class="s1">hist_struct </span><span class="s4">[:, ::</span><span class="s5">1</span><span class="s4">] </span><span class="s1">out</span><span class="s4">) </span><span class="s1">noexcept nogil</span><span class="s4">:  </span><span class="s2"># OUT</span>
+    <span class="s6">&quot;&quot;&quot;Compute histogram of the root node, not updating hessians. 
+ 
+    Used when the hessians of the loss are constant (typically LS loss). 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">cdef</span><span class="s4">:</span>
+        <span class="s1">unsigned int i </span><span class="s4">= </span><span class="s5">0</span>
+        <span class="s1">unsigned int n_samples </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s1">unsigned int unrolled_upper </span><span class="s4">= (</span><span class="s1">n_samples </span><span class="s4">// </span><span class="s5">4</span><span class="s4">) * </span><span class="s5">4</span>
+
+        <span class="s1">unsigned int bin_0</span>
+        <span class="s1">unsigned int bin_1</span>
+        <span class="s1">unsigned int bin_2</span>
+        <span class="s1">unsigned int bin_3</span>
+        <span class="s1">unsigned int bin_idx</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s5">0</span><span class="s4">, </span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s5">4</span><span class="s4">):</span>
+        <span class="s1">bin_0 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">bin_1 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">bin_2 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">bin_3 </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">2</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i </span><span class="s4">+ </span><span class="s5">3</span><span class="s4">]</span>
+
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_0</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_1</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_2</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_3</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">unrolled_upper</span><span class="s4">, </span><span class="s1">n_samples</span><span class="s4">):</span>
+        <span class="s1">bin_idx </span><span class="s4">= </span><span class="s1">binned_feature</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">sum_gradients </span><span class="s4">+= </span><span class="s1">all_gradients</span><span class="s4">[</span><span class="s1">i</span><span class="s4">]</span>
+        <span class="s1">out</span><span class="s4">[</span><span class="s1">feature_idx</span><span class="s4">, </span><span class="s1">bin_idx</span><span class="s4">].</span><span class="s1">count </span><span class="s4">+= </span><span class="s5">1</span>
+</pre>
+</body>
+</html>

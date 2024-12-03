@@ -1,0 +1,594 @@
+<html>
+<head>
+<title>compressor.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #7a7e85;}
+.s6 { color: #a5c261;}
+.s7 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+compressor.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Classes and functions for managing compressors.&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">io</span>
+<span class="s2">import </span><span class="s1">zlib</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">backports </span><span class="s2">import </span><span class="s1">LooseVersion</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">from </span><span class="s1">threading </span><span class="s2">import </span><span class="s1">RLock</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s2">from </span><span class="s1">dummy_threading </span><span class="s2">import </span><span class="s1">RLock</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">bz2</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s1">bz2 </span><span class="s3">= </span><span class="s2">None</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">lz4</span>
+    <span class="s2">from </span><span class="s1">lz4</span><span class="s3">.</span><span class="s1">frame </span><span class="s2">import </span><span class="s1">LZ4FrameFile</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s1">lz4 </span><span class="s3">= </span><span class="s2">None</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">lzma</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s1">lzma </span><span class="s3">= </span><span class="s2">None</span>
+
+
+<span class="s1">LZ4_NOT_INSTALLED_ERROR </span><span class="s3">= (</span><span class="s4">'LZ4 is not installed. Install it with pip: '</span>
+                           <span class="s4">'https://python-lz4.readthedocs.io/'</span><span class="s3">)</span>
+
+<span class="s5"># Registered compressors</span>
+<span class="s1">_COMPRESSORS </span><span class="s3">= {}</span>
+
+<span class="s5"># Magic numbers of supported compression file formats.</span>
+<span class="s1">_ZFILE_PREFIX </span><span class="s3">= </span><span class="s6">b'ZF'  </span><span class="s5"># used with pickle files created before 0.9.3.</span>
+<span class="s1">_ZLIB_PREFIX </span><span class="s3">= </span><span class="s6">b'</span><span class="s2">\x78</span><span class="s6">'</span>
+<span class="s1">_GZIP_PREFIX </span><span class="s3">= </span><span class="s6">b'</span><span class="s2">\x1f\x8b</span><span class="s6">'</span>
+<span class="s1">_BZ2_PREFIX </span><span class="s3">= </span><span class="s6">b'BZ'</span>
+<span class="s1">_XZ_PREFIX </span><span class="s3">= </span><span class="s6">b'</span><span class="s2">\xfd\x37\x7a\x58\x5a</span><span class="s6">'</span>
+<span class="s1">_LZMA_PREFIX </span><span class="s3">= </span><span class="s6">b'</span><span class="s2">\x5d\x00</span><span class="s6">'</span>
+<span class="s1">_LZ4_PREFIX </span><span class="s3">= </span><span class="s6">b'</span><span class="s2">\x04\x22\x4D\x18</span><span class="s6">'</span>
+
+
+<span class="s2">def </span><span class="s1">register_compressor</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">, </span><span class="s1">compressor</span><span class="s3">,</span>
+                        <span class="s1">force</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Register a new compressor. 
+ 
+    Parameters 
+    ---------- 
+    compressor_name: str. 
+        The name of the compressor. 
+    compressor: CompressorWrapper 
+        An instance of a 'CompressorWrapper'. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">global </span><span class="s1">_COMPRESSORS</span>
+    <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">, </span><span class="s1">str</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Compressor name should be a string, &quot;</span>
+                         <span class="s4">&quot;'{}' given.&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">))</span>
+
+    <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">, </span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Compressor should implement the CompressorWrapper &quot;</span>
+                         <span class="s4">&quot;interface, '{}' given.&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">))</span>
+
+    <span class="s2">if </span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s2">is not None and</span>
+            <span class="s3">(</span><span class="s2">not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">, </span><span class="s4">'read'</span><span class="s3">) </span><span class="s2">or</span>
+             <span class="s2">not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">, </span><span class="s4">'write'</span><span class="s3">) </span><span class="s2">or</span>
+             <span class="s2">not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">, </span><span class="s4">'seek'</span><span class="s3">) </span><span class="s2">or</span>
+             <span class="s2">not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">, </span><span class="s4">'tell'</span><span class="s3">))):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Compressor 'fileobj_factory' attribute should &quot;</span>
+                         <span class="s4">&quot;implement the file object interface, '{}' given.&quot;</span>
+                         <span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">compressor</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">))</span>
+
+    <span class="s2">if </span><span class="s1">compressor_name </span><span class="s2">in </span><span class="s1">_COMPRESSORS </span><span class="s2">and not </span><span class="s1">force</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Compressor '{}' already registered.&quot;</span>
+                         <span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">))</span>
+
+    <span class="s1">_COMPRESSORS</span><span class="s3">[</span><span class="s1">compressor_name</span><span class="s3">] = </span><span class="s1">compressor</span>
+
+
+<span class="s2">class </span><span class="s1">CompressorWrapper</span><span class="s3">():</span>
+    <span class="s0">&quot;&quot;&quot;A wrapper around a compressor file object. 
+ 
+    Attributes 
+    ---------- 
+    obj: a file-like object 
+        The object must implement the buffer interface and will be used 
+        internally to compress/decompress the data. 
+    prefix: bytestring 
+        A bytestring corresponding to the magic number that identifies the 
+        file format associated to the compressor. 
+    extension: str 
+        The file extension used to automatically select this compressor during 
+        a dump to a file. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">, </span><span class="s1">prefix</span><span class="s3">=</span><span class="s6">b''</span><span class="s3">, </span><span class="s1">extension</span><span class="s3">=</span><span class="s4">''</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s3">= </span><span class="s1">obj</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">prefix </span><span class="s3">= </span><span class="s1">prefix</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">extension </span><span class="s3">= </span><span class="s1">extension</span>
+
+    <span class="s2">def </span><span class="s1">compressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">, </span><span class="s1">compresslevel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a compressor file object.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">compresslevel </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">,</span>
+                                        <span class="s1">compresslevel</span><span class="s3">=</span><span class="s1">compresslevel</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">decompressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a decompressor file object.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">BZ2CompressorWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s1">prefix </span><span class="s3">= </span><span class="s1">_BZ2_PREFIX</span>
+    <span class="s1">extension </span><span class="s3">= </span><span class="s4">'.bz2'</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">bz2 </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s3">= </span><span class="s1">bz2</span><span class="s3">.</span><span class="s1">BZ2File</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_check_versions</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">bz2 </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">'bz2 module is not compiled on your python '</span>
+                             <span class="s4">'standard library.'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">compressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">, </span><span class="s1">compresslevel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a compressor file object.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_versions</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">compresslevel </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">,</span>
+                                        <span class="s1">compresslevel</span><span class="s3">=</span><span class="s1">compresslevel</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">decompressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a decompressor file object.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_versions</span><span class="s3">()</span>
+        <span class="s1">fileobj </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">fileobj</span>
+
+
+<span class="s2">class </span><span class="s1">LZMACompressorWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s1">prefix </span><span class="s3">= </span><span class="s1">_LZMA_PREFIX</span>
+    <span class="s1">extension </span><span class="s3">= </span><span class="s4">'.lzma'</span>
+    <span class="s1">_lzma_format_name </span><span class="s3">= </span><span class="s4">'FORMAT_ALONE'</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">lzma </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s3">= </span><span class="s1">lzma</span><span class="s3">.</span><span class="s1">LZMAFile</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_lzma_format </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">lzma</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lzma_format_name</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_check_versions</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">lzma </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">'lzma module is not compiled on your python '</span>
+                             <span class="s4">'standard library.'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">compressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">, </span><span class="s1">compresslevel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a compressor file object.&quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">compresslevel </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">,</span>
+                                        <span class="s1">format</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lzma_format</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">,</span>
+                                        <span class="s1">format</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lzma_format</span><span class="s3">,</span>
+                                        <span class="s1">preset</span><span class="s3">=</span><span class="s1">compresslevel</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">decompressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a decompressor file object.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">lzma</span><span class="s3">.</span><span class="s1">LZMAFile</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">XZCompressorWrapper</span><span class="s3">(</span><span class="s1">LZMACompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s1">prefix </span><span class="s3">= </span><span class="s1">_XZ_PREFIX</span>
+    <span class="s1">extension </span><span class="s3">= </span><span class="s4">'.xz'</span>
+    <span class="s1">_lzma_format_name </span><span class="s3">= </span><span class="s4">'FORMAT_XZ'</span>
+
+
+<span class="s2">class </span><span class="s1">LZ4CompressorWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s1">prefix </span><span class="s3">= </span><span class="s1">_LZ4_PREFIX</span>
+    <span class="s1">extension </span><span class="s3">= </span><span class="s4">'.lz4'</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">lz4 </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s3">= </span><span class="s1">LZ4FrameFile</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">def </span><span class="s1">_check_versions</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">lz4 </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">LZ4_NOT_INSTALLED_ERROR</span><span class="s3">)</span>
+        <span class="s1">lz4_version </span><span class="s3">= </span><span class="s1">lz4</span><span class="s3">.</span><span class="s1">__version__</span>
+        <span class="s2">if </span><span class="s1">lz4_version</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">&quot;v&quot;</span><span class="s3">):</span>
+            <span class="s1">lz4_version </span><span class="s3">= </span><span class="s1">lz4_version</span><span class="s3">[</span><span class="s7">1</span><span class="s3">:]</span>
+        <span class="s2">if </span><span class="s1">LooseVersion</span><span class="s3">(</span><span class="s1">lz4_version</span><span class="s3">) &lt; </span><span class="s1">LooseVersion</span><span class="s3">(</span><span class="s4">'0.19'</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">LZ4_NOT_INSTALLED_ERROR</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">compressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">, </span><span class="s1">compresslevel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a compressor file object.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_versions</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">compresslevel </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'wb'</span><span class="s3">,</span>
+                                        <span class="s1">compression_level</span><span class="s3">=</span><span class="s1">compresslevel</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">decompressor_file</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Returns an instance of a decompressor file object.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_versions</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fileobj_factory</span><span class="s3">(</span><span class="s1">fileobj</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s3">)</span>
+
+
+<span class="s5">###############################################################################</span>
+<span class="s5">#  base file compression/decompression object definition</span>
+<span class="s1">_MODE_CLOSED </span><span class="s3">= </span><span class="s7">0</span>
+<span class="s1">_MODE_READ </span><span class="s3">= </span><span class="s7">1</span>
+<span class="s1">_MODE_READ_EOF </span><span class="s3">= </span><span class="s7">2</span>
+<span class="s1">_MODE_WRITE </span><span class="s3">= </span><span class="s7">3</span>
+<span class="s1">_BUFFER_SIZE </span><span class="s3">= </span><span class="s7">8192</span>
+
+
+<span class="s2">class </span><span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">io</span><span class="s3">.</span><span class="s1">BufferedIOBase</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;A file object providing transparent zlib (de)compression. 
+ 
+    TODO python2_drop: is it still needed since we dropped Python 2 support A 
+    BinaryZlibFile can act as a wrapper for an existing file object, or refer 
+    directly to a named file on disk. 
+ 
+    Note that BinaryZlibFile provides only a *binary* file interface: data read 
+    is returned as bytes, and data to be written should be given as bytes. 
+ 
+    This object is an adaptation of the BZ2File object and is compatible with 
+    versions of python &gt;= 2.7. 
+ 
+    If filename is a str or bytes object, it gives the name 
+    of the file to be opened. Otherwise, it should be a file object, 
+    which will be used to read or write the compressed data. 
+ 
+    mode can be 'rb' for reading (default) or 'wb' for (over)writing 
+ 
+    If mode is 'wb', compresslevel can be a number between 1 
+    and 9 specifying the level of compression: 1 produces the least 
+    compression, and 9 produces the most compression. 3 is the default. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">wbits </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">MAX_WBITS</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">&quot;rb&quot;</span><span class="s3">, </span><span class="s1">compresslevel</span><span class="s3">=</span><span class="s7">3</span><span class="s3">):</span>
+        <span class="s5"># This lock must be recursive, so that BufferedIOBase's</span>
+        <span class="s5"># readline(), readlines() and writelines() don't deadlock.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock </span><span class="s3">= </span><span class="s1">RLock</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_closefp </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">= </span><span class="s1">_MODE_CLOSED</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">= </span><span class="s7">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_size </span><span class="s3">= -</span><span class="s7">1</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">compresslevel </span><span class="s3">= </span><span class="s1">compresslevel</span>
+
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">compresslevel</span><span class="s3">, </span><span class="s1">int</span><span class="s3">) </span><span class="s2">or not </span><span class="s3">(</span><span class="s7">1 </span><span class="s3">&lt;= </span><span class="s1">compresslevel </span><span class="s3">&lt;= </span><span class="s7">9</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;'compresslevel' must be an integer &quot;</span>
+                             <span class="s4">&quot;between 1 and 9. You provided 'compresslevel={}'&quot;</span>
+                             <span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">compresslevel</span><span class="s3">))</span>
+
+        <span class="s2">if </span><span class="s1">mode </span><span class="s3">== </span><span class="s4">&quot;rb&quot;</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">= </span><span class="s1">_MODE_READ</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_decompressor </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">decompressobj</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">wbits</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s6">b&quot;&quot;</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s7">0</span>
+        <span class="s2">elif </span><span class="s1">mode </span><span class="s3">== </span><span class="s4">&quot;wb&quot;</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">= </span><span class="s1">_MODE_WRITE</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressor </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">compressobj</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">compresslevel</span><span class="s3">,</span>
+                                                <span class="s1">zlib</span><span class="s3">.</span><span class="s1">DEFLATED</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">wbits</span><span class="s3">,</span>
+                                                <span class="s1">zlib</span><span class="s3">.</span><span class="s1">DEF_MEM_LEVEL</span><span class="s3">, </span><span class="s7">0</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Invalid mode: %r&quot; </span><span class="s3">% (</span><span class="s1">mode</span><span class="s3">,))</span>
+
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">str</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp </span><span class="s3">= </span><span class="s1">io</span><span class="s3">.</span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_closefp </span><span class="s3">= </span><span class="s2">True</span>
+        <span class="s2">elif </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s4">&quot;read&quot;</span><span class="s3">) </span><span class="s2">or </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s4">&quot;write&quot;</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp </span><span class="s3">= </span><span class="s1">filename</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span><span class="s4">&quot;filename must be a str or bytes object, &quot;</span>
+                            <span class="s4">&quot;or a file&quot;</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">close</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Flush and close the file. 
+ 
+        May be called more than once without error. Once the file is 
+        closed, any other operation on it will raise a ValueError. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">== </span><span class="s1">_MODE_CLOSED</span><span class="s3">:</span>
+                <span class="s2">return</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s2">in </span><span class="s3">(</span><span class="s1">_MODE_READ</span><span class="s3">, </span><span class="s1">_MODE_READ_EOF</span><span class="s3">):</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_decompressor </span><span class="s3">= </span><span class="s2">None</span>
+                <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">== </span><span class="s1">_MODE_WRITE</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_compressor</span><span class="s3">.</span><span class="s1">flush</span><span class="s3">())</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressor </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s2">finally</span><span class="s3">:</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_closefp</span><span class="s3">:</span>
+                        <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+                <span class="s2">finally</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp </span><span class="s3">= </span><span class="s2">None</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_closefp </span><span class="s3">= </span><span class="s2">False</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">= </span><span class="s1">_MODE_CLOSED</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s6">b&quot;&quot;</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s7">0</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">closed</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;True if this file is closed.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">== </span><span class="s1">_MODE_CLOSED</span>
+
+    <span class="s2">def </span><span class="s1">fileno</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the file descriptor for the underlying file.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">fileno</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">seekable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return whether the file supports seeking.&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">readable</span><span class="s3">() </span><span class="s2">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">seekable</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">readable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return whether the file was opened for reading.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s2">in </span><span class="s3">(</span><span class="s1">_MODE_READ</span><span class="s3">, </span><span class="s1">_MODE_READ_EOF</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">writable</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return whether the file was opened for writing.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">== </span><span class="s1">_MODE_WRITE</span>
+
+    <span class="s5"># Mode-checking helper functions.</span>
+
+    <span class="s2">def </span><span class="s1">_check_not_closed</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">closed</span><span class="s3">:</span>
+            <span class="s1">fname </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">, </span><span class="s4">'name'</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+            <span class="s1">msg </span><span class="s3">= </span><span class="s4">&quot;I/O operation on closed file&quot;</span>
+            <span class="s2">if </span><span class="s1">fname </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">msg </span><span class="s3">+= </span><span class="s4">&quot; {}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">)</span>
+            <span class="s1">msg </span><span class="s3">+= </span><span class="s4">&quot;.&quot;</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_check_can_read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s2">not in </span><span class="s3">(</span><span class="s1">_MODE_READ</span><span class="s3">, </span><span class="s1">_MODE_READ_EOF</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+            <span class="s2">raise </span><span class="s1">io</span><span class="s3">.</span><span class="s1">UnsupportedOperation</span><span class="s3">(</span><span class="s4">&quot;File not open for reading&quot;</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_check_can_write</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">!= </span><span class="s1">_MODE_WRITE</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+            <span class="s2">raise </span><span class="s1">io</span><span class="s3">.</span><span class="s1">UnsupportedOperation</span><span class="s3">(</span><span class="s4">&quot;File not open for writing&quot;</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_check_can_seek</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s2">not in </span><span class="s3">(</span><span class="s1">_MODE_READ</span><span class="s3">, </span><span class="s1">_MODE_READ_EOF</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+            <span class="s2">raise </span><span class="s1">io</span><span class="s3">.</span><span class="s1">UnsupportedOperation</span><span class="s3">(</span><span class="s4">&quot;Seeking is only supported &quot;</span>
+                                          <span class="s4">&quot;on files open for reading&quot;</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">seekable</span><span class="s3">():</span>
+            <span class="s2">raise </span><span class="s1">io</span><span class="s3">.</span><span class="s1">UnsupportedOperation</span><span class="s3">(</span><span class="s4">&quot;The underlying file object &quot;</span>
+                                          <span class="s4">&quot;does not support seeking&quot;</span><span class="s3">)</span>
+
+    <span class="s5"># Fill the readahead buffer if it is empty. Returns False on EOF.</span>
+    <span class="s2">def </span><span class="s1">_fill_buffer</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">== </span><span class="s1">_MODE_READ_EOF</span><span class="s3">:</span>
+            <span class="s2">return False</span>
+        <span class="s5"># Depending on the input data, our call to the decompressor may not</span>
+        <span class="s5"># return any data. In this case, try again after reading another block.</span>
+        <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">== </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">):</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">rawblock </span><span class="s3">= (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_decompressor</span><span class="s3">.</span><span class="s1">unused_data </span><span class="s2">or</span>
+                            <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">_BUFFER_SIZE</span><span class="s3">))</span>
+                <span class="s2">if not </span><span class="s1">rawblock</span><span class="s3">:</span>
+                    <span class="s2">raise </span><span class="s1">EOFError</span>
+            <span class="s2">except </span><span class="s1">EOFError</span><span class="s3">:</span>
+                <span class="s5"># End-of-stream marker and end of file. We're good.</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">= </span><span class="s1">_MODE_READ_EOF</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_size </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span>
+                <span class="s2">return False</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_decompressor</span><span class="s3">.</span><span class="s1">decompress</span><span class="s3">(</span><span class="s1">rawblock</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s7">0</span>
+        <span class="s2">return True</span>
+
+    <span class="s5"># Read data until EOF.</span>
+    <span class="s5"># If return_data is false, consume the data without returning it.</span>
+    <span class="s2">def </span><span class="s1">_read_all</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">return_data</span><span class="s3">=</span><span class="s2">True</span><span class="s3">):</span>
+        <span class="s5"># The loop assumes that _buffer_offset is 0. Ensure that this is true.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset</span><span class="s3">:]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s7">0</span>
+
+        <span class="s1">blocks </span><span class="s3">= []</span>
+        <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fill_buffer</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">return_data</span><span class="s3">:</span>
+                <span class="s1">blocks</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s6">b&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">return_data</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s6">b&quot;&quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+
+    <span class="s5"># Read a block of up to n bytes.</span>
+    <span class="s5"># If return_data is false, consume the data without returning it.</span>
+    <span class="s2">def </span><span class="s1">_read_block</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">n_bytes</span><span class="s3">, </span><span class="s1">return_data</span><span class="s3">=</span><span class="s2">True</span><span class="s3">):</span>
+        <span class="s5"># If we have enough data buffered, return immediately.</span>
+        <span class="s1">end </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">+ </span><span class="s1">n_bytes</span>
+        <span class="s2">if </span><span class="s1">end </span><span class="s3">&lt;= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">):</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset</span><span class="s3">: </span><span class="s1">end</span><span class="s3">]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s1">end</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">data </span><span class="s2">if </span><span class="s1">return_data </span><span class="s2">else None</span>
+
+        <span class="s5"># The loop assumes that _buffer_offset is 0. Ensure that this is true.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset</span><span class="s3">:]</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s7">0</span>
+
+        <span class="s1">blocks </span><span class="s3">= []</span>
+        <span class="s2">while </span><span class="s1">n_bytes </span><span class="s3">&gt; </span><span class="s7">0 </span><span class="s2">and </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_fill_buffer</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">n_bytes </span><span class="s3">&lt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">):</span>
+                <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span><span class="s3">[:</span><span class="s1">n_bytes</span><span class="s3">]</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s1">n_bytes</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s6">b&quot;&quot;</span>
+            <span class="s2">if </span><span class="s1">return_data</span><span class="s3">:</span>
+                <span class="s1">blocks</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s1">n_bytes </span><span class="s3">-= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">return_data</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s6">b&quot;&quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">blocks</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=-</span><span class="s7">1</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Read up to size uncompressed bytes from the file. 
+ 
+        If size is negative or omitted, read until EOF is reached. 
+        Returns b'' if the file is already at EOF. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_can_read</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">size </span><span class="s3">== </span><span class="s7">0</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s6">b&quot;&quot;</span>
+            <span class="s2">elif </span><span class="s1">size </span><span class="s3">&lt; </span><span class="s7">0</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_read_all</span><span class="s3">()</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_read_block</span><span class="s3">(</span><span class="s1">size</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">readinto</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Read up to len(b) bytes into b. 
+ 
+        Returns the number of bytes read (0 for EOF). 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">io</span><span class="s3">.</span><span class="s1">BufferedIOBase</span><span class="s3">.</span><span class="s1">readinto</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">write</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Write a byte string to the file. 
+ 
+        Returns the number of uncompressed bytes written, which is 
+        always len(data). Note that due to buffering, the file on disk 
+        may not reflect the data written until close() is called. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_can_write</span><span class="s3">()</span>
+            <span class="s5"># Convert data type if called by io.BufferedWriter.</span>
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, </span><span class="s1">memoryview</span><span class="s3">):</span>
+                <span class="s1">data </span><span class="s3">= </span><span class="s1">data</span><span class="s3">.</span><span class="s1">tobytes</span><span class="s3">()</span>
+
+            <span class="s1">compressed </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_compressor</span><span class="s3">.</span><span class="s1">compress</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">compressed</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s5"># Rewind the file to the beginning of the data stream.</span>
+    <span class="s2">def </span><span class="s1">_rewind</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_fp</span><span class="s3">.</span><span class="s1">seek</span><span class="s3">(</span><span class="s7">0</span><span class="s3">, </span><span class="s7">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_mode </span><span class="s3">= </span><span class="s1">_MODE_READ</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">= </span><span class="s7">0</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_decompressor </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">decompressobj</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">wbits</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer </span><span class="s3">= </span><span class="s6">b&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_buffer_offset </span><span class="s3">= </span><span class="s7">0</span>
+
+    <span class="s2">def </span><span class="s1">seek</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">whence</span><span class="s3">=</span><span class="s7">0</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Change the file position. 
+ 
+        The new position is specified by offset, relative to the 
+        position indicated by whence. Values for whence are: 
+ 
+            0: start of stream (default); offset must not be negative 
+            1: current stream position 
+            2: end of stream; offset must not be positive 
+ 
+        Returns the new file position. 
+ 
+        Note that seeking is emulated, so depending on the parameters, 
+        this operation may be extremely slow. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_can_seek</span><span class="s3">()</span>
+
+            <span class="s5"># Recalculate offset as an absolute file position.</span>
+            <span class="s2">if </span><span class="s1">whence </span><span class="s3">== </span><span class="s7">0</span><span class="s3">:</span>
+                <span class="s2">pass</span>
+            <span class="s2">elif </span><span class="s1">whence </span><span class="s3">== </span><span class="s7">1</span><span class="s3">:</span>
+                <span class="s1">offset </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">+ </span><span class="s1">offset</span>
+            <span class="s2">elif </span><span class="s1">whence </span><span class="s3">== </span><span class="s7">2</span><span class="s3">:</span>
+                <span class="s5"># Seeking relative to EOF - we need to know the file's size.</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_size </span><span class="s3">&lt; </span><span class="s7">0</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_read_all</span><span class="s3">(</span><span class="s1">return_data</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+                <span class="s1">offset </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_size </span><span class="s3">+ </span><span class="s1">offset</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Invalid value for whence: %s&quot; </span><span class="s3">% (</span><span class="s1">whence</span><span class="s3">,))</span>
+
+            <span class="s5"># Make it so that offset is the number of bytes to skip forward.</span>
+            <span class="s2">if </span><span class="s1">offset </span><span class="s3">&lt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_rewind</span><span class="s3">()</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">offset </span><span class="s3">-= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span>
+
+            <span class="s5"># Read and discard data until we reach the desired position.</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_read_block</span><span class="s3">(</span><span class="s1">offset</span><span class="s3">, </span><span class="s1">return_data</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span>
+
+    <span class="s2">def </span><span class="s1">tell</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the current file position.&quot;&quot;&quot;</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span>
+
+
+<span class="s2">class </span><span class="s1">ZlibCompressorWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">CompressorWrapper</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">BinaryZlibFile</span><span class="s3">,</span>
+                                   <span class="s1">prefix</span><span class="s3">=</span><span class="s1">_ZLIB_PREFIX</span><span class="s3">, </span><span class="s1">extension</span><span class="s3">=</span><span class="s4">'.z'</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">BinaryGzipFile</span><span class="s3">(</span><span class="s1">BinaryZlibFile</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;A file object providing transparent gzip (de)compression. 
+ 
+    If filename is a str or bytes object, it gives the name 
+    of the file to be opened. Otherwise, it should be a file object, 
+    which will be used to read or write the compressed data. 
+ 
+    mode can be 'rb' for reading (default) or 'wb' for (over)writing 
+ 
+    If mode is 'wb', compresslevel can be a number between 1 
+    and 9 specifying the level of compression: 1 produces the least 
+    compression, and 9 produces the most compression. 3 is the default. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">wbits </span><span class="s3">= </span><span class="s7">31  </span><span class="s5"># zlib compressor/decompressor wbits value for gzip format.</span>
+
+
+<span class="s2">class </span><span class="s1">GzipCompressorWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">CompressorWrapper</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">BinaryGzipFile</span><span class="s3">,</span>
+                                   <span class="s1">prefix</span><span class="s3">=</span><span class="s1">_GZIP_PREFIX</span><span class="s3">, </span><span class="s1">extension</span><span class="s3">=</span><span class="s4">'.gz'</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

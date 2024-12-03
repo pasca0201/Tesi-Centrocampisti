@@ -1,0 +1,277 @@
+<html>
+<head>
+<title>_svmlight_format_fast.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #a5c261;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_svmlight_format_fast.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0"># Optimized inner loop of load_svmlight_file.</span>
+<span class="s0">#</span>
+<span class="s0"># Authors: Mathieu Blondel &lt;mathieu@mblondel.org&gt;</span>
+<span class="s0">#          Lars Buitinck</span>
+<span class="s0">#          Olivier Grisel &lt;olivier.grisel@ensta.org&gt;</span>
+<span class="s0"># License: BSD 3 clause</span>
+
+<span class="s2">import </span><span class="s1">array</span>
+<span class="s2">from </span><span class="s1">cpython </span><span class="s2">cimport </span><span class="s1">array</span>
+<span class="s2">cimport </span><span class="s1">cython</span>
+<span class="s2">from </span><span class="s1">libc</span><span class="s3">.</span><span class="s1">string </span><span class="s2">cimport </span><span class="s1">strchr</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+
+<span class="s2">cdef </span><span class="s1">bytes COMMA </span><span class="s3">= </span><span class="s4">u','</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">'ascii'</span><span class="s3">)</span>
+<span class="s2">cdef </span><span class="s1">bytes COLON </span><span class="s3">= </span><span class="s4">u':'</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">'ascii'</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_load_svmlight_file</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">bint multilabel</span><span class="s3">, </span><span class="s1">bint zero_based</span><span class="s3">,</span>
+                        <span class="s1">bint query_id</span><span class="s3">, </span><span class="s1">long long offset</span><span class="s3">, </span><span class="s1">long long length</span><span class="s3">):</span>
+    <span class="s2">cdef </span><span class="s1">array</span><span class="s3">.</span><span class="s1">array data</span><span class="s3">, </span><span class="s1">indices</span><span class="s3">, </span><span class="s1">indptr</span>
+    <span class="s2">cdef </span><span class="s1">bytes line</span>
+    <span class="s2">cdef </span><span class="s1">char </span><span class="s3">*</span><span class="s1">hash_ptr</span>
+    <span class="s2">cdef </span><span class="s1">char </span><span class="s3">*</span><span class="s1">line_cstr</span>
+    <span class="s2">cdef </span><span class="s1">int idx</span><span class="s3">, </span><span class="s1">prev_idx</span>
+    <span class="s2">cdef </span><span class="s1">Py_ssize_t i</span>
+    <span class="s2">cdef </span><span class="s1">bytes qid_prefix </span><span class="s3">= </span><span class="s5">b'qid'</span>
+    <span class="s2">cdef </span><span class="s1">Py_ssize_t n_features</span>
+    <span class="s2">cdef </span><span class="s1">long long offset_max </span><span class="s3">= </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">length </span><span class="s2">if </span><span class="s1">length </span><span class="s3">&gt; </span><span class="s6">0 </span><span class="s2">else </span><span class="s3">-</span><span class="s6">1</span>
+
+    <span class="s0"># Special-case float32 but use float64 for everything else;</span>
+    <span class="s0"># the Python code will do further conversions.</span>
+    <span class="s2">if </span><span class="s1">dtype </span><span class="s3">== </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">:</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">array</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s4">&quot;f&quot;</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">array</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s4">&quot;d&quot;</span><span class="s3">)</span>
+
+    <span class="s1">indices </span><span class="s3">= </span><span class="s1">array</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s4">&quot;q&quot;</span><span class="s3">)</span>
+    <span class="s1">indptr </span><span class="s3">= </span><span class="s1">array</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s4">&quot;q&quot;</span><span class="s3">, [</span><span class="s6">0</span><span class="s3">])</span>
+    <span class="s1">query </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">multilabel</span><span class="s3">:</span>
+        <span class="s1">labels </span><span class="s3">= []</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">labels </span><span class="s3">= </span><span class="s1">array</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s4">&quot;d&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">offset </span><span class="s3">&gt; </span><span class="s6">0</span><span class="s3">:</span>
+        <span class="s1">f</span><span class="s3">.</span><span class="s1">seek</span><span class="s3">(</span><span class="s1">offset</span><span class="s3">)</span>
+        <span class="s0"># drop the current line that might be truncated and is to be</span>
+        <span class="s0"># fetched by another call</span>
+        <span class="s1">f</span><span class="s3">.</span><span class="s1">readline</span><span class="s3">()</span>
+
+    <span class="s2">for </span><span class="s1">line </span><span class="s2">in </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s0"># skip comments</span>
+        <span class="s1">line_cstr </span><span class="s3">= </span><span class="s1">line</span>
+        <span class="s1">hash_ptr </span><span class="s3">= </span><span class="s1">strchr</span><span class="s3">(</span><span class="s1">line_cstr</span><span class="s3">, </span><span class="s6">35</span><span class="s3">)  </span><span class="s0"># ASCII value of '#' is 35</span>
+        <span class="s2">if </span><span class="s1">hash_ptr </span><span class="s3">!= </span><span class="s1">NULL</span><span class="s3">:</span>
+            <span class="s1">line </span><span class="s3">= </span><span class="s1">line</span><span class="s3">[:</span><span class="s1">hash_ptr </span><span class="s3">- </span><span class="s1">line_cstr</span><span class="s3">]</span>
+
+        <span class="s1">line_parts </span><span class="s3">= </span><span class="s1">line</span><span class="s3">.</span><span class="s1">split</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">line_parts</span><span class="s3">) == </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">target</span><span class="s3">, </span><span class="s1">features </span><span class="s3">= </span><span class="s1">line_parts</span><span class="s3">[</span><span class="s6">0</span><span class="s3">], </span><span class="s1">line_parts</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+        <span class="s2">if </span><span class="s1">multilabel</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">COLON </span><span class="s2">in </span><span class="s1">target</span><span class="s3">:</span>
+                <span class="s1">target</span><span class="s3">, </span><span class="s1">features </span><span class="s3">= [], </span><span class="s1">line_parts</span><span class="s3">[</span><span class="s6">0</span><span class="s3">:]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">target </span><span class="s3">= [</span><span class="s1">float</span><span class="s3">(</span><span class="s1">y</span><span class="s3">) </span><span class="s2">for </span><span class="s1">y </span><span class="s2">in </span><span class="s1">target</span><span class="s3">.</span><span class="s1">split</span><span class="s3">(</span><span class="s1">COMMA</span><span class="s3">)]</span>
+            <span class="s1">target</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">()</span>
+            <span class="s1">labels</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">target</span><span class="s3">))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">array</span><span class="s3">.</span><span class="s1">resize_smart</span><span class="s3">(</span><span class="s1">labels</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">labels</span><span class="s3">) + </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">labels</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">labels</span><span class="s3">) - </span><span class="s6">1</span><span class="s3">] = </span><span class="s1">float</span><span class="s3">(</span><span class="s1">target</span><span class="s3">)</span>
+
+        <span class="s1">prev_idx </span><span class="s3">= -</span><span class="s6">1</span>
+        <span class="s1">n_features </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">features</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">n_features </span><span class="s2">and </span><span class="s1">features</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">startswith</span><span class="s3">(</span><span class="s1">qid_prefix</span><span class="s3">):</span>
+            <span class="s1">_</span><span class="s3">, </span><span class="s1">value </span><span class="s3">= </span><span class="s1">features</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">split</span><span class="s3">(</span><span class="s1">COLON</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">query_id</span><span class="s3">:</span>
+                <span class="s1">query</span><span class="s3">.</span><span class="s1">resize</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">query</span><span class="s3">) + </span><span class="s6">1</span><span class="s3">)</span>
+                <span class="s1">query</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">query</span><span class="s3">) - </span><span class="s6">1</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+            <span class="s1">features</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s6">0</span><span class="s3">)</span>
+            <span class="s1">n_features </span><span class="s3">-= </span><span class="s6">1</span>
+
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s1">n_features</span><span class="s3">):</span>
+            <span class="s1">idx_s</span><span class="s3">, </span><span class="s1">value </span><span class="s3">= </span><span class="s1">features</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">split</span><span class="s3">(</span><span class="s1">COLON</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">idx </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">idx_s</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">idx </span><span class="s3">&lt; </span><span class="s6">0 </span><span class="s2">or not </span><span class="s1">zero_based </span><span class="s2">and </span><span class="s1">idx </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                    <span class="s4">&quot;Invalid index %d in SVMlight/LibSVM data file.&quot; </span><span class="s3">% </span><span class="s1">idx</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">idx </span><span class="s3">&lt;= </span><span class="s1">prev_idx</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Feature indices in SVMlight/LibSVM data &quot;</span>
+                                 <span class="s4">&quot;file should be sorted and unique.&quot;</span><span class="s3">)</span>
+
+            <span class="s1">array</span><span class="s3">.</span><span class="s1">resize_smart</span><span class="s3">(</span><span class="s1">indices</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">indices</span><span class="s3">) + </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">indices</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">indices</span><span class="s3">) - </span><span class="s6">1</span><span class="s3">] = </span><span class="s1">idx</span>
+
+            <span class="s1">array</span><span class="s3">.</span><span class="s1">resize_smart</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">) + </span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s1">data</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">) - </span><span class="s6">1</span><span class="s3">] = </span><span class="s1">float</span><span class="s3">(</span><span class="s1">value</span><span class="s3">)</span>
+
+            <span class="s1">prev_idx </span><span class="s3">= </span><span class="s1">idx</span>
+
+        <span class="s0"># increment index pointer array size</span>
+        <span class="s1">array</span><span class="s3">.</span><span class="s1">resize_smart</span><span class="s3">(</span><span class="s1">indptr</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">indptr</span><span class="s3">) + </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s1">indptr</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">indptr</span><span class="s3">) - </span><span class="s6">1</span><span class="s3">] = </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">offset_max </span><span class="s3">!= -</span><span class="s6">1 </span><span class="s2">and </span><span class="s1">f</span><span class="s3">.</span><span class="s1">tell</span><span class="s3">() &gt; </span><span class="s1">offset_max</span><span class="s3">:</span>
+            <span class="s0"># Stop here and let another call deal with the following.</span>
+            <span class="s2">break</span>
+
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">data</span><span class="s3">, </span><span class="s1">indices</span><span class="s3">, </span><span class="s1">indptr</span><span class="s3">, </span><span class="s1">labels</span><span class="s3">, </span><span class="s1">query</span><span class="s3">)</span>
+
+
+<span class="s0"># Two fused types are defined to be able to</span>
+<span class="s0"># use all possible combinations of parameters.</span>
+<span class="s2">ctypedef </span><span class="s1">fused int_or_float</span><span class="s3">:</span>
+    <span class="s1">cython</span><span class="s3">.</span><span class="s1">integral</span>
+    <span class="s1">cython</span><span class="s3">.</span><span class="s1">floating</span>
+    <span class="s1">signed long long</span>
+
+<span class="s2">ctypedef </span><span class="s1">fused double_or_longlong</span><span class="s3">:</span>
+    <span class="s1">double</span>
+    <span class="s1">signed long long</span>
+
+<span class="s2">ctypedef </span><span class="s1">fused int_or_longlong</span><span class="s3">:</span>
+    <span class="s1">cython</span><span class="s3">.</span><span class="s1">integral</span>
+    <span class="s1">signed long long</span>
+
+
+<span class="s2">def </span><span class="s1">get_dense_row_string</span><span class="s3">(</span>
+    <span class="s1">const int_or_float</span><span class="s3">[:, :] </span><span class="s1">X</span><span class="s3">,</span>
+    <span class="s1">Py_ssize_t</span><span class="s3">[:] </span><span class="s1">x_inds</span><span class="s3">,</span>
+    <span class="s1">double_or_longlong</span><span class="s3">[:] </span><span class="s1">x_vals</span><span class="s3">,</span>
+    <span class="s1">Py_ssize_t row</span><span class="s3">,</span>
+    <span class="s1">str value_pattern</span><span class="s3">,</span>
+    <span class="s1">bint one_based</span><span class="s3">,</span>
+<span class="s3">):</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">Py_ssize_t row_length </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s1">Py_ssize_t x_nz_used </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s1">Py_ssize_t k</span>
+        <span class="s1">int_or_float val</span>
+
+    <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">row_length</span><span class="s3">):</span>
+        <span class="s1">val </span><span class="s3">= </span><span class="s1">X</span><span class="s3">[</span><span class="s1">row</span><span class="s3">, </span><span class="s1">k</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">val </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+        <span class="s1">x_inds</span><span class="s3">[</span><span class="s1">x_nz_used</span><span class="s3">] = </span><span class="s1">k</span>
+        <span class="s1">x_vals</span><span class="s3">[</span><span class="s1">x_nz_used</span><span class="s3">] = &lt;</span><span class="s1">double_or_longlong</span><span class="s3">&gt; </span><span class="s1">val</span>
+        <span class="s1">x_nz_used </span><span class="s3">+= </span><span class="s6">1</span>
+
+    <span class="s1">reprs </span><span class="s3">= [</span>
+        <span class="s1">value_pattern </span><span class="s3">% (</span><span class="s1">x_inds</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] + </span><span class="s1">one_based</span><span class="s3">, </span><span class="s1">x_vals</span><span class="s3">[</span><span class="s1">i</span><span class="s3">])</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">x_nz_used</span><span class="s3">)</span>
+    <span class="s3">]</span>
+
+    <span class="s2">return </span><span class="s4">&quot; &quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">reprs</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">get_sparse_row_string</span><span class="s3">(</span>
+    <span class="s1">int_or_float</span><span class="s3">[:] </span><span class="s1">X_data</span><span class="s3">,</span>
+    <span class="s1">int</span><span class="s3">[:] </span><span class="s1">X_indptr</span><span class="s3">,</span>
+    <span class="s1">int</span><span class="s3">[:] </span><span class="s1">X_indices</span><span class="s3">,</span>
+    <span class="s1">Py_ssize_t row</span><span class="s3">,</span>
+    <span class="s1">str value_pattern</span><span class="s3">,</span>
+    <span class="s1">bint one_based</span><span class="s3">,</span>
+<span class="s3">):</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">Py_ssize_t row_start </span><span class="s3">= </span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s1">row</span><span class="s3">]</span>
+        <span class="s1">Py_ssize_t row_end </span><span class="s3">= </span><span class="s1">X_indptr</span><span class="s3">[</span><span class="s1">row</span><span class="s3">+</span><span class="s6">1</span><span class="s3">]</span>
+
+    <span class="s1">reprs </span><span class="s3">= [</span>
+        <span class="s1">value_pattern </span><span class="s3">% (</span><span class="s1">X_indices</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] + </span><span class="s1">one_based</span><span class="s3">, </span><span class="s1">X_data</span><span class="s3">[</span><span class="s1">i</span><span class="s3">])</span>
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">row_start</span><span class="s3">, </span><span class="s1">row_end</span><span class="s3">)</span>
+    <span class="s3">]</span>
+
+    <span class="s2">return </span><span class="s4">&quot; &quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">reprs</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_dump_svmlight_file</span><span class="s3">(</span>
+    <span class="s1">X</span><span class="s3">,</span>
+    <span class="s1">y</span><span class="s3">,</span>
+    <span class="s1">f</span><span class="s3">,</span>
+    <span class="s1">bint multilabel</span><span class="s3">,</span>
+    <span class="s1">bint one_based</span><span class="s3">,</span>
+    <span class="s1">int_or_longlong</span><span class="s3">[:] </span><span class="s1">query_id</span><span class="s3">,</span>
+    <span class="s1">bint X_is_sp</span><span class="s3">,</span>
+    <span class="s1">bint y_is_sp</span><span class="s3">,</span>
+<span class="s3">):</span>
+    <span class="s2">cdef </span><span class="s1">bint X_is_integral</span>
+    <span class="s2">cdef </span><span class="s1">bint query_id_is_not_empty </span><span class="s3">= </span><span class="s1">query_id</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s6">0</span>
+    <span class="s1">X_is_integral </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">kind </span><span class="s3">== </span><span class="s4">&quot;i&quot;</span>
+    <span class="s2">if </span><span class="s1">X_is_integral</span><span class="s3">:</span>
+        <span class="s1">value_pattern </span><span class="s3">= </span><span class="s4">&quot;%d:%d&quot;</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">value_pattern </span><span class="s3">= </span><span class="s4">&quot;%d:%.16g&quot;</span>
+    <span class="s2">if </span><span class="s1">y</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">kind </span><span class="s3">== </span><span class="s4">&quot;i&quot;</span><span class="s3">:</span>
+        <span class="s1">label_pattern </span><span class="s3">= </span><span class="s4">&quot;%d&quot;</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">label_pattern </span><span class="s3">= </span><span class="s4">&quot;%.16g&quot;</span>
+
+    <span class="s1">line_pattern </span><span class="s3">= </span><span class="s4">&quot;%s&quot;</span>
+    <span class="s2">if </span><span class="s1">query_id_is_not_empty</span><span class="s3">:</span>
+        <span class="s1">line_pattern </span><span class="s3">+= </span><span class="s4">&quot; qid:%d&quot;</span>
+    <span class="s1">line_pattern </span><span class="s3">+= </span><span class="s4">&quot; %s</span><span class="s2">\n</span><span class="s4">&quot;</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">Py_ssize_t num_labels </span><span class="s3">= </span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s1">Py_ssize_t x_len </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s1">Py_ssize_t row_length </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s1">Py_ssize_t i</span>
+        <span class="s1">Py_ssize_t j</span>
+        <span class="s1">Py_ssize_t col_start</span>
+        <span class="s1">Py_ssize_t col_end</span>
+        <span class="s1">Py_ssize_t</span><span class="s3">[:] </span><span class="s1">x_inds </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">row_length</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+        <span class="s1">signed long long</span><span class="s3">[:] </span><span class="s1">x_vals_int</span>
+        <span class="s1">double</span><span class="s3">[:] </span><span class="s1">x_vals_float</span>
+
+    <span class="s2">if not </span><span class="s1">X_is_sp</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">X_is_integral</span><span class="s3">:</span>
+            <span class="s1">x_vals_int </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">row_length</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">longlong</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">x_vals_float </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">row_length</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">x_len</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">X_is_sp</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">X_is_integral</span><span class="s3">:</span>
+                <span class="s1">s </span><span class="s3">= </span><span class="s1">get_dense_row_string</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, </span><span class="s1">x_inds</span><span class="s3">, </span><span class="s1">x_vals_int</span><span class="s3">, </span><span class="s1">i</span><span class="s3">, </span><span class="s1">value_pattern</span><span class="s3">, </span><span class="s1">one_based</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">s </span><span class="s3">= </span><span class="s1">get_dense_row_string</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, </span><span class="s1">x_inds</span><span class="s3">, </span><span class="s1">x_vals_float</span><span class="s3">, </span><span class="s1">i</span><span class="s3">, </span><span class="s1">value_pattern</span><span class="s3">, </span><span class="s1">one_based</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">s </span><span class="s3">= </span><span class="s1">get_sparse_row_string</span><span class="s3">(</span><span class="s1">X</span><span class="s3">.</span><span class="s1">data</span><span class="s3">, </span><span class="s1">X</span><span class="s3">.</span><span class="s1">indptr</span><span class="s3">, </span><span class="s1">X</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">, </span><span class="s1">i</span><span class="s3">, </span><span class="s1">value_pattern</span><span class="s3">, </span><span class="s1">one_based</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">multilabel</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">y_is_sp</span><span class="s3">:</span>
+                <span class="s1">col_start </span><span class="s3">= </span><span class="s1">y</span><span class="s3">.</span><span class="s1">indptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+                <span class="s1">col_end </span><span class="s3">= </span><span class="s1">y</span><span class="s3">.</span><span class="s1">indptr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">+</span><span class="s6">1</span><span class="s3">]</span>
+                <span class="s1">labels_str </span><span class="s3">= </span><span class="s4">','</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">label_pattern </span><span class="s3">% </span><span class="s1">y</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">col_start</span><span class="s3">, </span><span class="s1">col_end</span><span class="s3">) </span><span class="s2">if </span><span class="s1">y</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] != </span><span class="s6">0</span><span class="s3">))</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">labels_str </span><span class="s3">= </span><span class="s4">','</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">label_pattern </span><span class="s3">% </span><span class="s1">j </span><span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">num_labels</span><span class="s3">) </span><span class="s2">if </span><span class="s1">y</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">] != </span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">y_is_sp</span><span class="s3">:</span>
+                <span class="s1">labels_str </span><span class="s3">= </span><span class="s1">label_pattern </span><span class="s3">% </span><span class="s1">y</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">labels_str </span><span class="s3">= </span><span class="s1">label_pattern </span><span class="s3">% </span><span class="s1">y</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s6">0</span><span class="s3">]</span>
+
+        <span class="s2">if </span><span class="s1">query_id_is_not_empty</span><span class="s3">:</span>
+            <span class="s1">feat </span><span class="s3">= (</span><span class="s1">labels_str</span><span class="s3">, </span><span class="s1">query_id</span><span class="s3">[</span><span class="s1">i</span><span class="s3">], </span><span class="s1">s</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">feat </span><span class="s3">= (</span><span class="s1">labels_str</span><span class="s3">, </span><span class="s1">s</span><span class="s3">)</span>
+
+        <span class="s1">f</span><span class="s3">.</span><span class="s1">write</span><span class="s3">((</span><span class="s1">line_pattern </span><span class="s3">% </span><span class="s1">feat</span><span class="s3">).</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">&quot;utf-8&quot;</span><span class="s3">))</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,227 @@
+<html>
+<head>
+<title>_weight_vector.pyx.tp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_weight_vector.pyx.tp</font>
+</center></td></tr></table>
+<pre><span class="s0">{{py:</span>
+
+<span class="s0">&quot;&quot;&quot;</span>
+<span class="s0">Efficient (dense) parameter vector implementation for linear models.</span>
+
+<span class="s0">Template file for easily generate fused types consistent code using Tempita</span>
+<span class="s0">(https://github.com/cython/cython/blob/master/Cython/Tempita/_tempita.py).</span>
+
+<span class="s0">Generated file: weight_vector.pxd</span>
+
+<span class="s0">Each class is duplicated for all dtypes (float and double). The keywords</span>
+<span class="s0">between double braces are substituted in setup.py.</span>
+<span class="s0">&quot;&quot;&quot;</span>
+
+<span class="s0"># name_suffix, c_type, reset_wscale_threshold</span>
+<span class="s0">dtypes = [('64', 'double', 1e-9),</span>
+          <span class="s0">('32', 'float', 1e-6)]</span>
+
+<span class="s0">}}</span>
+
+<span class="s0"># cython: binding=False</span>
+<span class="s0">#</span>
+<span class="s0"># Author: Peter Prettenhofer &lt;peter.prettenhofer@gmail.com&gt;</span>
+<span class="s0">#         Lars Buitinck</span>
+<span class="s0">#         Danny Sullivan &lt;dsullivan7@hotmail.com&gt;</span>
+<span class="s0">#</span>
+<span class="s0"># License: BSD 3 clause</span>
+
+<span class="s0">cimport cython</span>
+<span class="s0">from libc.limits cimport INT_MAX</span>
+<span class="s0">from libc.math cimport sqrt</span>
+
+<span class="s0">from ._cython_blas cimport _dot, _scal, _axpy</span>
+
+<span class="s0">{{for name_suffix, c_type, reset_wscale_threshold in dtypes}}</span>
+
+<span class="s0">cdef class WeightVector{{name_suffix}}(object):</span>
+    <span class="s0">&quot;&quot;&quot;Dense vector represented by a scalar and a numpy array.</span>
+
+    <span class="s0">The class provides methods to ``add`` a sparse vector</span>
+    <span class="s0">and scale the vector.</span>
+    <span class="s0">Representing a vector explicitly as a scalar times a</span>
+    <span class="s0">vector allows for efficient scaling operations.</span>
+
+    <span class="s0">Attributes</span>
+    <span class="s0">----------</span>
+    <span class="s0">w : ndarray, dtype={{c_type}}, order='C'</span>
+        <span class="s0">The numpy array which backs the weight vector.</span>
+    <span class="s0">aw : ndarray, dtype={{c_type}}, order='C'</span>
+        <span class="s0">The numpy array which backs the average_weight vector.</span>
+    <span class="s0">w_data_ptr : {{c_type}}*</span>
+        <span class="s0">A pointer to the data of the numpy array.</span>
+    <span class="s0">wscale : {{c_type}}</span>
+        <span class="s0">The scale of the vector.</span>
+    <span class="s0">n_features : int</span>
+        <span class="s0">The number of features (= dimensionality of ``w``).</span>
+    <span class="s0">sq_norm : {{c_type}}</span>
+        <span class="s0">The squared norm of ``w``.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">def __cinit__(self,</span>
+                  <span class="s0">{{c_type}}[::1] w,</span>
+                  <span class="s0">{{c_type}}[::1] aw):</span>
+
+        <span class="s0">if w.shape[0] &gt; INT_MAX:</span>
+            <span class="s0">raise ValueError(&quot;More than %d features not supported; got %d.&quot;</span>
+                             <span class="s0">% (INT_MAX, w.shape[0]))</span>
+        <span class="s0">self.w = w</span>
+        <span class="s0">self.w_data_ptr = &amp;w[0]</span>
+        <span class="s0">self.wscale = 1.0</span>
+        <span class="s0">self.n_features = w.shape[0]</span>
+        <span class="s0">self.sq_norm = _dot(self.n_features, self.w_data_ptr, 1, self.w_data_ptr, 1)</span>
+
+        <span class="s0">self.aw = aw</span>
+        <span class="s0">if self.aw is not None:</span>
+            <span class="s0">self.aw_data_ptr = &amp;aw[0]</span>
+            <span class="s0">self.average_a = 0.0</span>
+            <span class="s0">self.average_b = 1.0</span>
+
+    <span class="s0">cdef void add(self, {{c_type}} *x_data_ptr, int *x_ind_ptr, int xnnz,</span>
+                  <span class="s0">{{c_type}} c) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Scales sample x by constant c and adds it to the weight vector.</span>
+
+        <span class="s0">This operation updates ``sq_norm``.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">x_data_ptr : {{c_type}}*</span>
+            <span class="s0">The array which holds the feature values of ``x``.</span>
+        <span class="s0">x_ind_ptr : np.intc*</span>
+            <span class="s0">The array which holds the feature indices of ``x``.</span>
+        <span class="s0">xnnz : int</span>
+            <span class="s0">The number of non-zero features of ``x``.</span>
+        <span class="s0">c : {{c_type}}</span>
+            <span class="s0">The scaling constant for the example.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef int j</span>
+        <span class="s0">cdef int idx</span>
+        <span class="s0">cdef double val</span>
+        <span class="s0">cdef double innerprod = 0.0</span>
+        <span class="s0">cdef double xsqnorm = 0.0</span>
+
+        <span class="s0"># the next two lines save a factor of 2!</span>
+        <span class="s0">cdef {{c_type}} wscale = self.wscale</span>
+        <span class="s0">cdef {{c_type}}* w_data_ptr = self.w_data_ptr</span>
+
+        <span class="s0">for j in range(xnnz):</span>
+            <span class="s0">idx = x_ind_ptr[j]</span>
+            <span class="s0">val = x_data_ptr[j]</span>
+            <span class="s0">innerprod += (w_data_ptr[idx] * val)</span>
+            <span class="s0">xsqnorm += (val * val)</span>
+            <span class="s0">w_data_ptr[idx] += val * (c / wscale)</span>
+
+        <span class="s0">self.sq_norm += (xsqnorm * c * c) + (2.0 * innerprod * wscale * c)</span>
+
+    <span class="s0"># Update the average weights according to the sparse trick defined</span>
+    <span class="s0"># here: https://research.microsoft.com/pubs/192769/tricks-2012.pdf</span>
+    <span class="s0"># by Leon Bottou</span>
+    <span class="s0">cdef void add_average(self, {{c_type}} *x_data_ptr, int *x_ind_ptr, int xnnz,</span>
+                          <span class="s0">{{c_type}} c, {{c_type}} num_iter) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Updates the average weight vector.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">x_data_ptr : {{c_type}}*</span>
+            <span class="s0">The array which holds the feature values of ``x``.</span>
+        <span class="s0">x_ind_ptr : np.intc*</span>
+            <span class="s0">The array which holds the feature indices of ``x``.</span>
+        <span class="s0">xnnz : int</span>
+            <span class="s0">The number of non-zero features of ``x``.</span>
+        <span class="s0">c : {{c_type}}</span>
+            <span class="s0">The scaling constant for the example.</span>
+        <span class="s0">num_iter : {{c_type}}</span>
+            <span class="s0">The total number of iterations.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef int j</span>
+        <span class="s0">cdef int idx</span>
+        <span class="s0">cdef double val</span>
+        <span class="s0">cdef double mu = 1.0 / num_iter</span>
+        <span class="s0">cdef double average_a = self.average_a</span>
+        <span class="s0">cdef double wscale = self.wscale</span>
+        <span class="s0">cdef {{c_type}}* aw_data_ptr = self.aw_data_ptr</span>
+
+        <span class="s0">for j in range(xnnz):</span>
+            <span class="s0">idx = x_ind_ptr[j]</span>
+            <span class="s0">val = x_data_ptr[j]</span>
+            <span class="s0">aw_data_ptr[idx] += (self.average_a * val * (-c / wscale))</span>
+
+        <span class="s0"># Once the sample has been processed</span>
+        <span class="s0"># update the average_a and average_b</span>
+        <span class="s0">if num_iter &gt; 1:</span>
+            <span class="s0">self.average_b /= (1.0 - mu)</span>
+        <span class="s0">self.average_a += mu * self.average_b * wscale</span>
+
+    <span class="s0">cdef {{c_type}} dot(self, {{c_type}} *x_data_ptr, int *x_ind_ptr,</span>
+                    <span class="s0">int xnnz) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Computes the dot product of a sample x and the weight vector.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">x_data_ptr : {{c_type}}*</span>
+            <span class="s0">The array which holds the feature values of ``x``.</span>
+        <span class="s0">x_ind_ptr : np.intc*</span>
+            <span class="s0">The array which holds the feature indices of ``x``.</span>
+        <span class="s0">xnnz : int</span>
+            <span class="s0">The number of non-zero features of ``x`` (length of x_ind_ptr).</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">innerprod : {{c_type}}</span>
+            <span class="s0">The inner product of ``x`` and ``w``.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">cdef int j</span>
+        <span class="s0">cdef int idx</span>
+        <span class="s0">cdef double innerprod = 0.0</span>
+        <span class="s0">cdef {{c_type}}* w_data_ptr = self.w_data_ptr</span>
+        <span class="s0">for j in range(xnnz):</span>
+            <span class="s0">idx = x_ind_ptr[j]</span>
+            <span class="s0">innerprod += w_data_ptr[idx] * x_data_ptr[j]</span>
+        <span class="s0">innerprod *= self.wscale</span>
+        <span class="s0">return innerprod</span>
+
+    <span class="s0">cdef void scale(self, {{c_type}} c) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Scales the weight vector by a constant ``c``.</span>
+
+        <span class="s0">It updates ``wscale`` and ``sq_norm``. If ``wscale`` gets too</span>
+        <span class="s0">small we call ``reset_swcale``.&quot;&quot;&quot;</span>
+        <span class="s0">self.wscale *= c</span>
+        <span class="s0">self.sq_norm *= (c * c)</span>
+
+        <span class="s0">if self.wscale &lt; {{reset_wscale_threshold}}:</span>
+            <span class="s0">self.reset_wscale()</span>
+
+    <span class="s0">cdef void reset_wscale(self) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Scales each coef of ``w`` by ``wscale`` and resets it to 1. &quot;&quot;&quot;</span>
+        <span class="s0">if self.aw_data_ptr != NULL:</span>
+            <span class="s0">_axpy(self.n_features, self.average_a,</span>
+                  <span class="s0">self.w_data_ptr, 1, self.aw_data_ptr, 1)</span>
+            <span class="s0">_scal(self.n_features, 1.0 / self.average_b, self.aw_data_ptr, 1)</span>
+            <span class="s0">self.average_a = 0.0</span>
+            <span class="s0">self.average_b = 1.0</span>
+
+        <span class="s0">_scal(self.n_features, self.wscale, self.w_data_ptr, 1)</span>
+        <span class="s0">self.wscale = 1.0</span>
+
+    <span class="s0">cdef {{c_type}} norm(self) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;The L2 norm of the weight vector. &quot;&quot;&quot;</span>
+        <span class="s0">return sqrt(self.sq_norm)</span>
+
+<span class="s0">{{endfor}}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,821 @@
+<html>
+<head>
+<title>_tree.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_tree.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0"># Tree handling (condensing, finding stable clusters) for hdbscan</span>
+<span class="s0"># Authors: Leland McInnes</span>
+<span class="s0"># Copyright (c) 2015, Leland McInnes</span>
+<span class="s0"># All rights reserved.</span>
+
+<span class="s0"># Redistribution and use in source and binary forms, with or without</span>
+<span class="s0"># modification, are permitted provided that the following conditions are met:</span>
+
+<span class="s0"># 1. Redistributions of source code must retain the above copyright notice,</span>
+<span class="s0"># this list of conditions and the following disclaimer.</span>
+
+<span class="s0"># 2. Redistributions in binary form must reproduce the above copyright notice,</span>
+<span class="s0"># this list of conditions and the following disclaimer in the documentation</span>
+<span class="s0"># and/or other materials provided with the distribution.</span>
+
+<span class="s0"># 3. Neither the name of the copyright holder nor the names of its contributors</span>
+<span class="s0"># may be used to endorse or promote products derived from this software without</span>
+<span class="s0"># specific prior written permission.</span>
+
+<span class="s0"># THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&quot;</span>
+<span class="s0"># AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE</span>
+<span class="s0"># IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE</span>
+<span class="s0"># ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE</span>
+<span class="s0"># LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR</span>
+<span class="s0"># CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF</span>
+<span class="s0"># SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS</span>
+<span class="s0"># INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN</span>
+<span class="s0"># CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)</span>
+<span class="s0"># ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE</span>
+<span class="s0"># POSSIBILITY OF SUCH DAMAGE.</span>
+
+
+<span class="s2">cimport </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">cnp</span>
+<span class="s2">from </span><span class="s1">libc</span><span class="s3">.</span><span class="s1">math </span><span class="s2">cimport </span><span class="s1">isinf</span>
+<span class="s2">import </span><span class="s1">cython</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s1">cnp</span><span class="s3">.</span><span class="s1">import_array</span><span class="s3">()</span>
+
+<span class="s2">cdef </span><span class="s1">extern </span><span class="s2">from </span><span class="s4">&quot;numpy/arrayobject.h&quot;</span><span class="s3">:</span>
+    <span class="s1">intp_t </span><span class="s3">* </span><span class="s1">PyArray_SHAPE</span><span class="s3">(</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject </span><span class="s3">*)</span>
+
+<span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t INFTY </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+<span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t NOISE </span><span class="s3">= -</span><span class="s5">1</span>
+
+<span class="s1">HIERARCHY_dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">([</span>
+    <span class="s3">(</span><span class="s4">&quot;left_node&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">),</span>
+    <span class="s3">(</span><span class="s4">&quot;right_node&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">),</span>
+    <span class="s3">(</span><span class="s4">&quot;value&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">),</span>
+    <span class="s3">(</span><span class="s4">&quot;cluster_size&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">),</span>
+<span class="s3">])</span>
+
+<span class="s1">CONDENSED_dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">([</span>
+    <span class="s3">(</span><span class="s4">&quot;parent&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">),</span>
+    <span class="s3">(</span><span class="s4">&quot;child&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">),</span>
+    <span class="s3">(</span><span class="s4">&quot;value&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">),</span>
+    <span class="s3">(</span><span class="s4">&quot;cluster_size&quot;</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">),</span>
+<span class="s3">])</span>
+
+<span class="s2">cpdef </span><span class="s1">tuple tree_to_labels</span><span class="s3">(</span>
+    <span class="s1">const HIERARCHY_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">single_linkage_tree</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t min_cluster_size</span><span class="s3">=</span><span class="s5">10</span><span class="s3">,</span>
+    <span class="s1">cluster_selection_method</span><span class="s3">=</span><span class="s4">&quot;eom&quot;</span><span class="s3">,</span>
+    <span class="s1">bint allow_single_cluster</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t cluster_selection_epsilon</span><span class="s3">=</span><span class="s5">0.0</span><span class="s3">,</span>
+    <span class="s1">max_cluster_size</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+<span class="s3">):</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">condensed_tree</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">labels</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">probabilities</span>
+
+    <span class="s1">condensed_tree </span><span class="s3">= </span><span class="s1">_condense_tree</span><span class="s3">(</span><span class="s1">single_linkage_tree</span><span class="s3">, </span><span class="s1">min_cluster_size</span><span class="s3">)</span>
+    <span class="s1">labels</span><span class="s3">, </span><span class="s1">probabilities </span><span class="s3">= </span><span class="s1">_get_clusters</span><span class="s3">(</span>
+        <span class="s1">condensed_tree</span><span class="s3">,</span>
+        <span class="s1">_compute_stability</span><span class="s3">(</span><span class="s1">condensed_tree</span><span class="s3">),</span>
+        <span class="s1">cluster_selection_method</span><span class="s3">,</span>
+        <span class="s1">allow_single_cluster</span><span class="s3">,</span>
+        <span class="s1">cluster_selection_epsilon</span><span class="s3">,</span>
+        <span class="s1">max_cluster_size</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">labels</span><span class="s3">, </span><span class="s1">probabilities</span><span class="s3">)</span>
+
+<span class="s2">cdef </span><span class="s1">list bfs_from_hierarchy</span><span class="s3">(</span>
+    <span class="s1">const HIERARCHY_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">hierarchy</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t bfs_root</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Perform a breadth first search on a tree in scipy hclust format. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">cdef </span><span class="s1">list process_queue</span><span class="s3">, </span><span class="s1">next_queue</span><span class="s3">, </span><span class="s1">result</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t n_samples </span><span class="s3">= </span><span class="s1">hierarchy</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] + </span><span class="s5">1</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t node</span>
+    <span class="s1">process_queue </span><span class="s3">= [</span><span class="s1">bfs_root</span><span class="s3">]</span>
+    <span class="s1">result </span><span class="s3">= []</span>
+
+    <span class="s2">while </span><span class="s1">process_queue</span><span class="s3">:</span>
+        <span class="s1">result</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">process_queue</span><span class="s3">)</span>
+        <span class="s0"># By construction, node i is formed by the union of nodes</span>
+        <span class="s0"># hierarchy[i - n_samples, 0] and hierarchy[i - n_samples, 1]</span>
+        <span class="s1">process_queue </span><span class="s3">= [</span>
+            <span class="s1">x </span><span class="s3">- </span><span class="s1">n_samples</span>
+            <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">process_queue</span>
+            <span class="s2">if </span><span class="s1">x </span><span class="s3">&gt;= </span><span class="s1">n_samples</span>
+        <span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">process_queue</span><span class="s3">:</span>
+            <span class="s1">next_queue </span><span class="s3">= []</span>
+            <span class="s2">for </span><span class="s1">node </span><span class="s2">in </span><span class="s1">process_queue</span><span class="s3">:</span>
+                <span class="s1">next_queue</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span>
+                    <span class="s3">[</span>
+                        <span class="s1">hierarchy</span><span class="s3">[</span><span class="s1">node</span><span class="s3">].</span><span class="s1">left_node</span><span class="s3">,</span>
+                        <span class="s1">hierarchy</span><span class="s3">[</span><span class="s1">node</span><span class="s3">].</span><span class="s1">right_node</span><span class="s3">,</span>
+                    <span class="s3">]</span>
+                <span class="s3">)</span>
+            <span class="s1">process_queue </span><span class="s3">= </span><span class="s1">next_queue</span>
+    <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s2">cpdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">_condense_tree</span><span class="s3">(</span>
+    <span class="s1">const HIERARCHY_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">hierarchy</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t min_cluster_size</span><span class="s3">=</span><span class="s5">10</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot;Condense a tree according to a minimum cluster size. This is akin 
+    to the runt pruning procedure of Stuetzle. The result is a much simpler 
+    tree that is easier to visualize. We include extra information on the 
+    lambda value at which individual points depart clusters for later 
+    analysis and computation. 
+ 
+    Parameters 
+    ---------- 
+    hierarchy : ndarray of shape (n_samples,), dtype=HIERARCHY_dtype 
+        A single linkage hierarchy in scipy.cluster.hierarchy format. 
+ 
+    min_cluster_size : int, optional (default 10) 
+        The minimum size of clusters to consider. Clusters smaller than this 
+        are pruned from the tree. 
+ 
+    Returns 
+    ------- 
+    condensed_tree : ndarray of shape (n_samples,), dtype=CONDENSED_dtype 
+        Effectively an edgelist encoding a parent/child pair, along with a 
+        value and the corresponding cluster_size in each row providing a tree 
+        structure. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t root </span><span class="s3">= </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">hierarchy</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t n_samples </span><span class="s3">= </span><span class="s1">hierarchy</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] + </span><span class="s5">1</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t next_label </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s3">+ </span><span class="s5">1</span>
+        <span class="s1">list result_list</span><span class="s3">, </span><span class="s1">node_list </span><span class="s3">= </span><span class="s1">bfs_from_hierarchy</span><span class="s3">(</span><span class="s1">hierarchy</span><span class="s3">, </span><span class="s1">root</span><span class="s3">)</span>
+
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">relabel</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">uint8_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">ignore</span>
+
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t node</span><span class="s3">, </span><span class="s1">sub_node</span><span class="s3">, </span><span class="s1">left</span><span class="s3">, </span><span class="s1">right</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t lambda_value</span><span class="s3">, </span><span class="s1">distance</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t left_count</span><span class="s3">, </span><span class="s1">right_count</span>
+        <span class="s1">HIERARCHY_t children</span>
+
+    <span class="s1">relabel </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">root </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+    <span class="s1">relabel</span><span class="s3">[</span><span class="s1">root</span><span class="s3">] = </span><span class="s1">n_samples</span>
+    <span class="s1">result_list </span><span class="s3">= []</span>
+    <span class="s1">ignore </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">node_list</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">bool</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">node </span><span class="s2">in </span><span class="s1">node_list</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">ignore</span><span class="s3">[</span><span class="s1">node</span><span class="s3">] </span><span class="s2">or </span><span class="s1">node </span><span class="s3">&lt; </span><span class="s1">n_samples</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">children </span><span class="s3">= </span><span class="s1">hierarchy</span><span class="s3">[</span><span class="s1">node </span><span class="s3">- </span><span class="s1">n_samples</span><span class="s3">]</span>
+        <span class="s1">left </span><span class="s3">= </span><span class="s1">children</span><span class="s3">.</span><span class="s1">left_node</span>
+        <span class="s1">right </span><span class="s3">= </span><span class="s1">children</span><span class="s3">.</span><span class="s1">right_node</span>
+        <span class="s1">distance </span><span class="s3">= </span><span class="s1">children</span><span class="s3">.</span><span class="s1">value</span>
+        <span class="s2">if </span><span class="s1">distance </span><span class="s3">&gt; </span><span class="s5">0.0</span><span class="s3">:</span>
+            <span class="s1">lambda_value </span><span class="s3">= </span><span class="s5">1.0 </span><span class="s3">/ </span><span class="s1">distance</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">lambda_value </span><span class="s3">= </span><span class="s1">INFTY</span>
+
+        <span class="s2">if </span><span class="s1">left </span><span class="s3">&gt;= </span><span class="s1">n_samples</span><span class="s3">:</span>
+            <span class="s1">left_count </span><span class="s3">= </span><span class="s1">hierarchy</span><span class="s3">[</span><span class="s1">left </span><span class="s3">- </span><span class="s1">n_samples</span><span class="s3">].</span><span class="s1">cluster_size</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">left_count </span><span class="s3">= </span><span class="s5">1</span>
+
+        <span class="s2">if </span><span class="s1">right </span><span class="s3">&gt;= </span><span class="s1">n_samples</span><span class="s3">:</span>
+            <span class="s1">right_count </span><span class="s3">= &lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">&gt; </span><span class="s1">hierarchy</span><span class="s3">[</span><span class="s1">right </span><span class="s3">- </span><span class="s1">n_samples</span><span class="s3">].</span><span class="s1">cluster_size</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">right_count </span><span class="s3">= </span><span class="s5">1</span>
+
+        <span class="s2">if </span><span class="s1">left_count </span><span class="s3">&gt;= </span><span class="s1">min_cluster_size </span><span class="s2">and </span><span class="s1">right_count </span><span class="s3">&gt;= </span><span class="s1">min_cluster_size</span><span class="s3">:</span>
+            <span class="s1">relabel</span><span class="s3">[</span><span class="s1">left</span><span class="s3">] = </span><span class="s1">next_label</span>
+            <span class="s1">next_label </span><span class="s3">+= </span><span class="s5">1</span>
+            <span class="s1">result_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                <span class="s3">(</span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">], </span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">left</span><span class="s3">], </span><span class="s1">lambda_value</span><span class="s3">, </span><span class="s1">left_count</span><span class="s3">)</span>
+            <span class="s3">)</span>
+
+            <span class="s1">relabel</span><span class="s3">[</span><span class="s1">right</span><span class="s3">] = </span><span class="s1">next_label</span>
+            <span class="s1">next_label </span><span class="s3">+= </span><span class="s5">1</span>
+            <span class="s1">result_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                <span class="s3">(</span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">], </span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">right</span><span class="s3">], </span><span class="s1">lambda_value</span><span class="s3">, </span><span class="s1">right_count</span><span class="s3">)</span>
+            <span class="s3">)</span>
+
+        <span class="s2">elif </span><span class="s1">left_count </span><span class="s3">&lt; </span><span class="s1">min_cluster_size </span><span class="s2">and </span><span class="s1">right_count </span><span class="s3">&lt; </span><span class="s1">min_cluster_size</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">sub_node </span><span class="s2">in </span><span class="s1">bfs_from_hierarchy</span><span class="s3">(</span><span class="s1">hierarchy</span><span class="s3">, </span><span class="s1">left</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">sub_node </span><span class="s3">&lt; </span><span class="s1">n_samples</span><span class="s3">:</span>
+                    <span class="s1">result_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                        <span class="s3">(</span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">], </span><span class="s1">sub_node</span><span class="s3">, </span><span class="s1">lambda_value</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+                    <span class="s3">)</span>
+                <span class="s1">ignore</span><span class="s3">[</span><span class="s1">sub_node</span><span class="s3">] = </span><span class="s2">True</span>
+
+            <span class="s2">for </span><span class="s1">sub_node </span><span class="s2">in </span><span class="s1">bfs_from_hierarchy</span><span class="s3">(</span><span class="s1">hierarchy</span><span class="s3">, </span><span class="s1">right</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">sub_node </span><span class="s3">&lt; </span><span class="s1">n_samples</span><span class="s3">:</span>
+                    <span class="s1">result_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                        <span class="s3">(</span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">], </span><span class="s1">sub_node</span><span class="s3">, </span><span class="s1">lambda_value</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+                    <span class="s3">)</span>
+                <span class="s1">ignore</span><span class="s3">[</span><span class="s1">sub_node</span><span class="s3">] = </span><span class="s2">True</span>
+
+        <span class="s2">elif </span><span class="s1">left_count </span><span class="s3">&lt; </span><span class="s1">min_cluster_size</span><span class="s3">:</span>
+            <span class="s1">relabel</span><span class="s3">[</span><span class="s1">right</span><span class="s3">] = </span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">]</span>
+            <span class="s2">for </span><span class="s1">sub_node </span><span class="s2">in </span><span class="s1">bfs_from_hierarchy</span><span class="s3">(</span><span class="s1">hierarchy</span><span class="s3">, </span><span class="s1">left</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">sub_node </span><span class="s3">&lt; </span><span class="s1">n_samples</span><span class="s3">:</span>
+                    <span class="s1">result_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                        <span class="s3">(</span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">], </span><span class="s1">sub_node</span><span class="s3">, </span><span class="s1">lambda_value</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+                    <span class="s3">)</span>
+                <span class="s1">ignore</span><span class="s3">[</span><span class="s1">sub_node</span><span class="s3">] = </span><span class="s2">True</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">relabel</span><span class="s3">[</span><span class="s1">left</span><span class="s3">] = </span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">]</span>
+            <span class="s2">for </span><span class="s1">sub_node </span><span class="s2">in </span><span class="s1">bfs_from_hierarchy</span><span class="s3">(</span><span class="s1">hierarchy</span><span class="s3">, </span><span class="s1">right</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">sub_node </span><span class="s3">&lt; </span><span class="s1">n_samples</span><span class="s3">:</span>
+                    <span class="s1">result_list</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                        <span class="s3">(</span><span class="s1">relabel</span><span class="s3">[</span><span class="s1">node</span><span class="s3">], </span><span class="s1">sub_node</span><span class="s3">, </span><span class="s1">lambda_value</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+                    <span class="s3">)</span>
+                <span class="s1">ignore</span><span class="s3">[</span><span class="s1">sub_node</span><span class="s3">] = </span><span class="s2">True</span>
+
+    <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">result_list</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">CONDENSED_dtype</span><span class="s3">)</span>
+
+
+<span class="s2">cdef </span><span class="s1">dict _compute_stability</span><span class="s3">(</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">condensed_tree</span>
+<span class="s3">):</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">result</span><span class="s3">, </span><span class="s1">births</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[:] </span><span class="s1">parents </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">]</span>
+
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t parent</span><span class="s3">, </span><span class="s1">cluster_size</span><span class="s3">, </span><span class="s1">result_index</span><span class="s3">, </span><span class="s1">idx</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t lambda_val</span>
+        <span class="s1">CONDENSED_t condensed_node</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t largest_child </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">].</span><span class="s1">max</span><span class="s3">()</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t smallest_cluster </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">min</span><span class="s3">(</span><span class="s1">parents</span><span class="s3">)</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t num_clusters </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">parents</span><span class="s3">) - </span><span class="s1">smallest_cluster </span><span class="s3">+ </span><span class="s5">1</span>
+        <span class="s1">dict stability_dict </span><span class="s3">= {}</span>
+
+    <span class="s1">largest_child </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">largest_child</span><span class="s3">, </span><span class="s1">smallest_cluster</span><span class="s3">)</span>
+    <span class="s1">births </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">largest_child </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">PyArray_SHAPE</span><span class="s3">(&lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject</span><span class="s3">*&gt; </span><span class="s1">condensed_tree</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]):</span>
+        <span class="s1">condensed_node </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">]</span>
+        <span class="s1">births</span><span class="s3">[</span><span class="s1">condensed_node</span><span class="s3">.</span><span class="s1">child</span><span class="s3">] = </span><span class="s1">condensed_node</span><span class="s3">.</span><span class="s1">value</span>
+
+    <span class="s1">births</span><span class="s3">[</span><span class="s1">smallest_cluster</span><span class="s3">] = </span><span class="s5">0.0</span>
+
+    <span class="s1">result </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">num_clusters</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">PyArray_SHAPE</span><span class="s3">(&lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject</span><span class="s3">*&gt; </span><span class="s1">condensed_tree</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]):</span>
+        <span class="s1">condensed_node </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">]</span>
+        <span class="s1">parent </span><span class="s3">= </span><span class="s1">condensed_node</span><span class="s3">.</span><span class="s1">parent</span>
+        <span class="s1">lambda_val </span><span class="s3">= </span><span class="s1">condensed_node</span><span class="s3">.</span><span class="s1">value</span>
+        <span class="s1">cluster_size </span><span class="s3">= </span><span class="s1">condensed_node</span><span class="s3">.</span><span class="s1">cluster_size</span>
+
+        <span class="s1">result_index </span><span class="s3">= </span><span class="s1">parent </span><span class="s3">- </span><span class="s1">smallest_cluster</span>
+        <span class="s1">result</span><span class="s3">[</span><span class="s1">result_index</span><span class="s3">] += (</span><span class="s1">lambda_val </span><span class="s3">- </span><span class="s1">births</span><span class="s3">[</span><span class="s1">parent</span><span class="s3">]) * </span><span class="s1">cluster_size</span>
+
+    <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">num_clusters</span><span class="s3">):</span>
+        <span class="s1">stability_dict</span><span class="s3">[</span><span class="s1">idx </span><span class="s3">+ </span><span class="s1">smallest_cluster</span><span class="s3">] = </span><span class="s1">result</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">]</span>
+
+    <span class="s2">return </span><span class="s1">stability_dict</span>
+
+
+<span class="s2">cdef </span><span class="s1">list bfs_from_cluster_tree</span><span class="s3">(</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">condensed_tree</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t bfs_root</span>
+<span class="s3">):</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">list result </span><span class="s3">= []</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">] </span><span class="s1">process_queue </span><span class="s3">= (</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s1">bfs_root</span><span class="s3">], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+        <span class="s3">)</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">] </span><span class="s1">children </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">]</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[:] </span><span class="s1">parents </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">]</span>
+
+    <span class="s2">while </span><span class="s1">len</span><span class="s3">(</span><span class="s1">process_queue</span><span class="s3">) &gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">result</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">process_queue</span><span class="s3">.</span><span class="s1">tolist</span><span class="s3">())</span>
+        <span class="s1">process_queue </span><span class="s3">= </span><span class="s1">children</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isin</span><span class="s3">(</span><span class="s1">parents</span><span class="s3">, </span><span class="s1">process_queue</span><span class="s3">)]</span>
+
+    <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">max_lambdas</span><span class="s3">(</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">condensed_tree</span><span class="s3">):</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t parent</span><span class="s3">, </span><span class="s1">current_parent</span><span class="s3">, </span><span class="s1">idx</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t lambda_val</span><span class="s3">, </span><span class="s1">max_lambda</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">deaths</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t largest_parent </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">].</span><span class="s1">max</span><span class="s3">()</span>
+
+    <span class="s1">deaths </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">largest_parent </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">)</span>
+    <span class="s1">current_parent </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">parent</span>
+    <span class="s1">max_lambda </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">value</span>
+
+    <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s5">1</span><span class="s3">, </span><span class="s1">PyArray_SHAPE</span><span class="s3">(&lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject</span><span class="s3">*&gt; </span><span class="s1">condensed_tree</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]):</span>
+        <span class="s1">parent </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">].</span><span class="s1">parent</span>
+        <span class="s1">lambda_val </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">].</span><span class="s1">value</span>
+
+        <span class="s2">if </span><span class="s1">parent </span><span class="s3">== </span><span class="s1">current_parent</span><span class="s3">:</span>
+            <span class="s1">max_lambda </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">max_lambda</span><span class="s3">, </span><span class="s1">lambda_val</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">deaths</span><span class="s3">[</span><span class="s1">current_parent</span><span class="s3">] = </span><span class="s1">max_lambda</span>
+            <span class="s1">current_parent </span><span class="s3">= </span><span class="s1">parent</span>
+            <span class="s1">max_lambda </span><span class="s3">= </span><span class="s1">lambda_val</span>
+
+    <span class="s1">deaths</span><span class="s3">[</span><span class="s1">current_parent</span><span class="s3">] = </span><span class="s1">max_lambda  </span><span class="s0"># value for last parent</span>
+    <span class="s2">return </span><span class="s1">deaths</span>
+
+
+<span class="s3">@</span><span class="s1">cython</span><span class="s3">.</span><span class="s1">final</span>
+<span class="s2">cdef class </span><span class="s1">TreeUnionFind</span><span class="s3">:</span>
+
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[:, ::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">data</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">uint8_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">is_component</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">size</span><span class="s3">):</span>
+        <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t idx</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">data </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s1">size</span><span class="s3">, </span><span class="s5">2</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">size</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">idx</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">is_component </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">size</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">)</span>
+
+    <span class="s2">cdef </span><span class="s1">void union</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t x</span><span class="s3">, </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t y</span><span class="s3">):</span>
+        <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t x_root </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">find</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+        <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t y_root </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">find</span><span class="s3">(</span><span class="s1">y</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x_root</span><span class="s3">, </span><span class="s5">1</span><span class="s3">] &lt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">y_root</span><span class="s3">, </span><span class="s5">1</span><span class="s3">]:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x_root</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">y_root</span>
+        <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x_root</span><span class="s3">, </span><span class="s5">1</span><span class="s3">] &gt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">y_root</span><span class="s3">, </span><span class="s5">1</span><span class="s3">]:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">y_root</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">x_root</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">y_root</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">x_root</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x_root</span><span class="s3">, </span><span class="s5">1</span><span class="s3">] += </span><span class="s5">1</span>
+        <span class="s2">return</span>
+
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t find</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t x</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] != </span><span class="s1">x</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">find</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x</span><span class="s3">, </span><span class="s5">0</span><span class="s3">])</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">is_component</span><span class="s3">[</span><span class="s1">x</span><span class="s3">] = </span><span class="s2">False</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">data</span><span class="s3">[</span><span class="s1">x</span><span class="s3">, </span><span class="s5">0</span><span class="s3">]</span>
+
+
+<span class="s2">cpdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">labelling_at_cut</span><span class="s3">(</span>
+        <span class="s1">const HIERARCHY_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">linkage</span><span class="s3">,</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t cut</span><span class="s3">,</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t min_cluster_size</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot;Given a single linkage tree and a cut value, return the 
+    vector of cluster labels at that cut value. This is useful 
+    for Robust Single Linkage, and extracting DBSCAN results 
+    from a single HDBSCAN run. 
+ 
+    Parameters 
+    ---------- 
+    linkage : ndarray of shape (n_samples,), dtype=HIERARCHY_dtype 
+        The single linkage tree in scipy.cluster.hierarchy format. 
+ 
+    cut : double 
+        The cut value at which to find clusters. 
+ 
+    min_cluster_size : int 
+        The minimum cluster size; clusters below this size at 
+        the cut will be considered noise. 
+ 
+    Returns 
+    ------- 
+    labels : ndarray of shape (n_samples,) 
+        The cluster labels for each point in the data set; 
+        a label of -1 denotes a noise assignment. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t n</span><span class="s3">, </span><span class="s1">cluster</span><span class="s3">, </span><span class="s1">root</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">cluster_label</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">unique_labels</span><span class="s3">, </span><span class="s1">cluster_size</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">result</span>
+        <span class="s1">TreeUnionFind union_find</span>
+        <span class="s1">dict cluster_label_map</span>
+        <span class="s1">HIERARCHY_t node</span>
+
+    <span class="s1">root </span><span class="s3">= </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">linkage</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">n_samples </span><span class="s3">= </span><span class="s1">root </span><span class="s3">// </span><span class="s5">2 </span><span class="s3">+ </span><span class="s5">1</span>
+    <span class="s1">result </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+    <span class="s1">union_find </span><span class="s3">= </span><span class="s1">TreeUnionFind</span><span class="s3">(</span><span class="s1">root </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">)</span>
+
+    <span class="s1">cluster </span><span class="s3">= </span><span class="s1">n_samples</span>
+    <span class="s2">for </span><span class="s1">node </span><span class="s2">in </span><span class="s1">linkage</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">node</span><span class="s3">.</span><span class="s1">value </span><span class="s3">&lt; </span><span class="s1">cut</span><span class="s3">:</span>
+            <span class="s1">union_find</span><span class="s3">.</span><span class="s1">union</span><span class="s3">(</span><span class="s1">node</span><span class="s3">.</span><span class="s1">left_node</span><span class="s3">, </span><span class="s1">cluster</span><span class="s3">)</span>
+            <span class="s1">union_find</span><span class="s3">.</span><span class="s1">union</span><span class="s3">(</span><span class="s1">node</span><span class="s3">.</span><span class="s1">right_node</span><span class="s3">, </span><span class="s1">cluster</span><span class="s3">)</span>
+        <span class="s1">cluster </span><span class="s3">+= </span><span class="s5">1</span>
+
+    <span class="s1">cluster_size </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">cluster</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+        <span class="s1">cluster </span><span class="s3">= </span><span class="s1">union_find</span><span class="s3">.</span><span class="s1">find</span><span class="s3">(</span><span class="s1">n</span><span class="s3">)</span>
+        <span class="s1">cluster_size</span><span class="s3">[</span><span class="s1">cluster</span><span class="s3">] += </span><span class="s5">1</span>
+        <span class="s1">result</span><span class="s3">[</span><span class="s1">n</span><span class="s3">] = </span><span class="s1">cluster</span>
+
+    <span class="s1">cluster_label_map </span><span class="s3">= {-</span><span class="s5">1</span><span class="s3">: </span><span class="s1">NOISE</span><span class="s3">}</span>
+    <span class="s1">cluster_label </span><span class="s3">= </span><span class="s5">0</span>
+    <span class="s1">unique_labels </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">unique</span><span class="s3">(</span><span class="s1">result</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">cluster </span><span class="s2">in </span><span class="s1">unique_labels</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">cluster_size</span><span class="s3">[</span><span class="s1">cluster</span><span class="s3">] &lt; </span><span class="s1">min_cluster_size</span><span class="s3">:</span>
+            <span class="s1">cluster_label_map</span><span class="s3">[</span><span class="s1">cluster</span><span class="s3">] = </span><span class="s1">NOISE</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">cluster_label_map</span><span class="s3">[</span><span class="s1">cluster</span><span class="s3">] = </span><span class="s1">cluster_label</span>
+            <span class="s1">cluster_label </span><span class="s3">+= </span><span class="s5">1</span>
+
+    <span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_samples</span><span class="s3">):</span>
+        <span class="s1">result</span><span class="s3">[</span><span class="s1">n</span><span class="s3">] = </span><span class="s1">cluster_label_map</span><span class="s3">[</span><span class="s1">result</span><span class="s3">[</span><span class="s1">n</span><span class="s3">]]</span>
+
+    <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s2">cpdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">_do_labelling</span><span class="s3">(</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">condensed_tree</span><span class="s3">,</span>
+        <span class="s1">set clusters</span><span class="s3">,</span>
+        <span class="s1">dict cluster_label_map</span><span class="s3">,</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t allow_single_cluster</span><span class="s3">,</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t cluster_selection_epsilon</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot;Given a condensed tree, clusters and a labeling map for the clusters, 
+    return an array containing the labels of each point based on cluster 
+    membership. Note that this is where points may be marked as noisy 
+    outliers. The determination of some points as noise is in large, single- 
+    cluster datasets is controlled by the `allow_single_cluster` and 
+    `cluster_selection_epsilon` parameters. 
+ 
+    Parameters 
+    ---------- 
+    condensed_tree : ndarray of shape (n_samples,), dtype=CONDENSED_dtype 
+        Effectively an edgelist encoding a parent/child pair, along with a 
+        value and the corresponding cluster_size in each row providing a tree 
+        structure. 
+ 
+    clusters : set 
+        The set of nodes corresponding to identified clusters. These node 
+        values should be the same as those present in `condensed_tree`. 
+ 
+    cluster_label_map : dict 
+        A mapping from the node values present in `clusters` to the labels 
+        which will be returned. 
+ 
+    Returns 
+    ------- 
+    labels : ndarray of shape (n_samples,) 
+        The cluster labels for each point in the data set; 
+        a label of -1 denotes a noise assignment. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t root_cluster</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">result</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">] </span><span class="s1">parent_array</span><span class="s3">, </span><span class="s1">child_array</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">] </span><span class="s1">lambda_array</span>
+        <span class="s1">TreeUnionFind union_find</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t n</span><span class="s3">, </span><span class="s1">parent</span><span class="s3">, </span><span class="s1">child</span><span class="s3">, </span><span class="s1">cluster</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t threshold</span>
+
+    <span class="s1">child_array </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">]</span>
+    <span class="s1">parent_array </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">]</span>
+    <span class="s1">lambda_array </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'value'</span><span class="s3">]</span>
+
+    <span class="s1">root_cluster </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">min</span><span class="s3">(</span><span class="s1">parent_array</span><span class="s3">)</span>
+    <span class="s1">result </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">root_cluster</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">intp</span><span class="s3">)</span>
+    <span class="s1">union_find </span><span class="s3">= </span><span class="s1">TreeUnionFind</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">parent_array</span><span class="s3">) + </span><span class="s5">1</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">PyArray_SHAPE</span><span class="s3">(&lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject</span><span class="s3">*&gt; </span><span class="s1">condensed_tree</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]):</span>
+        <span class="s1">child </span><span class="s3">= </span><span class="s1">child_array</span><span class="s3">[</span><span class="s1">n</span><span class="s3">]</span>
+        <span class="s1">parent </span><span class="s3">= </span><span class="s1">parent_array</span><span class="s3">[</span><span class="s1">n</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">child </span><span class="s2">not in </span><span class="s1">clusters</span><span class="s3">:</span>
+            <span class="s1">union_find</span><span class="s3">.</span><span class="s1">union</span><span class="s3">(</span><span class="s1">parent</span><span class="s3">, </span><span class="s1">child</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">root_cluster</span><span class="s3">):</span>
+        <span class="s1">cluster </span><span class="s3">= </span><span class="s1">union_find</span><span class="s3">.</span><span class="s1">find</span><span class="s3">(</span><span class="s1">n</span><span class="s3">)</span>
+        <span class="s1">label </span><span class="s3">= </span><span class="s1">NOISE</span>
+        <span class="s2">if </span><span class="s1">cluster </span><span class="s3">!= </span><span class="s1">root_cluster</span><span class="s3">:</span>
+            <span class="s1">label </span><span class="s3">= </span><span class="s1">cluster_label_map</span><span class="s3">[</span><span class="s1">cluster</span><span class="s3">]</span>
+        <span class="s2">elif </span><span class="s1">len</span><span class="s3">(</span><span class="s1">clusters</span><span class="s3">) == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">allow_single_cluster</span><span class="s3">:</span>
+            <span class="s0"># There can only be one edge with this particular child hence this</span>
+            <span class="s0"># expression extracts a unique, scalar lambda value.</span>
+            <span class="s1">parent_lambda </span><span class="s3">= </span><span class="s1">lambda_array</span><span class="s3">[</span><span class="s1">child_array </span><span class="s3">== </span><span class="s1">n</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">cluster_selection_epsilon </span><span class="s3">!= </span><span class="s5">0.0</span><span class="s3">:</span>
+                <span class="s1">threshold </span><span class="s3">= </span><span class="s5">1 </span><span class="s3">/ </span><span class="s1">cluster_selection_epsilon</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s0"># The threshold should be calculated per-sample based on the</span>
+                <span class="s0"># largest lambda of any simbling node.</span>
+                <span class="s1">threshold </span><span class="s3">= </span><span class="s1">lambda_array</span><span class="s3">[</span><span class="s1">parent_array </span><span class="s3">== </span><span class="s1">cluster</span><span class="s3">].</span><span class="s1">max</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">parent_lambda </span><span class="s3">&gt;= </span><span class="s1">threshold</span><span class="s3">:</span>
+                <span class="s1">label </span><span class="s3">= </span><span class="s1">cluster_label_map</span><span class="s3">[</span><span class="s1">cluster</span><span class="s3">]</span>
+
+        <span class="s1">result</span><span class="s3">[</span><span class="s1">n</span><span class="s3">] = </span><span class="s1">label</span>
+
+    <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">get_probabilities</span><span class="s3">(</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">condensed_tree</span><span class="s3">,</span>
+    <span class="s1">dict cluster_map</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">labels</span>
+<span class="s3">):</span>
+
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">result</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">[:] </span><span class="s1">lambda_array</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">deaths</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[:] </span><span class="s1">child_array</span><span class="s3">, </span><span class="s1">parent_array</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t root_cluster</span><span class="s3">, </span><span class="s1">n</span><span class="s3">, </span><span class="s1">point</span><span class="s3">, </span><span class="s1">cluster_num</span><span class="s3">, </span><span class="s1">cluster</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t max_lambda</span><span class="s3">, </span><span class="s1">lambda_val</span>
+
+    <span class="s1">child_array </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">]</span>
+    <span class="s1">parent_array </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">]</span>
+    <span class="s1">lambda_array </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'value'</span><span class="s3">]</span>
+
+    <span class="s1">result </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">labels</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+    <span class="s1">deaths </span><span class="s3">= </span><span class="s1">max_lambdas</span><span class="s3">(</span><span class="s1">condensed_tree</span><span class="s3">)</span>
+    <span class="s1">root_cluster </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">min</span><span class="s3">(</span><span class="s1">parent_array</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">n </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">PyArray_SHAPE</span><span class="s3">(&lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject</span><span class="s3">*&gt; </span><span class="s1">condensed_tree</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]):</span>
+        <span class="s1">point </span><span class="s3">= </span><span class="s1">child_array</span><span class="s3">[</span><span class="s1">n</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">point </span><span class="s3">&gt;= </span><span class="s1">root_cluster</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">cluster_num </span><span class="s3">= </span><span class="s1">labels</span><span class="s3">[</span><span class="s1">point</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">cluster_num </span><span class="s3">== -</span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">cluster </span><span class="s3">= </span><span class="s1">cluster_map</span><span class="s3">[</span><span class="s1">cluster_num</span><span class="s3">]</span>
+        <span class="s1">max_lambda </span><span class="s3">= </span><span class="s1">deaths</span><span class="s3">[</span><span class="s1">cluster</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">max_lambda </span><span class="s3">== </span><span class="s5">0.0 </span><span class="s2">or </span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">lambda_array</span><span class="s3">[</span><span class="s1">n</span><span class="s3">]):</span>
+            <span class="s1">result</span><span class="s3">[</span><span class="s1">point</span><span class="s3">] = </span><span class="s5">1.0</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">lambda_val </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">lambda_array</span><span class="s3">[</span><span class="s1">n</span><span class="s3">], </span><span class="s1">max_lambda</span><span class="s3">)</span>
+            <span class="s1">result</span><span class="s3">[</span><span class="s1">point</span><span class="s3">] = </span><span class="s1">lambda_val </span><span class="s3">/ </span><span class="s1">max_lambda</span>
+
+    <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s2">cpdef </span><span class="s1">list recurse_leaf_dfs</span><span class="s3">(</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">cluster_tree</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t current_node</span>
+<span class="s3">):</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">[:] </span><span class="s1">children</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t child</span>
+
+    <span class="s1">children </span><span class="s3">= </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">] == </span><span class="s1">current_node</span><span class="s3">][</span><span class="s4">'child'</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">children</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] == </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">[</span><span class="s1">current_node</span><span class="s3">,]</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">sum</span><span class="s3">([</span><span class="s1">recurse_leaf_dfs</span><span class="s3">(</span><span class="s1">cluster_tree</span><span class="s3">, </span><span class="s1">child</span><span class="s3">) </span><span class="s2">for </span><span class="s1">child </span><span class="s2">in </span><span class="s1">children</span><span class="s3">], [])</span>
+
+
+<span class="s2">cpdef </span><span class="s1">list get_cluster_tree_leaves</span><span class="s3">(</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">cluster_tree</span><span class="s3">):</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t root</span>
+    <span class="s2">if </span><span class="s1">PyArray_SHAPE</span><span class="s3">(&lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject</span><span class="s3">*&gt; </span><span class="s1">cluster_tree</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">] == </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">[]</span>
+    <span class="s1">root </span><span class="s3">= </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">].</span><span class="s1">min</span><span class="s3">()</span>
+    <span class="s2">return </span><span class="s1">recurse_leaf_dfs</span><span class="s3">(</span><span class="s1">cluster_tree</span><span class="s3">, </span><span class="s1">root</span><span class="s3">)</span>
+
+<span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t traverse_upwards</span><span class="s3">(</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">cluster_tree</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t cluster_selection_epsilon</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t leaf</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t allow_single_cluster</span>
+<span class="s3">):</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t root</span><span class="s3">, </span><span class="s1">parent</span>
+    <span class="s2">cdef </span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t parent_eps</span>
+
+    <span class="s1">root </span><span class="s3">= </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">].</span><span class="s1">min</span><span class="s3">()</span>
+    <span class="s1">parent </span><span class="s3">= </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">] == </span><span class="s1">leaf</span><span class="s3">][</span><span class="s4">'parent'</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">parent </span><span class="s3">== </span><span class="s1">root</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">allow_single_cluster</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">parent</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">leaf  </span><span class="s0"># return node closest to root</span>
+
+    <span class="s1">parent_eps </span><span class="s3">= </span><span class="s5">1 </span><span class="s3">/ </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">] == </span><span class="s1">parent</span><span class="s3">][</span><span class="s4">'value'</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">parent_eps </span><span class="s3">&gt; </span><span class="s1">cluster_selection_epsilon</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">parent</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">traverse_upwards</span><span class="s3">(</span>
+            <span class="s1">cluster_tree</span><span class="s3">,</span>
+            <span class="s1">cluster_selection_epsilon</span><span class="s3">,</span>
+            <span class="s1">parent</span><span class="s3">,</span>
+            <span class="s1">allow_single_cluster</span>
+        <span class="s3">)</span>
+
+<span class="s2">cdef </span><span class="s1">set epsilon_search</span><span class="s3">(</span>
+    <span class="s1">set leaves</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">cluster_tree</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t cluster_selection_epsilon</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t allow_single_cluster</span>
+<span class="s3">):</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">list selected_clusters </span><span class="s3">= </span><span class="s1">list</span><span class="s3">()</span>
+        <span class="s1">list processed </span><span class="s3">= </span><span class="s1">list</span><span class="s3">()</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t leaf</span><span class="s3">, </span><span class="s1">epsilon_child</span><span class="s3">, </span><span class="s1">sub_node</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t eps</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">uint8_t</span><span class="s3">[:] </span><span class="s1">leaf_nodes</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">] </span><span class="s1">children </span><span class="s3">= </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">]</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">] </span><span class="s1">distances </span><span class="s3">= </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'value'</span><span class="s3">]</span>
+
+    <span class="s2">for </span><span class="s1">leaf </span><span class="s2">in </span><span class="s1">leaves</span><span class="s3">:</span>
+        <span class="s1">leaf_nodes </span><span class="s3">= </span><span class="s1">children </span><span class="s3">== </span><span class="s1">leaf</span>
+        <span class="s1">eps </span><span class="s3">= </span><span class="s5">1 </span><span class="s3">/ </span><span class="s1">distances</span><span class="s3">[</span><span class="s1">leaf_nodes</span><span class="s3">][</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">eps </span><span class="s3">&lt; </span><span class="s1">cluster_selection_epsilon</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">leaf </span><span class="s2">not in </span><span class="s1">processed</span><span class="s3">:</span>
+                <span class="s1">epsilon_child </span><span class="s3">= </span><span class="s1">traverse_upwards</span><span class="s3">(</span>
+                    <span class="s1">cluster_tree</span><span class="s3">,</span>
+                    <span class="s1">cluster_selection_epsilon</span><span class="s3">,</span>
+                    <span class="s1">leaf</span><span class="s3">,</span>
+                    <span class="s1">allow_single_cluster</span>
+                <span class="s3">)</span>
+                <span class="s1">selected_clusters</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">epsilon_child</span><span class="s3">)</span>
+
+                <span class="s2">for </span><span class="s1">sub_node </span><span class="s2">in </span><span class="s1">bfs_from_cluster_tree</span><span class="s3">(</span><span class="s1">cluster_tree</span><span class="s3">, </span><span class="s1">epsilon_child</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">sub_node </span><span class="s3">!= </span><span class="s1">epsilon_child</span><span class="s3">:</span>
+                        <span class="s1">processed</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">sub_node</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">selected_clusters</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">leaf</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">set</span><span class="s3">(</span><span class="s1">selected_clusters</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">cython</span><span class="s3">.</span><span class="s1">wraparound</span><span class="s3">(</span><span class="s2">True</span><span class="s3">)</span>
+<span class="s2">cdef </span><span class="s1">tuple _get_clusters</span><span class="s3">(</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">condensed_tree</span><span class="s3">,</span>
+    <span class="s1">dict stability</span><span class="s3">,</span>
+    <span class="s1">cluster_selection_method</span><span class="s3">=</span><span class="s4">'eom'</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">uint8_t allow_single_cluster</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+    <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t cluster_selection_epsilon</span><span class="s3">=</span><span class="s5">0.0</span><span class="s3">,</span>
+    <span class="s1">max_cluster_size</span><span class="s3">=</span><span class="s2">None</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot;Given a tree and stability dict, produce the cluster labels 
+    (and probabilities) for a flat clustering based on the chosen 
+    cluster selection method. 
+ 
+    Parameters 
+    ---------- 
+    condensed_tree : ndarray of shape (n_samples,), dtype=CONDENSED_dtype 
+        Effectively an edgelist encoding a parent/child pair, along with a 
+        value and the corresponding cluster_size in each row providing a tree 
+        structure. 
+ 
+    stability : dict 
+        A dictionary mapping cluster_ids to stability values 
+ 
+    cluster_selection_method : string, optional (default 'eom') 
+        The method of selecting clusters. The default is the 
+        Excess of Mass algorithm specified by 'eom'. The alternate 
+        option is 'leaf'. 
+ 
+    allow_single_cluster : boolean, optional (default False) 
+        Whether to allow a single cluster to be selected by the 
+        Excess of Mass algorithm. 
+ 
+    cluster_selection_epsilon: double, optional (default 0.0) 
+        A distance threshold for cluster splits. 
+ 
+    max_cluster_size: int, default=None 
+        The maximum size for clusters located by the EOM clusterer. Can 
+        be overridden by the cluster_selection_epsilon parameter in 
+        rare cases. 
+ 
+    Returns 
+    ------- 
+    labels : ndarray of shape (n_samples,) 
+        An integer array of cluster labels, with -1 denoting noise. 
+ 
+    probabilities : ndarray (n_samples,) 
+        The cluster membership strength of each sample. 
+ 
+    stabilities : ndarray (n_clusters,) 
+        The cluster coherence strengths of each cluster. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">cdef</span><span class="s3">:</span>
+        <span class="s1">list node_list</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">CONDENSED_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">cluster_tree</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">uint8_t</span><span class="s3">[::</span><span class="s5">1</span><span class="s3">] </span><span class="s1">child_selection</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">labels</span>
+        <span class="s1">dict is_cluster</span><span class="s3">, </span><span class="s1">cluster_sizes</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t subtree_stability</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">intp_t node</span><span class="s3">, </span><span class="s1">sub_node</span><span class="s3">, </span><span class="s1">cluster</span><span class="s3">, </span><span class="s1">n_samples</span>
+        <span class="s1">cnp</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">[</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">float64_t</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s4">'c'</span><span class="s3">] </span><span class="s1">probs</span>
+
+    <span class="s0"># Assume clusters are ordered by numeric id equivalent to</span>
+    <span class="s0"># a topological sort of the tree; This is valid given the</span>
+    <span class="s0"># current implementation above, so don't change that ... or</span>
+    <span class="s0"># if you do, change this accordingly!</span>
+    <span class="s2">if </span><span class="s1">allow_single_cluster</span><span class="s3">:</span>
+        <span class="s1">node_list </span><span class="s3">= </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">stability</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">(), </span><span class="s1">reverse</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">node_list </span><span class="s3">= </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">stability</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">(), </span><span class="s1">reverse</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)[:-</span><span class="s5">1</span><span class="s3">]</span>
+        <span class="s0"># (exclude root)</span>
+
+    <span class="s1">cluster_tree </span><span class="s3">= </span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'cluster_size'</span><span class="s3">] &gt; </span><span class="s5">1</span><span class="s3">]</span>
+    <span class="s1">is_cluster </span><span class="s3">= {</span><span class="s1">cluster</span><span class="s3">: </span><span class="s2">True for </span><span class="s1">cluster </span><span class="s2">in </span><span class="s1">node_list</span><span class="s3">}</span>
+    <span class="s1">n_samples </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'cluster_size'</span><span class="s3">] == </span><span class="s5">1</span><span class="s3">][</span><span class="s4">'child'</span><span class="s3">]) + </span><span class="s5">1</span>
+
+    <span class="s2">if </span><span class="s1">max_cluster_size </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">max_cluster_size </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s3">+ </span><span class="s5">1  </span><span class="s0"># Set to a value that will never be triggered</span>
+    <span class="s1">cluster_sizes </span><span class="s3">= {</span>
+        <span class="s1">child</span><span class="s3">: </span><span class="s1">cluster_size </span><span class="s2">for </span><span class="s1">child</span><span class="s3">, </span><span class="s1">cluster_size</span>
+        <span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">], </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'cluster_size'</span><span class="s3">])</span>
+    <span class="s3">}</span>
+    <span class="s2">if </span><span class="s1">allow_single_cluster</span><span class="s3">:</span>
+        <span class="s0"># Compute cluster size for the root node</span>
+        <span class="s1">cluster_sizes</span><span class="s3">[</span><span class="s1">node_list</span><span class="s3">[-</span><span class="s5">1</span><span class="s3">]] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span>
+            <span class="s1">cluster_tree</span><span class="s3">[</span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">] == </span><span class="s1">node_list</span><span class="s3">[-</span><span class="s5">1</span><span class="s3">]][</span><span class="s4">'cluster_size'</span><span class="s3">])</span>
+
+    <span class="s2">if </span><span class="s1">cluster_selection_method </span><span class="s3">== </span><span class="s4">'eom'</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">node </span><span class="s2">in </span><span class="s1">node_list</span><span class="s3">:</span>
+            <span class="s1">child_selection </span><span class="s3">= (</span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">] == </span><span class="s1">node</span><span class="s3">)</span>
+            <span class="s1">subtree_stability </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">([</span>
+                <span class="s1">stability</span><span class="s3">[</span><span class="s1">child</span><span class="s3">] </span><span class="s2">for</span>
+                <span class="s1">child </span><span class="s2">in </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'child'</span><span class="s3">][</span><span class="s1">child_selection</span><span class="s3">]])</span>
+            <span class="s2">if </span><span class="s1">subtree_stability </span><span class="s3">&gt; </span><span class="s1">stability</span><span class="s3">[</span><span class="s1">node</span><span class="s3">] </span><span class="s2">or </span><span class="s1">cluster_sizes</span><span class="s3">[</span><span class="s1">node</span><span class="s3">] &gt; </span><span class="s1">max_cluster_size</span><span class="s3">:</span>
+                <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">node</span><span class="s3">] = </span><span class="s2">False</span>
+                <span class="s1">stability</span><span class="s3">[</span><span class="s1">node</span><span class="s3">] = </span><span class="s1">subtree_stability</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">for </span><span class="s1">sub_node </span><span class="s2">in </span><span class="s1">bfs_from_cluster_tree</span><span class="s3">(</span><span class="s1">cluster_tree</span><span class="s3">, </span><span class="s1">node</span><span class="s3">):</span>
+                    <span class="s2">if </span><span class="s1">sub_node </span><span class="s3">!= </span><span class="s1">node</span><span class="s3">:</span>
+                        <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">sub_node</span><span class="s3">] = </span><span class="s2">False</span>
+
+        <span class="s2">if </span><span class="s1">cluster_selection_epsilon </span><span class="s3">!= </span><span class="s5">0.0 </span><span class="s2">and </span><span class="s1">PyArray_SHAPE</span><span class="s3">(&lt;</span><span class="s1">cnp</span><span class="s3">.</span><span class="s1">PyArrayObject</span><span class="s3">*&gt; </span><span class="s1">cluster_tree</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">] &gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">eom_clusters </span><span class="s3">= [</span><span class="s1">c </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">is_cluster </span><span class="s2">if </span><span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">c</span><span class="s3">]]</span>
+            <span class="s1">selected_clusters </span><span class="s3">= []</span>
+            <span class="s0"># first check if eom_clusters only has root node, which skips epsilon check.</span>
+            <span class="s2">if </span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">eom_clusters</span><span class="s3">) == </span><span class="s5">1 </span><span class="s2">and </span><span class="s1">eom_clusters</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] == </span><span class="s1">cluster_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">].</span><span class="s1">min</span><span class="s3">()):</span>
+                <span class="s2">if </span><span class="s1">allow_single_cluster</span><span class="s3">:</span>
+                    <span class="s1">selected_clusters </span><span class="s3">= </span><span class="s1">eom_clusters</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">selected_clusters </span><span class="s3">= </span><span class="s1">epsilon_search</span><span class="s3">(</span>
+                    <span class="s1">set</span><span class="s3">(</span><span class="s1">eom_clusters</span><span class="s3">),</span>
+                    <span class="s1">cluster_tree</span><span class="s3">,</span>
+                    <span class="s1">cluster_selection_epsilon</span><span class="s3">,</span>
+                    <span class="s1">allow_single_cluster</span>
+                <span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">is_cluster</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">c </span><span class="s2">in </span><span class="s1">selected_clusters</span><span class="s3">:</span>
+                    <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">c</span><span class="s3">] = </span><span class="s2">True</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">c</span><span class="s3">] = </span><span class="s2">False</span>
+
+    <span class="s2">elif </span><span class="s1">cluster_selection_method </span><span class="s3">== </span><span class="s4">'leaf'</span><span class="s3">:</span>
+        <span class="s1">leaves </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">get_cluster_tree_leaves</span><span class="s3">(</span><span class="s1">cluster_tree</span><span class="s3">))</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">leaves</span><span class="s3">) == </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">is_cluster</span><span class="s3">:</span>
+                <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">c</span><span class="s3">] = </span><span class="s2">False</span>
+            <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">condensed_tree</span><span class="s3">[</span><span class="s4">'parent'</span><span class="s3">].</span><span class="s1">min</span><span class="s3">()] = </span><span class="s2">True</span>
+
+        <span class="s2">if </span><span class="s1">cluster_selection_epsilon </span><span class="s3">!= </span><span class="s5">0.0</span><span class="s3">:</span>
+            <span class="s1">selected_clusters </span><span class="s3">= </span><span class="s1">epsilon_search</span><span class="s3">(</span>
+                <span class="s1">leaves</span><span class="s3">,</span>
+                <span class="s1">cluster_tree</span><span class="s3">,</span>
+                <span class="s1">cluster_selection_epsilon</span><span class="s3">,</span>
+                <span class="s1">allow_single_cluster</span>
+            <span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">selected_clusters </span><span class="s3">= </span><span class="s1">leaves</span>
+
+        <span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">is_cluster</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">c </span><span class="s2">in </span><span class="s1">selected_clusters</span><span class="s3">:</span>
+                <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">c</span><span class="s3">] = </span><span class="s2">True</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">c</span><span class="s3">] = </span><span class="s2">False</span>
+
+    <span class="s1">clusters </span><span class="s3">= </span><span class="s1">set</span><span class="s3">([</span><span class="s1">c </span><span class="s2">for </span><span class="s1">c </span><span class="s2">in </span><span class="s1">is_cluster </span><span class="s2">if </span><span class="s1">is_cluster</span><span class="s3">[</span><span class="s1">c</span><span class="s3">]])</span>
+    <span class="s1">cluster_map </span><span class="s3">= {</span><span class="s1">c</span><span class="s3">: </span><span class="s1">n </span><span class="s2">for </span><span class="s1">n</span><span class="s3">, </span><span class="s1">c </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">list</span><span class="s3">(</span><span class="s1">clusters</span><span class="s3">)))}</span>
+    <span class="s1">reverse_cluster_map </span><span class="s3">= {</span><span class="s1">n</span><span class="s3">: </span><span class="s1">c </span><span class="s2">for </span><span class="s1">c</span><span class="s3">, </span><span class="s1">n </span><span class="s2">in </span><span class="s1">cluster_map</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()}</span>
+
+    <span class="s1">labels </span><span class="s3">= </span><span class="s1">_do_labelling</span><span class="s3">(</span>
+        <span class="s1">condensed_tree</span><span class="s3">,</span>
+        <span class="s1">clusters</span><span class="s3">,</span>
+        <span class="s1">cluster_map</span><span class="s3">,</span>
+        <span class="s1">allow_single_cluster</span><span class="s3">,</span>
+        <span class="s1">cluster_selection_epsilon</span>
+    <span class="s3">)</span>
+    <span class="s1">probs </span><span class="s3">= </span><span class="s1">get_probabilities</span><span class="s3">(</span><span class="s1">condensed_tree</span><span class="s3">, </span><span class="s1">reverse_cluster_map</span><span class="s3">, </span><span class="s1">labels</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">labels</span><span class="s3">, </span><span class="s1">probs</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,279 @@
+<html>
+<head>
+<title>_csr_polynomial_expansion.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_csr_polynomial_expansion.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0"># Authors: Andrew nystrom &lt;awnystrom@gmail.com&gt;</span>
+<span class="s0">#          Meekail Zain &lt;zainmeekail@gmail.com&gt;</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_typedefs </span><span class="s2">cimport </span><span class="s1">uint8_t</span><span class="s3">, </span><span class="s1">int64_t</span><span class="s3">, </span><span class="s1">intp_t</span>
+
+<span class="s2">ctypedef </span><span class="s1">uint8_t FLAG_t</span>
+
+<span class="s0"># We use the following verbatim block to determine whether the current</span>
+<span class="s0"># platform's compiler supports 128-bit integer values intrinsically.</span>
+<span class="s0"># This should work for GCC and CLANG on 64-bit architectures, but doesn't for</span>
+<span class="s0"># MSVC on any architecture. We prefer to use 128-bit integers when possible</span>
+<span class="s0"># because the intermediate calculations have a non-trivial risk of overflow. It</span>
+<span class="s0"># is, however, very unlikely to come up on an average use case, hence 64-bit</span>
+<span class="s0"># integers (i.e. `long long`) are &quot;good enough&quot; for most common cases. There is</span>
+<span class="s0"># not much we can do to efficiently mitigate  the overflow risk on the Windows</span>
+<span class="s0"># platform at this time. Consider this a &quot;best effort&quot; design decision that</span>
+<span class="s0"># could be revisited later in case someone comes up with a safer option that</span>
+<span class="s0"># does not hurt the performance of the common cases.</span>
+<span class="s0"># See `test_sizeof_LARGEST_INT_t()`for more information on exact type expectations.</span>
+<span class="s2">cdef </span><span class="s1">extern </span><span class="s2">from </span><span class="s3">*:</span>
+    <span class="s4">&quot;&quot;&quot; 
+    #ifdef __SIZEOF_INT128__ 
+        typedef __int128 LARGEST_INT_t; 
+    #elif (__clang__ || __EMSCRIPTEN__) &amp;&amp; !__i386__ 
+        typedef _BitInt(128) LARGEST_INT_t; 
+    #else 
+        typedef long long LARGEST_INT_t; 
+    #endif 
+    &quot;&quot;&quot;</span>
+    <span class="s2">ctypedef </span><span class="s1">long long LARGEST_INT_t</span>
+
+
+<span class="s0"># Determine the size of `LARGEST_INT_t` at runtime.</span>
+<span class="s0"># Used in `test_sizeof_LARGEST_INT_t`.</span>
+<span class="s2">def </span><span class="s1">_get_sizeof_LARGEST_INT_t</span><span class="s3">():</span>
+    <span class="s2">return </span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">LARGEST_INT_t</span><span class="s3">)</span>
+
+
+<span class="s0"># TODO: use `{int,float}{32,64}_t` when cython#5230 is resolved:</span>
+<span class="s0"># https://github.com/cython/cython/issues/5230</span>
+<span class="s2">ctypedef </span><span class="s1">fused DATA_t</span><span class="s3">:</span>
+    <span class="s1">float</span>
+    <span class="s1">double</span>
+    <span class="s1">int</span>
+    <span class="s1">long long</span>
+<span class="s0"># INDEX_{A,B}_t are defined to generate a proper Cartesian product</span>
+<span class="s0"># of types through Cython fused-type expansion.</span>
+<span class="s2">ctypedef </span><span class="s1">fused INDEX_A_t</span><span class="s3">:</span>
+    <span class="s1">signed int</span>
+    <span class="s1">signed long long</span>
+<span class="s2">ctypedef </span><span class="s1">fused INDEX_B_t</span><span class="s3">:</span>
+    <span class="s1">signed int</span>
+    <span class="s1">signed long long</span>
+
+<span class="s2">cdef </span><span class="s1">inline int64_t _deg2_column</span><span class="s3">(</span>
+    <span class="s1">LARGEST_INT_t n_features</span><span class="s3">,</span>
+    <span class="s1">LARGEST_INT_t i</span><span class="s3">,</span>
+    <span class="s1">LARGEST_INT_t j</span><span class="s3">,</span>
+    <span class="s1">FLAG_t interaction_only</span>
+<span class="s3">) </span><span class="s1">nogil</span><span class="s3">:</span>
+    <span class="s4">&quot;&quot;&quot;Compute the index of the column for a degree 2 expansion 
+ 
+    n_features is the dimensionality of the input data, i and j are the indices 
+    for the columns involved in the expansion. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">interaction_only</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">n_features </span><span class="s3">* </span><span class="s1">i </span><span class="s3">- </span><span class="s1">i </span><span class="s3">* (</span><span class="s1">i </span><span class="s3">+ </span><span class="s5">3</span><span class="s3">) / </span><span class="s5">2 </span><span class="s3">- </span><span class="s5">1 </span><span class="s3">+ </span><span class="s1">j</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">n_features </span><span class="s3">* </span><span class="s1">i </span><span class="s3">- </span><span class="s1">i</span><span class="s3">* (</span><span class="s1">i </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">) / </span><span class="s5">2 </span><span class="s3">+ </span><span class="s1">j</span>
+
+
+<span class="s2">cdef </span><span class="s1">inline int64_t _deg3_column</span><span class="s3">(</span>
+    <span class="s1">LARGEST_INT_t n_features</span><span class="s3">,</span>
+    <span class="s1">LARGEST_INT_t i</span><span class="s3">,</span>
+    <span class="s1">LARGEST_INT_t j</span><span class="s3">,</span>
+    <span class="s1">LARGEST_INT_t k</span><span class="s3">,</span>
+    <span class="s1">FLAG_t interaction_only</span>
+<span class="s3">) </span><span class="s1">nogil</span><span class="s3">:</span>
+    <span class="s4">&quot;&quot;&quot;Compute the index of the column for a degree 3 expansion 
+ 
+    n_features is the dimensionality of the input data, i, j and k are the indices 
+    for the columns involved in the expansion. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">interaction_only</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">(</span>
+            <span class="s3">(</span>
+                <span class="s3">(</span><span class="s5">3 </span><span class="s3">* </span><span class="s1">n_features</span><span class="s3">) * (</span><span class="s1">n_features </span><span class="s3">* </span><span class="s1">i </span><span class="s3">- </span><span class="s1">i</span><span class="s3">**</span><span class="s5">2</span><span class="s3">)</span>
+                <span class="s3">+ </span><span class="s1">i </span><span class="s3">* (</span><span class="s1">i</span><span class="s3">**</span><span class="s5">2 </span><span class="s3">+ </span><span class="s5">11</span><span class="s3">) - (</span><span class="s5">3 </span><span class="s3">* </span><span class="s1">j</span><span class="s3">) * (</span><span class="s1">j </span><span class="s3">+ </span><span class="s5">3</span><span class="s3">)</span>
+            <span class="s3">) / </span><span class="s5">6 </span><span class="s3">+ </span><span class="s1">i</span><span class="s3">**</span><span class="s5">2 </span><span class="s3">+ </span><span class="s1">n_features </span><span class="s3">* (</span><span class="s1">j </span><span class="s3">- </span><span class="s5">1 </span><span class="s3">- </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">i</span><span class="s3">) + </span><span class="s1">k</span>
+        <span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">(</span>
+            <span class="s3">(</span>
+                <span class="s3">(</span><span class="s5">3 </span><span class="s3">* </span><span class="s1">n_features</span><span class="s3">) * (</span><span class="s1">n_features </span><span class="s3">* </span><span class="s1">i </span><span class="s3">- </span><span class="s1">i</span><span class="s3">**</span><span class="s5">2</span><span class="s3">)</span>
+                <span class="s3">+ </span><span class="s1">i </span><span class="s3">** </span><span class="s5">3 </span><span class="s3">- </span><span class="s1">i </span><span class="s3">- (</span><span class="s5">3 </span><span class="s3">* </span><span class="s1">j</span><span class="s3">) * (</span><span class="s1">j </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">)</span>
+            <span class="s3">) / </span><span class="s5">6 </span><span class="s3">+ </span><span class="s1">n_features </span><span class="s3">* </span><span class="s1">j </span><span class="s3">+ </span><span class="s1">k</span>
+        <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">py_calc_expanded_nnz_deg2</span><span class="s3">(</span><span class="s1">n</span><span class="s3">, </span><span class="s1">interaction_only</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">n </span><span class="s3">* (</span><span class="s1">n </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">) // </span><span class="s5">2 </span><span class="s3">- </span><span class="s1">interaction_only </span><span class="s3">* </span><span class="s1">n</span>
+
+
+<span class="s2">def </span><span class="s1">py_calc_expanded_nnz_deg3</span><span class="s3">(</span><span class="s1">n</span><span class="s3">, </span><span class="s1">interaction_only</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">n </span><span class="s3">* (</span><span class="s1">n</span><span class="s3">**</span><span class="s5">2 </span><span class="s3">+ </span><span class="s5">3 </span><span class="s3">* </span><span class="s1">n </span><span class="s3">+ </span><span class="s5">2</span><span class="s3">) // </span><span class="s5">6 </span><span class="s3">- </span><span class="s1">interaction_only </span><span class="s3">* </span><span class="s1">n</span><span class="s3">**</span><span class="s5">2</span>
+
+
+<span class="s2">cpdef </span><span class="s1">int64_t _calc_expanded_nnz</span><span class="s3">(</span>
+    <span class="s1">LARGEST_INT_t n</span><span class="s3">,</span>
+    <span class="s1">FLAG_t interaction_only</span><span class="s3">,</span>
+    <span class="s1">LARGEST_INT_t degree</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Calculates the number of non-zero interaction terms generated by the 
+    non-zero elements of a single row. 
+    &quot;&quot;&quot;</span>
+    <span class="s0"># This is the maximum value before the intermediate computation</span>
+    <span class="s0"># d**2 + d overflows</span>
+    <span class="s0"># Solution to d**2 + d = maxint64</span>
+    <span class="s0"># SymPy: solve(x**2 + x - int64_max, x)</span>
+    <span class="s2">cdef </span><span class="s1">int64_t MAX_SAFE_INDEX_CALC_DEG2 </span><span class="s3">= </span><span class="s5">3037000499</span>
+
+    <span class="s0"># This is the maximum value before the intermediate computation</span>
+    <span class="s0"># d**3 + 3 * d**2 + 2*d overflows</span>
+    <span class="s0"># Solution to d**3 + 3 * d**2 + 2*d = maxint64</span>
+    <span class="s0"># SymPy: solve(x * (x**2 + 3 * x + 2) - int64_max, x)</span>
+    <span class="s2">cdef </span><span class="s1">int64_t MAX_SAFE_INDEX_CALC_DEG3 </span><span class="s3">= </span><span class="s5">2097151</span>
+
+    <span class="s2">if </span><span class="s1">degree </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:</span>
+        <span class="s0"># Only need to check when not using 128-bit integers</span>
+        <span class="s2">if </span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">LARGEST_INT_t</span><span class="s3">) &lt; </span><span class="s5">16 </span><span class="s2">and </span><span class="s1">n </span><span class="s3">&lt;= </span><span class="s1">MAX_SAFE_INDEX_CALC_DEG2</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">n </span><span class="s3">* (</span><span class="s1">n </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">) / </span><span class="s5">2 </span><span class="s3">- </span><span class="s1">interaction_only </span><span class="s3">* </span><span class="s1">n</span>
+        <span class="s2">return </span><span class="s3">&lt;</span><span class="s1">int64_t</span><span class="s3">&gt; </span><span class="s1">py_calc_expanded_nnz_deg2</span><span class="s3">(</span><span class="s1">n</span><span class="s3">, </span><span class="s1">interaction_only</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s0"># Only need to check when not using 128-bit integers</span>
+        <span class="s2">if </span><span class="s1">sizeof</span><span class="s3">(</span><span class="s1">LARGEST_INT_t</span><span class="s3">) &lt; </span><span class="s5">16 </span><span class="s2">and </span><span class="s1">n </span><span class="s3">&lt;= </span><span class="s1">MAX_SAFE_INDEX_CALC_DEG3</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">n </span><span class="s3">* (</span><span class="s1">n</span><span class="s3">**</span><span class="s5">2 </span><span class="s3">+ </span><span class="s5">3 </span><span class="s3">* </span><span class="s1">n </span><span class="s3">+ </span><span class="s5">2</span><span class="s3">) / </span><span class="s5">6 </span><span class="s3">- </span><span class="s1">interaction_only </span><span class="s3">* </span><span class="s1">n</span><span class="s3">**</span><span class="s5">2</span>
+        <span class="s2">return </span><span class="s3">&lt;</span><span class="s1">int64_t</span><span class="s3">&gt; </span><span class="s1">py_calc_expanded_nnz_deg3</span><span class="s3">(</span><span class="s1">n</span><span class="s3">, </span><span class="s1">interaction_only</span><span class="s3">)</span>
+
+<span class="s2">cpdef </span><span class="s1">int64_t _calc_total_nnz</span><span class="s3">(</span>
+    <span class="s1">INDEX_A_t</span><span class="s3">[:] </span><span class="s1">indptr</span><span class="s3">,</span>
+    <span class="s1">FLAG_t interaction_only</span><span class="s3">,</span>
+    <span class="s1">int64_t degree</span><span class="s3">,</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Calculates the number of non-zero interaction terms generated by the 
+    non-zero elements across all rows for a single degree. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">cdef </span><span class="s1">int64_t total_nnz</span><span class="s3">=</span><span class="s5">0</span>
+    <span class="s2">cdef </span><span class="s1">intp_t row_idx</span>
+    <span class="s2">for </span><span class="s1">row_idx </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">indptr</span><span class="s3">) - </span><span class="s5">1</span><span class="s3">):</span>
+        <span class="s1">total_nnz </span><span class="s3">+= </span><span class="s1">_calc_expanded_nnz</span><span class="s3">(</span>
+            <span class="s1">indptr</span><span class="s3">[</span><span class="s1">row_idx </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">] - </span><span class="s1">indptr</span><span class="s3">[</span><span class="s1">row_idx</span><span class="s3">],</span>
+            <span class="s1">interaction_only</span><span class="s3">,</span>
+            <span class="s1">degree</span>
+        <span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">total_nnz</span>
+
+
+<span class="s2">cpdef </span><span class="s1">void _csr_polynomial_expansion</span><span class="s3">(</span>
+    <span class="s1">const DATA_t</span><span class="s3">[:] </span><span class="s1">data</span><span class="s3">,           </span><span class="s0"># IN READ-ONLY</span>
+    <span class="s1">const INDEX_A_t</span><span class="s3">[:] </span><span class="s1">indices</span><span class="s3">,     </span><span class="s0"># IN READ-ONLY</span>
+    <span class="s1">const INDEX_A_t</span><span class="s3">[:] </span><span class="s1">indptr</span><span class="s3">,      </span><span class="s0"># IN READ-ONLY</span>
+    <span class="s1">INDEX_A_t n_features</span><span class="s3">,</span>
+    <span class="s1">DATA_t</span><span class="s3">[:] </span><span class="s1">result_data</span><span class="s3">,          </span><span class="s0"># OUT</span>
+    <span class="s1">INDEX_B_t</span><span class="s3">[:] </span><span class="s1">result_indices</span><span class="s3">,    </span><span class="s0"># OUT</span>
+    <span class="s1">INDEX_B_t</span><span class="s3">[:] </span><span class="s1">result_indptr</span><span class="s3">,     </span><span class="s0"># OUT</span>
+    <span class="s1">FLAG_t interaction_only</span><span class="s3">,</span>
+    <span class="s1">FLAG_t degree</span>
+<span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Perform a second or third degree polynomial or interaction expansion on a 
+    compressed sparse row (CSR) matrix. The method used only takes products of 
+    non-zero features. For a matrix with density :math:`d`, this results in a 
+    speedup on the order of :math:`(1/d)^k` where :math:`k` is the degree of 
+    the expansion, assuming all rows are of similar density. 
+ 
+    Parameters 
+    ---------- 
+    data : memory view on nd-array 
+        The &quot;data&quot; attribute of the input CSR matrix. 
+ 
+    indices : memory view on nd-array 
+        The &quot;indices&quot; attribute of the input CSR matrix. 
+ 
+    indptr : memory view on nd-array 
+        The &quot;indptr&quot; attribute of the input CSR matrix. 
+ 
+    n_features : int 
+        The dimensionality of the input CSR matrix. 
+ 
+    result_data : nd-array 
+        The output CSR matrix's &quot;data&quot; attribute. 
+        It is modified by this routine. 
+ 
+    result_indices : nd-array 
+        The output CSR matrix's &quot;indices&quot; attribute. 
+        It is modified by this routine. 
+ 
+    result_indptr : nd-array 
+        The output CSR matrix's &quot;indptr&quot; attribute. 
+        It is modified by this routine. 
+ 
+    interaction_only : int 
+        0 for a polynomial expansion, 1 for an interaction expansion. 
+ 
+    degree : int 
+        The degree of the expansion. This must be either 2 or 3. 
+ 
+    References 
+    ---------- 
+    &quot;Leveraging Sparsity to Speed Up Polynomial Feature Expansions of CSR 
+    Matrices Using K-Simplex Numbers&quot; by Andrew Nystrom and John Hughes. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0"># Make the arrays that will form the CSR matrix of the expansion.</span>
+    <span class="s2">cdef </span><span class="s1">INDEX_A_t row_i</span><span class="s3">, </span><span class="s1">row_starts</span><span class="s3">, </span><span class="s1">row_ends</span><span class="s3">, </span><span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">i_ptr</span><span class="s3">, </span><span class="s1">j_ptr</span><span class="s3">, </span><span class="s1">k_ptr</span>
+    <span class="s2">cdef </span><span class="s1">INDEX_B_t expanded_index</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">num_cols_in_row</span><span class="s3">, </span><span class="s1">col</span>
+    <span class="s2">with </span><span class="s1">nogil</span><span class="s3">:</span>
+        <span class="s1">result_indptr</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] = </span><span class="s1">indptr</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s2">for </span><span class="s1">row_i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">indptr</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]-</span><span class="s5">1</span><span class="s3">):</span>
+            <span class="s1">row_starts </span><span class="s3">= </span><span class="s1">indptr</span><span class="s3">[</span><span class="s1">row_i</span><span class="s3">]</span>
+            <span class="s1">row_ends </span><span class="s3">= </span><span class="s1">indptr</span><span class="s3">[</span><span class="s1">row_i </span><span class="s3">+ </span><span class="s5">1</span><span class="s3">]</span>
+            <span class="s1">num_cols_in_row </span><span class="s3">= </span><span class="s5">0</span>
+            <span class="s2">for </span><span class="s1">i_ptr </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">row_starts</span><span class="s3">, </span><span class="s1">row_ends</span><span class="s3">):</span>
+                <span class="s1">i </span><span class="s3">= </span><span class="s1">indices</span><span class="s3">[</span><span class="s1">i_ptr</span><span class="s3">]</span>
+                <span class="s2">for </span><span class="s1">j_ptr </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">i_ptr </span><span class="s3">+ </span><span class="s1">interaction_only</span><span class="s3">, </span><span class="s1">row_ends</span><span class="s3">):</span>
+                    <span class="s1">j </span><span class="s3">= </span><span class="s1">indices</span><span class="s3">[</span><span class="s1">j_ptr</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">degree </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:</span>
+                        <span class="s1">col </span><span class="s3">= &lt;</span><span class="s1">INDEX_B_t</span><span class="s3">&gt; </span><span class="s1">_deg2_column</span><span class="s3">(</span>
+                            <span class="s1">n_features</span><span class="s3">,</span>
+                            <span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">,</span>
+                            <span class="s1">interaction_only</span>
+                        <span class="s3">)</span>
+                        <span class="s1">result_indices</span><span class="s3">[</span><span class="s1">expanded_index</span><span class="s3">] = </span><span class="s1">col</span>
+                        <span class="s1">result_data</span><span class="s3">[</span><span class="s1">expanded_index</span><span class="s3">] = (</span>
+                            <span class="s1">data</span><span class="s3">[</span><span class="s1">i_ptr</span><span class="s3">] * </span><span class="s1">data</span><span class="s3">[</span><span class="s1">j_ptr</span><span class="s3">]</span>
+                        <span class="s3">)</span>
+                        <span class="s1">expanded_index </span><span class="s3">+= </span><span class="s5">1</span>
+                        <span class="s1">num_cols_in_row </span><span class="s3">+= </span><span class="s5">1</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s0"># degree == 3</span>
+                        <span class="s2">for </span><span class="s1">k_ptr </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">j_ptr </span><span class="s3">+ </span><span class="s1">interaction_only</span><span class="s3">, </span><span class="s1">row_ends</span><span class="s3">):</span>
+                            <span class="s1">k </span><span class="s3">= </span><span class="s1">indices</span><span class="s3">[</span><span class="s1">k_ptr</span><span class="s3">]</span>
+                            <span class="s1">col </span><span class="s3">= &lt;</span><span class="s1">INDEX_B_t</span><span class="s3">&gt; </span><span class="s1">_deg3_column</span><span class="s3">(</span>
+                                <span class="s1">n_features</span><span class="s3">,</span>
+                                <span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">k</span><span class="s3">,</span>
+                                <span class="s1">interaction_only</span>
+                            <span class="s3">)</span>
+                            <span class="s1">result_indices</span><span class="s3">[</span><span class="s1">expanded_index</span><span class="s3">] = </span><span class="s1">col</span>
+                            <span class="s1">result_data</span><span class="s3">[</span><span class="s1">expanded_index</span><span class="s3">] = (</span>
+                                <span class="s1">data</span><span class="s3">[</span><span class="s1">i_ptr</span><span class="s3">] * </span><span class="s1">data</span><span class="s3">[</span><span class="s1">j_ptr</span><span class="s3">] * </span><span class="s1">data</span><span class="s3">[</span><span class="s1">k_ptr</span><span class="s3">]</span>
+                            <span class="s3">)</span>
+                            <span class="s1">expanded_index </span><span class="s3">+= </span><span class="s5">1</span>
+                            <span class="s1">num_cols_in_row </span><span class="s3">+= </span><span class="s5">1</span>
+
+            <span class="s1">result_indptr</span><span class="s3">[</span><span class="s1">row_i</span><span class="s3">+</span><span class="s5">1</span><span class="s3">] = </span><span class="s1">result_indptr</span><span class="s3">[</span><span class="s1">row_i</span><span class="s3">] + </span><span class="s1">num_cols_in_row</span>
+    <span class="s2">return</span>
+</pre>
+</body>
+</html>

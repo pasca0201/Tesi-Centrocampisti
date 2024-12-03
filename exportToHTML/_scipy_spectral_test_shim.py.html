@@ -1,0 +1,511 @@
+<html>
+<head>
+<title>_scipy_spectral_test_shim.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_scipy_spectral_test_shim.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Helpers to utilize existing stft / istft tests for testing `ShortTimeFFT`. 
+ 
+This module provides the functions stft_compare() and istft_compare(), which, 
+compares the output between the existing (i)stft() and the shortTimeFFT based 
+_(i)stft_wrapper() implementations in this module. 
+ 
+For testing add the following imports to the file ``tests/test_spectral.py``:: 
+ 
+    from ._scipy_spectral_test_shim import stft_compare as stft 
+    from ._scipy_spectral_test_shim import istft_compare as istft 
+ 
+and remove the existing imports of stft and istft. 
+ 
+The idea of these wrappers is not to provide a backward-compatible interface 
+but to demonstrate that the ShortTimeFFT implementation is at least as capable 
+as the existing one and delivers comparable results. Furthermore, the 
+wrappers highlight the different philosophies of the implementations, 
+especially in the border handling. 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">platform</span>
+<span class="s2">from </span><span class="s1">typing </span><span class="s2">import </span><span class="s1">cast</span><span class="s3">, </span><span class="s1">Literal</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy</span><span class="s3">.</span><span class="s1">testing </span><span class="s2">import </span><span class="s1">assert_allclose</span>
+
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">signal </span><span class="s2">import </span><span class="s1">ShortTimeFFT</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">signal </span><span class="s2">import </span><span class="s1">csd</span><span class="s3">, </span><span class="s1">get_window</span><span class="s3">, </span><span class="s1">stft</span><span class="s3">, </span><span class="s1">istft</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">signal</span><span class="s3">.</span><span class="s1">_arraytools </span><span class="s2">import </span><span class="s1">const_ext</span><span class="s3">, </span><span class="s1">even_ext</span><span class="s3">, </span><span class="s1">odd_ext</span><span class="s3">, </span><span class="s1">zero_ext</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">signal</span><span class="s3">.</span><span class="s1">_short_time_fft </span><span class="s2">import </span><span class="s1">FFT_MODE_TYPE</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">signal</span><span class="s3">.</span><span class="s1">_spectral_py </span><span class="s2">import </span><span class="s1">_spectral_helper</span><span class="s3">, </span><span class="s1">_triage_segments</span><span class="s3">, </span><span class="s1">\</span>
+    <span class="s1">_median_bias</span>
+
+
+<span class="s2">def </span><span class="s1">_stft_wrapper</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s4">256</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                  <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                  <span class="s1">boundary</span><span class="s3">=</span><span class="s5">'zeros'</span><span class="s3">, </span><span class="s1">padded</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">=</span><span class="s5">'spectrum'</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Wrapper for the SciPy `stft()` function based on `ShortTimeFFT` for 
+    unit testing. 
+ 
+    Handling the boundary and padding is where `ShortTimeFFT` and `stft()` 
+    differ in behavior. Parts of `_spectral_helper()` were copied to mimic 
+    the` stft()` behavior. 
+ 
+    This function is meant to be solely used by `stft_compare()`. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">scaling </span><span class="s2">not in </span><span class="s3">(</span><span class="s5">'psd'</span><span class="s3">, </span><span class="s5">'spectrum'</span><span class="s3">):  </span><span class="s6"># same errors as in original stft:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;Parameter </span><span class="s2">{</span><span class="s1">scaling</span><span class="s3">=</span><span class="s2">} </span><span class="s5">not in ['spectrum', 'psd']!&quot;</span><span class="s3">)</span>
+
+    <span class="s6"># The following lines are taken from the original _spectral_helper():</span>
+    <span class="s1">boundary_funcs </span><span class="s3">= {</span><span class="s5">'even'</span><span class="s3">: </span><span class="s1">even_ext</span><span class="s3">,</span>
+                      <span class="s5">'odd'</span><span class="s3">: </span><span class="s1">odd_ext</span><span class="s3">,</span>
+                      <span class="s5">'constant'</span><span class="s3">: </span><span class="s1">const_ext</span><span class="s3">,</span>
+                      <span class="s5">'zeros'</span><span class="s3">: </span><span class="s1">zero_ext</span><span class="s3">,</span>
+                      <span class="s2">None</span><span class="s3">: </span><span class="s2">None</span><span class="s3">}</span>
+
+    <span class="s2">if </span><span class="s1">boundary </span><span class="s2">not in </span><span class="s1">boundary_funcs</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;Unknown boundary option '</span><span class="s2">{</span><span class="s1">boundary</span><span class="s2">}</span><span class="s5">', must be one&quot; </span><span class="s3">+</span>
+                         <span class="s5">f&quot; of: </span><span class="s2">{</span><span class="s1">list</span><span class="s3">(</span><span class="s1">boundary_funcs</span><span class="s3">.</span><span class="s1">keys</span><span class="s3">())</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">x</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">nperseg </span><span class="s2">is not None</span><span class="s3">:  </span><span class="s6"># if specified by user</span>
+        <span class="s1">nperseg </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">nperseg</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">nperseg </span><span class="s3">&lt; </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'nperseg must be a positive integer'</span><span class="s3">)</span>
+
+    <span class="s6"># parse window; if array like, then set nperseg = win.shape</span>
+    <span class="s1">win</span><span class="s3">, </span><span class="s1">nperseg </span><span class="s3">= </span><span class="s1">_triage_segments</span><span class="s3">(</span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">,</span>
+                                    <span class="s1">input_length</span><span class="s3">=</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">])</span>
+
+    <span class="s2">if </span><span class="s1">nfft </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">nfft </span><span class="s3">= </span><span class="s1">nperseg</span>
+    <span class="s2">elif </span><span class="s1">nfft </span><span class="s3">&lt; </span><span class="s1">nperseg</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'nfft must be greater than or equal to nperseg.'</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">nfft </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">nfft</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">noverlap </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">noverlap </span><span class="s3">= </span><span class="s1">nperseg</span><span class="s3">//</span><span class="s4">2</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">noverlap </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">noverlap</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">noverlap </span><span class="s3">&gt;= </span><span class="s1">nperseg</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'noverlap must be less than nperseg.'</span><span class="s3">)</span>
+    <span class="s1">nstep </span><span class="s3">= </span><span class="s1">nperseg </span><span class="s3">- </span><span class="s1">noverlap</span>
+    <span class="s1">n </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">]</span>
+
+    <span class="s6"># Padding occurs after boundary extension, so that the extended signal ends</span>
+    <span class="s6"># in zeros, instead of introducing an impulse at the end.</span>
+    <span class="s6"># I.e. if x = [..., 3, 2]</span>
+    <span class="s6"># extend then pad -&gt; [..., 3, 2, 2, 3, 0, 0, 0]</span>
+    <span class="s6"># pad then extend -&gt; [..., 3, 2, 0, 0, 0, 2, 3]</span>
+
+    <span class="s2">if </span><span class="s1">boundary </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">ext_func </span><span class="s3">= </span><span class="s1">boundary_funcs</span><span class="s3">[</span><span class="s1">boundary</span><span class="s3">]</span>
+        <span class="s6"># Extend by nperseg//2 in front and back:</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">ext_func</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">//</span><span class="s4">2</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">padded</span><span class="s3">:</span>
+        <span class="s6"># Pad to integer number of windowed segments</span>
+        <span class="s6"># I.e make x.shape[-1] = nperseg + (nseg-1)*nstep, with integer nseg</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">moveaxis</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">)</span>
+
+        <span class="s6"># This is an edge case where shortTimeFFT returns one more time slice</span>
+        <span class="s6"># than the Scipy stft() shorten to remove last time slice:</span>
+        <span class="s2">if </span><span class="s1">n </span><span class="s3">% </span><span class="s4">2 </span><span class="s3">== </span><span class="s4">1 </span><span class="s2">and </span><span class="s1">nperseg </span><span class="s3">% </span><span class="s4">2 </span><span class="s3">== </span><span class="s4">1 </span><span class="s2">and </span><span class="s1">noverlap </span><span class="s3">% </span><span class="s4">2 </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x</span><span class="s3">[..., :</span><span class="s1">axis </span><span class="s3">- </span><span class="s4">1</span><span class="s3">]</span>
+
+        <span class="s1">nadd </span><span class="s3">= (-(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">]-</span><span class="s1">nperseg</span><span class="s3">) % </span><span class="s1">nstep</span><span class="s3">) % </span><span class="s1">nperseg</span>
+        <span class="s1">zeros_shape </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[:-</span><span class="s4">1</span><span class="s3">]) + [</span><span class="s1">nadd</span><span class="s3">]</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">x</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">zeros_shape</span><span class="s3">)), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">moveaxis</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+
+    <span class="s6">#  ... end original _spectral_helper() code.</span>
+    <span class="s1">scale_to </span><span class="s3">= {</span><span class="s5">'spectrum'</span><span class="s3">: </span><span class="s5">'magnitude'</span><span class="s3">, </span><span class="s5">'psd'</span><span class="s3">: </span><span class="s5">'psd'</span><span class="s3">}[</span><span class="s1">scaling</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">iscomplexobj</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s2">and </span><span class="s1">return_onesided</span><span class="s3">:</span>
+        <span class="s1">return_onesided </span><span class="s3">= </span><span class="s2">False</span>
+    <span class="s6"># using cast() to make mypy happy:</span>
+    <span class="s1">fft_mode </span><span class="s3">= </span><span class="s1">cast</span><span class="s3">(</span><span class="s1">FFT_MODE_TYPE</span><span class="s3">, </span><span class="s5">'onesided' </span><span class="s2">if </span><span class="s1">return_onesided </span><span class="s2">else </span><span class="s5">'twosided'</span><span class="s3">)</span>
+
+    <span class="s1">ST </span><span class="s3">= </span><span class="s1">ShortTimeFFT</span><span class="s3">(</span><span class="s1">win</span><span class="s3">, </span><span class="s1">nstep</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">fft_mode</span><span class="s3">=</span><span class="s1">fft_mode</span><span class="s3">, </span><span class="s1">mfft</span><span class="s3">=</span><span class="s1">nfft</span><span class="s3">,</span>
+                      <span class="s1">scale_to</span><span class="s3">=</span><span class="s1">scale_to</span><span class="s3">, </span><span class="s1">phase_shift</span><span class="s3">=</span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s1">k_off </span><span class="s3">= </span><span class="s1">nperseg </span><span class="s3">// </span><span class="s4">2</span>
+    <span class="s1">p0 </span><span class="s3">= </span><span class="s4">0  </span><span class="s6"># ST.lower_border_end[1] + 1</span>
+    <span class="s1">nn </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">] </span><span class="s2">if </span><span class="s1">padded </span><span class="s2">else </span><span class="s1">n</span><span class="s3">+</span><span class="s1">k_off</span><span class="s3">+</span><span class="s4">1</span>
+    <span class="s1">p1 </span><span class="s3">= </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">upper_border_begin</span><span class="s3">(</span><span class="s1">nn</span><span class="s3">)[</span><span class="s4">1</span><span class="s3">]  </span><span class="s6"># ST.p_max(n) + 1</span>
+
+    <span class="s6"># This is bad hack to pass the test test_roundtrip_boundary_extension():</span>
+    <span class="s2">if </span><span class="s1">padded </span><span class="s2">is True and </span><span class="s1">nperseg </span><span class="s3">- </span><span class="s1">noverlap </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+        <span class="s1">p1 </span><span class="s3">-= </span><span class="s1">nperseg </span><span class="s3">// </span><span class="s4">2 </span><span class="s3">- </span><span class="s4">1  </span><span class="s6"># the reasoning behind this is not clear to me</span>
+
+    <span class="s1">detr </span><span class="s3">= </span><span class="s2">None if </span><span class="s1">detrend </span><span class="s2">is False else </span><span class="s1">detrend</span>
+    <span class="s1">Sxx </span><span class="s3">= </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">stft_detrend</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">detr</span><span class="s3">, </span><span class="s1">p0</span><span class="s3">, </span><span class="s1">p1</span><span class="s3">, </span><span class="s1">k_offset</span><span class="s3">=</span><span class="s1">k_off</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">)</span>
+    <span class="s1">t </span><span class="s3">= </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">t</span><span class="s3">(</span><span class="s1">nn</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s1">p1 </span><span class="s3">- </span><span class="s1">p0</span><span class="s3">, </span><span class="s1">k_offset</span><span class="s3">=</span><span class="s4">0 </span><span class="s2">if </span><span class="s1">boundary </span><span class="s2">is not None else </span><span class="s1">k_off</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">x</span><span class="s3">.</span><span class="s1">dtype </span><span class="s2">in </span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">complex64</span><span class="s3">):</span>
+        <span class="s1">Sxx </span><span class="s3">= </span><span class="s1">Sxx</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">complex64</span><span class="s3">)</span>
+
+    <span class="s6"># workaround for test_average_all_segments() - seems to be buggy behavior:</span>
+    <span class="s2">if </span><span class="s1">boundary </span><span class="s2">is None and </span><span class="s1">padded </span><span class="s2">is False</span><span class="s3">:</span>
+        <span class="s1">t</span><span class="s3">, </span><span class="s1">Sxx </span><span class="s3">= </span><span class="s1">t</span><span class="s3">[</span><span class="s4">1</span><span class="s3">:-</span><span class="s4">1</span><span class="s3">], </span><span class="s1">Sxx</span><span class="s3">[..., :-</span><span class="s4">2</span><span class="s3">]</span>
+        <span class="s1">t </span><span class="s3">-= </span><span class="s1">k_off </span><span class="s3">/ </span><span class="s1">fs</span>
+
+    <span class="s2">return </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">f</span><span class="s3">, </span><span class="s1">t</span><span class="s3">, </span><span class="s1">Sxx</span>
+
+
+<span class="s2">def </span><span class="s1">_istft_wrapper</span><span class="s3">(</span><span class="s1">Zxx</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                   <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">input_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">boundary</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">time_axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">,</span>
+                   <span class="s1">freq_axis</span><span class="s3">=-</span><span class="s4">2</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">=</span><span class="s5">'spectrum'</span><span class="s3">) </span><span class="s1">-&gt; \</span>
+        <span class="s1">tuple</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">, </span><span class="s1">tuple</span><span class="s3">[</span><span class="s1">int</span><span class="s3">, </span><span class="s1">int</span><span class="s3">]]:</span>
+    <span class="s0">&quot;&quot;&quot;Wrapper for the SciPy `istft()` function based on `ShortTimeFFT` for 
+        unit testing. 
+ 
+    Note that only option handling is implemented as far as to handle the unit 
+    tests. E.g., the case ``nperseg=None`` is not handled. 
+ 
+    This function is meant to be solely used by `istft_compare()`. 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># *** Lines are taken from _spectral_py.istft() ***:</span>
+    <span class="s2">if </span><span class="s1">Zxx</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">&lt; </span><span class="s4">2</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'Input stft must be at least 2d!'</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">freq_axis </span><span class="s3">== </span><span class="s1">time_axis</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'Must specify differing time and frequency axes!'</span><span class="s3">)</span>
+
+    <span class="s1">nseg </span><span class="s3">= </span><span class="s1">Zxx</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">time_axis</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">input_onesided</span><span class="s3">:</span>
+        <span class="s6"># Assume even segment length</span>
+        <span class="s1">n_default </span><span class="s3">= </span><span class="s4">2</span><span class="s3">*(</span><span class="s1">Zxx</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">freq_axis</span><span class="s3">] - </span><span class="s4">1</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">n_default </span><span class="s3">= </span><span class="s1">Zxx</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">freq_axis</span><span class="s3">]</span>
+
+    <span class="s6"># Check windowing parameters</span>
+    <span class="s2">if </span><span class="s1">nperseg </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">nperseg </span><span class="s3">= </span><span class="s1">n_default</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">nperseg </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">nperseg</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">nperseg </span><span class="s3">&lt; </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'nperseg must be a positive integer'</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">nfft </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">input_onesided </span><span class="s2">and </span><span class="s3">(</span><span class="s1">nperseg </span><span class="s3">== </span><span class="s1">n_default </span><span class="s3">+ </span><span class="s4">1</span><span class="s3">):</span>
+            <span class="s6"># Odd nperseg, no FFT padding</span>
+            <span class="s1">nfft </span><span class="s3">= </span><span class="s1">nperseg</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">nfft </span><span class="s3">= </span><span class="s1">n_default</span>
+    <span class="s2">elif </span><span class="s1">nfft </span><span class="s3">&lt; </span><span class="s1">nperseg</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'nfft must be greater than or equal to nperseg.'</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">nfft </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">nfft</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">noverlap </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">noverlap </span><span class="s3">= </span><span class="s1">nperseg</span><span class="s3">//</span><span class="s4">2</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">noverlap </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">noverlap</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">noverlap </span><span class="s3">&gt;= </span><span class="s1">nperseg</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'noverlap must be less than nperseg.'</span><span class="s3">)</span>
+    <span class="s1">nstep </span><span class="s3">= </span><span class="s1">nperseg </span><span class="s3">- </span><span class="s1">noverlap</span>
+
+    <span class="s6"># Get window as array</span>
+    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">window</span><span class="s3">, </span><span class="s1">str</span><span class="s3">) </span><span class="s2">or </span><span class="s1">type</span><span class="s3">(</span><span class="s1">window</span><span class="s3">) </span><span class="s2">is </span><span class="s1">tuple</span><span class="s3">:</span>
+        <span class="s1">win </span><span class="s3">= </span><span class="s1">get_window</span><span class="s3">(</span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">win </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">window</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">win</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">) != </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'window must be 1-D'</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">win</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] != </span><span class="s1">nperseg</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f'window must have length of </span><span class="s2">{</span><span class="s1">nperseg</span><span class="s2">}</span><span class="s5">'</span><span class="s3">)</span>
+
+    <span class="s1">outputlength </span><span class="s3">= </span><span class="s1">nperseg </span><span class="s3">+ (</span><span class="s1">nseg</span><span class="s3">-</span><span class="s4">1</span><span class="s3">)*</span><span class="s1">nstep</span>
+    <span class="s6"># *** End block of: Taken from _spectral_py.istft() ***</span>
+
+    <span class="s6"># Using cast() to make mypy happy:</span>
+    <span class="s1">fft_mode </span><span class="s3">= </span><span class="s1">cast</span><span class="s3">(</span><span class="s1">FFT_MODE_TYPE</span><span class="s3">, </span><span class="s5">'onesided' </span><span class="s2">if </span><span class="s1">input_onesided </span><span class="s2">else </span><span class="s5">'twosided'</span><span class="s3">)</span>
+    <span class="s1">scale_to </span><span class="s3">= </span><span class="s1">cast</span><span class="s3">(</span><span class="s1">Literal</span><span class="s3">[</span><span class="s5">'magnitude'</span><span class="s3">, </span><span class="s5">'psd'</span><span class="s3">],</span>
+                    <span class="s3">{</span><span class="s5">'spectrum'</span><span class="s3">: </span><span class="s5">'magnitude'</span><span class="s3">, </span><span class="s5">'psd'</span><span class="s3">: </span><span class="s5">'psd'</span><span class="s3">}[</span><span class="s1">scaling</span><span class="s3">])</span>
+
+    <span class="s1">ST </span><span class="s3">= </span><span class="s1">ShortTimeFFT</span><span class="s3">(</span><span class="s1">win</span><span class="s3">, </span><span class="s1">nstep</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">fft_mode</span><span class="s3">=</span><span class="s1">fft_mode</span><span class="s3">, </span><span class="s1">mfft</span><span class="s3">=</span><span class="s1">nfft</span><span class="s3">,</span>
+                      <span class="s1">scale_to</span><span class="s3">=</span><span class="s1">scale_to</span><span class="s3">, </span><span class="s1">phase_shift</span><span class="s3">=</span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">boundary</span><span class="s3">:</span>
+        <span class="s1">j </span><span class="s3">= </span><span class="s1">nperseg </span><span class="s2">if </span><span class="s1">nperseg </span><span class="s3">% </span><span class="s4">2 </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">else </span><span class="s1">nperseg </span><span class="s3">- </span><span class="s4">1</span>
+        <span class="s1">k0 </span><span class="s3">= </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">k_min </span><span class="s3">+ </span><span class="s1">nperseg </span><span class="s3">// </span><span class="s4">2</span>
+        <span class="s1">k1 </span><span class="s3">= </span><span class="s1">outputlength </span><span class="s3">- </span><span class="s1">j </span><span class="s3">+ </span><span class="s1">k0</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s5">&quot;boundary=False does not make sense with&quot; </span><span class="s3">+</span>
+                                  <span class="s5">&quot;ShortTimeFFT.istft()!&quot;</span><span class="s3">)</span>
+
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">istft</span><span class="s3">(</span><span class="s1">Zxx</span><span class="s3">, </span><span class="s1">k0</span><span class="s3">=</span><span class="s1">k0</span><span class="s3">, </span><span class="s1">k1</span><span class="s3">=</span><span class="s1">k1</span><span class="s3">, </span><span class="s1">f_axis</span><span class="s3">=</span><span class="s1">freq_axis</span><span class="s3">, </span><span class="s1">t_axis</span><span class="s3">=</span><span class="s1">time_axis</span><span class="s3">)</span>
+    <span class="s1">t </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">k1 </span><span class="s3">- </span><span class="s1">k0</span><span class="s3">) * </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">T</span>
+    <span class="s1">k_hi </span><span class="s3">= </span><span class="s1">ST</span><span class="s3">.</span><span class="s1">upper_border_begin</span><span class="s3">(</span><span class="s1">k1 </span><span class="s3">- </span><span class="s1">k0</span><span class="s3">)[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s6"># using cast() to make mypy happy:</span>
+    <span class="s2">return </span><span class="s1">t</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, (</span><span class="s1">ST</span><span class="s3">.</span><span class="s1">lower_border_end</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s1">k_hi</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_csd_wrapper</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                 <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s5">'constant'</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                 <span class="s1">scaling</span><span class="s3">=</span><span class="s5">'density'</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">average</span><span class="s3">=</span><span class="s5">'mean'</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Wrapper for the `csd()` function based on `ShortTimeFFT` for 
+        unit testing. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">freqs</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">Pxy </span><span class="s3">= </span><span class="s1">_csd_test_shim</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">, </span><span class="s1">nfft</span><span class="s3">,</span>
+                                   <span class="s1">detrend</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+
+    <span class="s6"># The following code is taken from csd():</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">) &gt;= </span><span class="s4">2 </span><span class="s2">and </span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">size </span><span class="s3">&gt; </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] &gt; </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">average </span><span class="s3">== </span><span class="s5">'median'</span><span class="s3">:</span>
+                <span class="s6"># np.median must be passed real arrays for the desired result</span>
+                <span class="s1">bias </span><span class="s3">= </span><span class="s1">_median_bias</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">])</span>
+                <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">iscomplexobj</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">):</span>
+                    <span class="s1">Pxy </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">median</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+                           <span class="s3">+ </span><span class="s4">1j </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">median</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">imag</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">))</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">Pxy </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">median</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s1">Pxy </span><span class="s3">/= </span><span class="s1">bias</span>
+            <span class="s2">elif </span><span class="s1">average </span><span class="s3">== </span><span class="s5">'mean'</span><span class="s3">:</span>
+                <span class="s1">Pxy </span><span class="s3">= </span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">mean</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f'average must be &quot;median&quot; or &quot;mean&quot;, got </span><span class="s2">{</span><span class="s1">average</span><span class="s2">}</span><span class="s5">'</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">Pxy </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">, </span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[:-</span><span class="s4">1</span><span class="s3">])</span>
+
+    <span class="s2">return </span><span class="s1">freqs</span><span class="s3">, </span><span class="s1">Pxy</span>
+
+
+<span class="s2">def </span><span class="s1">_csd_test_shim</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                   <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s5">'constant'</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                   <span class="s1">scaling</span><span class="s3">=</span><span class="s5">'density'</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Compare output of  _spectral_helper() and ShortTimeFFT, more 
+    precisely _spect_helper_csd() for used in csd_wrapper(). 
+ 
+   The motivation of this function is to test if the ShortTimeFFT-based 
+   wrapper `_spect_helper_csd()` returns the same values as `_spectral_helper`. 
+   This function should only be usd by csd() in (unit) testing. 
+   &quot;&quot;&quot;</span>
+    <span class="s1">freqs</span><span class="s3">, </span><span class="s1">t</span><span class="s3">, </span><span class="s1">Pxy </span><span class="s3">= </span><span class="s1">_spectral_helper</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">, </span><span class="s1">nfft</span><span class="s3">,</span>
+                                     <span class="s1">detrend</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">,</span>
+                                     <span class="s1">mode</span><span class="s3">=</span><span class="s5">'psd'</span><span class="s3">)</span>
+    <span class="s1">freqs1</span><span class="s3">, </span><span class="s1">Pxy1 </span><span class="s3">= </span><span class="s1">_spect_helper_csd</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">, </span><span class="s1">nfft</span><span class="s3">,</span>
+                                     <span class="s1">detrend</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">freqs1</span><span class="s3">, </span><span class="s1">freqs</span><span class="s3">)</span>
+    <span class="s1">amax_Pxy </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">).</span><span class="s1">max</span><span class="s3">(), </span><span class="s4">1</span><span class="s3">) </span><span class="s2">if </span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">size </span><span class="s2">else </span><span class="s4">1</span>
+    <span class="s1">atol </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">resolution </span><span class="s3">* </span><span class="s1">amax_Pxy  </span><span class="s6"># needed for large Pxy</span>
+    <span class="s6"># for c_ in range(Pxy.shape[-1]):</span>
+    <span class="s6">#    np.testing.assert_allclose(Pxy1[:, c_], Pxy[:, c_], atol=atol)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">Pxy1</span><span class="s3">, </span><span class="s1">Pxy</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">=</span><span class="s1">atol</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">freqs</span><span class="s3">, </span><span class="s1">t</span><span class="s3">, </span><span class="s1">Pxy</span>
+
+
+<span class="s2">def </span><span class="s1">_spect_helper_csd</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                      <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s5">'constant'</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                      <span class="s1">scaling</span><span class="s3">=</span><span class="s5">'density'</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Wrapper for replacing _spectral_helper() by using the ShortTimeFFT 
+      for use by csd(). 
+ 
+    This function should be only used by _csd_test_shim() and is only useful 
+    for testing the ShortTimeFFT implementation. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s6"># The following lines are taken from the original _spectral_helper():</span>
+    <span class="s1">same_data </span><span class="s3">= </span><span class="s1">y </span><span class="s2">is </span><span class="s1">x</span>
+    <span class="s1">axis </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+
+    <span class="s6"># Ensure we have np.arrays, get outdtype</span>
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s1">same_data</span><span class="s3">:</span>
+        <span class="s1">y </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">y</span><span class="s3">)</span>
+    <span class="s6">#     outdtype = np.result_type(x, y, np.complex64)</span>
+    <span class="s6"># else:</span>
+    <span class="s6">#     outdtype = np.result_type(x, np.complex64)</span>
+
+    <span class="s2">if not </span><span class="s1">same_data</span><span class="s3">:</span>
+        <span class="s6"># Check if we can broadcast the outer axes together</span>
+        <span class="s1">xouter </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s1">youter </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s1">xouter</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+        <span class="s1">youter</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">outershape </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">xouter</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">youter</span><span class="s3">)).</span><span class="s1">shape</span>
+        <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'x and y cannot be broadcast together.'</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+
+    <span class="s2">if </span><span class="s1">same_data</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">x</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">x</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">or </span><span class="s1">y</span><span class="s3">.</span><span class="s1">size </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+            <span class="s1">outshape </span><span class="s3">= </span><span class="s1">outershape </span><span class="s3">+ (</span><span class="s1">min</span><span class="s3">([</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">], </span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">]]),)</span>
+            <span class="s1">emptyout </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">moveaxis</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">outshape</span><span class="s3">), -</span><span class="s4">1</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">emptyout</span><span class="s3">, </span><span class="s1">emptyout</span>
+
+    <span class="s2">if </span><span class="s1">nperseg </span><span class="s2">is not None</span><span class="s3">:  </span><span class="s6"># if specified by user</span>
+        <span class="s1">nperseg </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">nperseg</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">nperseg </span><span class="s3">&lt; </span><span class="s4">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'nperseg must be a positive integer'</span><span class="s3">)</span>
+
+    <span class="s6"># parse window; if array like, then set nperseg = win.shape</span>
+    <span class="s1">n </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">] </span><span class="s2">if </span><span class="s1">same_data </span><span class="s2">else </span><span class="s1">max</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">], </span><span class="s1">y</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">])</span>
+    <span class="s1">win</span><span class="s3">, </span><span class="s1">nperseg </span><span class="s3">= </span><span class="s1">_triage_segments</span><span class="s3">(</span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">, </span><span class="s1">input_length</span><span class="s3">=</span><span class="s1">n</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">nfft </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">nfft </span><span class="s3">= </span><span class="s1">nperseg</span>
+    <span class="s2">elif </span><span class="s1">nfft </span><span class="s3">&lt; </span><span class="s1">nperseg</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'nfft must be greater than or equal to nperseg.'</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">nfft </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">nfft</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">noverlap </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">noverlap </span><span class="s3">= </span><span class="s1">nperseg </span><span class="s3">// </span><span class="s4">2</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">noverlap </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">noverlap</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">noverlap </span><span class="s3">&gt;= </span><span class="s1">nperseg</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">'noverlap must be less than nperseg.'</span><span class="s3">)</span>
+    <span class="s1">nstep </span><span class="s3">= </span><span class="s1">nperseg </span><span class="s3">- </span><span class="s1">noverlap</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">iscomplexobj</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s2">and </span><span class="s1">return_onesided</span><span class="s3">:</span>
+        <span class="s1">return_onesided </span><span class="s3">= </span><span class="s2">False</span>
+
+    <span class="s6"># using cast() to make mypy happy:</span>
+    <span class="s1">fft_mode </span><span class="s3">= </span><span class="s1">cast</span><span class="s3">(</span><span class="s1">FFT_MODE_TYPE</span><span class="s3">, </span><span class="s5">'onesided' </span><span class="s2">if </span><span class="s1">return_onesided</span>
+                    <span class="s2">else </span><span class="s5">'twosided'</span><span class="s3">)</span>
+    <span class="s1">scale </span><span class="s3">= {</span><span class="s5">'spectrum'</span><span class="s3">: </span><span class="s5">'magnitude'</span><span class="s3">, </span><span class="s5">'density'</span><span class="s3">: </span><span class="s5">'psd'</span><span class="s3">}[</span><span class="s1">scaling</span><span class="s3">]</span>
+    <span class="s1">SFT </span><span class="s3">= </span><span class="s1">ShortTimeFFT</span><span class="s3">(</span><span class="s1">win</span><span class="s3">, </span><span class="s1">nstep</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">fft_mode</span><span class="s3">=</span><span class="s1">fft_mode</span><span class="s3">, </span><span class="s1">mfft</span><span class="s3">=</span><span class="s1">nfft</span><span class="s3">,</span>
+                       <span class="s1">scale_to</span><span class="s3">=</span><span class="s1">scale</span><span class="s3">, </span><span class="s1">phase_shift</span><span class="s3">=</span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s6"># _spectral_helper() calculates X.conj()*Y instead of X*Y.conj():</span>
+    <span class="s1">Pxy </span><span class="s3">= </span><span class="s1">SFT</span><span class="s3">.</span><span class="s1">spectrogram</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">detr</span><span class="s3">=</span><span class="s2">None if </span><span class="s1">detrend </span><span class="s2">is False else </span><span class="s1">detrend</span><span class="s3">,</span>
+                          <span class="s1">p0</span><span class="s3">=</span><span class="s4">0</span><span class="s3">, </span><span class="s1">p1</span><span class="s3">=(</span><span class="s1">n</span><span class="s3">-</span><span class="s1">noverlap</span><span class="s3">)//</span><span class="s1">SFT</span><span class="s3">.</span><span class="s1">hop</span><span class="s3">, </span><span class="s1">k_offset</span><span class="s3">=</span><span class="s1">nperseg</span><span class="s3">//</span><span class="s4">2</span><span class="s3">,</span>
+                          <span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">).</span><span class="s1">conj</span><span class="s3">()</span>
+    <span class="s6"># Note:</span>
+    <span class="s6"># 'onesided2X' scaling of ShortTimeFFT conflicts with the</span>
+    <span class="s6"># scaling='spectrum' parameter, since it doubles the squared magnitude,</span>
+    <span class="s6"># which in the view of the ShortTimeFFT implementation does not make sense.</span>
+    <span class="s6"># Hence, the doubling of the square is implemented here:</span>
+    <span class="s2">if </span><span class="s1">return_onesided</span><span class="s3">:</span>
+        <span class="s1">f_axis </span><span class="s3">= </span><span class="s1">Pxy</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">- </span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">axis </span><span class="s2">if </span><span class="s1">axis </span><span class="s3">&lt; </span><span class="s4">0 </span><span class="s2">else </span><span class="s1">axis</span>
+        <span class="s1">Pxy </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">moveaxis</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">, </span><span class="s1">f_axis</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">Pxy</span><span class="s3">[..., </span><span class="s4">1</span><span class="s3">:-</span><span class="s4">1 </span><span class="s2">if </span><span class="s1">SFT</span><span class="s3">.</span><span class="s1">mfft </span><span class="s3">% </span><span class="s4">2 </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">else None</span><span class="s3">] *= </span><span class="s4">2</span>
+        <span class="s1">Pxy </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">moveaxis</span><span class="s3">(</span><span class="s1">Pxy</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">, </span><span class="s1">f_axis</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">SFT</span><span class="s3">.</span><span class="s1">f</span><span class="s3">, </span><span class="s1">Pxy</span>
+
+
+<span class="s2">def </span><span class="s1">stft_compare</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s4">256</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                 <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                 <span class="s1">boundary</span><span class="s3">=</span><span class="s5">'zeros'</span><span class="s3">, </span><span class="s1">padded</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">=</span><span class="s5">'spectrum'</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Assert that the results from the existing `stft()` and `_stft_wrapper()` 
+    are close to each other. 
+ 
+    For comparing the STFT values an absolute tolerance of the floating point 
+    resolution was added to circumvent problems with the following tests: 
+    * For float32 the tolerances are much higher in 
+      TestSTFT.test_roundtrip_float32()). 
+    * The TestSTFT.test_roundtrip_scaling() has a high relative deviation. 
+      Interestingly this did not appear in Scipy 1.9.1 but only in the current 
+      development version. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">kw </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">x</span><span class="s3">=</span><span class="s1">x</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s1">fs</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s1">nperseg</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s1">noverlap</span><span class="s3">,</span>
+              <span class="s1">nfft</span><span class="s3">=</span><span class="s1">nfft</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s1">detrend</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">=</span><span class="s1">return_onesided</span><span class="s3">,</span>
+              <span class="s1">boundary</span><span class="s3">=</span><span class="s1">boundary</span><span class="s3">, </span><span class="s1">padded</span><span class="s3">=</span><span class="s1">padded</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">=</span><span class="s1">scaling</span><span class="s3">)</span>
+    <span class="s1">f</span><span class="s3">, </span><span class="s1">t</span><span class="s3">, </span><span class="s1">Zxx </span><span class="s3">= </span><span class="s1">stft</span><span class="s3">(**</span><span class="s1">kw</span><span class="s3">)</span>
+    <span class="s1">f_wrapper</span><span class="s3">, </span><span class="s1">t_wrapper</span><span class="s3">, </span><span class="s1">Zxx_wrapper </span><span class="s3">= </span><span class="s1">_stft_wrapper</span><span class="s3">(**</span><span class="s1">kw</span><span class="s3">)</span>
+
+    <span class="s1">e_msg_part </span><span class="s3">= </span><span class="s5">&quot; of `stft_wrapper()` differ from `stft()`.&quot;</span>
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">f_wrapper</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">err_msg</span><span class="s3">=</span><span class="s5">f&quot;Frequencies </span><span class="s2">{</span><span class="s1">e_msg_part</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">t_wrapper</span><span class="s3">, </span><span class="s1">t</span><span class="s3">, </span><span class="s1">err_msg</span><span class="s3">=</span><span class="s5">f&quot;Time slices </span><span class="s2">{</span><span class="s1">e_msg_part</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+
+    <span class="s6"># Adapted tolerances to account for:</span>
+    <span class="s1">atol </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">Zxx</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">resolution </span><span class="s3">* </span><span class="s4">2</span>
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">Zxx_wrapper</span><span class="s3">, </span><span class="s1">Zxx</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">=</span><span class="s1">atol</span><span class="s3">,</span>
+                    <span class="s1">err_msg</span><span class="s3">=</span><span class="s5">f&quot;STFT values </span><span class="s2">{</span><span class="s1">e_msg_part</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">f</span><span class="s3">, </span><span class="s1">t</span><span class="s3">, </span><span class="s1">Zxx</span>
+
+
+<span class="s2">def </span><span class="s1">istft_compare</span><span class="s3">(</span><span class="s1">Zxx</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                  <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">input_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">boundary</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">time_axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">,</span>
+                  <span class="s1">freq_axis</span><span class="s3">=-</span><span class="s4">2</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">=</span><span class="s5">'spectrum'</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Assert that the results from the existing `istft()` and 
+    `_istft_wrapper()` are close to each other. 
+ 
+    Quirks: 
+    * If ``boundary=False`` the comparison is skipped, since it does not 
+      make sense with ShortTimeFFT.istft(). Only used in test 
+      TestSTFT.test_roundtrip_boundary_extension(). 
+    * If ShortTimeFFT.istft() decides the STFT is not invertible, the 
+      comparison is skipped, since istft() only emits a warning and does not 
+      return a correct result. Only used in 
+      ShortTimeFFT.test_roundtrip_not_nola(). 
+    * For comparing the signals an absolute tolerance of the floating point 
+      resolution was added to account for the low accuracy of float32 (Occurs 
+      only in TestSTFT.test_roundtrip_float32()). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">kw </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">Zxx</span><span class="s3">=</span><span class="s1">Zxx</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s1">fs</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s1">nperseg</span><span class="s3">,</span>
+              <span class="s1">noverlap</span><span class="s3">=</span><span class="s1">noverlap</span><span class="s3">, </span><span class="s1">nfft</span><span class="s3">=</span><span class="s1">nfft</span><span class="s3">, </span><span class="s1">input_onesided</span><span class="s3">=</span><span class="s1">input_onesided</span><span class="s3">,</span>
+              <span class="s1">boundary</span><span class="s3">=</span><span class="s1">boundary</span><span class="s3">, </span><span class="s1">time_axis</span><span class="s3">=</span><span class="s1">time_axis</span><span class="s3">, </span><span class="s1">freq_axis</span><span class="s3">=</span><span class="s1">freq_axis</span><span class="s3">,</span>
+              <span class="s1">scaling</span><span class="s3">=</span><span class="s1">scaling</span><span class="s3">)</span>
+
+    <span class="s1">t</span><span class="s3">, </span><span class="s1">x </span><span class="s3">= </span><span class="s1">istft</span><span class="s3">(**</span><span class="s1">kw</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s1">boundary</span><span class="s3">:  </span><span class="s6"># skip test_roundtrip_boundary_extension():</span>
+        <span class="s2">return </span><span class="s1">t</span><span class="s3">, </span><span class="s1">x  </span><span class="s6"># _istft_wrapper does() not implement this case</span>
+    <span class="s2">try</span><span class="s3">:  </span><span class="s6"># if inversion fails, istft() only emits a warning:</span>
+        <span class="s1">t_wrapper</span><span class="s3">, </span><span class="s1">x_wrapper</span><span class="s3">, (</span><span class="s1">k_lo</span><span class="s3">, </span><span class="s1">k_hi</span><span class="s3">) = </span><span class="s1">_istft_wrapper</span><span class="s3">(**</span><span class="s1">kw</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">v</span><span class="s3">:  </span><span class="s6"># Do nothing if inversion fails:</span>
+        <span class="s2">if </span><span class="s1">v</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] == </span><span class="s5">&quot;Short-time Fourier Transform not invertible!&quot;</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">t</span><span class="s3">, </span><span class="s1">x</span>
+        <span class="s2">raise </span><span class="s1">v</span>
+
+    <span class="s1">e_msg_part </span><span class="s3">= </span><span class="s5">&quot; of `istft_wrapper()` differ from `istft()`&quot;</span>
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">t</span><span class="s3">, </span><span class="s1">t_wrapper</span><span class="s3">, </span><span class="s1">err_msg</span><span class="s3">=</span><span class="s5">f&quot;Sample times </span><span class="s2">{</span><span class="s1">e_msg_part</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+
+    <span class="s6"># Adapted tolerances to account for resolution loss:</span>
+    <span class="s1">atol </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">resolution</span><span class="s3">*</span><span class="s4">2  </span><span class="s6"># instead of default atol = 0</span>
+    <span class="s1">rtol </span><span class="s3">= </span><span class="s4">1e-7  </span><span class="s6"># default for np.allclose()</span>
+
+    <span class="s6"># Relax atol on 32-Bit platforms a bit to pass CI tests.</span>
+    <span class="s6">#  - Not clear why there are discrepancies (in the FFT maybe?)</span>
+    <span class="s6">#  - Not sure what changed on 'i686' since earlier on those test passed</span>
+    <span class="s2">if </span><span class="s1">x</span><span class="s3">.</span><span class="s1">dtype </span><span class="s3">== </span><span class="s1">np</span><span class="s3">.</span><span class="s1">float32 </span><span class="s2">and </span><span class="s1">platform</span><span class="s3">.</span><span class="s1">machine</span><span class="s3">() == </span><span class="s5">'i686'</span><span class="s3">:</span>
+        <span class="s6"># float32 gets only used by TestSTFT.test_roundtrip_float32() so</span>
+        <span class="s6"># we are using the tolerances from there to circumvent CI problems</span>
+        <span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol </span><span class="s3">= </span><span class="s4">1e-4</span><span class="s3">, </span><span class="s4">1e-5</span>
+    <span class="s2">elif </span><span class="s1">platform</span><span class="s3">.</span><span class="s1">machine</span><span class="s3">() </span><span class="s2">in </span><span class="s3">(</span><span class="s5">'aarch64'</span><span class="s3">, </span><span class="s5">'i386'</span><span class="s3">, </span><span class="s5">'i686'</span><span class="s3">):</span>
+        <span class="s1">atol </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">atol</span><span class="s3">, </span><span class="s4">1e-12</span><span class="s3">)  </span><span class="s6"># 2e-15 seems too tight for 32-Bit platforms</span>
+
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">x_wrapper</span><span class="s3">[</span><span class="s1">k_lo</span><span class="s3">:</span><span class="s1">k_hi</span><span class="s3">], </span><span class="s1">x</span><span class="s3">[</span><span class="s1">k_lo</span><span class="s3">:</span><span class="s1">k_hi</span><span class="s3">], </span><span class="s1">atol</span><span class="s3">=</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">=</span><span class="s1">rtol</span><span class="s3">,</span>
+                    <span class="s1">err_msg</span><span class="s3">=</span><span class="s5">f&quot;Signal values </span><span class="s2">{</span><span class="s1">e_msg_part</span><span class="s2">}</span><span class="s5">&quot;</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">t</span><span class="s3">, </span><span class="s1">x</span>
+
+
+<span class="s2">def </span><span class="s1">csd_compare</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s4">1.0</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s5">'hann'</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">noverlap</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                <span class="s1">nfft</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s5">'constant'</span><span class="s3">, </span><span class="s1">return_onesided</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                <span class="s1">scaling</span><span class="s3">=</span><span class="s5">'density'</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">average</span><span class="s3">=</span><span class="s5">'mean'</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Assert that the results from the existing `csd()` and `_csd_wrapper()` 
+    are close to each other. &quot;&quot;&quot;</span>
+    <span class="s1">kw </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">x</span><span class="s3">=</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">=</span><span class="s1">y</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">=</span><span class="s1">fs</span><span class="s3">, </span><span class="s1">window</span><span class="s3">=</span><span class="s1">window</span><span class="s3">, </span><span class="s1">nperseg</span><span class="s3">=</span><span class="s1">nperseg</span><span class="s3">,</span>
+              <span class="s1">noverlap</span><span class="s3">=</span><span class="s1">noverlap</span><span class="s3">, </span><span class="s1">nfft</span><span class="s3">=</span><span class="s1">nfft</span><span class="s3">, </span><span class="s1">detrend</span><span class="s3">=</span><span class="s1">detrend</span><span class="s3">,</span>
+              <span class="s1">return_onesided</span><span class="s3">=</span><span class="s1">return_onesided</span><span class="s3">, </span><span class="s1">scaling</span><span class="s3">=</span><span class="s1">scaling</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">,</span>
+              <span class="s1">average</span><span class="s3">=</span><span class="s1">average</span><span class="s3">)</span>
+    <span class="s1">freqs0</span><span class="s3">, </span><span class="s1">Pxy0 </span><span class="s3">= </span><span class="s1">csd</span><span class="s3">(**</span><span class="s1">kw</span><span class="s3">)</span>
+    <span class="s1">freqs1</span><span class="s3">, </span><span class="s1">Pxy1 </span><span class="s3">= </span><span class="s1">_csd_wrapper</span><span class="s3">(**</span><span class="s1">kw</span><span class="s3">)</span>
+
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">freqs1</span><span class="s3">, </span><span class="s1">freqs0</span><span class="s3">)</span>
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">Pxy1</span><span class="s3">, </span><span class="s1">Pxy0</span><span class="s3">)</span>
+    <span class="s1">assert_allclose</span><span class="s3">(</span><span class="s1">freqs1</span><span class="s3">, </span><span class="s1">freqs0</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">freqs0</span><span class="s3">, </span><span class="s1">Pxy0</span>
+</pre>
+</body>
+</html>

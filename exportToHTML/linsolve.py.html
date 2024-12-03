@@ -1,0 +1,765 @@
+<html>
+<head>
+<title>linsolve.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #7a7e85;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+linsolve.py</font>
+</center></td></tr></table>
+<pre><span class="s0">from </span><span class="s1">warnings </span><span class="s0">import </span><span class="s1">warn</span><span class="s2">, </span><span class="s1">catch_warnings</span><span class="s2">, </span><span class="s1">simplefilter</span>
+
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">numpy </span><span class="s0">import </span><span class="s1">asarray</span>
+<span class="s0">from </span><span class="s1">scipy</span><span class="s2">.</span><span class="s1">sparse </span><span class="s0">import </span><span class="s2">(</span><span class="s1">issparse</span><span class="s2">,</span>
+                          <span class="s1">SparseEfficiencyWarning</span><span class="s2">, </span><span class="s1">csc_matrix</span><span class="s2">, </span><span class="s1">eye</span><span class="s2">, </span><span class="s1">diags</span><span class="s2">)</span>
+<span class="s0">from </span><span class="s1">scipy</span><span class="s2">.</span><span class="s1">sparse</span><span class="s2">.</span><span class="s1">_sputils </span><span class="s0">import </span><span class="s1">is_pydata_spmatrix</span><span class="s2">, </span><span class="s1">convert_pydata_sparse_to_scipy</span>
+<span class="s0">from </span><span class="s1">scipy</span><span class="s2">.</span><span class="s1">linalg </span><span class="s0">import </span><span class="s1">LinAlgError</span>
+<span class="s0">import </span><span class="s1">copy</span>
+
+<span class="s0">from </span><span class="s2">. </span><span class="s0">import </span><span class="s1">_superlu</span>
+
+<span class="s1">noScikit </span><span class="s2">= </span><span class="s0">False</span>
+<span class="s0">try</span><span class="s2">:</span>
+    <span class="s0">import </span><span class="s1">scikits</span><span class="s2">.</span><span class="s1">umfpack </span><span class="s0">as </span><span class="s1">umfpack</span>
+<span class="s0">except </span><span class="s1">ImportError</span><span class="s2">:</span>
+    <span class="s1">noScikit </span><span class="s2">= </span><span class="s0">True</span>
+
+<span class="s1">useUmfpack </span><span class="s2">= </span><span class="s0">not </span><span class="s1">noScikit</span>
+
+<span class="s1">__all__ </span><span class="s2">= [</span><span class="s3">'use_solver'</span><span class="s2">, </span><span class="s3">'spsolve'</span><span class="s2">, </span><span class="s3">'splu'</span><span class="s2">, </span><span class="s3">'spilu'</span><span class="s2">, </span><span class="s3">'factorized'</span><span class="s2">,</span>
+           <span class="s3">'MatrixRankWarning'</span><span class="s2">, </span><span class="s3">'spsolve_triangular'</span><span class="s2">]</span>
+
+
+<span class="s0">class </span><span class="s1">MatrixRankWarning</span><span class="s2">(</span><span class="s1">UserWarning</span><span class="s2">):</span>
+    <span class="s0">pass</span>
+
+
+<span class="s0">def </span><span class="s1">use_solver</span><span class="s2">(**</span><span class="s1">kwargs</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Select default sparse direct solver to be used. 
+ 
+    Parameters 
+    ---------- 
+    useUmfpack : bool, optional 
+        Use UMFPACK [1]_, [2]_, [3]_, [4]_. over SuperLU. Has effect only 
+        if ``scikits.umfpack`` is installed. Default: True 
+    assumeSortedIndices : bool, optional 
+        Allow UMFPACK to skip the step of sorting indices for a CSR/CSC matrix. 
+        Has effect only if useUmfpack is True and ``scikits.umfpack`` is 
+        installed. Default: False 
+ 
+    Notes 
+    ----- 
+    The default sparse solver is UMFPACK when available 
+    (``scikits.umfpack`` is installed). This can be changed by passing 
+    useUmfpack = False, which then causes the always present SuperLU 
+    based solver to be used. 
+ 
+    UMFPACK requires a CSR/CSC matrix to have sorted column/row indices. If 
+    sure that the matrix fulfills this, pass ``assumeSortedIndices=True`` 
+    to gain some speed. 
+ 
+    References 
+    ---------- 
+    .. [1] T. A. Davis, Algorithm 832:  UMFPACK - an unsymmetric-pattern 
+           multifrontal method with a column pre-ordering strategy, ACM 
+           Trans. on Mathematical Software, 30(2), 2004, pp. 196--199. 
+           https://dl.acm.org/doi/abs/10.1145/992200.992206 
+ 
+    .. [2] T. A. Davis, A column pre-ordering strategy for the 
+           unsymmetric-pattern multifrontal method, ACM Trans. 
+           on Mathematical Software, 30(2), 2004, pp. 165--195. 
+           https://dl.acm.org/doi/abs/10.1145/992200.992205 
+ 
+    .. [3] T. A. Davis and I. S. Duff, A combined unifrontal/multifrontal 
+           method for unsymmetric sparse matrices, ACM Trans. on 
+           Mathematical Software, 25(1), 1999, pp. 1--19. 
+           https://doi.org/10.1145/305658.287640 
+ 
+    .. [4] T. A. Davis and I. S. Duff, An unsymmetric-pattern multifrontal 
+           method for sparse LU factorization, SIAM J. Matrix Analysis and 
+           Computations, 18(1), 1997, pp. 140--158. 
+           https://doi.org/10.1137/S0895479894246905T. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse.linalg import use_solver, spsolve 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; R = np.random.randn(5, 5) 
+    &gt;&gt;&gt; A = csc_matrix(R) 
+    &gt;&gt;&gt; b = np.random.randn(5) 
+    &gt;&gt;&gt; use_solver(useUmfpack=False) # enforce superLU over UMFPACK 
+    &gt;&gt;&gt; x = spsolve(A, b) 
+    &gt;&gt;&gt; np.allclose(A.dot(x), b) 
+    True 
+    &gt;&gt;&gt; use_solver(useUmfpack=True) # reset umfPack usage to default 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s3">'useUmfpack' </span><span class="s0">in </span><span class="s1">kwargs</span><span class="s2">:</span>
+        <span class="s1">globals</span><span class="s2">()[</span><span class="s3">'useUmfpack'</span><span class="s2">] = </span><span class="s1">kwargs</span><span class="s2">[</span><span class="s3">'useUmfpack'</span><span class="s2">]</span>
+    <span class="s0">if </span><span class="s1">useUmfpack </span><span class="s0">and </span><span class="s3">'assumeSortedIndices' </span><span class="s0">in </span><span class="s1">kwargs</span><span class="s2">:</span>
+        <span class="s1">umfpack</span><span class="s2">.</span><span class="s1">configure</span><span class="s2">(</span><span class="s1">assumeSortedIndices</span><span class="s2">=</span><span class="s1">kwargs</span><span class="s2">[</span><span class="s3">'assumeSortedIndices'</span><span class="s2">])</span>
+
+<span class="s0">def </span><span class="s1">_get_umf_family</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot;Get umfpack family string given the sparse matrix dtype.&quot;&quot;&quot;</span>
+    <span class="s1">_families </span><span class="s2">= {</span>
+        <span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">): </span><span class="s3">'di'</span><span class="s2">,</span>
+        <span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">complex128</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">): </span><span class="s3">'zi'</span><span class="s2">,</span>
+        <span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">): </span><span class="s3">'dl'</span><span class="s2">,</span>
+        <span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">complex128</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">): </span><span class="s3">'zl'</span>
+    <span class="s2">}</span>
+
+    <span class="s5"># A.dtype.name can only be &quot;float64&quot; or</span>
+    <span class="s5"># &quot;complex128&quot; in control flow</span>
+    <span class="s1">f_type </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">np</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+    <span class="s5"># control flow may allow for more index</span>
+    <span class="s5"># types to get through here</span>
+    <span class="s1">i_type </span><span class="s2">= </span><span class="s1">getattr</span><span class="s2">(</span><span class="s1">np</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">indices</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">name</span><span class="s2">)</span>
+
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s1">family </span><span class="s2">= </span><span class="s1">_families</span><span class="s2">[(</span><span class="s1">f_type</span><span class="s2">, </span><span class="s1">i_type</span><span class="s2">)]</span>
+
+    <span class="s0">except </span><span class="s1">KeyError </span><span class="s0">as </span><span class="s1">e</span><span class="s2">:</span>
+        <span class="s1">msg </span><span class="s2">= (</span><span class="s3">'only float64 or complex128 matrices with int32 or int64 '</span>
+               <span class="s3">f'indices are supported! (got: matrix: </span><span class="s0">{</span><span class="s1">f_type</span><span class="s0">}</span><span class="s3">, indices: </span><span class="s0">{</span><span class="s1">i_type</span><span class="s0">}</span><span class="s3">)'</span><span class="s2">)</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s1">msg</span><span class="s2">) </span><span class="s0">from </span><span class="s1">e</span>
+
+    <span class="s5"># See gh-8278. Considered converting only if</span>
+    <span class="s5"># A.shape[0]*A.shape[1] &gt; np.iinfo(np.int32).max,</span>
+    <span class="s5"># but that didn't always fix the issue.</span>
+    <span class="s1">family </span><span class="s2">= </span><span class="s1">family</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] + </span><span class="s3">&quot;l&quot;</span>
+    <span class="s1">A_new </span><span class="s2">= </span><span class="s1">copy</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+    <span class="s1">A_new</span><span class="s2">.</span><span class="s1">indptr </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">A</span><span class="s2">.</span><span class="s1">indptr</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+    <span class="s1">A_new</span><span class="s2">.</span><span class="s1">indices </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">A</span><span class="s2">.</span><span class="s1">indices</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int64</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">family</span><span class="s2">, </span><span class="s1">A_new</span>
+
+<span class="s0">def </span><span class="s1">_safe_downcast_indices</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+    <span class="s5"># check for safe downcasting</span>
+    <span class="s1">max_value </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">iinfo</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intc</span><span class="s2">).</span><span class="s1">max</span>
+
+    <span class="s0">if </span><span class="s1">A</span><span class="s2">.</span><span class="s1">indptr</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">] &gt; </span><span class="s1">max_value</span><span class="s2">:  </span><span class="s5"># indptr[-1] is max b/c indptr always sorted</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">&quot;indptr values too large for SuperLU&quot;</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">max</span><span class="s2">(*</span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">) &gt; </span><span class="s1">max_value</span><span class="s2">:  </span><span class="s5"># only check large enough arrays</span>
+        <span class="s0">if </span><span class="s1">np</span><span class="s2">.</span><span class="s1">any</span><span class="s2">(</span><span class="s1">A</span><span class="s2">.</span><span class="s1">indices </span><span class="s2">&gt; </span><span class="s1">max_value</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">&quot;indices values too large for SuperLU&quot;</span><span class="s2">)</span>
+
+    <span class="s1">indices </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">indices</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intc</span><span class="s2">, </span><span class="s1">copy</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+    <span class="s1">indptr </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">indptr</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intc</span><span class="s2">, </span><span class="s1">copy</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+    <span class="s0">return </span><span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr</span>
+
+<span class="s0">def </span><span class="s1">spsolve</span><span class="s2">(</span><span class="s1">A</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">permc_spec</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">use_umfpack</span><span class="s2">=</span><span class="s0">True</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot;Solve the sparse linear system Ax=b, where b may be a vector or a matrix. 
+ 
+    Parameters 
+    ---------- 
+    A : ndarray or sparse matrix 
+        The square matrix A will be converted into CSC or CSR form 
+    b : ndarray or sparse matrix 
+        The matrix or vector representing the right hand side of the equation. 
+        If a vector, b.shape must be (n,) or (n, 1). 
+    permc_spec : str, optional 
+        How to permute the columns of the matrix for sparsity preservation. 
+        (default: 'COLAMD') 
+ 
+        - ``NATURAL``: natural ordering. 
+        - ``MMD_ATA``: minimum degree ordering on the structure of A^T A. 
+        - ``MMD_AT_PLUS_A``: minimum degree ordering on the structure of A^T+A. 
+        - ``COLAMD``: approximate minimum degree column ordering [1]_, [2]_. 
+ 
+    use_umfpack : bool, optional 
+        if True (default) then use UMFPACK for the solution [3]_, [4]_, [5]_, 
+        [6]_ . This is only referenced if b is a vector and 
+        ``scikits.umfpack`` is installed. 
+ 
+    Returns 
+    ------- 
+    x : ndarray or sparse matrix 
+        the solution of the sparse linear equation. 
+        If b is a vector, then x is a vector of size A.shape[1] 
+        If b is a matrix, then x is a matrix of size (A.shape[1], b.shape[1]) 
+ 
+    Notes 
+    ----- 
+    For solving the matrix expression AX = B, this solver assumes the resulting 
+    matrix X is sparse, as is often the case for very sparse inputs.  If the 
+    resulting X is dense, the construction of this sparse result will be 
+    relatively expensive.  In that case, consider converting A to a dense 
+    matrix and using scipy.linalg.solve or its variants. 
+ 
+    References 
+    ---------- 
+    .. [1] T. A. Davis, J. R. Gilbert, S. Larimore, E. Ng, Algorithm 836: 
+           COLAMD, an approximate column minimum degree ordering algorithm, 
+           ACM Trans. on Mathematical Software, 30(3), 2004, pp. 377--380. 
+           :doi:`10.1145/1024074.1024080` 
+ 
+    .. [2] T. A. Davis, J. R. Gilbert, S. Larimore, E. Ng, A column approximate 
+           minimum degree ordering algorithm, ACM Trans. on Mathematical 
+           Software, 30(3), 2004, pp. 353--376. :doi:`10.1145/1024074.1024079` 
+ 
+    .. [3] T. A. Davis, Algorithm 832:  UMFPACK - an unsymmetric-pattern 
+           multifrontal method with a column pre-ordering strategy, ACM 
+           Trans. on Mathematical Software, 30(2), 2004, pp. 196--199. 
+           https://dl.acm.org/doi/abs/10.1145/992200.992206 
+ 
+    .. [4] T. A. Davis, A column pre-ordering strategy for the 
+           unsymmetric-pattern multifrontal method, ACM Trans. 
+           on Mathematical Software, 30(2), 2004, pp. 165--195. 
+           https://dl.acm.org/doi/abs/10.1145/992200.992205 
+ 
+    .. [5] T. A. Davis and I. S. Duff, A combined unifrontal/multifrontal 
+           method for unsymmetric sparse matrices, ACM Trans. on 
+           Mathematical Software, 25(1), 1999, pp. 1--19. 
+           https://doi.org/10.1145/305658.287640 
+ 
+    .. [6] T. A. Davis and I. S. Duff, An unsymmetric-pattern multifrontal 
+           method for sparse LU factorization, SIAM J. Matrix Analysis and 
+           Computations, 18(1), 1997, pp. 140--158. 
+           https://doi.org/10.1137/S0895479894246905T. 
+ 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; from scipy.sparse.linalg import spsolve 
+    &gt;&gt;&gt; A = csc_matrix([[3, 2, 0], [1, -1, 0], [0, 5, 1]], dtype=float) 
+    &gt;&gt;&gt; B = csc_matrix([[2, 0], [-1, 0], [2, 0]], dtype=float) 
+    &gt;&gt;&gt; x = spsolve(A, B) 
+    &gt;&gt;&gt; np.allclose(A.dot(x).toarray(), B.toarray()) 
+    True 
+    &quot;&quot;&quot;</span>
+    <span class="s1">is_pydata_sparse </span><span class="s2">= </span><span class="s1">is_pydata_spmatrix</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+    <span class="s1">pydata_sparse_cls </span><span class="s2">= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">__class__ </span><span class="s0">if </span><span class="s1">is_pydata_sparse </span><span class="s0">else None</span>
+    <span class="s1">A </span><span class="s2">= </span><span class="s1">convert_pydata_sparse_to_scipy</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+    <span class="s1">b </span><span class="s2">= </span><span class="s1">convert_pydata_sparse_to_scipy</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">if not </span><span class="s2">(</span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">A</span><span class="s2">) </span><span class="s0">and </span><span class="s1">A</span><span class="s2">.</span><span class="s1">format </span><span class="s0">in </span><span class="s2">(</span><span class="s3">&quot;csc&quot;</span><span class="s2">, </span><span class="s3">&quot;csr&quot;</span><span class="s2">)):</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">csc_matrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+        <span class="s1">warn</span><span class="s2">(</span><span class="s3">'spsolve requires A be CSC or CSR matrix format'</span><span class="s2">,</span>
+             <span class="s1">SparseEfficiencyWarning</span><span class="s2">, </span><span class="s1">stacklevel</span><span class="s2">=</span><span class="s6">2</span><span class="s2">)</span>
+
+    <span class="s5"># b is a vector only if b have shape (n,) or (n, 1)</span>
+    <span class="s1">b_is_sparse </span><span class="s2">= </span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+    <span class="s0">if not </span><span class="s1">b_is_sparse</span><span class="s2">:</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+    <span class="s1">b_is_vector </span><span class="s2">= ((</span><span class="s1">b</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s6">1</span><span class="s2">) </span><span class="s0">or </span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s6">2 </span><span class="s0">and </span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] == </span><span class="s6">1</span><span class="s2">))</span>
+
+    <span class="s5"># sum duplicates for non-canonical format</span>
+    <span class="s1">A</span><span class="s2">.</span><span class="s1">sum_duplicates</span><span class="s2">()</span>
+    <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">_asfptype</span><span class="s2">()  </span><span class="s5"># upcast to a floating point format</span>
+    <span class="s1">result_dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">promote_types</span><span class="s2">(</span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">b</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype </span><span class="s2">!= </span><span class="s1">result_dtype</span><span class="s2">:</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">result_dtype</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">b</span><span class="s2">.</span><span class="s1">dtype </span><span class="s2">!= </span><span class="s1">result_dtype</span><span class="s2">:</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">result_dtype</span><span class="s2">)</span>
+
+    <span class="s5"># validate input shapes</span>
+    <span class="s1">M</span><span class="s2">, </span><span class="s1">N </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span>
+    <span class="s0">if </span><span class="s2">(</span><span class="s1">M </span><span class="s2">!= </span><span class="s1">N</span><span class="s2">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">f&quot;matrix must be square (has shape </span><span class="s0">{</span><span class="s2">(</span><span class="s1">M</span><span class="s2">, </span><span class="s1">N</span><span class="s2">)</span><span class="s0">}</span><span class="s3">)&quot;</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">M </span><span class="s2">!= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]:</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">f&quot;matrix - rhs dimension mismatch (</span><span class="s0">{</span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span><span class="s0">} </span><span class="s3">- </span><span class="s0">{</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span><span class="s0">}</span><span class="s3">)&quot;</span><span class="s2">)</span>
+
+    <span class="s1">use_umfpack </span><span class="s2">= </span><span class="s1">use_umfpack </span><span class="s0">and </span><span class="s1">useUmfpack</span>
+
+    <span class="s0">if </span><span class="s1">b_is_vector </span><span class="s0">and </span><span class="s1">use_umfpack</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">b_is_sparse</span><span class="s2">:</span>
+            <span class="s1">b_vec </span><span class="s2">= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">toarray</span><span class="s2">()</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">b_vec </span><span class="s2">= </span><span class="s1">b</span>
+        <span class="s1">b_vec </span><span class="s2">= </span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">b_vec</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">).</span><span class="s1">ravel</span><span class="s2">()</span>
+
+        <span class="s0">if </span><span class="s1">noScikit</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s3">'Scikits.umfpack not installed.'</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">char </span><span class="s0">not in </span><span class="s3">'dD'</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">&quot;convert matrix data to double, please, using&quot;</span>
+                  <span class="s3">&quot; .astype(), or set linsolve.useUmfpack = False&quot;</span><span class="s2">)</span>
+
+        <span class="s1">umf_family</span><span class="s2">, </span><span class="s1">A </span><span class="s2">= </span><span class="s1">_get_umf_family</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+        <span class="s1">umf </span><span class="s2">= </span><span class="s1">umfpack</span><span class="s2">.</span><span class="s1">UmfpackContext</span><span class="s2">(</span><span class="s1">umf_family</span><span class="s2">)</span>
+        <span class="s1">x </span><span class="s2">= </span><span class="s1">umf</span><span class="s2">.</span><span class="s1">linsolve</span><span class="s2">(</span><span class="s1">umfpack</span><span class="s2">.</span><span class="s1">UMFPACK_A</span><span class="s2">, </span><span class="s1">A</span><span class="s2">, </span><span class="s1">b_vec</span><span class="s2">,</span>
+                         <span class="s1">autoTranspose</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">b_is_vector </span><span class="s0">and </span><span class="s1">b_is_sparse</span><span class="s2">:</span>
+            <span class="s1">b </span><span class="s2">= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">toarray</span><span class="s2">()</span>
+            <span class="s1">b_is_sparse </span><span class="s2">= </span><span class="s0">False</span>
+
+        <span class="s0">if not </span><span class="s1">b_is_sparse</span><span class="s2">:</span>
+            <span class="s0">if </span><span class="s1">A</span><span class="s2">.</span><span class="s1">format </span><span class="s2">== </span><span class="s3">&quot;csc&quot;</span><span class="s2">:</span>
+                <span class="s1">flag </span><span class="s2">= </span><span class="s6">1  </span><span class="s5"># CSC format</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">flag </span><span class="s2">= </span><span class="s6">0  </span><span class="s5"># CSR format</span>
+
+            <span class="s1">indices </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">indices</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intc</span><span class="s2">, </span><span class="s1">copy</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+            <span class="s1">indptr </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">indptr</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intc</span><span class="s2">, </span><span class="s1">copy</span><span class="s2">=</span><span class="s0">False</span><span class="s2">)</span>
+            <span class="s1">options </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">ColPerm</span><span class="s2">=</span><span class="s1">permc_spec</span><span class="s2">)</span>
+            <span class="s1">x</span><span class="s2">, </span><span class="s1">info </span><span class="s2">= </span><span class="s1">_superlu</span><span class="s2">.</span><span class="s1">gssv</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">nnz</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">data</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr</span><span class="s2">,</span>
+                                    <span class="s1">b</span><span class="s2">, </span><span class="s1">flag</span><span class="s2">, </span><span class="s1">options</span><span class="s2">=</span><span class="s1">options</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">info </span><span class="s2">!= </span><span class="s6">0</span><span class="s2">:</span>
+                <span class="s1">warn</span><span class="s2">(</span><span class="s3">&quot;Matrix is exactly singular&quot;</span><span class="s2">, </span><span class="s1">MatrixRankWarning</span><span class="s2">, </span><span class="s1">stacklevel</span><span class="s2">=</span><span class="s6">2</span><span class="s2">)</span>
+                <span class="s1">x</span><span class="s2">.</span><span class="s1">fill</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">nan</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">b_is_vector</span><span class="s2">:</span>
+                <span class="s1">x </span><span class="s2">= </span><span class="s1">x</span><span class="s2">.</span><span class="s1">ravel</span><span class="s2">()</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s5"># b is sparse</span>
+            <span class="s1">Afactsolve </span><span class="s2">= </span><span class="s1">factorized</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+
+            <span class="s0">if not </span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">format </span><span class="s2">== </span><span class="s3">&quot;csc&quot; </span><span class="s0">or </span><span class="s1">is_pydata_spmatrix</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)):</span>
+                <span class="s1">warn</span><span class="s2">(</span><span class="s3">'spsolve is more efficient when sparse b '</span>
+                     <span class="s3">'is in the CSC matrix format'</span><span class="s2">,</span>
+                     <span class="s1">SparseEfficiencyWarning</span><span class="s2">, </span><span class="s1">stacklevel</span><span class="s2">=</span><span class="s6">2</span><span class="s2">)</span>
+                <span class="s1">b </span><span class="s2">= </span><span class="s1">csc_matrix</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+
+            <span class="s5"># Create a sparse output matrix by repeatedly applying</span>
+            <span class="s5"># the sparse factorization to solve columns of b.</span>
+            <span class="s1">data_segs </span><span class="s2">= []</span>
+            <span class="s1">row_segs </span><span class="s2">= []</span>
+            <span class="s1">col_segs </span><span class="s2">= []</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">1</span><span class="s2">]):</span>
+                <span class="s5"># TODO: replace this with</span>
+                <span class="s5"># bj = b[:, j].toarray().ravel()</span>
+                <span class="s5"># once 1D sparse arrays are supported.</span>
+                <span class="s5"># That is a slightly faster code path.</span>
+                <span class="s1">bj </span><span class="s2">= </span><span class="s1">b</span><span class="s2">[:, [</span><span class="s1">j</span><span class="s2">]].</span><span class="s1">toarray</span><span class="s2">().</span><span class="s1">ravel</span><span class="s2">()</span>
+                <span class="s1">xj </span><span class="s2">= </span><span class="s1">Afactsolve</span><span class="s2">(</span><span class="s1">bj</span><span class="s2">)</span>
+                <span class="s1">w </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">flatnonzero</span><span class="s2">(</span><span class="s1">xj</span><span class="s2">)</span>
+                <span class="s1">segment_length </span><span class="s2">= </span><span class="s1">w</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]</span>
+                <span class="s1">row_segs</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">w</span><span class="s2">)</span>
+                <span class="s1">col_segs</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">full</span><span class="s2">(</span><span class="s1">segment_length</span><span class="s2">, </span><span class="s1">j</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">int</span><span class="s2">))</span>
+                <span class="s1">data_segs</span><span class="s2">.</span><span class="s1">append</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">xj</span><span class="s2">[</span><span class="s1">w</span><span class="s2">], </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">))</span>
+            <span class="s1">sparse_data </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">concatenate</span><span class="s2">(</span><span class="s1">data_segs</span><span class="s2">)</span>
+            <span class="s1">sparse_row </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">concatenate</span><span class="s2">(</span><span class="s1">row_segs</span><span class="s2">)</span>
+            <span class="s1">sparse_col </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">concatenate</span><span class="s2">(</span><span class="s1">col_segs</span><span class="s2">)</span>
+            <span class="s1">x </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">__class__</span><span class="s2">((</span><span class="s1">sparse_data</span><span class="s2">, (</span><span class="s1">sparse_row</span><span class="s2">, </span><span class="s1">sparse_col</span><span class="s2">)),</span>
+                           <span class="s1">shape</span><span class="s2">=</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+            <span class="s0">if </span><span class="s1">is_pydata_sparse</span><span class="s2">:</span>
+                <span class="s1">x </span><span class="s2">= </span><span class="s1">pydata_sparse_cls</span><span class="s2">.</span><span class="s1">from_scipy_sparse</span><span class="s2">(</span><span class="s1">x</span><span class="s2">)</span>
+
+    <span class="s0">return </span><span class="s1">x</span>
+
+
+<span class="s0">def </span><span class="s1">splu</span><span class="s2">(</span><span class="s1">A</span><span class="s2">, </span><span class="s1">permc_spec</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">diag_pivot_thresh</span><span class="s2">=</span><span class="s0">None</span><span class="s2">,</span>
+         <span class="s1">relax</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">panel_size</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">options</span><span class="s2">=</span><span class="s1">dict</span><span class="s2">()):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Compute the LU decomposition of a sparse, square matrix. 
+ 
+    Parameters 
+    ---------- 
+    A : sparse matrix 
+        Sparse matrix to factorize. Most efficient when provided in CSC 
+        format. Other formats will be converted to CSC before factorization. 
+    permc_spec : str, optional 
+        How to permute the columns of the matrix for sparsity preservation. 
+        (default: 'COLAMD') 
+ 
+        - ``NATURAL``: natural ordering. 
+        - ``MMD_ATA``: minimum degree ordering on the structure of A^T A. 
+        - ``MMD_AT_PLUS_A``: minimum degree ordering on the structure of A^T+A. 
+        - ``COLAMD``: approximate minimum degree column ordering 
+ 
+    diag_pivot_thresh : float, optional 
+        Threshold used for a diagonal entry to be an acceptable pivot. 
+        See SuperLU user's guide for details [1]_ 
+    relax : int, optional 
+        Expert option for customizing the degree of relaxing supernodes. 
+        See SuperLU user's guide for details [1]_ 
+    panel_size : int, optional 
+        Expert option for customizing the panel size. 
+        See SuperLU user's guide for details [1]_ 
+    options : dict, optional 
+        Dictionary containing additional expert options to SuperLU. 
+        See SuperLU user guide [1]_ (section 2.4 on the 'Options' argument) 
+        for more details. For example, you can specify 
+        ``options=dict(Equil=False, IterRefine='SINGLE'))`` 
+        to turn equilibration off and perform a single iterative refinement. 
+ 
+    Returns 
+    ------- 
+    invA : scipy.sparse.linalg.SuperLU 
+        Object, which has a ``solve`` method. 
+ 
+    See also 
+    -------- 
+    spilu : incomplete LU decomposition 
+ 
+    Notes 
+    ----- 
+    This function uses the SuperLU library. 
+ 
+    References 
+    ---------- 
+    .. [1] SuperLU https://portal.nersc.gov/project/sparse/superlu/ 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; from scipy.sparse.linalg import splu 
+    &gt;&gt;&gt; A = csc_matrix([[1., 0., 0.], [5., 0., 2.], [0., -1., 0.]], dtype=float) 
+    &gt;&gt;&gt; B = splu(A) 
+    &gt;&gt;&gt; x = np.array([1., 2., 3.], dtype=float) 
+    &gt;&gt;&gt; B.solve(x) 
+    array([ 1. , -3. , -1.5]) 
+    &gt;&gt;&gt; A.dot(B.solve(x)) 
+    array([ 1.,  2.,  3.]) 
+    &gt;&gt;&gt; B.solve(A.dot(x)) 
+    array([ 1.,  2.,  3.]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">is_pydata_spmatrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">csc_construct_func</span><span class="s2">(*</span><span class="s1">a</span><span class="s2">, </span><span class="s1">cls</span><span class="s2">=</span><span class="s1">type</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)):</span>
+            <span class="s0">return </span><span class="s1">cls</span><span class="s2">.</span><span class="s1">from_scipy_sparse</span><span class="s2">(</span><span class="s1">csc_matrix</span><span class="s2">(*</span><span class="s1">a</span><span class="s2">))</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">to_scipy_sparse</span><span class="s2">().</span><span class="s1">tocsc</span><span class="s2">()</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">csc_construct_func </span><span class="s2">= </span><span class="s1">csc_matrix</span>
+
+    <span class="s0">if not </span><span class="s2">(</span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">A</span><span class="s2">) </span><span class="s0">and </span><span class="s1">A</span><span class="s2">.</span><span class="s1">format </span><span class="s2">== </span><span class="s3">&quot;csc&quot;</span><span class="s2">):</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">csc_matrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+        <span class="s1">warn</span><span class="s2">(</span><span class="s3">'splu converted its input to CSC format'</span><span class="s2">,</span>
+             <span class="s1">SparseEfficiencyWarning</span><span class="s2">, </span><span class="s1">stacklevel</span><span class="s2">=</span><span class="s6">2</span><span class="s2">)</span>
+
+    <span class="s5"># sum duplicates for non-canonical format</span>
+    <span class="s1">A</span><span class="s2">.</span><span class="s1">sum_duplicates</span><span class="s2">()</span>
+    <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">_asfptype</span><span class="s2">()  </span><span class="s5"># upcast to a floating point format</span>
+
+    <span class="s1">M</span><span class="s2">, </span><span class="s1">N </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span>
+    <span class="s0">if </span><span class="s2">(</span><span class="s1">M </span><span class="s2">!= </span><span class="s1">N</span><span class="s2">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">&quot;can only factor square matrices&quot;</span><span class="s2">)  </span><span class="s5"># is this true?</span>
+
+    <span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr </span><span class="s2">= </span><span class="s1">_safe_downcast_indices</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+
+    <span class="s1">_options </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">DiagPivotThresh</span><span class="s2">=</span><span class="s1">diag_pivot_thresh</span><span class="s2">, </span><span class="s1">ColPerm</span><span class="s2">=</span><span class="s1">permc_spec</span><span class="s2">,</span>
+                    <span class="s1">PanelSize</span><span class="s2">=</span><span class="s1">panel_size</span><span class="s2">, </span><span class="s1">Relax</span><span class="s2">=</span><span class="s1">relax</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">options </span><span class="s0">is not None</span><span class="s2">:</span>
+        <span class="s1">_options</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">options</span><span class="s2">)</span>
+
+    <span class="s5"># Ensure that no column permutations are applied</span>
+    <span class="s0">if </span><span class="s2">(</span><span class="s1">_options</span><span class="s2">[</span><span class="s3">&quot;ColPerm&quot;</span><span class="s2">] == </span><span class="s3">&quot;NATURAL&quot;</span><span class="s2">):</span>
+        <span class="s1">_options</span><span class="s2">[</span><span class="s3">&quot;SymmetricMode&quot;</span><span class="s2">] = </span><span class="s0">True</span>
+
+    <span class="s0">return </span><span class="s1">_superlu</span><span class="s2">.</span><span class="s1">gstrf</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">nnz</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">data</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr</span><span class="s2">,</span>
+                          <span class="s1">csc_construct_func</span><span class="s2">=</span><span class="s1">csc_construct_func</span><span class="s2">,</span>
+                          <span class="s1">ilu</span><span class="s2">=</span><span class="s0">False</span><span class="s2">, </span><span class="s1">options</span><span class="s2">=</span><span class="s1">_options</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">spilu</span><span class="s2">(</span><span class="s1">A</span><span class="s2">, </span><span class="s1">drop_tol</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">fill_factor</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">drop_rule</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">permc_spec</span><span class="s2">=</span><span class="s0">None</span><span class="s2">,</span>
+          <span class="s1">diag_pivot_thresh</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">relax</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">panel_size</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">options</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Compute an incomplete LU decomposition for a sparse, square matrix. 
+ 
+    The resulting object is an approximation to the inverse of `A`. 
+ 
+    Parameters 
+    ---------- 
+    A : (N, N) array_like 
+        Sparse matrix to factorize. Most efficient when provided in CSC format. 
+        Other formats will be converted to CSC before factorization. 
+    drop_tol : float, optional 
+        Drop tolerance (0 &lt;= tol &lt;= 1) for an incomplete LU decomposition. 
+        (default: 1e-4) 
+    fill_factor : float, optional 
+        Specifies the fill ratio upper bound (&gt;= 1.0) for ILU. (default: 10) 
+    drop_rule : str, optional 
+        Comma-separated string of drop rules to use. 
+        Available rules: ``basic``, ``prows``, ``column``, ``area``, 
+        ``secondary``, ``dynamic``, ``interp``. (Default: ``basic,area``) 
+ 
+        See SuperLU documentation for details. 
+ 
+    Remaining other options 
+        Same as for `splu` 
+ 
+    Returns 
+    ------- 
+    invA_approx : scipy.sparse.linalg.SuperLU 
+        Object, which has a ``solve`` method. 
+ 
+    See also 
+    -------- 
+    splu : complete LU decomposition 
+ 
+    Notes 
+    ----- 
+    To improve the better approximation to the inverse, you may need to 
+    increase `fill_factor` AND decrease `drop_tol`. 
+ 
+    This function uses the SuperLU library. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; from scipy.sparse.linalg import spilu 
+    &gt;&gt;&gt; A = csc_matrix([[1., 0., 0.], [5., 0., 2.], [0., -1., 0.]], dtype=float) 
+    &gt;&gt;&gt; B = spilu(A) 
+    &gt;&gt;&gt; x = np.array([1., 2., 3.], dtype=float) 
+    &gt;&gt;&gt; B.solve(x) 
+    array([ 1. , -3. , -1.5]) 
+    &gt;&gt;&gt; A.dot(B.solve(x)) 
+    array([ 1.,  2.,  3.]) 
+    &gt;&gt;&gt; B.solve(A.dot(x)) 
+    array([ 1.,  2.,  3.]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">is_pydata_spmatrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+        <span class="s0">def </span><span class="s1">csc_construct_func</span><span class="s2">(*</span><span class="s1">a</span><span class="s2">, </span><span class="s1">cls</span><span class="s2">=</span><span class="s1">type</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)):</span>
+            <span class="s0">return </span><span class="s1">cls</span><span class="s2">.</span><span class="s1">from_scipy_sparse</span><span class="s2">(</span><span class="s1">csc_matrix</span><span class="s2">(*</span><span class="s1">a</span><span class="s2">))</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">to_scipy_sparse</span><span class="s2">().</span><span class="s1">tocsc</span><span class="s2">()</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">csc_construct_func </span><span class="s2">= </span><span class="s1">csc_matrix</span>
+
+    <span class="s0">if not </span><span class="s2">(</span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">A</span><span class="s2">) </span><span class="s0">and </span><span class="s1">A</span><span class="s2">.</span><span class="s1">format </span><span class="s2">== </span><span class="s3">&quot;csc&quot;</span><span class="s2">):</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">csc_matrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+        <span class="s1">warn</span><span class="s2">(</span><span class="s3">'spilu converted its input to CSC format'</span><span class="s2">,</span>
+             <span class="s1">SparseEfficiencyWarning</span><span class="s2">, </span><span class="s1">stacklevel</span><span class="s2">=</span><span class="s6">2</span><span class="s2">)</span>
+
+    <span class="s5"># sum duplicates for non-canonical format</span>
+    <span class="s1">A</span><span class="s2">.</span><span class="s1">sum_duplicates</span><span class="s2">()</span>
+    <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">_asfptype</span><span class="s2">()  </span><span class="s5"># upcast to a floating point format</span>
+
+    <span class="s1">M</span><span class="s2">, </span><span class="s1">N </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span>
+    <span class="s0">if </span><span class="s2">(</span><span class="s1">M </span><span class="s2">!= </span><span class="s1">N</span><span class="s2">):</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">&quot;can only factor square matrices&quot;</span><span class="s2">)  </span><span class="s5"># is this true?</span>
+
+    <span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr </span><span class="s2">= </span><span class="s1">_safe_downcast_indices</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+
+    <span class="s1">_options </span><span class="s2">= </span><span class="s1">dict</span><span class="s2">(</span><span class="s1">ILU_DropRule</span><span class="s2">=</span><span class="s1">drop_rule</span><span class="s2">, </span><span class="s1">ILU_DropTol</span><span class="s2">=</span><span class="s1">drop_tol</span><span class="s2">,</span>
+                    <span class="s1">ILU_FillFactor</span><span class="s2">=</span><span class="s1">fill_factor</span><span class="s2">,</span>
+                    <span class="s1">DiagPivotThresh</span><span class="s2">=</span><span class="s1">diag_pivot_thresh</span><span class="s2">, </span><span class="s1">ColPerm</span><span class="s2">=</span><span class="s1">permc_spec</span><span class="s2">,</span>
+                    <span class="s1">PanelSize</span><span class="s2">=</span><span class="s1">panel_size</span><span class="s2">, </span><span class="s1">Relax</span><span class="s2">=</span><span class="s1">relax</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">options </span><span class="s0">is not None</span><span class="s2">:</span>
+        <span class="s1">_options</span><span class="s2">.</span><span class="s1">update</span><span class="s2">(</span><span class="s1">options</span><span class="s2">)</span>
+
+    <span class="s5"># Ensure that no column permutations are applied</span>
+    <span class="s0">if </span><span class="s2">(</span><span class="s1">_options</span><span class="s2">[</span><span class="s3">&quot;ColPerm&quot;</span><span class="s2">] == </span><span class="s3">&quot;NATURAL&quot;</span><span class="s2">):</span>
+        <span class="s1">_options</span><span class="s2">[</span><span class="s3">&quot;SymmetricMode&quot;</span><span class="s2">] = </span><span class="s0">True</span>
+
+    <span class="s0">return </span><span class="s1">_superlu</span><span class="s2">.</span><span class="s1">gstrf</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">nnz</span><span class="s2">, </span><span class="s1">A</span><span class="s2">.</span><span class="s1">data</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr</span><span class="s2">,</span>
+                          <span class="s1">csc_construct_func</span><span class="s2">=</span><span class="s1">csc_construct_func</span><span class="s2">,</span>
+                          <span class="s1">ilu</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">options</span><span class="s2">=</span><span class="s1">_options</span><span class="s2">)</span>
+
+
+<span class="s0">def </span><span class="s1">factorized</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Return a function for solving a sparse linear system, with A pre-factorized. 
+ 
+    Parameters 
+    ---------- 
+    A : (N, N) array_like 
+        Input. A in CSC format is most efficient. A CSR format matrix will 
+        be converted to CSC before factorization. 
+ 
+    Returns 
+    ------- 
+    solve : callable 
+        To solve the linear system of equations given in `A`, the `solve` 
+        callable should be passed an ndarray of shape (N,). 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse.linalg import factorized 
+    &gt;&gt;&gt; from scipy.sparse import csc_matrix 
+    &gt;&gt;&gt; A = np.array([[ 3. ,  2. , -1. ], 
+    ...               [ 2. , -2. ,  4. ], 
+    ...               [-1. ,  0.5, -1. ]]) 
+    &gt;&gt;&gt; solve = factorized(csc_matrix(A)) # Makes LU decomposition. 
+    &gt;&gt;&gt; rhs1 = np.array([1, -2, 0]) 
+    &gt;&gt;&gt; solve(rhs1) # Uses the LU factors. 
+    array([ 1., -2., -2.]) 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">is_pydata_spmatrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">to_scipy_sparse</span><span class="s2">().</span><span class="s1">tocsc</span><span class="s2">()</span>
+
+    <span class="s0">if </span><span class="s1">useUmfpack</span><span class="s2">:</span>
+        <span class="s0">if </span><span class="s1">noScikit</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">RuntimeError</span><span class="s2">(</span><span class="s3">'Scikits.umfpack not installed.'</span><span class="s2">)</span>
+
+        <span class="s0">if not </span><span class="s2">(</span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">A</span><span class="s2">) </span><span class="s0">and </span><span class="s1">A</span><span class="s2">.</span><span class="s1">format </span><span class="s2">== </span><span class="s3">&quot;csc&quot;</span><span class="s2">):</span>
+            <span class="s1">A </span><span class="s2">= </span><span class="s1">csc_matrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+            <span class="s1">warn</span><span class="s2">(</span><span class="s3">'splu converted its input to CSC format'</span><span class="s2">,</span>
+                 <span class="s1">SparseEfficiencyWarning</span><span class="s2">, </span><span class="s1">stacklevel</span><span class="s2">=</span><span class="s6">2</span><span class="s2">)</span>
+
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">_asfptype</span><span class="s2">()  </span><span class="s5"># upcast to a floating point format</span>
+
+        <span class="s0">if </span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">char </span><span class="s0">not in </span><span class="s3">'dD'</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s3">&quot;convert matrix data to double, please, using&quot;</span>
+                  <span class="s3">&quot; .astype(), or set linsolve.useUmfpack = False&quot;</span><span class="s2">)</span>
+
+        <span class="s1">umf_family</span><span class="s2">, </span><span class="s1">A </span><span class="s2">= </span><span class="s1">_get_umf_family</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+        <span class="s1">umf </span><span class="s2">= </span><span class="s1">umfpack</span><span class="s2">.</span><span class="s1">UmfpackContext</span><span class="s2">(</span><span class="s1">umf_family</span><span class="s2">)</span>
+
+        <span class="s5"># Make LU decomposition.</span>
+        <span class="s1">umf</span><span class="s2">.</span><span class="s1">numeric</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+
+        <span class="s0">def </span><span class="s1">solve</span><span class="s2">(</span><span class="s1">b</span><span class="s2">):</span>
+            <span class="s0">with </span><span class="s1">np</span><span class="s2">.</span><span class="s1">errstate</span><span class="s2">(</span><span class="s1">divide</span><span class="s2">=</span><span class="s3">&quot;ignore&quot;</span><span class="s2">, </span><span class="s1">invalid</span><span class="s2">=</span><span class="s3">&quot;ignore&quot;</span><span class="s2">):</span>
+                <span class="s5"># Ignoring warnings with numpy &gt;= 1.23.0, see gh-16523</span>
+                <span class="s1">result </span><span class="s2">= </span><span class="s1">umf</span><span class="s2">.</span><span class="s1">solve</span><span class="s2">(</span><span class="s1">umfpack</span><span class="s2">.</span><span class="s1">UMFPACK_A</span><span class="s2">, </span><span class="s1">A</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">autoTranspose</span><span class="s2">=</span><span class="s0">True</span><span class="s2">)</span>
+
+            <span class="s0">return </span><span class="s1">result</span>
+
+        <span class="s0">return </span><span class="s1">solve</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">splu</span><span class="s2">(</span><span class="s1">A</span><span class="s2">).</span><span class="s1">solve</span>
+
+
+<span class="s0">def </span><span class="s1">spsolve_triangular</span><span class="s2">(</span><span class="s1">A</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">lower</span><span class="s2">=</span><span class="s0">True</span><span class="s2">, </span><span class="s1">overwrite_A</span><span class="s2">=</span><span class="s0">False</span><span class="s2">, </span><span class="s1">overwrite_b</span><span class="s2">=</span><span class="s0">False</span><span class="s2">,</span>
+                       <span class="s1">unit_diagonal</span><span class="s2">=</span><span class="s0">False</span><span class="s2">):</span>
+    <span class="s4">&quot;&quot;&quot; 
+    Solve the equation ``A x = b`` for `x`, assuming A is a triangular matrix. 
+ 
+    Parameters 
+    ---------- 
+    A : (M, M) sparse matrix 
+        A sparse square triangular matrix. Should be in CSR or CSC format. 
+    b : (M,) or (M, N) array_like 
+        Right-hand side matrix in ``A x = b`` 
+    lower : bool, optional 
+        Whether `A` is a lower or upper triangular matrix. 
+        Default is lower triangular matrix. 
+    overwrite_A : bool, optional 
+        Allow changing `A`. 
+        Enabling gives a performance gain. Default is False. 
+    overwrite_b : bool, optional 
+        Allow overwriting data in `b`. 
+        Enabling gives a performance gain. Default is False. 
+        If `overwrite_b` is True, it should be ensured that 
+        `b` has an appropriate dtype to be able to store the result. 
+    unit_diagonal : bool, optional 
+        If True, diagonal elements of `a` are assumed to be 1. 
+ 
+        .. versionadded:: 1.4.0 
+ 
+    Returns 
+    ------- 
+    x : (M,) or (M, N) ndarray 
+        Solution to the system ``A x = b``. Shape of return matches shape 
+        of `b`. 
+ 
+    Raises 
+    ------ 
+    LinAlgError 
+        If `A` is singular or not triangular. 
+    ValueError 
+        If shape of `A` or shape of `b` do not match the requirements. 
+ 
+    Notes 
+    ----- 
+    .. versionadded:: 0.19.0 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.sparse import csc_array 
+    &gt;&gt;&gt; from scipy.sparse.linalg import spsolve_triangular 
+    &gt;&gt;&gt; A = csc_array([[3, 0, 0], [1, -1, 0], [2, 0, 1]], dtype=float) 
+    &gt;&gt;&gt; B = np.array([[2, 0], [-1, 0], [2, 0]], dtype=float) 
+    &gt;&gt;&gt; x = spsolve_triangular(A, B) 
+    &gt;&gt;&gt; np.allclose(A.dot(x), B) 
+    True 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0">if </span><span class="s1">is_pydata_spmatrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">):</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">to_scipy_sparse</span><span class="s2">().</span><span class="s1">tocsc</span><span class="s2">()</span>
+    
+    <span class="s1">trans </span><span class="s2">= </span><span class="s3">&quot;N&quot;</span>
+    <span class="s0">if </span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">A</span><span class="s2">) </span><span class="s0">and </span><span class="s1">A</span><span class="s2">.</span><span class="s1">format </span><span class="s2">== </span><span class="s3">&quot;csr&quot;</span><span class="s2">:</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">T</span>
+        <span class="s1">trans </span><span class="s2">= </span><span class="s3">&quot;T&quot;</span>
+        <span class="s1">lower </span><span class="s2">= </span><span class="s0">not </span><span class="s1">lower</span>
+
+    <span class="s0">if not </span><span class="s2">(</span><span class="s1">issparse</span><span class="s2">(</span><span class="s1">A</span><span class="s2">) </span><span class="s0">and </span><span class="s1">A</span><span class="s2">.</span><span class="s1">format </span><span class="s2">== </span><span class="s3">&quot;csc&quot;</span><span class="s2">): </span>
+        <span class="s1">warn</span><span class="s2">(</span><span class="s3">'CSC or CSR matrix format is required. Converting to CSC matrix.'</span><span class="s2">,</span>
+             <span class="s1">SparseEfficiencyWarning</span><span class="s2">, </span><span class="s1">stacklevel</span><span class="s2">=</span><span class="s6">2</span><span class="s2">)</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">csc_matrix</span><span class="s2">(</span><span class="s1">A</span><span class="s2">)</span>
+    <span class="s0">elif not </span><span class="s1">overwrite_A</span><span class="s2">:</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+
+
+    <span class="s1">M</span><span class="s2">, </span><span class="s1">N </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span>
+    <span class="s0">if </span><span class="s1">M </span><span class="s2">!= </span><span class="s1">N</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+            <span class="s3">f'A must be a square matrix but its shape is </span><span class="s0">{</span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span><span class="s0">}</span><span class="s3">.'</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">unit_diagonal</span><span class="s2">:</span>
+        <span class="s0">with </span><span class="s1">catch_warnings</span><span class="s2">():</span>
+            <span class="s1">simplefilter</span><span class="s2">(</span><span class="s3">'ignore'</span><span class="s2">, </span><span class="s1">SparseEfficiencyWarning</span><span class="s2">)</span>
+            <span class="s1">A</span><span class="s2">.</span><span class="s1">setdiag</span><span class="s2">(</span><span class="s6">1</span><span class="s2">)</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">diag </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">diagonal</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">np</span><span class="s2">.</span><span class="s1">any</span><span class="s2">(</span><span class="s1">diag </span><span class="s2">== </span><span class="s6">0</span><span class="s2">):</span>
+            <span class="s0">raise </span><span class="s1">LinAlgError</span><span class="s2">(</span>
+                <span class="s3">'A is singular: zero entry on diagonal.'</span><span class="s2">)</span>
+        <span class="s1">invdiag </span><span class="s2">= </span><span class="s6">1</span><span class="s2">/</span><span class="s1">diag</span>
+        <span class="s0">if </span><span class="s1">trans </span><span class="s2">== </span><span class="s3">&quot;N&quot;</span><span class="s2">:</span>
+            <span class="s1">A </span><span class="s2">= </span><span class="s1">A </span><span class="s2">@ </span><span class="s1">diags</span><span class="s2">(</span><span class="s1">invdiag</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">A </span><span class="s2">= (</span><span class="s1">A</span><span class="s2">.</span><span class="s1">T </span><span class="s2">@ </span><span class="s1">diags</span><span class="s2">(</span><span class="s1">invdiag</span><span class="s2">)).</span><span class="s1">T</span>
+
+    <span class="s5"># sum duplicates for non-canonical format</span>
+    <span class="s1">A</span><span class="s2">.</span><span class="s1">sum_duplicates</span><span class="s2">()</span>
+
+    <span class="s1">b </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asanyarray</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">b</span><span class="s2">.</span><span class="s1">ndim </span><span class="s0">not in </span><span class="s2">[</span><span class="s6">1</span><span class="s2">, </span><span class="s6">2</span><span class="s2">]:</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+            <span class="s3">f'b must have 1 or 2 dims but its shape is </span><span class="s0">{</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s0">}</span><span class="s3">.'</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">M </span><span class="s2">!= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">]:</span>
+        <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+            <span class="s3">'The size of the dimensions of A must be equal to '</span>
+            <span class="s3">'the size of the first dimension of b but the shape of A is '</span>
+            <span class="s3">f'</span><span class="s0">{</span><span class="s1">A</span><span class="s2">.</span><span class="s1">shape</span><span class="s0">} </span><span class="s3">and the shape of b is </span><span class="s0">{</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s0">}</span><span class="s3">.'</span>
+        <span class="s2">)</span>
+
+    <span class="s1">result_dtype </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">promote_types</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">promote_types</span><span class="s2">(</span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float32</span><span class="s2">), </span><span class="s1">b</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">A</span><span class="s2">.</span><span class="s1">dtype </span><span class="s2">!= </span><span class="s1">result_dtype</span><span class="s2">:</span>
+        <span class="s1">A </span><span class="s2">= </span><span class="s1">A</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">result_dtype</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">b</span><span class="s2">.</span><span class="s1">dtype </span><span class="s2">!= </span><span class="s1">result_dtype</span><span class="s2">:</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">astype</span><span class="s2">(</span><span class="s1">result_dtype</span><span class="s2">)</span>
+    <span class="s0">elif not </span><span class="s1">overwrite_b</span><span class="s2">:</span>
+        <span class="s1">b </span><span class="s2">= </span><span class="s1">b</span><span class="s2">.</span><span class="s1">copy</span><span class="s2">()</span>
+
+    <span class="s0">if </span><span class="s1">lower</span><span class="s2">:</span>
+        <span class="s1">L </span><span class="s2">= </span><span class="s1">A</span>
+        <span class="s1">U </span><span class="s2">= </span><span class="s1">csc_matrix</span><span class="s2">((</span><span class="s1">N</span><span class="s2">, </span><span class="s1">N</span><span class="s2">), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">result_dtype</span><span class="s2">)</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">L </span><span class="s2">= </span><span class="s1">eye</span><span class="s2">(</span><span class="s1">N</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">result_dtype</span><span class="s2">, </span><span class="s1">format</span><span class="s2">=</span><span class="s3">'csc'</span><span class="s2">)</span>
+        <span class="s1">U </span><span class="s2">= </span><span class="s1">A</span>
+        <span class="s1">U</span><span class="s2">.</span><span class="s1">setdiag</span><span class="s2">(</span><span class="s6">0</span><span class="s2">)</span>
+
+    <span class="s1">x</span><span class="s2">, </span><span class="s1">info </span><span class="s2">= </span><span class="s1">_superlu</span><span class="s2">.</span><span class="s1">gstrs</span><span class="s2">(</span><span class="s1">trans</span><span class="s2">,</span>
+                             <span class="s1">N</span><span class="s2">, </span><span class="s1">L</span><span class="s2">.</span><span class="s1">nnz</span><span class="s2">, </span><span class="s1">L</span><span class="s2">.</span><span class="s1">data</span><span class="s2">, </span><span class="s1">L</span><span class="s2">.</span><span class="s1">indices</span><span class="s2">, </span><span class="s1">L</span><span class="s2">.</span><span class="s1">indptr</span><span class="s2">,</span>
+                             <span class="s1">N</span><span class="s2">, </span><span class="s1">U</span><span class="s2">.</span><span class="s1">nnz</span><span class="s2">, </span><span class="s1">U</span><span class="s2">.</span><span class="s1">data</span><span class="s2">, </span><span class="s1">U</span><span class="s2">.</span><span class="s1">indices</span><span class="s2">, </span><span class="s1">U</span><span class="s2">.</span><span class="s1">indptr</span><span class="s2">,</span>
+                             <span class="s1">b</span><span class="s2">)</span>
+    <span class="s0">if </span><span class="s1">info</span><span class="s2">:</span>
+        <span class="s0">raise </span><span class="s1">LinAlgError</span><span class="s2">(</span><span class="s3">'A is singular.'</span><span class="s2">)</span>
+
+    <span class="s0">if not </span><span class="s1">unit_diagonal</span><span class="s2">:</span>
+        <span class="s1">invdiag </span><span class="s2">= </span><span class="s1">invdiag</span><span class="s2">.</span><span class="s1">reshape</span><span class="s2">(-</span><span class="s6">1</span><span class="s2">, *([</span><span class="s6">1</span><span class="s2">] * (</span><span class="s1">len</span><span class="s2">(</span><span class="s1">x</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">) - </span><span class="s6">1</span><span class="s2">)))</span>
+        <span class="s1">x </span><span class="s2">= </span><span class="s1">x </span><span class="s2">* </span><span class="s1">invdiag</span>
+
+    <span class="s0">return </span><span class="s1">x</span>
+
+</pre>
+</body>
+</html>

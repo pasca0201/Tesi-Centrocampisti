@@ -1,0 +1,204 @@
+<html>
+<head>
+<title>serializer.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+serializer.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># ext/serializer.py</span>
+<span class="s0"># Copyright (C) 2005-2024 the SQLAlchemy authors and contributors</span>
+<span class="s0"># &lt;see AUTHORS file&gt;</span>
+<span class="s0">#</span>
+<span class="s0"># This module is part of SQLAlchemy and is released under</span>
+<span class="s0"># the MIT License: https://www.opensource.org/licenses/mit-license.php</span>
+<span class="s0"># mypy: ignore-errors</span>
+
+<span class="s2">&quot;&quot;&quot;Serializer/Deserializer objects for usage with SQLAlchemy query structures, 
+allowing &quot;contextual&quot; deserialization. 
+ 
+.. legacy:: 
+ 
+    The serializer extension is **legacy** and should not be used for 
+    new development. 
+ 
+Any SQLAlchemy query structure, either based on sqlalchemy.sql.* 
+or sqlalchemy.orm.* can be used.  The mappers, Tables, Columns, Session 
+etc. which are referenced by the structure are not persisted in serialized 
+form, but are instead re-associated with the query structure 
+when it is deserialized. 
+ 
+.. warning:: The serializer extension uses pickle to serialize and 
+   deserialize objects, so the same security consideration mentioned 
+   in the `python documentation 
+   &lt;https://docs.python.org/3/library/pickle.html&gt;`_ apply. 
+ 
+Usage is nearly the same as that of the standard Python pickle module:: 
+ 
+    from sqlalchemy.ext.serializer import loads, dumps 
+    metadata = MetaData(bind=some_engine) 
+    Session = scoped_session(sessionmaker()) 
+ 
+    # ... define mappers 
+ 
+    query = Session.query(MyClass). 
+        filter(MyClass.somedata=='foo').order_by(MyClass.sortkey) 
+ 
+    # pickle the query 
+    serialized = dumps(query) 
+ 
+    # unpickle.  Pass in metadata + scoped_session 
+    query2 = loads(serialized, metadata, Session) 
+ 
+    print query2.all() 
+ 
+Similar restrictions as when using raw pickle apply; mapped classes must be 
+themselves be pickleable, meaning they are importable from a module-level 
+namespace. 
+ 
+The serializer module is only appropriate for query structures.  It is not 
+needed for: 
+ 
+* instances of user-defined classes.   These contain no references to engines, 
+  sessions or expression constructs in the typical case and can be serialized 
+  directly. 
+ 
+* Table metadata that is to be loaded entirely from the serialized structure 
+  (i.e. is not already declared in the application).   Regular 
+  pickle.loads()/dumps() can be used to fully dump any ``MetaData`` object, 
+  typically one which was reflected from an existing database at some previous 
+  point in time.  The serializer module is specifically for the opposite case, 
+  where the Table metadata is already present in memory. 
+ 
+&quot;&quot;&quot;</span>
+
+<span class="s3">from </span><span class="s1">io </span><span class="s3">import </span><span class="s1">BytesIO</span>
+<span class="s3">import </span><span class="s1">pickle</span>
+<span class="s3">import </span><span class="s1">re</span>
+
+<span class="s3">from </span><span class="s4">.. </span><span class="s3">import </span><span class="s1">Column</span>
+<span class="s3">from </span><span class="s4">.. </span><span class="s3">import </span><span class="s1">Table</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">engine </span><span class="s3">import </span><span class="s1">Engine</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">orm </span><span class="s3">import </span><span class="s1">class_mapper</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">orm</span><span class="s4">.</span><span class="s1">interfaces </span><span class="s3">import </span><span class="s1">MapperProperty</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">orm</span><span class="s4">.</span><span class="s1">mapper </span><span class="s3">import </span><span class="s1">Mapper</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">orm</span><span class="s4">.</span><span class="s1">session </span><span class="s3">import </span><span class="s1">Session</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">util </span><span class="s3">import </span><span class="s1">b64decode</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">util </span><span class="s3">import </span><span class="s1">b64encode</span>
+
+
+<span class="s1">__all__ </span><span class="s4">= [</span><span class="s5">&quot;Serializer&quot;</span><span class="s4">, </span><span class="s5">&quot;Deserializer&quot;</span><span class="s4">, </span><span class="s5">&quot;dumps&quot;</span><span class="s4">, </span><span class="s5">&quot;loads&quot;</span><span class="s4">]</span>
+
+
+<span class="s3">class </span><span class="s1">Serializer</span><span class="s4">(</span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">Pickler</span><span class="s4">):</span>
+
+    <span class="s3">def </span><span class="s1">persistent_id</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">):</span>
+        <span class="s0"># print &quot;serializing:&quot;, repr(obj)</span>
+        <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">Mapper</span><span class="s4">) </span><span class="s3">and not </span><span class="s1">obj</span><span class="s4">.</span><span class="s1">non_primary</span><span class="s4">:</span>
+            <span class="s1">id_ </span><span class="s4">= </span><span class="s5">&quot;mapper:&quot; </span><span class="s4">+ </span><span class="s1">b64encode</span><span class="s4">(</span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">class_</span><span class="s4">))</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">MapperProperty</span><span class="s4">) </span><span class="s3">and not </span><span class="s1">obj</span><span class="s4">.</span><span class="s1">parent</span><span class="s4">.</span><span class="s1">non_primary</span><span class="s4">:</span>
+            <span class="s1">id_ </span><span class="s4">= (</span>
+                <span class="s5">&quot;mapperprop:&quot;</span>
+                <span class="s4">+ </span><span class="s1">b64encode</span><span class="s4">(</span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">parent</span><span class="s4">.</span><span class="s1">class_</span><span class="s4">))</span>
+                <span class="s4">+ </span><span class="s5">&quot;:&quot;</span>
+                <span class="s4">+ </span><span class="s1">obj</span><span class="s4">.</span><span class="s1">key</span>
+            <span class="s4">)</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">Table</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s5">&quot;parententity&quot; </span><span class="s3">in </span><span class="s1">obj</span><span class="s4">.</span><span class="s1">_annotations</span><span class="s4">:</span>
+                <span class="s1">id_ </span><span class="s4">= </span><span class="s5">&quot;mapper_selectable:&quot; </span><span class="s4">+ </span><span class="s1">b64encode</span><span class="s4">(</span>
+                    <span class="s1">pickle</span><span class="s4">.</span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">_annotations</span><span class="s4">[</span><span class="s5">&quot;parententity&quot;</span><span class="s4">].</span><span class="s1">class_</span><span class="s4">)</span>
+                <span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">id_ </span><span class="s4">= </span><span class="s5">f&quot;table:</span><span class="s3">{</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">key</span><span class="s3">}</span><span class="s5">&quot;</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">Column</span><span class="s4">) </span><span class="s3">and </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">table</span><span class="s4">, </span><span class="s1">Table</span><span class="s4">):</span>
+            <span class="s1">id_ </span><span class="s4">= </span><span class="s5">f&quot;column:</span><span class="s3">{</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">table</span><span class="s4">.</span><span class="s1">key</span><span class="s3">}</span><span class="s5">:</span><span class="s3">{</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">key</span><span class="s3">}</span><span class="s5">&quot;</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">Session</span><span class="s4">):</span>
+            <span class="s1">id_ </span><span class="s4">= </span><span class="s5">&quot;session:&quot;</span>
+        <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">Engine</span><span class="s4">):</span>
+            <span class="s1">id_ </span><span class="s4">= </span><span class="s5">&quot;engine:&quot;</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">return None</span>
+        <span class="s3">return </span><span class="s1">id_</span>
+
+
+<span class="s1">our_ids </span><span class="s4">= </span><span class="s1">re</span><span class="s4">.</span><span class="s1">compile</span><span class="s4">(</span>
+    <span class="s5">r&quot;(mapperprop|mapper|mapper_selectable|table|column|&quot;</span>
+    <span class="s5">r&quot;session|attribute|engine):(.*)&quot;</span>
+<span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">Deserializer</span><span class="s4">(</span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">Unpickler</span><span class="s4">):</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">file</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">scoped_session</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">engine</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">file</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">metadata </span><span class="s4">= </span><span class="s1">metadata</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">scoped_session </span><span class="s4">= </span><span class="s1">scoped_session</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">engine </span><span class="s4">= </span><span class="s1">engine</span>
+
+    <span class="s3">def </span><span class="s1">get_engine</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">engine</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">engine</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">scoped_session </span><span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">scoped_session</span><span class="s4">().</span><span class="s1">bind</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">scoped_session</span><span class="s4">().</span><span class="s1">bind</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">return None</span>
+
+    <span class="s3">def </span><span class="s1">persistent_load</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">id_</span><span class="s4">):</span>
+        <span class="s1">m </span><span class="s4">= </span><span class="s1">our_ids</span><span class="s4">.</span><span class="s1">match</span><span class="s4">(</span><span class="s1">str</span><span class="s4">(</span><span class="s1">id_</span><span class="s4">))</span>
+        <span class="s3">if not </span><span class="s1">m</span><span class="s4">:</span>
+            <span class="s3">return None</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">type_</span><span class="s4">, </span><span class="s1">args </span><span class="s4">= </span><span class="s1">m</span><span class="s4">.</span><span class="s1">group</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s6">2</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;attribute&quot;</span><span class="s4">:</span>
+                <span class="s1">key</span><span class="s4">, </span><span class="s1">clsarg </span><span class="s4">= </span><span class="s1">args</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s5">&quot;:&quot;</span><span class="s4">)</span>
+                <span class="s1">cls </span><span class="s4">= </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">loads</span><span class="s4">(</span><span class="s1">b64decode</span><span class="s4">(</span><span class="s1">clsarg</span><span class="s4">))</span>
+                <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">key</span><span class="s4">)</span>
+            <span class="s3">elif </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;mapper&quot;</span><span class="s4">:</span>
+                <span class="s1">cls </span><span class="s4">= </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">loads</span><span class="s4">(</span><span class="s1">b64decode</span><span class="s4">(</span><span class="s1">args</span><span class="s4">))</span>
+                <span class="s3">return </span><span class="s1">class_mapper</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">)</span>
+            <span class="s3">elif </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;mapper_selectable&quot;</span><span class="s4">:</span>
+                <span class="s1">cls </span><span class="s4">= </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">loads</span><span class="s4">(</span><span class="s1">b64decode</span><span class="s4">(</span><span class="s1">args</span><span class="s4">))</span>
+                <span class="s3">return </span><span class="s1">class_mapper</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">).</span><span class="s1">__clause_element__</span><span class="s4">()</span>
+            <span class="s3">elif </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;mapperprop&quot;</span><span class="s4">:</span>
+                <span class="s1">mapper</span><span class="s4">, </span><span class="s1">keyname </span><span class="s4">= </span><span class="s1">args</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s5">&quot;:&quot;</span><span class="s4">)</span>
+                <span class="s1">cls </span><span class="s4">= </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">loads</span><span class="s4">(</span><span class="s1">b64decode</span><span class="s4">(</span><span class="s1">mapper</span><span class="s4">))</span>
+                <span class="s3">return </span><span class="s1">class_mapper</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">).</span><span class="s1">attrs</span><span class="s4">[</span><span class="s1">keyname</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;table&quot;</span><span class="s4">:</span>
+                <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">metadata</span><span class="s4">.</span><span class="s1">tables</span><span class="s4">[</span><span class="s1">args</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;column&quot;</span><span class="s4">:</span>
+                <span class="s1">table</span><span class="s4">, </span><span class="s1">colname </span><span class="s4">= </span><span class="s1">args</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s5">&quot;:&quot;</span><span class="s4">)</span>
+                <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">metadata</span><span class="s4">.</span><span class="s1">tables</span><span class="s4">[</span><span class="s1">table</span><span class="s4">].</span><span class="s1">c</span><span class="s4">[</span><span class="s1">colname</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;session&quot;</span><span class="s4">:</span>
+                <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">scoped_session</span><span class="s4">()</span>
+            <span class="s3">elif </span><span class="s1">type_ </span><span class="s4">== </span><span class="s5">&quot;engine&quot;</span><span class="s4">:</span>
+                <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">get_engine</span><span class="s4">()</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">Exception</span><span class="s4">(</span><span class="s5">&quot;Unknown token: %s&quot; </span><span class="s4">% </span><span class="s1">type_</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">dumps</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">HIGHEST_PROTOCOL</span><span class="s4">):</span>
+    <span class="s1">buf </span><span class="s4">= </span><span class="s1">BytesIO</span><span class="s4">()</span>
+    <span class="s1">pickler </span><span class="s4">= </span><span class="s1">Serializer</span><span class="s4">(</span><span class="s1">buf</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">)</span>
+    <span class="s1">pickler</span><span class="s4">.</span><span class="s1">dump</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">buf</span><span class="s4">.</span><span class="s1">getvalue</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">loads</span><span class="s4">(</span><span class="s1">data</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">scoped_session</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">engine</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s1">buf </span><span class="s4">= </span><span class="s1">BytesIO</span><span class="s4">(</span><span class="s1">data</span><span class="s4">)</span>
+    <span class="s1">unpickler </span><span class="s4">= </span><span class="s1">Deserializer</span><span class="s4">(</span><span class="s1">buf</span><span class="s4">, </span><span class="s1">metadata</span><span class="s4">, </span><span class="s1">scoped_session</span><span class="s4">, </span><span class="s1">engine</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">load</span><span class="s4">()</span>
+</pre>
+</body>
+</html>

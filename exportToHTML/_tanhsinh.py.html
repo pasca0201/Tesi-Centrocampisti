@@ -1,0 +1,1254 @@
+<html>
+<head>
+<title>_tanhsinh.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_tanhsinh.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># mypy: disable-error-code=&quot;attr-defined&quot;</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">special</span>
+<span class="s2">import </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">_lib</span><span class="s3">.</span><span class="s1">_elementwise_iterative_method </span><span class="s2">as </span><span class="s1">eim</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">_lib</span><span class="s3">.</span><span class="s1">_util </span><span class="s2">import </span><span class="s1">_RichResult</span>
+
+<span class="s0"># todo:</span>
+<span class="s0">#  figure out warning situation</span>
+<span class="s0">#  address https://github.com/scipy/scipy/pull/18650#discussion_r1233032521</span>
+<span class="s0">#  without `minweight`, we are also suppressing infinities within the interval.</span>
+<span class="s0">#    Is that OK? If so, we can probably get rid of `status=3`.</span>
+<span class="s0">#  Add heuristic to stop when improvement is too slow / antithrashing</span>
+<span class="s0">#  support singularities? interval subdivision? this feature will be added</span>
+<span class="s0">#    eventually, but do we adjust the interface now?</span>
+<span class="s0">#  When doing log-integration, should the tolerances control the error of the</span>
+<span class="s0">#    log-integral or the error of the integral?  The trouble is that `log`</span>
+<span class="s0">#    inherently looses some precision so it may not be possible to refine</span>
+<span class="s0">#    the integral further. Example: 7th moment of stats.f(15, 20)</span>
+<span class="s0">#  respect function evaluation limit?</span>
+<span class="s0">#  make public?</span>
+
+
+<span class="s2">def </span><span class="s1">_tanhsinh</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, *, </span><span class="s1">args</span><span class="s3">=(), </span><span class="s1">log</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">maxfun</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+              <span class="s1">minlevel</span><span class="s3">=</span><span class="s4">2</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">preserve_shape</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+              <span class="s1">callback</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;Evaluate a convergent integral numerically using tanh-sinh quadrature. 
+ 
+    In practice, tanh-sinh quadrature achieves quadratic convergence for 
+    many integrands: the number of accurate *digits* scales roughly linearly 
+    with the number of function evaluations [1]_. 
+ 
+    Either or both of the limits of integration may be infinite, and 
+    singularities at the endpoints are acceptable. Divergent integrals and 
+    integrands with non-finite derivatives or singularities within an interval 
+    are out of scope, but the latter may be evaluated be calling `_tanhsinh` on 
+    each sub-interval separately. 
+ 
+    Parameters 
+    ---------- 
+    f : callable 
+        The function to be integrated. The signature must be:: 
+            func(x: ndarray, *fargs) -&gt; ndarray 
+         where each element of ``x`` is a finite real and ``fargs`` is a tuple, 
+         which may contain an arbitrary number of arrays that are broadcastable 
+         with `x`. ``func`` must be an elementwise-scalar function; see 
+         documentation of parameter `preserve_shape` for details. 
+         If ``func`` returns a value with complex dtype when evaluated at 
+         either endpoint, subsequent arguments ``x`` will have complex dtype 
+         (but zero imaginary part). 
+    a, b : array_like 
+        Real lower and upper limits of integration. Must be broadcastable. 
+        Elements may be infinite. 
+    args : tuple, optional 
+        Additional positional arguments to be passed to `func`. Must be arrays 
+        broadcastable with `a` and `b`. If the callable to be integrated 
+        requires arguments that are not broadcastable with `a` and `b`, wrap 
+        that callable with `f`. See Examples. 
+    log : bool, default: False 
+        Setting to True indicates that `f` returns the log of the integrand 
+        and that `atol` and `rtol` are expressed as the logs of the absolute 
+        and relative errors. In this case, the result object will contain the 
+        log of the integral and error. This is useful for integrands for which 
+        numerical underflow or overflow would lead to inaccuracies. 
+        When ``log=True``, the integrand (the exponential of `f`) must be real, 
+        but it may be negative, in which case the log of the integrand is a 
+        complex number with an imaginary part that is an odd multiple of π. 
+    maxlevel : int, default: 10 
+        The maximum refinement level of the algorithm. 
+ 
+        At the zeroth level, `f` is called once, performing 16 function 
+        evaluations. At each subsequent level, `f` is called once more, 
+        approximately doubling the number of function evaluations that have 
+        been performed. Accordingly, for many integrands, each successive level 
+        will double the number of accurate digits in the result (up to the 
+        limits of floating point precision). 
+ 
+        The algorithm will terminate after completing level `maxlevel` or after 
+        another termination condition is satisfied, whichever comes first. 
+    minlevel : int, default: 2 
+        The level at which to begin iteration (default: 2). This does not 
+        change the total number of function evaluations or the abscissae at 
+        which the function is evaluated; it changes only the *number of times* 
+        `f` is called. If ``minlevel=k``, then the integrand is evaluated at 
+        all abscissae from levels ``0`` through ``k`` in a single call. 
+        Note that if `minlevel` exceeds `maxlevel`, the provided `minlevel` is 
+        ignored, and `minlevel` is set equal to `maxlevel`. 
+    atol, rtol : float, optional 
+        Absolute termination tolerance (default: 0) and relative termination 
+        tolerance (default: ``eps**0.75``, where ``eps`` is the precision of 
+        the result dtype), respectively. The error estimate is as 
+        described in [1]_ Section 5. While not theoretically rigorous or 
+        conservative, it is said to work well in practice. Must be non-negative 
+        and finite if `log` is False, and must be expressed as the log of a 
+        non-negative and finite number if `log` is True. 
+    preserve_shape : bool, default: False 
+        In the following, &quot;arguments of `f`&quot; refers to the array ``x`` and 
+        any arrays within ``fargs``. Let ``shape`` be the broadcasted shape 
+        of `a`, `b`, and all elements of `args` (which is conceptually 
+        distinct from ``fargs`` passed into `f`). 
+ 
+        - When ``preserve_shape=False`` (default), `f` must accept arguments 
+          of *any* broadcastable shapes. 
+ 
+        - When ``preserve_shape=True``, `f` must accept arguments of shape 
+          ``shape`` *or* ``shape + (n,)``, where ``(n,)`` is the number of 
+          abscissae at which the function is being evaluated. 
+ 
+        In either case, for each scalar element ``xi`` within `x`, the array 
+        returned by `f` must include the scalar ``f(xi)`` at the same index. 
+        Consequently, the shape of the output is always the shape of the input 
+        ``x``. 
+ 
+        See Examples. 
+ 
+    callback : callable, optional 
+        An optional user-supplied function to be called before the first 
+        iteration and after each iteration. 
+        Called as ``callback(res)``, where ``res`` is a ``_RichResult`` 
+        similar to that returned by `_differentiate` (but containing the 
+        current iterate's values of all variables). If `callback` raises a 
+        ``StopIteration``, the algorithm will terminate immediately and 
+        `_tanhsinh` will return a result object. 
+ 
+    Returns 
+    ------- 
+    res : _RichResult 
+        An instance of `scipy._lib._util._RichResult` with the following 
+        attributes. (The descriptions are written as though the values will be 
+        scalars; however, if `func` returns an array, the outputs will be 
+        arrays of the same shape.) 
+        success : bool 
+            ``True`` when the algorithm terminated successfully (status ``0``). 
+        status : int 
+            An integer representing the exit status of the algorithm. 
+            ``0`` : The algorithm converged to the specified tolerances. 
+            ``-1`` : (unused) 
+            ``-2`` : The maximum number of iterations was reached. 
+            ``-3`` : A non-finite value was encountered. 
+            ``-4`` : Iteration was terminated by `callback`. 
+            ``1`` : The algorithm is proceeding normally (in `callback` only). 
+        integral : float 
+            An estimate of the integral 
+        error : float 
+            An estimate of the error. Only available if level two or higher 
+            has been completed; otherwise NaN. 
+        maxlevel : int 
+            The maximum refinement level used. 
+        nfev : int 
+            The number of points at which `func` was evaluated. 
+ 
+    See Also 
+    -------- 
+    quad, quadrature 
+ 
+    Notes 
+    ----- 
+    Implements the algorithm as described in [1]_ with minor adaptations for 
+    finite-precision arithmetic, including some described by [2]_ and [3]_. The 
+    tanh-sinh scheme was originally introduced in [4]_. 
+ 
+    Due to floating-point error in the abscissae, the function may be evaluated 
+    at the endpoints of the interval during iterations. The values returned by 
+    the function at the endpoints will be ignored. 
+ 
+    References 
+    ---------- 
+    [1] Bailey, David H., Karthik Jeyabalan, and Xiaoye S. Li. &quot;A comparison of 
+        three high-precision quadrature schemes.&quot; Experimental Mathematics 14.3 
+        (2005): 317-329. 
+    [2] Vanherck, Joren, Bart Sorée, and Wim Magnus. &quot;Tanh-sinh quadrature for 
+        single and multiple integration using floating-point arithmetic.&quot; 
+        arXiv preprint arXiv:2007.15057 (2020). 
+    [3] van Engelen, Robert A.  &quot;Improving the Double Exponential Quadrature 
+        Tanh-Sinh, Sinh-Sinh and Exp-Sinh Formulas.&quot; 
+        https://www.genivia.com/files/qthsh.pdf 
+    [4] Takahasi, Hidetosi, and Masatake Mori. &quot;Double exponential formulas for 
+        numerical integration.&quot; Publications of the Research Institute for 
+        Mathematical Sciences 9.3 (1974): 721-741. 
+ 
+    Example 
+    ------- 
+    Evaluate the Gaussian integral: 
+ 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.integrate._tanhsinh import _tanhsinh 
+    &gt;&gt;&gt; def f(x): 
+    ...     return np.exp(-x**2) 
+    &gt;&gt;&gt; res = _tanhsinh(f, -np.inf, np.inf) 
+    &gt;&gt;&gt; res.integral  # true value is np.sqrt(np.pi), 1.7724538509055159 
+     1.7724538509055159 
+    &gt;&gt;&gt; res.error  # actual error is 0 
+    4.0007963937534104e-16 
+ 
+    The value of the Gaussian function (bell curve) is nearly zero for 
+    arguments sufficiently far from zero, so the value of the integral 
+    over a finite interval is nearly the same. 
+ 
+    &gt;&gt;&gt; _tanhsinh(f, -20, 20).integral 
+    1.772453850905518 
+ 
+    However, with unfavorable integration limits, the integration scheme 
+    may not be able to find the important region. 
+ 
+    &gt;&gt;&gt; _tanhsinh(f, -np.inf, 1000).integral 
+    4.500490856620352 
+ 
+    In such cases, or when there are singularities within the interval, 
+    break the integral into parts with endpoints at the important points. 
+ 
+    &gt;&gt;&gt; _tanhsinh(f, -np.inf, 0).integral + _tanhsinh(f, 0, 1000).integral 
+    1.772453850905404 
+ 
+    For integration involving very large or very small magnitudes, use 
+    log-integration. (For illustrative purposes, the following example shows a 
+    case in which both regular and log-integration work, but for more extreme 
+    limits of integration, log-integration would avoid the underflow 
+    experienced when evaluating the integral normally.) 
+ 
+    &gt;&gt;&gt; res = _tanhsinh(f, 20, 30, rtol=1e-10) 
+    &gt;&gt;&gt; res.integral, res.error 
+    4.7819613911309014e-176, 4.670364401645202e-187 
+    &gt;&gt;&gt; def log_f(x): 
+    ...     return -x**2 
+    &gt;&gt;&gt; np.exp(res.integral), np.exp(res.error) 
+    4.7819613911306924e-176, 4.670364401645093e-187 
+ 
+    The limits of integration and elements of `args` may be broadcastable 
+    arrays, and integration is performed elementwise. 
+ 
+    &gt;&gt;&gt; from scipy import stats 
+    &gt;&gt;&gt; dist = stats.gausshyper(13.8, 3.12, 2.51, 5.18) 
+    &gt;&gt;&gt; a, b = dist.support() 
+    &gt;&gt;&gt; x = np.linspace(a, b, 100) 
+    &gt;&gt;&gt; res = _tanhsinh(dist.pdf, a, x) 
+    &gt;&gt;&gt; ref = dist.cdf(x) 
+    &gt;&gt;&gt; np.allclose(res.integral, ref) 
+ 
+    By default, `preserve_shape` is False, and therefore the callable 
+    `f` may be called with arrays of any broadcastable shapes. 
+    For example: 
+ 
+    &gt;&gt;&gt; shapes = [] 
+    &gt;&gt;&gt; def f(x, c): 
+    ...    shape = np.broadcast_shapes(x.shape, c.shape) 
+    ...    shapes.append(shape) 
+    ...    return np.sin(c*x) 
+    &gt;&gt;&gt; 
+    &gt;&gt;&gt; c = [1, 10, 30, 100] 
+    &gt;&gt;&gt; res = _tanhsinh(f, 0, 1, args=(c,), minlevel=1) 
+    &gt;&gt;&gt; shapes 
+    [(4,), (4, 66), (3, 64), (2, 128), (1, 256)] 
+ 
+    To understand where these shapes are coming from - and to better 
+    understand how `_tanhsinh` computes accurate results - note that 
+    higher values of ``c`` correspond with higher frequency sinusoids. 
+    The higher frequency sinusoids make the integrand more complicated, 
+    so more function evaluations are required to achieve the target 
+    accuracy: 
+ 
+    &gt;&gt;&gt; res.nfev 
+    array([ 67, 131, 259, 515]) 
+ 
+    The initial ``shape``, ``(4,)``, corresponds with evaluating the 
+    integrand at a single abscissa and all four frequencies; this is used 
+    for input validation and to determine the size and dtype of the arrays 
+    that store results. The next shape corresponds with evaluating the 
+    integrand at an initial grid of abscissae and all four frequencies. 
+    Successive calls to the function double the total number of abscissae at 
+    which the function has been evaluated. However, in later function 
+    evaluations, the integrand is evaluated at fewer frequencies because 
+    the corresponding integral has already converged to the required 
+    tolerance. This saves function evaluations to improve performance, but 
+    it requires the function to accept arguments of any shape. 
+ 
+    &quot;Vector-valued&quot; integrands, such as those written for use with 
+    `scipy.integrate.quad_vec`, are unlikely to satisfy this requirement. 
+    For example, consider 
+ 
+    &gt;&gt;&gt; def f(x): 
+    ...    return [x, np.sin(10*x), np.cos(30*x), x*np.sin(100*x)**2] 
+ 
+    This integrand is not compatible with `_tanhsinh` as written; for instance, 
+    the shape of the output will not be the same as the shape of ``x``. Such a 
+    function *could* be converted to a compatible form with the introduction of 
+    additional parameters, but this would be inconvenient. In such cases, 
+    a simpler solution would be to use `preserve_shape`. 
+ 
+    &gt;&gt;&gt; shapes = [] 
+    &gt;&gt;&gt; def f(x): 
+    ...     shapes.append(x.shape) 
+    ...     x0, x1, x2, x3 = x 
+    ...     return [x0, np.sin(10*x1), np.cos(30*x2), x3*np.sin(100*x3)] 
+    &gt;&gt;&gt; 
+    &gt;&gt;&gt; a = np.zeros(4) 
+    &gt;&gt;&gt; res = _tanhsinh(f, a, 1, preserve_shape=True) 
+    &gt;&gt;&gt; shapes 
+    [(4,), (4, 66), (4, 64), (4, 128), (4, 256)] 
+ 
+    Here, the broadcasted shape of `a` and `b` is ``(4,)``. With 
+    ``preserve_shape=True``, the function may be called with argument 
+    ``x`` of shape ``(4,)`` or ``(4, n)``, and this is what we observe. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxfun</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">, </span><span class="s1">minlevel</span><span class="s3">,</span>
+     <span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">preserve_shape</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">) = </span><span class="s1">_tanhsinh_iv</span><span class="s3">(</span>
+        <span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxfun</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">, </span><span class="s1">minlevel</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">,</span>
+        <span class="s1">rtol</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">preserve_shape</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">)</span>
+
+    <span class="s0"># Initialization</span>
+    <span class="s0"># `eim._initialize` does several important jobs, including</span>
+    <span class="s0"># ensuring that limits, each of the `args`, and the output of `f`</span>
+    <span class="s0"># broadcast correctly and are of consistent types. To save a function</span>
+    <span class="s0"># evaluation, I pass the midpoint of the integration interval. This comes</span>
+    <span class="s0"># at a cost of some gymnastics to ensure that the midpoint has the right</span>
+    <span class="s0"># shape and dtype. Did you know that 0d and &gt;0d arrays follow different</span>
+    <span class="s0"># type promotion rules?</span>
+    <span class="s2">with </span><span class="s1">np</span><span class="s3">.</span><span class="s1">errstate</span><span class="s3">(</span><span class="s1">over</span><span class="s3">=</span><span class="s6">'ignore'</span><span class="s3">, </span><span class="s1">invalid</span><span class="s3">=</span><span class="s6">'ignore'</span><span class="s3">, </span><span class="s1">divide</span><span class="s3">=</span><span class="s6">'ignore'</span><span class="s3">):</span>
+        <span class="s1">c </span><span class="s3">= ((</span><span class="s1">a</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">() + </span><span class="s1">b</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">())/</span><span class="s4">2</span><span class="s3">).</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">a</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s1">inf_a</span><span class="s3">, </span><span class="s1">inf_b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">a</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)</span>
+        <span class="s1">c</span><span class="s3">[</span><span class="s1">inf_a</span><span class="s3">] = </span><span class="s1">b</span><span class="s3">[</span><span class="s1">inf_a</span><span class="s3">] - </span><span class="s4">1  </span><span class="s0"># takes care of infinite a</span>
+        <span class="s1">c</span><span class="s3">[</span><span class="s1">inf_b</span><span class="s3">] = </span><span class="s1">a</span><span class="s3">[</span><span class="s1">inf_b</span><span class="s3">] + </span><span class="s4">1  </span><span class="s0"># takes care of infinite b</span>
+        <span class="s1">c</span><span class="s3">[</span><span class="s1">inf_a </span><span class="s3">&amp; </span><span class="s1">inf_b</span><span class="s3">] = </span><span class="s4">0  </span><span class="s0"># takes care of infinite a and b</span>
+        <span class="s1">temp </span><span class="s3">= </span><span class="s1">eim</span><span class="s3">.</span><span class="s1">_initialize</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, (</span><span class="s1">c</span><span class="s3">,), </span><span class="s1">args</span><span class="s3">, </span><span class="s1">complex_ok</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                               <span class="s1">preserve_shape</span><span class="s3">=</span><span class="s1">preserve_shape</span><span class="s3">)</span>
+    <span class="s1">f</span><span class="s3">, </span><span class="s1">xs</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">xp </span><span class="s3">= </span><span class="s1">temp</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">).</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">).</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+
+    <span class="s0"># Transform improper integrals</span>
+    <span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">a0</span><span class="s3">, </span><span class="s1">negative</span><span class="s3">, </span><span class="s1">abinf</span><span class="s3">, </span><span class="s1">ainf</span><span class="s3">, </span><span class="s1">binf </span><span class="s3">= </span><span class="s1">_transform_integrals</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+
+    <span class="s0"># Define variables we'll need</span>
+    <span class="s1">nit</span><span class="s3">, </span><span class="s1">nfev </span><span class="s3">= </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1  </span><span class="s0"># one function evaluation performed above</span>
+    <span class="s1">zero </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s4">0</span>
+    <span class="s1">pi </span><span class="s3">= </span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">type</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">pi</span><span class="s3">)</span>
+    <span class="s1">maxiter </span><span class="s3">= </span><span class="s1">maxlevel </span><span class="s3">- </span><span class="s1">minlevel </span><span class="s3">+ </span><span class="s4">1</span>
+    <span class="s1">eps </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">eps</span>
+    <span class="s2">if </span><span class="s1">rtol </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">rtol </span><span class="s3">= </span><span class="s4">0.75</span><span class="s3">*</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">eps</span><span class="s3">) </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s1">eps</span><span class="s3">**</span><span class="s4">0.75</span>
+
+    <span class="s1">Sn </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()  </span><span class="s0"># latest integral estimate</span>
+    <span class="s1">Sn</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">a</span><span class="s3">) | </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">b</span><span class="s3">) | </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">fs</span><span class="s3">[</span><span class="s4">0</span><span class="s3">])] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+    <span class="s1">Sk </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">Sn</span><span class="s3">).</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">)[:, </span><span class="s4">0</span><span class="s3">:</span><span class="s4">0</span><span class="s3">]  </span><span class="s0"># all integral estimates</span>
+    <span class="s1">aerr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()  </span><span class="s0"># absolute error</span>
+    <span class="s1">status </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">eim</span><span class="s3">.</span><span class="s1">_EINPROGRESS</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">int</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">h0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">_get_base_step</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">))  </span><span class="s0"># base step</span>
+
+    <span class="s0"># For term `d4` of error estimate ([1] Section 5), we need to keep the</span>
+    <span class="s0"># most extreme abscissae and corresponding `fj`s, `wj`s in Euler-Maclaurin</span>
+    <span class="s0"># sum. Here, we initialize these variables.</span>
+    <span class="s1">xr0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">fr0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">wr0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">xl0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">fl0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">wl0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">d4 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+
+    <span class="s1">work </span><span class="s3">= </span><span class="s1">_RichResult</span><span class="s3">(</span>
+        <span class="s1">Sn</span><span class="s3">=</span><span class="s1">Sn</span><span class="s3">, </span><span class="s1">Sk</span><span class="s3">=</span><span class="s1">Sk</span><span class="s3">, </span><span class="s1">aerr</span><span class="s3">=</span><span class="s1">aerr</span><span class="s3">, </span><span class="s1">h</span><span class="s3">=</span><span class="s1">h0</span><span class="s3">, </span><span class="s1">log</span><span class="s3">=</span><span class="s1">log</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">pi</span><span class="s3">=</span><span class="s1">pi</span><span class="s3">, </span><span class="s1">eps</span><span class="s3">=</span><span class="s1">eps</span><span class="s3">,</span>
+        <span class="s1">a</span><span class="s3">=</span><span class="s1">a</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">), </span><span class="s1">b</span><span class="s3">=</span><span class="s1">b</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">),  </span><span class="s0"># integration limits</span>
+        <span class="s1">n</span><span class="s3">=</span><span class="s1">minlevel</span><span class="s3">, </span><span class="s1">nit</span><span class="s3">=</span><span class="s1">nit</span><span class="s3">, </span><span class="s1">nfev</span><span class="s3">=</span><span class="s1">nfev</span><span class="s3">, </span><span class="s1">status</span><span class="s3">=</span><span class="s1">status</span><span class="s3">,  </span><span class="s0"># iter/eval counts</span>
+        <span class="s1">xr0</span><span class="s3">=</span><span class="s1">xr0</span><span class="s3">, </span><span class="s1">fr0</span><span class="s3">=</span><span class="s1">fr0</span><span class="s3">, </span><span class="s1">wr0</span><span class="s3">=</span><span class="s1">wr0</span><span class="s3">, </span><span class="s1">xl0</span><span class="s3">=</span><span class="s1">xl0</span><span class="s3">, </span><span class="s1">fl0</span><span class="s3">=</span><span class="s1">fl0</span><span class="s3">, </span><span class="s1">wl0</span><span class="s3">=</span><span class="s1">wl0</span><span class="s3">, </span><span class="s1">d4</span><span class="s3">=</span><span class="s1">d4</span><span class="s3">,  </span><span class="s0"># err est</span>
+        <span class="s1">ainf</span><span class="s3">=</span><span class="s1">ainf</span><span class="s3">, </span><span class="s1">binf</span><span class="s3">=</span><span class="s1">binf</span><span class="s3">, </span><span class="s1">abinf</span><span class="s3">=</span><span class="s1">abinf</span><span class="s3">, </span><span class="s1">a0</span><span class="s3">=</span><span class="s1">a0</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">))  </span><span class="s0"># transforms</span>
+    <span class="s0"># Constant scalars don't need to be put in `work` unless they need to be</span>
+    <span class="s0"># passed outside `tanhsinh`. Examples: atol, rtol, h0, minlevel.</span>
+
+    <span class="s0"># Correspondence between terms in the `work` object and the result</span>
+    <span class="s1">res_work_pairs </span><span class="s3">= [(</span><span class="s6">'status'</span><span class="s3">, </span><span class="s6">'status'</span><span class="s3">), (</span><span class="s6">'integral'</span><span class="s3">, </span><span class="s6">'Sn'</span><span class="s3">),</span>
+                      <span class="s3">(</span><span class="s6">'error'</span><span class="s3">, </span><span class="s6">'aerr'</span><span class="s3">), (</span><span class="s6">'nit'</span><span class="s3">, </span><span class="s6">'nit'</span><span class="s3">), (</span><span class="s6">'nfev'</span><span class="s3">, </span><span class="s6">'nfev'</span><span class="s3">)]</span>
+
+    <span class="s2">def </span><span class="s1">pre_func_eval</span><span class="s3">(</span><span class="s1">work</span><span class="s3">):</span>
+        <span class="s0"># Determine abscissae at which to evaluate `f`</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">h </span><span class="s3">= </span><span class="s1">h0 </span><span class="s3">/ </span><span class="s4">2</span><span class="s3">**</span><span class="s1">work</span><span class="s3">.</span><span class="s1">n</span>
+        <span class="s1">xjc</span><span class="s3">, </span><span class="s1">wj </span><span class="s3">= </span><span class="s1">_get_pairs</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">n</span><span class="s3">, </span><span class="s1">h0</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">work</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">,</span>
+                             <span class="s1">inclusive</span><span class="s3">=(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">n </span><span class="s3">== </span><span class="s1">minlevel</span><span class="s3">))</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">wj </span><span class="s3">= </span><span class="s1">_transform_to_limits</span><span class="s3">(</span><span class="s1">xjc</span><span class="s3">, </span><span class="s1">wj</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">a</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">b</span><span class="s3">)</span>
+
+        <span class="s0"># Perform abscissae substitutions for infinite limits of integration</span>
+        <span class="s1">xj </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+        <span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">] = </span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">] / (</span><span class="s4">1 </span><span class="s3">- </span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">]**</span><span class="s4">2</span><span class="s3">)</span>
+        <span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">binf</span><span class="s3">] = </span><span class="s4">1</span><span class="s3">/</span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">binf</span><span class="s3">] - </span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">work</span><span class="s3">.</span><span class="s1">a0</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">binf</span><span class="s3">]</span>
+        <span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">ainf</span><span class="s3">] *= -</span><span class="s4">1</span>
+        <span class="s2">return </span><span class="s1">xj</span>
+
+    <span class="s2">def </span><span class="s1">post_func_eval</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">fj</span><span class="s3">, </span><span class="s1">work</span><span class="s3">):</span>
+        <span class="s0"># Weight integrand as required by substitutions for infinite limits</span>
+        <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log</span><span class="s3">:</span>
+            <span class="s1">fj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">] += (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">] ** </span><span class="s4">2</span><span class="s3">)</span>
+                               <span class="s3">- </span><span class="s4">2</span><span class="s3">*</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s4">1 </span><span class="s3">- </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">] ** </span><span class="s4">2</span><span class="s3">))</span>
+            <span class="s1">fj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">binf</span><span class="s3">] -= </span><span class="s4">2 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">binf</span><span class="s3">])</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">fj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">] *= ((</span><span class="s4">1 </span><span class="s3">+ </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">]**</span><span class="s4">2</span><span class="s3">) /</span>
+                               <span class="s3">(</span><span class="s4">1 </span><span class="s3">- </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">abinf</span><span class="s3">]**</span><span class="s4">2</span><span class="s3">)**</span><span class="s4">2</span><span class="s3">)</span>
+            <span class="s1">fj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">binf</span><span class="s3">] *= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">binf</span><span class="s3">]**-</span><span class="s4">2.</span>
+
+        <span class="s0"># Estimate integral with Euler-Maclaurin Sum</span>
+        <span class="s1">fjwj</span><span class="s3">, </span><span class="s1">Sn </span><span class="s3">= </span><span class="s1">_euler_maclaurin_sum</span><span class="s3">(</span><span class="s1">fj</span><span class="s3">, </span><span class="s1">work</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">]:</span>
+            <span class="s1">Snm1 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">[:, -</span><span class="s4">1</span><span class="s3">]</span>
+            <span class="s1">Sn </span><span class="s3">= (</span><span class="s1">special</span><span class="s3">.</span><span class="s1">logsumexp</span><span class="s3">([</span><span class="s1">Snm1 </span><span class="s3">- </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s4">2</span><span class="s3">), </span><span class="s1">Sn</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">) </span><span class="s2">if </span><span class="s1">log</span>
+                  <span class="s2">else </span><span class="s1">Snm1 </span><span class="s3">/ </span><span class="s4">2 </span><span class="s3">+ </span><span class="s1">Sn</span><span class="s3">)</span>
+
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">fjwj </span><span class="s3">= </span><span class="s1">fjwj</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">Sn </span><span class="s3">= </span><span class="s1">Sn</span>
+
+    <span class="s2">def </span><span class="s1">check_termination</span><span class="s3">(</span><span class="s1">work</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Terminate due to convergence or encountering non-finite values&quot;&quot;&quot;</span>
+        <span class="s1">stop </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">bool</span><span class="s3">)</span>
+
+        <span class="s0"># Terminate before first iteration if integration limits are equal</span>
+        <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">nit </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+            <span class="s1">i </span><span class="s3">= (</span><span class="s1">work</span><span class="s3">.</span><span class="s1">a </span><span class="s3">== </span><span class="s1">work</span><span class="s3">.</span><span class="s1">b</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()  </span><span class="s0"># ravel singleton dimension</span>
+            <span class="s1">zero </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s4">0</span>
+            <span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">zero</span>
+            <span class="s1">work</span><span class="s3">.</span><span class="s1">aerr</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">zero</span>
+            <span class="s1">work</span><span class="s3">.</span><span class="s1">status</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">eim</span><span class="s3">.</span><span class="s1">_ECONVERGED</span>
+            <span class="s1">stop</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s2">True</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0"># Terminate if convergence criterion is met</span>
+            <span class="s1">work</span><span class="s3">.</span><span class="s1">rerr</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">aerr </span><span class="s3">= </span><span class="s1">_estimate_error</span><span class="s3">(</span><span class="s1">work</span><span class="s3">)</span>
+            <span class="s1">i </span><span class="s3">= ((</span><span class="s1">work</span><span class="s3">.</span><span class="s1">rerr </span><span class="s3">&lt; </span><span class="s1">rtol</span><span class="s3">) | (</span><span class="s1">work</span><span class="s3">.</span><span class="s1">rerr </span><span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">) &lt; </span><span class="s1">atol</span><span class="s3">) </span><span class="s2">if </span><span class="s1">log</span>
+                 <span class="s2">else </span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">rerr </span><span class="s3">&lt; </span><span class="s1">rtol</span><span class="s3">) | (</span><span class="s1">work</span><span class="s3">.</span><span class="s1">rerr </span><span class="s3">* </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">) &lt; </span><span class="s1">atol</span><span class="s3">))</span>
+            <span class="s1">work</span><span class="s3">.</span><span class="s1">status</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">eim</span><span class="s3">.</span><span class="s1">_ECONVERGED</span>
+            <span class="s1">stop</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s2">True</span>
+
+        <span class="s0"># Terminate if integral estimate becomes invalid</span>
+        <span class="s2">if </span><span class="s1">log</span><span class="s3">:</span>
+            <span class="s1">i </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isposinf</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">)) | </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">)) &amp; ~</span><span class="s1">stop</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">i </span><span class="s3">= ~</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">) &amp; ~</span><span class="s1">stop</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">status</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">eim</span><span class="s3">.</span><span class="s1">_EVALUEERR</span>
+        <span class="s1">stop</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s2">True</span>
+
+        <span class="s2">return </span><span class="s1">stop</span>
+
+    <span class="s2">def </span><span class="s1">post_termination_check</span><span class="s3">(</span><span class="s1">work</span><span class="s3">):</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">n </span><span class="s3">+= </span><span class="s4">1</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">Sk </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">]), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s2">return</span>
+
+    <span class="s2">def </span><span class="s1">customize_result</span><span class="s3">(</span><span class="s1">res</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">):</span>
+        <span class="s0"># If the integration limits were such that b &lt; a, we reversed them</span>
+        <span class="s0"># to perform the calculation, and the final result needs to be negated.</span>
+        <span class="s2">if </span><span class="s1">log </span><span class="s2">and </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">negative</span><span class="s3">):</span>
+            <span class="s1">pi </span><span class="s3">= </span><span class="s1">res</span><span class="s3">[</span><span class="s6">'integral'</span><span class="s3">].</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">type</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">pi</span><span class="s3">)</span>
+            <span class="s1">j </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">complex64</span><span class="s3">(</span><span class="s4">1j</span><span class="s3">)  </span><span class="s0"># minimum complex type</span>
+            <span class="s1">res</span><span class="s3">[</span><span class="s6">'integral'</span><span class="s3">] = </span><span class="s1">res</span><span class="s3">[</span><span class="s6">'integral'</span><span class="s3">] + </span><span class="s1">negative</span><span class="s3">*</span><span class="s1">pi</span><span class="s3">*</span><span class="s1">j</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">res</span><span class="s3">[</span><span class="s6">'integral'</span><span class="s3">][</span><span class="s1">negative</span><span class="s3">] *= -</span><span class="s4">1</span>
+
+        <span class="s0"># For this algorithm, it seems more appropriate to report the maximum</span>
+        <span class="s0"># level rather than the number of iterations in which it was performed.</span>
+        <span class="s1">res</span><span class="s3">[</span><span class="s6">'maxlevel'</span><span class="s3">] = </span><span class="s1">minlevel </span><span class="s3">+ </span><span class="s1">res</span><span class="s3">[</span><span class="s6">'nit'</span><span class="s3">] - </span><span class="s4">1</span>
+        <span class="s1">res</span><span class="s3">[</span><span class="s6">'maxlevel'</span><span class="s3">][</span><span class="s1">res</span><span class="s3">[</span><span class="s6">'nit'</span><span class="s3">] == </span><span class="s4">0</span><span class="s3">] = -</span><span class="s4">1</span>
+        <span class="s2">del </span><span class="s1">res</span><span class="s3">[</span><span class="s6">'nit'</span><span class="s3">]</span>
+        <span class="s2">return </span><span class="s1">shape</span>
+
+    <span class="s0"># Suppress all warnings initially, since there are many places in the code</span>
+    <span class="s0"># for which this is expected behavior.</span>
+    <span class="s2">with </span><span class="s1">np</span><span class="s3">.</span><span class="s1">errstate</span><span class="s3">(</span><span class="s1">over</span><span class="s3">=</span><span class="s6">'ignore'</span><span class="s3">, </span><span class="s1">invalid</span><span class="s3">=</span><span class="s6">'ignore'</span><span class="s3">, </span><span class="s1">divide</span><span class="s3">=</span><span class="s6">'ignore'</span><span class="s3">):</span>
+        <span class="s1">res </span><span class="s3">= </span><span class="s1">eim</span><span class="s3">.</span><span class="s1">_loop</span><span class="s3">(</span><span class="s1">work</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">, </span><span class="s1">maxiter</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">pre_func_eval</span><span class="s3">,</span>
+                        <span class="s1">post_func_eval</span><span class="s3">, </span><span class="s1">check_termination</span><span class="s3">, </span><span class="s1">post_termination_check</span><span class="s3">,</span>
+                        <span class="s1">customize_result</span><span class="s3">, </span><span class="s1">res_work_pairs</span><span class="s3">, </span><span class="s1">xp</span><span class="s3">, </span><span class="s1">preserve_shape</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">res</span>
+
+
+<span class="s2">def </span><span class="s1">_get_base_step</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">):</span>
+    <span class="s0"># Compute the base step length for the provided dtype. Theoretically, the</span>
+    <span class="s0"># Euler-Maclaurin sum is infinite, but it gets cut off when either the</span>
+    <span class="s0"># weights underflow or the abscissae cannot be distinguished from the</span>
+    <span class="s0"># limits of integration. The latter happens to occur first for float32 and</span>
+    <span class="s0"># float64, and it occurs when `xjc` (the abscissa complement)</span>
+    <span class="s0"># in `_compute_pair` underflows. We can solve for the argument `tmax` at</span>
+    <span class="s0"># which it will underflow using [2] Eq. 13.</span>
+    <span class="s1">fmin </span><span class="s3">= </span><span class="s4">4</span><span class="s3">*</span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">tiny  </span><span class="s0"># stay a little away from the limit</span>
+    <span class="s1">tmax </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arcsinh</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s4">2</span><span class="s3">/</span><span class="s1">fmin </span><span class="s3">- </span><span class="s4">1</span><span class="s3">) / </span><span class="s1">np</span><span class="s3">.</span><span class="s1">pi</span><span class="s3">)</span>
+
+    <span class="s0"># Based on this, we can choose a base step size `h` for level 0.</span>
+    <span class="s0"># The number of function evaluations will be `2 + m*2^(k+1)`, where `k` is</span>
+    <span class="s0"># the level and `m` is an integer we get to choose. I choose</span>
+    <span class="s0"># m = _N_BASE_STEPS = `8` somewhat arbitrarily, but a rationale is that a</span>
+    <span class="s0"># power of 2 makes floating point arithmetic more predictable. It also</span>
+    <span class="s0"># results in a base step size close to `1`, which is what [1] uses (and I</span>
+    <span class="s0"># used here until I found [2] and these ideas settled).</span>
+    <span class="s1">h0 </span><span class="s3">= </span><span class="s1">tmax </span><span class="s3">/ </span><span class="s1">_N_BASE_STEPS</span>
+    <span class="s2">return </span><span class="s1">h0</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">)</span>
+
+
+<span class="s1">_N_BASE_STEPS </span><span class="s3">= </span><span class="s4">8</span>
+
+
+<span class="s2">def </span><span class="s1">_compute_pair</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">h0</span><span class="s3">):</span>
+    <span class="s0"># Compute the abscissa-weight pairs for each level k. See [1] page 9.</span>
+
+    <span class="s0"># For now, we compute and store in 64-bit precision. If higher-precision</span>
+    <span class="s0"># data types become better supported, it would be good to compute these</span>
+    <span class="s0"># using the highest precision available. Or, once there is an Array API-</span>
+    <span class="s0"># compatible arbitrary precision array, we can compute at the required</span>
+    <span class="s0"># precision.</span>
+
+    <span class="s0"># &quot;....each level k of abscissa-weight pairs uses h = 2 **-k&quot;</span>
+    <span class="s0"># We adapt to floating point arithmetic using ideas of [2].</span>
+    <span class="s1">h </span><span class="s3">= </span><span class="s1">h0 </span><span class="s3">/ </span><span class="s4">2</span><span class="s3">**</span><span class="s1">k</span>
+    <span class="s1">max </span><span class="s3">= </span><span class="s1">_N_BASE_STEPS </span><span class="s3">* </span><span class="s4">2</span><span class="s3">**</span><span class="s1">k</span>
+
+    <span class="s0"># For iterations after the first, &quot;....the integrand function needs to be</span>
+    <span class="s0"># evaluated only at the odd-indexed abscissas at each level.&quot;</span>
+    <span class="s1">j </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">max</span><span class="s3">+</span><span class="s4">1</span><span class="s3">) </span><span class="s2">if </span><span class="s1">k </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, </span><span class="s1">max</span><span class="s3">+</span><span class="s4">1</span><span class="s3">, </span><span class="s4">2</span><span class="s3">)</span>
+    <span class="s1">jh </span><span class="s3">= </span><span class="s1">j </span><span class="s3">* </span><span class="s1">h</span>
+
+    <span class="s0"># &quot;In this case... the weights wj = u1/cosh(u2)^2, where...&quot;</span>
+    <span class="s1">pi_2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">pi </span><span class="s3">/ </span><span class="s4">2</span>
+    <span class="s1">u1 </span><span class="s3">= </span><span class="s1">pi_2</span><span class="s3">*</span><span class="s1">np</span><span class="s3">.</span><span class="s1">cosh</span><span class="s3">(</span><span class="s1">jh</span><span class="s3">)</span>
+    <span class="s1">u2 </span><span class="s3">= </span><span class="s1">pi_2</span><span class="s3">*</span><span class="s1">np</span><span class="s3">.</span><span class="s1">sinh</span><span class="s3">(</span><span class="s1">jh</span><span class="s3">)</span>
+    <span class="s0"># Denominators get big here. Overflow then underflow doesn't need warning.</span>
+    <span class="s0"># with np.errstate(under='ignore', over='ignore'):</span>
+    <span class="s1">wj </span><span class="s3">= </span><span class="s1">u1 </span><span class="s3">/ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">cosh</span><span class="s3">(</span><span class="s1">u2</span><span class="s3">)**</span><span class="s4">2</span>
+    <span class="s0"># &quot;We actually store 1-xj = 1/(...).&quot;</span>
+    <span class="s1">xjc </span><span class="s3">= </span><span class="s4">1 </span><span class="s3">/ (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">exp</span><span class="s3">(</span><span class="s1">u2</span><span class="s3">) * </span><span class="s1">np</span><span class="s3">.</span><span class="s1">cosh</span><span class="s3">(</span><span class="s1">u2</span><span class="s3">))  </span><span class="s0"># complement of xj = np.tanh(u2)</span>
+
+    <span class="s0"># When level k == 0, the zeroth xj corresponds with xj = 0. To simplify</span>
+    <span class="s0"># code, the function will be evaluated there twice; each gets half weight.</span>
+    <span class="s1">wj</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] = </span><span class="s1">wj</span><span class="s3">[</span><span class="s4">0</span><span class="s3">] / </span><span class="s4">2 </span><span class="s2">if </span><span class="s1">k </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">else </span><span class="s1">wj</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+
+    <span class="s2">return </span><span class="s1">xjc</span><span class="s3">, </span><span class="s1">wj  </span><span class="s0"># store at full precision</span>
+
+
+<span class="s2">def </span><span class="s1">_pair_cache</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">h0</span><span class="s3">):</span>
+    <span class="s0"># Cache the abscissa-weight pairs up to a specified level.</span>
+    <span class="s0"># Abscissae and weights of consecutive levels are concatenated.</span>
+    <span class="s0"># `index` records the indices that correspond with each level:</span>
+    <span class="s0"># `xjc[index[k]:index[k+1]` extracts the level `k` abscissae.</span>
+    <span class="s2">if </span><span class="s1">h0 </span><span class="s3">!= </span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">h0</span><span class="s3">:</span>
+        <span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">xjc </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s4">0</span><span class="s3">)</span>
+        <span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">wj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s4">0</span><span class="s3">)</span>
+        <span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices </span><span class="s3">= [</span><span class="s4">0</span><span class="s3">]</span>
+
+    <span class="s1">xjcs </span><span class="s3">= [</span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">xjc</span><span class="s3">]</span>
+    <span class="s1">wjs </span><span class="s3">= [</span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">wj</span><span class="s3">]</span>
+
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">)-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">k </span><span class="s3">+ </span><span class="s4">1</span><span class="s3">):</span>
+        <span class="s1">xjc</span><span class="s3">, </span><span class="s1">wj </span><span class="s3">= </span><span class="s1">_compute_pair</span><span class="s3">(</span><span class="s1">i</span><span class="s3">, </span><span class="s1">h0</span><span class="s3">)</span>
+        <span class="s1">xjcs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">xjc</span><span class="s3">)</span>
+        <span class="s1">wjs</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">wj</span><span class="s3">)</span>
+        <span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] + </span><span class="s1">len</span><span class="s3">(</span><span class="s1">xjc</span><span class="s3">))</span>
+
+    <span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">xjc </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">(</span><span class="s1">xjcs</span><span class="s3">)</span>
+    <span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">wj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">(</span><span class="s1">wjs</span><span class="s3">)</span>
+    <span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">h0 </span><span class="s3">= </span><span class="s1">h0</span>
+
+<span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">xjc </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s4">0</span><span class="s3">)</span>
+<span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">wj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s4">0</span><span class="s3">)</span>
+<span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices </span><span class="s3">= [</span><span class="s4">0</span><span class="s3">]</span>
+<span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">h0 </span><span class="s3">= </span><span class="s2">None</span>
+
+
+<span class="s2">def </span><span class="s1">_get_pairs</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">h0</span><span class="s3">, </span><span class="s1">inclusive</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">):</span>
+    <span class="s0"># Retrieve the specified abscissa-weight pairs from the cache</span>
+    <span class="s0"># If `inclusive`, return all up to and including the specified level</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">) &lt;= </span><span class="s1">k</span><span class="s3">+</span><span class="s4">2 </span><span class="s2">or </span><span class="s1">h0 </span><span class="s3">!= </span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">h0</span><span class="s3">:</span>
+        <span class="s1">_pair_cache</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s1">h0</span><span class="s3">)</span>
+
+    <span class="s1">xjc </span><span class="s3">= </span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">xjc</span>
+    <span class="s1">wj </span><span class="s3">= </span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">wj</span>
+    <span class="s1">indices </span><span class="s3">= </span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices</span>
+
+    <span class="s1">start </span><span class="s3">= </span><span class="s4">0 </span><span class="s2">if </span><span class="s1">inclusive </span><span class="s2">else </span><span class="s1">indices</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+    <span class="s1">end </span><span class="s3">= </span><span class="s1">indices</span><span class="s3">[</span><span class="s1">k</span><span class="s3">+</span><span class="s4">1</span><span class="s3">]</span>
+
+    <span class="s2">return </span><span class="s1">xjc</span><span class="s3">[</span><span class="s1">start</span><span class="s3">:</span><span class="s1">end</span><span class="s3">].</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">), </span><span class="s1">wj</span><span class="s3">[</span><span class="s1">start</span><span class="s3">:</span><span class="s1">end</span><span class="s3">].</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_transform_to_limits</span><span class="s3">(</span><span class="s1">xjc</span><span class="s3">, </span><span class="s1">wj</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+    <span class="s0"># Transform integral according to user-specified limits. This is just</span>
+    <span class="s0"># math that follows from the fact that the standard limits are (-1, 1).</span>
+    <span class="s0"># Note: If we had stored xj instead of xjc, we would have</span>
+    <span class="s0"># xj = alpha * xj + beta, where beta = (a + b)/2</span>
+    <span class="s1">alpha </span><span class="s3">= (</span><span class="s1">b </span><span class="s3">- </span><span class="s1">a</span><span class="s3">) / </span><span class="s4">2</span>
+    <span class="s1">xj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((-</span><span class="s1">alpha </span><span class="s3">* </span><span class="s1">xjc </span><span class="s3">+ </span><span class="s1">b</span><span class="s3">, </span><span class="s1">alpha </span><span class="s3">* </span><span class="s1">xjc </span><span class="s3">+ </span><span class="s1">a</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+    <span class="s1">wj </span><span class="s3">= </span><span class="s1">wj</span><span class="s3">*</span><span class="s1">alpha  </span><span class="s0"># arguments get broadcasted, so we can't use *=</span>
+    <span class="s1">wj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">wj</span><span class="s3">, </span><span class="s1">wj</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+
+    <span class="s0"># Points at the boundaries can be generated due to finite precision</span>
+    <span class="s0"># arithmetic, but these function values aren't supposed to be included in</span>
+    <span class="s0"># the Euler-Maclaurin sum. Ideally we wouldn't evaluate the function at</span>
+    <span class="s0"># these points; however, we can't easily filter out points since this</span>
+    <span class="s0"># function is vectorized. Instead, zero the weights.</span>
+    <span class="s1">invalid </span><span class="s3">= (</span><span class="s1">xj </span><span class="s3">&lt;= </span><span class="s1">a</span><span class="s3">) | (</span><span class="s1">xj </span><span class="s3">&gt;= </span><span class="s1">b</span><span class="s3">)</span>
+    <span class="s1">wj</span><span class="s3">[</span><span class="s1">invalid</span><span class="s3">] = </span><span class="s4">0</span>
+    <span class="s2">return </span><span class="s1">xj</span><span class="s3">, </span><span class="s1">wj</span>
+
+
+<span class="s2">def </span><span class="s1">_euler_maclaurin_sum</span><span class="s3">(</span><span class="s1">fj</span><span class="s3">, </span><span class="s1">work</span><span class="s3">):</span>
+    <span class="s0"># Perform the Euler-Maclaurin Sum, [1] Section 4</span>
+
+    <span class="s0"># The error estimate needs to know the magnitude of the last term</span>
+    <span class="s0"># omitted from the Euler-Maclaurin sum. This is a bit involved because</span>
+    <span class="s0"># it may have been computed at a previous level. I sure hope it's worth</span>
+    <span class="s0"># all the trouble.</span>
+    <span class="s1">xr0</span><span class="s3">, </span><span class="s1">fr0</span><span class="s3">, </span><span class="s1">wr0 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xr0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">fr0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">wr0</span>
+    <span class="s1">xl0</span><span class="s3">, </span><span class="s1">fl0</span><span class="s3">, </span><span class="s1">wl0 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xl0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">fl0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">wl0</span>
+
+    <span class="s0"># It is much more convenient to work with the transposes of our work</span>
+    <span class="s0"># variables here.</span>
+    <span class="s1">xj</span><span class="s3">, </span><span class="s1">fj</span><span class="s3">, </span><span class="s1">wj </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">xj</span><span class="s3">.</span><span class="s1">T</span><span class="s3">, </span><span class="s1">fj</span><span class="s3">.</span><span class="s1">T</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">wj</span><span class="s3">.</span><span class="s1">T</span>
+    <span class="s1">n_x</span><span class="s3">, </span><span class="s1">n_active </span><span class="s3">= </span><span class="s1">xj</span><span class="s3">.</span><span class="s1">shape  </span><span class="s0"># number of abscissae, number of active elements</span>
+
+    <span class="s0"># We'll work with the left and right sides separately</span>
+    <span class="s1">xr</span><span class="s3">, </span><span class="s1">xl </span><span class="s3">= </span><span class="s1">xj</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">n_x </span><span class="s3">// </span><span class="s4">2</span><span class="s3">, </span><span class="s1">n_active</span><span class="s3">).</span><span class="s1">copy</span><span class="s3">()  </span><span class="s0"># this gets modified</span>
+    <span class="s1">fr</span><span class="s3">, </span><span class="s1">fl </span><span class="s3">= </span><span class="s1">fj</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">n_x </span><span class="s3">// </span><span class="s4">2</span><span class="s3">, </span><span class="s1">n_active</span><span class="s3">)</span>
+    <span class="s1">wr</span><span class="s3">, </span><span class="s1">wl </span><span class="s3">= </span><span class="s1">wj</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">n_x </span><span class="s3">// </span><span class="s4">2</span><span class="s3">, </span><span class="s1">n_active</span><span class="s3">)</span>
+
+    <span class="s1">invalid_r </span><span class="s3">= ~</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">fr</span><span class="s3">) | (</span><span class="s1">wr </span><span class="s3">== </span><span class="s4">0</span><span class="s3">)</span>
+    <span class="s1">invalid_l </span><span class="s3">= ~</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">fl</span><span class="s3">) | (</span><span class="s1">wl </span><span class="s3">== </span><span class="s4">0</span><span class="s3">)</span>
+
+    <span class="s0"># integer index of the maximum abscissa at this level</span>
+    <span class="s1">xr</span><span class="s3">[</span><span class="s1">invalid_r</span><span class="s3">] = -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+    <span class="s1">ir </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">argmax</span><span class="s3">(</span><span class="s1">xr</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s0"># abscissa, function value, and weight at this index</span>
+    <span class="s1">xr_max </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">take_along_axis</span><span class="s3">(</span><span class="s1">xr</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">fr_max </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">take_along_axis</span><span class="s3">(</span><span class="s1">fr</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">wr_max </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">take_along_axis</span><span class="s3">(</span><span class="s1">wr</span><span class="s3">, </span><span class="s1">ir</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s0"># boolean indices at which maximum abscissa at this level exceeds</span>
+    <span class="s0"># the incumbent maximum abscissa (from all previous levels)</span>
+    <span class="s1">j </span><span class="s3">= </span><span class="s1">xr_max </span><span class="s3">&gt; </span><span class="s1">xr0</span>
+    <span class="s0"># Update record of the incumbent abscissa, function value, and weight</span>
+    <span class="s1">xr0</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">xr_max</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+    <span class="s1">fr0</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">fr_max</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+    <span class="s1">wr0</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">wr_max</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+
+    <span class="s0"># integer index of the minimum abscissa at this level</span>
+    <span class="s1">xl</span><span class="s3">[</span><span class="s1">invalid_l</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+    <span class="s1">il </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">argmin</span><span class="s3">(</span><span class="s1">xl</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s0"># abscissa, function value, and weight at this index</span>
+    <span class="s1">xl_min </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">take_along_axis</span><span class="s3">(</span><span class="s1">xl</span><span class="s3">, </span><span class="s1">il</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">fl_min </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">take_along_axis</span><span class="s3">(</span><span class="s1">fl</span><span class="s3">, </span><span class="s1">il</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">wl_min </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">take_along_axis</span><span class="s3">(</span><span class="s1">wl</span><span class="s3">, </span><span class="s1">il</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s0"># boolean indices at which minimum abscissa at this level is less than</span>
+    <span class="s0"># the incumbent minimum abscissa (from all previous levels)</span>
+    <span class="s1">j </span><span class="s3">= </span><span class="s1">xl_min </span><span class="s3">&lt; </span><span class="s1">xl0</span>
+    <span class="s0"># Update record of the incumbent abscissa, function value, and weight</span>
+    <span class="s1">xl0</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">xl_min</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+    <span class="s1">fl0</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">fl_min</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+    <span class="s1">wl0</span><span class="s3">[</span><span class="s1">j</span><span class="s3">] = </span><span class="s1">wl_min</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+    <span class="s1">fj </span><span class="s3">= </span><span class="s1">fj</span><span class="s3">.</span><span class="s1">T</span>
+
+    <span class="s0"># Compute the error estimate `d4` - the magnitude of the leftmost or</span>
+    <span class="s0"># rightmost term, whichever is greater.</span>
+    <span class="s1">flwl0 </span><span class="s3">= </span><span class="s1">fl0 </span><span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">wl0</span><span class="s3">) </span><span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log </span><span class="s2">else </span><span class="s1">fl0 </span><span class="s3">* </span><span class="s1">wl0  </span><span class="s0"># leftmost term</span>
+    <span class="s1">frwr0 </span><span class="s3">= </span><span class="s1">fr0 </span><span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">wr0</span><span class="s3">) </span><span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log </span><span class="s2">else </span><span class="s1">fr0 </span><span class="s3">* </span><span class="s1">wr0  </span><span class="s0"># rightmost term</span>
+    <span class="s1">magnitude </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">real </span><span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log </span><span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span>
+    <span class="s1">work</span><span class="s3">.</span><span class="s1">d4 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s1">magnitude</span><span class="s3">(</span><span class="s1">flwl0</span><span class="s3">), </span><span class="s1">magnitude</span><span class="s3">(</span><span class="s1">frwr0</span><span class="s3">))</span>
+
+    <span class="s0"># There are two approaches to dealing with function values that are</span>
+    <span class="s0"># numerically infinite due to approaching a singularity - zero them, or</span>
+    <span class="s0"># replace them with the function value at the nearest non-infinite point.</span>
+    <span class="s0"># [3] pg. 22 suggests the latter, so let's do that given that we have the</span>
+    <span class="s0"># information.</span>
+    <span class="s1">fr0b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">fr0</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">, :], </span><span class="s1">fr</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+    <span class="s1">fl0b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">fl0</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">, :], </span><span class="s1">fl</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+    <span class="s1">fr</span><span class="s3">[</span><span class="s1">invalid_r</span><span class="s3">] = </span><span class="s1">fr0b</span><span class="s3">[</span><span class="s1">invalid_r</span><span class="s3">]</span>
+    <span class="s1">fl</span><span class="s3">[</span><span class="s1">invalid_l</span><span class="s3">] = </span><span class="s1">fl0b</span><span class="s3">[</span><span class="s1">invalid_l</span><span class="s3">]</span>
+
+    <span class="s0"># When wj is zero, log emits a warning</span>
+    <span class="s0"># with np.errstate(divide='ignore'):</span>
+    <span class="s1">fjwj </span><span class="s3">= </span><span class="s1">fj </span><span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">wj</span><span class="s3">) </span><span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log </span><span class="s2">else </span><span class="s1">fj </span><span class="s3">* </span><span class="s1">work</span><span class="s3">.</span><span class="s1">wj</span>
+
+    <span class="s0"># update integral estimate</span>
+    <span class="s1">Sn </span><span class="s3">= (</span><span class="s1">special</span><span class="s3">.</span><span class="s1">logsumexp</span><span class="s3">(</span><span class="s1">fjwj </span><span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">h</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">) </span><span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log</span>
+          <span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">fjwj</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">) * </span><span class="s1">work</span><span class="s3">.</span><span class="s1">h</span><span class="s3">)</span>
+
+    <span class="s1">work</span><span class="s3">.</span><span class="s1">xr0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">fr0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">wr0 </span><span class="s3">= </span><span class="s1">xr0</span><span class="s3">, </span><span class="s1">fr0</span><span class="s3">, </span><span class="s1">wr0</span>
+    <span class="s1">work</span><span class="s3">.</span><span class="s1">xl0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">fl0</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">wl0 </span><span class="s3">= </span><span class="s1">xl0</span><span class="s3">, </span><span class="s1">fl0</span><span class="s3">, </span><span class="s1">wl0</span>
+
+    <span class="s2">return </span><span class="s1">fjwj</span><span class="s3">, </span><span class="s1">Sn</span>
+
+
+<span class="s2">def </span><span class="s1">_estimate_error</span><span class="s3">(</span><span class="s1">work</span><span class="s3">):</span>
+    <span class="s0"># Estimate the error according to [1] Section 5</span>
+
+    <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">n </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">or </span><span class="s1">work</span><span class="s3">.</span><span class="s1">nit </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s0"># The paper says to use &quot;one&quot; as the error before it can be calculated.</span>
+        <span class="s0"># NaN seems to be more appropriate.</span>
+        <span class="s1">nan </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full_like</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">nan</span><span class="s3">, </span><span class="s1">nan</span>
+
+    <span class="s1">indices </span><span class="s3">= </span><span class="s1">_pair_cache</span><span class="s3">.</span><span class="s1">indices</span>
+
+    <span class="s1">n_active </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">)  </span><span class="s0"># number of active elements</span>
+    <span class="s1">axis_kwargs </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">, </span><span class="s1">keepdims</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s0"># With a jump start (starting at level higher than 0), we haven't</span>
+    <span class="s0"># explicitly calculated the integral estimate at lower levels. But we have</span>
+    <span class="s0"># all the function value-weight products, so we can compute the</span>
+    <span class="s0"># lower-level estimates.</span>
+    <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] == </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s1">h </span><span class="s3">= </span><span class="s4">2 </span><span class="s3">* </span><span class="s1">work</span><span class="s3">.</span><span class="s1">h  </span><span class="s0"># step size at this level</span>
+        <span class="s1">n_x </span><span class="s3">= </span><span class="s1">indices</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">n</span><span class="s3">]  </span><span class="s0"># number of abscissa up to this level</span>
+        <span class="s0"># The right and left fjwj terms from all levels are concatenated along</span>
+        <span class="s0"># the last axis. Get out only the terms up to this level.</span>
+        <span class="s1">fjwj_rl </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">fjwj</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">n_active</span><span class="s3">, </span><span class="s4">2</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">fjwj </span><span class="s3">= </span><span class="s1">fjwj_rl</span><span class="s3">[:, :, :</span><span class="s1">n_x</span><span class="s3">].</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">n_active</span><span class="s3">, </span><span class="s4">2</span><span class="s3">*</span><span class="s1">n_x</span><span class="s3">)</span>
+        <span class="s0"># Compute the Euler-Maclaurin sum at this level</span>
+        <span class="s1">Snm1 </span><span class="s3">= (</span><span class="s1">special</span><span class="s3">.</span><span class="s1">logsumexp</span><span class="s3">(</span><span class="s1">fjwj</span><span class="s3">, **</span><span class="s1">axis_kwargs</span><span class="s3">) + </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">h</span><span class="s3">) </span><span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log</span>
+                <span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">fjwj</span><span class="s3">, **</span><span class="s1">axis_kwargs</span><span class="s3">) * </span><span class="s1">h</span><span class="s3">)</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">Sk </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">Snm1</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">n </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+        <span class="s1">nan </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full_like</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">nan</span><span class="s3">, </span><span class="s1">nan</span>
+
+    <span class="s0"># The paper says not to calculate the error for n&lt;=2, but it's not clear</span>
+    <span class="s0"># about whether it starts at level 0 or level 1. We start at level 0, so</span>
+    <span class="s0"># why not compute the error beginning in level 2?</span>
+    <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] &lt; </span><span class="s4">2</span><span class="s3">:</span>
+        <span class="s1">h </span><span class="s3">= </span><span class="s4">4 </span><span class="s3">* </span><span class="s1">work</span><span class="s3">.</span><span class="s1">h  </span><span class="s0"># step size at this level</span>
+        <span class="s1">n_x </span><span class="s3">= </span><span class="s1">indices</span><span class="s3">[</span><span class="s1">work</span><span class="s3">.</span><span class="s1">n</span><span class="s3">-</span><span class="s4">1</span><span class="s3">]  </span><span class="s0"># number of abscissa up to this level</span>
+        <span class="s0"># The right and left fjwj terms from all levels are concatenated along</span>
+        <span class="s0"># the last axis. Get out only the terms up to this level.</span>
+        <span class="s1">fjwj_rl </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">fjwj</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">), </span><span class="s4">2</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">fjwj </span><span class="s3">= </span><span class="s1">fjwj_rl</span><span class="s3">[..., :</span><span class="s1">n_x</span><span class="s3">].</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">n_active</span><span class="s3">, </span><span class="s4">2</span><span class="s3">*</span><span class="s1">n_x</span><span class="s3">)</span>
+        <span class="s0"># Compute the Euler-Maclaurin sum at this level</span>
+        <span class="s1">Snm2 </span><span class="s3">= (</span><span class="s1">special</span><span class="s3">.</span><span class="s1">logsumexp</span><span class="s3">(</span><span class="s1">fjwj</span><span class="s3">, **</span><span class="s1">axis_kwargs</span><span class="s3">) + </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">h</span><span class="s3">) </span><span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log</span>
+                <span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">fjwj</span><span class="s3">, **</span><span class="s1">axis_kwargs</span><span class="s3">) * </span><span class="s1">h</span><span class="s3">)</span>
+        <span class="s1">work</span><span class="s3">.</span><span class="s1">Sk </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">((</span><span class="s1">Snm2</span><span class="s3">, </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+
+    <span class="s1">Snm2 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">[..., -</span><span class="s4">2</span><span class="s3">]</span>
+    <span class="s1">Snm1 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sk</span><span class="s3">[..., -</span><span class="s4">1</span><span class="s3">]</span>
+
+    <span class="s1">e1 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">eps</span>
+
+    <span class="s2">if </span><span class="s1">work</span><span class="s3">.</span><span class="s1">log</span><span class="s3">:</span>
+        <span class="s1">log_e1 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">e1</span><span class="s3">)</span>
+        <span class="s0"># Currently, only real integrals are supported in log-scale. All</span>
+        <span class="s0"># complex values have imaginary part in increments of pi*j, which just</span>
+        <span class="s0"># carries sign information of the original integral, so use of</span>
+        <span class="s0"># `np.real` here is equivalent to absolute value in real scale.</span>
+        <span class="s1">d1 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">special</span><span class="s3">.</span><span class="s1">logsumexp</span><span class="s3">([</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">, </span><span class="s1">Snm1 </span><span class="s3">+ </span><span class="s1">work</span><span class="s3">.</span><span class="s1">pi</span><span class="s3">*</span><span class="s4">1j</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">))</span>
+        <span class="s1">d2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">special</span><span class="s3">.</span><span class="s1">logsumexp</span><span class="s3">([</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">, </span><span class="s1">Snm2 </span><span class="s3">+ </span><span class="s1">work</span><span class="s3">.</span><span class="s1">pi</span><span class="s3">*</span><span class="s4">1j</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">))</span>
+        <span class="s1">d3 </span><span class="s3">= </span><span class="s1">log_e1 </span><span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">fjwj</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">d4 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">d4</span>
+        <span class="s1">aerr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">([</span><span class="s1">d1 </span><span class="s3">** </span><span class="s4">2 </span><span class="s3">/ </span><span class="s1">d2</span><span class="s3">, </span><span class="s4">2 </span><span class="s3">* </span><span class="s1">d1</span><span class="s3">, </span><span class="s1">d3</span><span class="s3">, </span><span class="s1">d4</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)</span>
+        <span class="s1">rerr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s1">log_e1</span><span class="s3">, </span><span class="s1">aerr </span><span class="s3">- </span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">))</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s0"># Note: explicit computation of log10 of each of these is unnecessary.</span>
+        <span class="s1">d1 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn </span><span class="s3">- </span><span class="s1">Snm1</span><span class="s3">)</span>
+        <span class="s1">d2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn </span><span class="s3">- </span><span class="s1">Snm2</span><span class="s3">)</span>
+        <span class="s1">d3 </span><span class="s3">= </span><span class="s1">e1 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">fjwj</span><span class="s3">), </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+        <span class="s1">d4 </span><span class="s3">= </span><span class="s1">work</span><span class="s3">.</span><span class="s1">d4</span>
+        <span class="s0"># If `d1` is 0, no need to warn. This does the right thing.</span>
+        <span class="s0"># with np.errstate(divide='ignore'):</span>
+        <span class="s1">aerr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">([</span><span class="s1">d1</span><span class="s3">**(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">d1</span><span class="s3">)/</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">d2</span><span class="s3">)), </span><span class="s1">d1</span><span class="s3">**</span><span class="s4">2</span><span class="s3">, </span><span class="s1">d3</span><span class="s3">, </span><span class="s1">d4</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)</span>
+        <span class="s1">rerr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s1">e1</span><span class="s3">, </span><span class="s1">aerr</span><span class="s3">/</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">))</span>
+    <span class="s2">return </span><span class="s1">rerr</span><span class="s3">, </span><span class="s1">aerr</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">work</span><span class="s3">.</span><span class="s1">Sn</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_transform_integrals</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+    <span class="s0"># Transform integrals to a form with finite a &lt; b</span>
+    <span class="s0"># For b &lt; a, we reverse the limits and will multiply the final result by -1</span>
+    <span class="s0"># For infinite limit on the right, we use the substitution x = 1/t - 1 + a</span>
+    <span class="s0"># For infinite limit on the left, we substitute x = -x and treat as above</span>
+    <span class="s0"># For infinite limits, we substitute x = t / (1-t**2)</span>
+
+    <span class="s1">negative </span><span class="s3">= </span><span class="s1">b </span><span class="s3">&lt; </span><span class="s1">a</span>
+    <span class="s1">a</span><span class="s3">[</span><span class="s1">negative</span><span class="s3">], </span><span class="s1">b</span><span class="s3">[</span><span class="s1">negative</span><span class="s3">] = </span><span class="s1">b</span><span class="s3">[</span><span class="s1">negative</span><span class="s3">], </span><span class="s1">a</span><span class="s3">[</span><span class="s1">negative</span><span class="s3">]</span>
+
+    <span class="s1">abinf </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">a</span><span class="s3">) &amp; </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)</span>
+    <span class="s1">a</span><span class="s3">[</span><span class="s1">abinf</span><span class="s3">], </span><span class="s1">b</span><span class="s3">[</span><span class="s1">abinf</span><span class="s3">] = -</span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span>
+
+    <span class="s1">ainf </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)</span>
+    <span class="s1">a</span><span class="s3">[</span><span class="s1">ainf</span><span class="s3">], </span><span class="s1">b</span><span class="s3">[</span><span class="s1">ainf</span><span class="s3">] = -</span><span class="s1">b</span><span class="s3">[</span><span class="s1">ainf</span><span class="s3">], -</span><span class="s1">a</span><span class="s3">[</span><span class="s1">ainf</span><span class="s3">]</span>
+
+    <span class="s1">binf </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)</span>
+    <span class="s1">a0 </span><span class="s3">= </span><span class="s1">a</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">a</span><span class="s3">[</span><span class="s1">binf</span><span class="s3">], </span><span class="s1">b</span><span class="s3">[</span><span class="s1">binf</span><span class="s3">] = </span><span class="s4">0</span><span class="s3">, </span><span class="s4">1</span>
+
+    <span class="s2">return </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">a0</span><span class="s3">, </span><span class="s1">negative</span><span class="s3">, </span><span class="s1">abinf</span><span class="s3">, </span><span class="s1">ainf</span><span class="s3">, </span><span class="s1">binf</span>
+
+
+<span class="s2">def </span><span class="s1">_tanhsinh_iv</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxfun</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">, </span><span class="s1">minlevel</span><span class="s3">,</span>
+                 <span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">preserve_shape</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">):</span>
+    <span class="s0"># Input validation and standardization</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'`f` must be callable.'</span>
+    <span class="s2">if not </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">f</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'All elements of `a` and `b` must be real numbers.'</span>
+    <span class="s1">a</span><span class="s3">, </span><span class="s1">b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_arrays</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">iscomplex</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)) </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">iscomplex</span><span class="s3">(</span><span class="s1">b</span><span class="s3">)):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'`log` must be True or False.'</span>
+    <span class="s2">if </span><span class="s1">log </span><span class="s2">not in </span><span class="s3">{</span><span class="s2">True</span><span class="s3">, </span><span class="s2">False</span><span class="s3">}:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s1">log </span><span class="s3">= </span><span class="s1">bool</span><span class="s3">(</span><span class="s1">log</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">atol </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">atol </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s4">0</span>
+
+    <span class="s1">rtol_temp </span><span class="s3">= </span><span class="s1">rtol </span><span class="s2">if </span><span class="s1">rtol </span><span class="s2">is not None else </span><span class="s4">0.</span>
+
+    <span class="s1">params </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">([</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol_temp</span><span class="s3">, </span><span class="s4">0.</span><span class="s3">])</span>
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">&quot;`atol` and `rtol` must be real numbers.&quot;</span>
+    <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">params</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">floating</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">log</span><span class="s3">:</span>
+        <span class="s1">message </span><span class="s3">= </span><span class="s6">'`atol` and `rtol` may not be positive infinity.'</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isposinf</span><span class="s3">(</span><span class="s1">params</span><span class="s3">)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">message </span><span class="s3">= </span><span class="s6">'`atol` and `rtol` must be non-negative and finite.'</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">params </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">) </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">params</span><span class="s3">)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s1">atol </span><span class="s3">= </span><span class="s1">params</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">rtol </span><span class="s3">= </span><span class="s1">rtol </span><span class="s2">if </span><span class="s1">rtol </span><span class="s2">is None else </span><span class="s1">params</span><span class="s3">[</span><span class="s4">1</span><span class="s3">]</span>
+
+    <span class="s1">BIGINT </span><span class="s3">= </span><span class="s1">float</span><span class="s3">(</span><span class="s4">2</span><span class="s3">**</span><span class="s4">62</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">maxfun </span><span class="s2">is None and </span><span class="s1">maxlevel </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">maxlevel </span><span class="s3">= </span><span class="s4">10</span>
+
+    <span class="s1">maxfun </span><span class="s3">= </span><span class="s1">BIGINT </span><span class="s2">if </span><span class="s1">maxfun </span><span class="s2">is None else </span><span class="s1">maxfun</span>
+    <span class="s1">maxlevel </span><span class="s3">= </span><span class="s1">BIGINT </span><span class="s2">if </span><span class="s1">maxlevel </span><span class="s2">is None else </span><span class="s1">maxlevel</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'`maxfun`, `maxlevel`, and `minlevel` must be integers.'</span>
+    <span class="s1">params </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">([</span><span class="s1">maxfun</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">, </span><span class="s1">minlevel</span><span class="s3">])</span>
+    <span class="s2">if not </span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">params</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">number</span><span class="s3">)</span>
+            <span class="s2">and </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isreal</span><span class="s3">(</span><span class="s1">params</span><span class="s3">))</span>
+            <span class="s2">and </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">params</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">) == </span><span class="s1">params</span><span class="s3">)):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'`maxfun`, `maxlevel`, and `minlevel` must be non-negative.'</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">params </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s1">maxfun</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">, </span><span class="s1">minlevel </span><span class="s3">= </span><span class="s1">params</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">int64</span><span class="s3">)</span>
+    <span class="s1">minlevel </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">minlevel</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">)</span>
+
+    <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">iterable</span><span class="s3">(</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">args </span><span class="s3">= (</span><span class="s1">args</span><span class="s3">,)</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'`preserve_shape` must be True or False.'</span>
+    <span class="s2">if </span><span class="s1">preserve_shape </span><span class="s2">not in </span><span class="s3">{</span><span class="s2">True</span><span class="s3">, </span><span class="s2">False</span><span class="s3">}:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">callback </span><span class="s2">is not None and not </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">callback</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s6">'`callback` must be callable.'</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxfun</span><span class="s3">, </span><span class="s1">maxlevel</span><span class="s3">, </span><span class="s1">minlevel</span><span class="s3">,</span>
+            <span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">preserve_shape</span><span class="s3">, </span><span class="s1">callback</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_logsumexp</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">):</span>
+    <span class="s0"># logsumexp raises with empty array</span>
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+    <span class="s1">shape </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">shape</span><span class="s3">[</span><span class="s1">axis</span><span class="s3">] == </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s1">shape</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">fill_value</span><span class="s3">=-</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">x</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">special</span><span class="s3">.</span><span class="s1">logsumexp</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s1">axis</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_nsum_iv</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxterms</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">):</span>
+    <span class="s0"># Input validation and standardization</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'`f` must be callable.'</span>
+    <span class="s2">if not </span><span class="s1">callable</span><span class="s3">(</span><span class="s1">f</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'All elements of `a`, `b`, and `step` must be real numbers.'</span>
+    <span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_arrays</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">)</span>
+    <span class="s1">dtype </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">result_type</span><span class="s3">(</span><span class="s1">a</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">b</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">step</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">number</span><span class="s3">) </span><span class="s2">or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">complexfloating</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s1">valid_a </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)</span>
+    <span class="s1">valid_b </span><span class="s3">= </span><span class="s1">b </span><span class="s3">&gt;= </span><span class="s1">a  </span><span class="s0"># NaNs will be False</span>
+    <span class="s1">valid_step </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">step</span><span class="s3">) &amp; (</span><span class="s1">step </span><span class="s3">&gt; </span><span class="s4">0</span><span class="s3">)</span>
+    <span class="s1">valid_abstep </span><span class="s3">= </span><span class="s1">valid_a </span><span class="s3">&amp; </span><span class="s1">valid_b </span><span class="s3">&amp; </span><span class="s1">valid_step</span>
+
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">'`log` must be True or False.'</span>
+    <span class="s2">if </span><span class="s1">log </span><span class="s2">not in </span><span class="s3">{</span><span class="s2">True</span><span class="s3">, </span><span class="s2">False</span><span class="s3">}:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">atol </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">atol </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s4">0</span>
+
+    <span class="s1">rtol_temp </span><span class="s3">= </span><span class="s1">rtol </span><span class="s2">if </span><span class="s1">rtol </span><span class="s2">is not None else </span><span class="s4">0.</span>
+
+    <span class="s1">params </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">([</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol_temp</span><span class="s3">, </span><span class="s4">0.</span><span class="s3">])</span>
+    <span class="s1">message </span><span class="s3">= </span><span class="s6">&quot;`atol` and `rtol` must be real numbers.&quot;</span>
+    <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">params</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">floating</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">log</span><span class="s3">:</span>
+        <span class="s1">message </span><span class="s3">= </span><span class="s6">'`atol`, `rtol` may not be positive infinity or NaN.'</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isposinf</span><span class="s3">(</span><span class="s1">params</span><span class="s3">) | </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isnan</span><span class="s3">(</span><span class="s1">params</span><span class="s3">)):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">message </span><span class="s3">= </span><span class="s6">'`atol`, and `rtol` must be non-negative and finite.'</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">((</span><span class="s1">params </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">) | (~</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">params</span><span class="s3">))):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+    <span class="s1">atol </span><span class="s3">= </span><span class="s1">params</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">rtol </span><span class="s3">= </span><span class="s1">rtol </span><span class="s2">if </span><span class="s1">rtol </span><span class="s2">is None else </span><span class="s1">params</span><span class="s3">[</span><span class="s4">1</span><span class="s3">]</span>
+
+    <span class="s1">maxterms_int </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">maxterms</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">maxterms_int </span><span class="s3">!= </span><span class="s1">maxterms </span><span class="s2">or </span><span class="s1">maxterms </span><span class="s3">&lt; </span><span class="s4">0</span><span class="s3">:</span>
+        <span class="s1">message </span><span class="s3">= </span><span class="s6">&quot;`maxterms` must be a non-negative integer.&quot;</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+    <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">iterable</span><span class="s3">(</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s1">args </span><span class="s3">= (</span><span class="s1">args</span><span class="s3">,)</span>
+
+    <span class="s2">return </span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">, </span><span class="s1">valid_abstep</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxterms_int</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span>
+
+
+<span class="s2">def </span><span class="s1">_nsum</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">=</span><span class="s4">1</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(), </span><span class="s1">log</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">maxterms</span><span class="s3">=</span><span class="s1">int</span><span class="s3">(</span><span class="s4">2</span><span class="s3">**</span><span class="s4">20</span><span class="s3">), </span><span class="s1">atol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+          <span class="s1">rtol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s6">r&quot;&quot;&quot;Evaluate a convergent sum. 
+ 
+    For finite `b`, this evaluates:: 
+ 
+        f(a + np.arange(n)*step).sum() 
+ 
+    where ``n = int((b - a) / step) + 1``. If `f` is smooth, positive, and 
+    monotone decreasing, `b` may be infinite, in which case the infinite sum 
+    is approximated using integration. 
+ 
+    Parameters 
+    ---------- 
+    f : callable 
+        The function that evaluates terms to be summed. The signature must be:: 
+ 
+            f(x: ndarray, *args) -&gt; ndarray 
+ 
+         where each element of ``x`` is a finite real and ``args`` is a tuple, 
+         which may contain an arbitrary number of arrays that are broadcastable 
+         with `x`. `f` must represent a smooth, positive, and monotone decreasing 
+         function of `x`; `_nsum` performs no checks to verify that these conditions 
+         are met and may return erroneous results if they are violated. 
+    a, b : array_like 
+        Real lower and upper limits of summed terms. Must be broadcastable. 
+        Each element of `a` must be finite and less than the corresponding 
+        element in `b`, but elements of `b` may be infinite. 
+    step : array_like 
+        Finite, positive, real step between summed terms. Must be broadcastable 
+        with `a` and `b`. 
+    args : tuple, optional 
+        Additional positional arguments to be passed to `f`. Must be arrays 
+        broadcastable with `a`, `b`, and `step`. If the callable to be summed 
+        requires arguments that are not broadcastable with `a`, `b`, and `step`, 
+        wrap that callable with `f`. See Examples. 
+    log : bool, default: False 
+        Setting to True indicates that `f` returns the log of the terms 
+        and that `atol` and `rtol` are expressed as the logs of the absolute 
+        and relative errors. In this case, the result object will contain the 
+        log of the sum and error. This is useful for summands for which 
+        numerical underflow or overflow would lead to inaccuracies. 
+    maxterms : int, default: 2**32 
+        The maximum number of terms to evaluate when summing directly.  
+        Additional function evaluations may be performed for input 
+        validation and integral evaluation.  
+    atol, rtol : float, optional 
+        Absolute termination tolerance (default: 0) and relative termination 
+        tolerance (default: ``eps**0.5``, where ``eps`` is the precision of 
+        the result dtype), respectively. Must be non-negative 
+        and finite if `log` is False, and must be expressed as the log of a 
+        non-negative and finite number if `log` is True. 
+ 
+    Returns 
+    ------- 
+    res : _RichResult 
+        An instance of `scipy._lib._util._RichResult` with the following 
+        attributes. (The descriptions are written as though the values will be 
+        scalars; however, if `func` returns an array, the outputs will be 
+ 
+        arrays of the same shape.) 
+        success : bool 
+            ``True`` when the algorithm terminated successfully (status ``0``). 
+        status : int 
+            An integer representing the exit status of the algorithm. 
+            ``0`` : The algorithm converged to the specified tolerances. 
+            ``-1`` : Element(s) of `a`, `b`, or `step` are invalid 
+            ``-2`` : Numerical integration reached its iteration limit; the sum may be divergent. 
+            ``-3`` : A non-finite value was encountered. 
+        sum : float 
+            An estimate of the sum. 
+        error : float 
+            An estimate of the absolute error, assuming all terms are non-negative. 
+        nfev : int 
+            The number of points at which `func` was evaluated. 
+ 
+    See Also 
+    -------- 
+    tanhsinh 
+ 
+    Notes 
+    ----- 
+    The method implemented for infinite summation is related to the integral 
+    test for convergence of an infinite series: assuming `step` size 1 for 
+    simplicity of exposition, the sum of a monotone decreasing function is bounded by 
+ 
+    .. math:: 
+ 
+        \int_u^\infty f(x) dx \leq \sum_{k=u}^\infty f(k) \leq \int_u^\infty f(x) dx + f(u) 
+ 
+    Let :math:`a` represent  `a`, :math:`n` represent `maxterms`, :math:`\epsilon_a` 
+    represent `atol`, and :math:`\epsilon_r` represent `rtol`. 
+    The implementation first evaluates the integral :math:`S_l=\int_a^\infty f(x) dx` 
+    as a lower bound of the infinite sum. Then, it seeks a value :math:`c &gt; a` such 
+    that :math:`f(c) &lt; \epsilon_a + S_l \epsilon_r`, if it exists; otherwise, 
+    let :math:`c = a + n`. Then the infinite sum is approximated as 
+     
+    .. math:: 
+ 
+        \sum_{k=a}^{c-1} f(k) + \int_c^\infty f(x) dx + f(c)/2 
+ 
+    and the reported error is :math:`f(c)/2` plus the error estimate of 
+    numerical integration. The approach described above is generalized for non-unit 
+    `step` and finite `b` that is too large for direct evaluation of the sum, 
+    i.e. ``b - a + 1 &gt; maxterms``. 
+ 
+    References 
+    ---------- 
+    [1] Wikipedia. &quot;Integral test for convergence.&quot; 
+    https://en.wikipedia.org/wiki/Integral_test_for_convergence 
+ 
+    Examples 
+    -------- 
+    Compute the infinite sum of the reciprocals of squared integers. 
+     
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.integrate._tanhsinh import _nsum 
+    &gt;&gt;&gt; res = _nsum(lambda k: 1/k**2, 1, np.inf, maxterms=1e3) 
+    &gt;&gt;&gt; ref = np.pi**2/6  # true value 
+    &gt;&gt;&gt; res.error  # estimated error 
+    4.990014980029223e-07 
+    &gt;&gt;&gt; (res.sum - ref)/ref  # true error 
+    -1.0101760641302586e-10 
+    &gt;&gt;&gt; res.nfev  # number of points at which callable was evaluated 
+    1142 
+     
+    Compute the infinite sums of the reciprocals of integers raised to powers ``p``. 
+     
+    &gt;&gt;&gt; from scipy import special 
+    &gt;&gt;&gt; p = np.arange(2, 10) 
+    &gt;&gt;&gt; res = _nsum(lambda k, p: 1/k**p, 1, np.inf, maxterms=1e3, args=(p,)) 
+    &gt;&gt;&gt; ref = special.zeta(p, 1) 
+    &gt;&gt;&gt; np.allclose(res.sum, ref) 
+    True 
+     
+    &quot;&quot;&quot; </span><span class="s0"># noqa: E501</span>
+    <span class="s0"># Potential future work:</span>
+    <span class="s0"># - more careful testing of when `b` is slightly less than `a` plus an</span>
+    <span class="s0">#   integer multiple of step (needed before this is public)</span>
+    <span class="s0"># - improve error estimate of `_direct` sum</span>
+    <span class="s0"># - add other methods for convergence acceleration (Richardson, epsilon)</span>
+    <span class="s0"># - support infinite lower limit?</span>
+    <span class="s0"># - support negative monotone increasing functions?</span>
+    <span class="s0"># - b &lt; a / negative step?</span>
+    <span class="s0"># - complex-valued function?</span>
+    <span class="s0"># - check for violations of monotonicity?</span>
+
+    <span class="s0"># Function-specific input validation / standardization</span>
+    <span class="s1">tmp </span><span class="s3">= </span><span class="s1">_nsum_iv</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxterms</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">)</span>
+    <span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">, </span><span class="s1">valid_abstep</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">maxterms</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol </span><span class="s3">= </span><span class="s1">tmp</span>
+
+    <span class="s0"># Additional elementwise algorithm input validation / standardization</span>
+    <span class="s1">tmp </span><span class="s3">= </span><span class="s1">eim</span><span class="s3">.</span><span class="s1">_initialize</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, (</span><span class="s1">a</span><span class="s3">,), </span><span class="s1">args</span><span class="s3">, </span><span class="s1">complex_ok</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+    <span class="s1">f</span><span class="s3">, </span><span class="s1">xs</span><span class="s3">, </span><span class="s1">fs</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">xp </span><span class="s3">= </span><span class="s1">tmp</span>
+
+    <span class="s0"># Finish preparing `a`, `b`, and `step` arrays</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">xs</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">().</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s1">step </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">step</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">().</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s1">valid_abstep </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">valid_abstep</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">).</span><span class="s1">ravel</span><span class="s3">()</span>
+    <span class="s1">nterms </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">floor</span><span class="s3">((</span><span class="s1">b </span><span class="s3">- </span><span class="s1">a</span><span class="s3">) / </span><span class="s1">step</span><span class="s3">)</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">a </span><span class="s3">+ </span><span class="s1">nterms</span><span class="s3">*</span><span class="s1">step</span>
+
+    <span class="s0"># Define constants</span>
+    <span class="s1">eps </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">dtype</span><span class="s3">).</span><span class="s1">eps</span>
+    <span class="s1">zero </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(-</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s4">0</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)[()]</span>
+    <span class="s2">if </span><span class="s1">rtol </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">rtol </span><span class="s3">= </span><span class="s4">0.5</span><span class="s3">*</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">eps</span><span class="s3">) </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s1">eps</span><span class="s3">**</span><span class="s4">0.5</span>
+    <span class="s1">constants </span><span class="s3">= (</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">eps</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">maxterms</span><span class="s3">)</span>
+
+    <span class="s0"># Prepare result arrays</span>
+    <span class="s1">S </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)</span>
+    <span class="s1">E </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">a</span><span class="s3">)</span>
+    <span class="s1">status </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">a</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">int</span><span class="s3">)</span>
+    <span class="s1">nfev </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">a</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">int</span><span class="s3">)  </span><span class="s0"># one function evaluation above</span>
+
+    <span class="s0"># Branch for direct sum evaluation / integral approximation / invalid input</span>
+    <span class="s1">i1 </span><span class="s3">= (</span><span class="s1">nterms </span><span class="s3">+ </span><span class="s4">1 </span><span class="s3">&lt;= </span><span class="s1">maxterms</span><span class="s3">) &amp; </span><span class="s1">valid_abstep</span>
+    <span class="s1">i2 </span><span class="s3">= (</span><span class="s1">nterms </span><span class="s3">+ </span><span class="s4">1 </span><span class="s3">&gt; </span><span class="s1">maxterms</span><span class="s3">) &amp; </span><span class="s1">valid_abstep</span>
+    <span class="s1">i3 </span><span class="s3">= ~</span><span class="s1">valid_abstep</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">i1</span><span class="s3">):</span>
+        <span class="s1">args_direct </span><span class="s3">= [</span><span class="s1">arg</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">] </span><span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">args</span><span class="s3">]</span>
+        <span class="s1">tmp </span><span class="s3">= </span><span class="s1">_direct</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">], </span><span class="s1">b</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">], </span><span class="s1">step</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">], </span><span class="s1">args_direct</span><span class="s3">, </span><span class="s1">constants</span><span class="s3">)</span>
+        <span class="s1">S</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">], </span><span class="s1">E</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">] = </span><span class="s1">tmp</span><span class="s3">[:-</span><span class="s4">1</span><span class="s3">]</span>
+        <span class="s1">nfev</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">] += </span><span class="s1">tmp</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">]</span>
+        <span class="s1">status</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">] = -</span><span class="s4">3 </span><span class="s3">* (~</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">S</span><span class="s3">[</span><span class="s1">i1</span><span class="s3">]))</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">i2</span><span class="s3">):</span>
+        <span class="s1">args_indirect </span><span class="s3">= [</span><span class="s1">arg</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">] </span><span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">args</span><span class="s3">]</span>
+        <span class="s1">tmp </span><span class="s3">= </span><span class="s1">_integral_bound</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">], </span><span class="s1">b</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">], </span><span class="s1">step</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">], </span><span class="s1">args_indirect</span><span class="s3">, </span><span class="s1">constants</span><span class="s3">)</span>
+        <span class="s1">S</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">], </span><span class="s1">E</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">], </span><span class="s1">status</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">] = </span><span class="s1">tmp</span><span class="s3">[:-</span><span class="s4">1</span><span class="s3">]</span>
+        <span class="s1">nfev</span><span class="s3">[</span><span class="s1">i2</span><span class="s3">] += </span><span class="s1">tmp</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">i3</span><span class="s3">):</span>
+        <span class="s1">S</span><span class="s3">[</span><span class="s1">i3</span><span class="s3">], </span><span class="s1">E</span><span class="s3">[</span><span class="s1">i3</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+        <span class="s1">status</span><span class="s3">[</span><span class="s1">i3</span><span class="s3">] = -</span><span class="s4">1</span>
+
+    <span class="s0"># Return results</span>
+    <span class="s1">S</span><span class="s3">, </span><span class="s1">E </span><span class="s3">= </span><span class="s1">S</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">)[()], </span><span class="s1">E</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">)[()]</span>
+    <span class="s1">status</span><span class="s3">, </span><span class="s1">nfev </span><span class="s3">= </span><span class="s1">status</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">)[()], </span><span class="s1">nfev</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">)[()]</span>
+    <span class="s2">return </span><span class="s1">_RichResult</span><span class="s3">(</span><span class="s1">sum</span><span class="s3">=</span><span class="s1">S</span><span class="s3">, </span><span class="s1">error</span><span class="s3">=</span><span class="s1">E</span><span class="s3">, </span><span class="s1">status</span><span class="s3">=</span><span class="s1">status</span><span class="s3">, </span><span class="s1">success</span><span class="s3">=</span><span class="s1">status </span><span class="s3">== </span><span class="s4">0</span><span class="s3">,</span>
+                       <span class="s1">nfev</span><span class="s3">=</span><span class="s1">nfev</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_direct</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">constants</span><span class="s3">, </span><span class="s1">inclusive</span><span class="s3">=</span><span class="s2">True</span><span class="s3">):</span>
+    <span class="s0"># Directly evaluate the sum.</span>
+
+    <span class="s0"># When used in the context of distributions, `args` would contain the</span>
+    <span class="s0"># distribution parameters. We have broadcasted for simplicity, but we could</span>
+    <span class="s0"># reduce function evaluations when distribution parameters are the same but</span>
+    <span class="s0"># sum limits differ. Roughly:</span>
+    <span class="s0"># - compute the function at all points between min(a) and max(b),</span>
+    <span class="s0"># - compute the cumulative sum,</span>
+    <span class="s0"># - take the difference between elements of the cumulative sum</span>
+    <span class="s0">#   corresponding with b and a.</span>
+    <span class="s0"># This is left to future enhancement</span>
+
+    <span class="s1">dtype</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">eps</span><span class="s3">, </span><span class="s1">zero</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">constants</span>
+
+    <span class="s0"># To allow computation in a single vectorized call, find the maximum number</span>
+    <span class="s0"># of points (over all slices) at which the function needs to be evaluated.</span>
+    <span class="s0"># Note: if `inclusive` is `True`, then we want `1` more term in the sum.</span>
+    <span class="s0"># I didn't think it was great style to use `True` as `1` in Python, so I</span>
+    <span class="s0"># explicitly converted it to an `int` before using it.</span>
+    <span class="s1">inclusive_adjustment </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">inclusive</span><span class="s3">)</span>
+    <span class="s1">steps </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">round</span><span class="s3">((</span><span class="s1">b </span><span class="s3">- </span><span class="s1">a</span><span class="s3">) / </span><span class="s1">step</span><span class="s3">) + </span><span class="s1">inclusive_adjustment</span>
+    <span class="s0"># Equivalently, steps = np.round((b - a) / step) + inclusive</span>
+    <span class="s1">max_steps </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">steps</span><span class="s3">))</span>
+
+    <span class="s0"># In each slice, the function will be evaluated at the same number of points,</span>
+    <span class="s0"># but excessive points (those beyond the right sum limit `b`) are replaced</span>
+    <span class="s0"># with NaN to (potentially) reduce the time of these unnecessary calculations.</span>
+    <span class="s0"># Use a new last axis for these calculations for consistency with other</span>
+    <span class="s0"># elementwise algorithms.</span>
+    <span class="s1">a2</span><span class="s3">, </span><span class="s1">b2</span><span class="s3">, </span><span class="s1">step2 </span><span class="s3">= </span><span class="s1">a</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">], </span><span class="s1">b</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">], </span><span class="s1">step</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">]</span>
+    <span class="s1">args2 </span><span class="s3">= [</span><span class="s1">arg</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">] </span><span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">args</span><span class="s3">]</span>
+    <span class="s1">ks </span><span class="s3">= </span><span class="s1">a2 </span><span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">max_steps</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">) * </span><span class="s1">step2</span>
+    <span class="s1">i_nan </span><span class="s3">= </span><span class="s1">ks </span><span class="s3">&gt;= (</span><span class="s1">b2 </span><span class="s3">+ </span><span class="s1">inclusive_adjustment</span><span class="s3">*</span><span class="s1">step2</span><span class="s3">/</span><span class="s4">2</span><span class="s3">)</span>
+    <span class="s1">ks</span><span class="s3">[</span><span class="s1">i_nan</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+    <span class="s1">fs </span><span class="s3">= </span><span class="s1">f</span><span class="s3">(</span><span class="s1">ks</span><span class="s3">, *</span><span class="s1">args2</span><span class="s3">)</span>
+
+    <span class="s0"># The function evaluated at NaN is NaN, and NaNs are zeroed in the sum.</span>
+    <span class="s0"># In some cases it may be faster to loop over slices than to vectorize</span>
+    <span class="s0"># like this. This is an optimization that can be added later.</span>
+    <span class="s1">fs</span><span class="s3">[</span><span class="s1">i_nan</span><span class="s3">] = </span><span class="s1">zero</span>
+    <span class="s1">nfev </span><span class="s3">= </span><span class="s1">max_steps </span><span class="s3">- </span><span class="s1">i_nan</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+    <span class="s1">S </span><span class="s3">= </span><span class="s1">_logsumexp</span><span class="s3">(</span><span class="s1">fs</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">) </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">fs</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">)</span>
+    <span class="s0"># Rough, non-conservative error estimate. See gh-19667 for improvement ideas.</span>
+    <span class="s1">E </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">real</span><span class="s3">(</span><span class="s1">S</span><span class="s3">) + </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">eps</span><span class="s3">) </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s1">eps </span><span class="s3">* </span><span class="s1">abs</span><span class="s3">(</span><span class="s1">S</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">S</span><span class="s3">, </span><span class="s1">E</span><span class="s3">, </span><span class="s1">nfev</span>
+
+
+<span class="s2">def </span><span class="s1">_integral_bound</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">step</span><span class="s3">, </span><span class="s1">args</span><span class="s3">, </span><span class="s1">constants</span><span class="s3">):</span>
+    <span class="s0"># Estimate the sum with integral approximation</span>
+    <span class="s1">dtype</span><span class="s3">, </span><span class="s1">log</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">, </span><span class="s1">maxterms </span><span class="s3">= </span><span class="s1">constants</span>
+    <span class="s1">log2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s4">2</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+
+    <span class="s0"># Get a lower bound on the sum and compute effective absolute tolerance</span>
+    <span class="s1">lb </span><span class="s3">= </span><span class="s1">_tanhsinh</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=</span><span class="s1">args</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">=</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">=</span><span class="s1">rtol</span><span class="s3">, </span><span class="s1">log</span><span class="s3">=</span><span class="s1">log</span><span class="s3">)</span>
+    <span class="s1">tol </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">broadcast_to</span><span class="s3">(</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">.</span><span class="s1">integral</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+    <span class="s1">tol </span><span class="s3">= </span><span class="s1">_logsumexp</span><span class="s3">((</span><span class="s1">tol</span><span class="s3">, </span><span class="s1">rtol </span><span class="s3">+ </span><span class="s1">lb</span><span class="s3">.</span><span class="s1">integral</span><span class="s3">)) </span><span class="s2">if </span><span class="s1">log </span><span class="s2">else </span><span class="s1">tol </span><span class="s3">+ </span><span class="s1">rtol</span><span class="s3">*</span><span class="s1">lb</span><span class="s3">.</span><span class="s1">integral</span>
+    <span class="s1">i_skip </span><span class="s3">= </span><span class="s1">lb</span><span class="s3">.</span><span class="s1">status </span><span class="s3">&lt; </span><span class="s4">0  </span><span class="s0"># avoid unnecessary f_evals if integral is divergent</span>
+    <span class="s1">tol</span><span class="s3">[</span><span class="s1">i_skip</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+    <span class="s1">status </span><span class="s3">= </span><span class="s1">lb</span><span class="s3">.</span><span class="s1">status</span>
+
+    <span class="s0"># As in `_direct`, we'll need a temporary new axis for points</span>
+    <span class="s0"># at which to evaluate the function. Append axis at the end for</span>
+    <span class="s0"># consistency with other elementwise algorithms.</span>
+    <span class="s1">a2 </span><span class="s3">= </span><span class="s1">a</span><span class="s3">[..., </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">]</span>
+    <span class="s1">step2 </span><span class="s3">= </span><span class="s1">step</span><span class="s3">[..., </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">]</span>
+    <span class="s1">args2 </span><span class="s3">= [</span><span class="s1">arg</span><span class="s3">[..., </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">] </span><span class="s2">for </span><span class="s1">arg </span><span class="s2">in </span><span class="s1">args</span><span class="s3">]</span>
+
+    <span class="s0"># Find the location of a term that is less than the tolerance (if possible)</span>
+    <span class="s1">log2maxterms </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">floor</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">log2</span><span class="s3">(</span><span class="s1">maxterms</span><span class="s3">)) </span><span class="s2">if </span><span class="s1">maxterms </span><span class="s2">else </span><span class="s4">0</span>
+    <span class="s1">n_steps </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">([</span><span class="s4">2</span><span class="s3">**</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">log2maxterms</span><span class="s3">), [</span><span class="s1">maxterms</span><span class="s3">]], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+    <span class="s1">nfev </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">n_steps</span><span class="s3">)</span>
+    <span class="s1">ks </span><span class="s3">= </span><span class="s1">a2 </span><span class="s3">+ </span><span class="s1">n_steps </span><span class="s3">* </span><span class="s1">step2</span>
+    <span class="s1">fks </span><span class="s3">= </span><span class="s1">f</span><span class="s3">(</span><span class="s1">ks</span><span class="s3">, *</span><span class="s1">args2</span><span class="s3">)</span>
+    <span class="s1">nt </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">minimum</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">fks </span><span class="s3">&gt; </span><span class="s1">tol</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=-</span><span class="s4">1</span><span class="s3">),  </span><span class="s1">n_steps</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">]-</span><span class="s4">1</span><span class="s3">)</span>
+    <span class="s1">n_steps </span><span class="s3">= </span><span class="s1">n_steps</span><span class="s3">[</span><span class="s1">nt</span><span class="s3">]</span>
+
+    <span class="s0"># Directly evaluate the sum up to this term</span>
+    <span class="s1">k </span><span class="s3">= </span><span class="s1">a </span><span class="s3">+ </span><span class="s1">n_steps </span><span class="s3">* </span><span class="s1">step</span>
+    <span class="s1">left</span><span class="s3">, </span><span class="s1">left_error</span><span class="s3">, </span><span class="s1">left_nfev </span><span class="s3">= </span><span class="s1">_direct</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">step</span><span class="s3">, </span><span class="s1">args</span><span class="s3">,</span>
+                                          <span class="s1">constants</span><span class="s3">, </span><span class="s1">inclusive</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+    <span class="s1">i_skip </span><span class="s3">|= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isposinf</span><span class="s3">(</span><span class="s1">left</span><span class="s3">)  </span><span class="s0"># if sum is not finite, no sense in continuing</span>
+    <span class="s1">status</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isposinf</span><span class="s3">(</span><span class="s1">left</span><span class="s3">)] = -</span><span class="s4">3</span>
+    <span class="s1">k</span><span class="s3">[</span><span class="s1">i_skip</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span>
+
+    <span class="s0"># Use integration to estimate the remaining sum</span>
+    <span class="s0"># Possible optimization for future work: if there were no terms less than</span>
+    <span class="s0"># the tolerance, there is no need to compute the integral to better accuracy.</span>
+    <span class="s0"># Something like:</span>
+    <span class="s0"># atol = np.maximum(atol, np.minimum(fk/2 - fb/2))</span>
+    <span class="s0"># rtol = np.maximum(rtol, np.minimum((fk/2 - fb/2)/left))</span>
+    <span class="s0"># where `fk`/`fb` are currently calculated below.</span>
+    <span class="s1">right </span><span class="s3">= </span><span class="s1">_tanhsinh</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=</span><span class="s1">args</span><span class="s3">, </span><span class="s1">atol</span><span class="s3">=</span><span class="s1">atol</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">=</span><span class="s1">rtol</span><span class="s3">, </span><span class="s1">log</span><span class="s3">=</span><span class="s1">log</span><span class="s3">)</span>
+
+    <span class="s0"># Calculate the full estimate and error from the pieces</span>
+    <span class="s1">fk </span><span class="s3">= </span><span class="s1">fks</span><span class="s3">[</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">fks</span><span class="s3">)), </span><span class="s1">nt</span><span class="s3">]</span>
+    <span class="s1">fb </span><span class="s3">= </span><span class="s1">f</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">)</span>
+    <span class="s1">nfev </span><span class="s3">+= </span><span class="s4">1</span>
+    <span class="s2">if </span><span class="s1">log</span><span class="s3">:</span>
+        <span class="s1">log_step </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">log</span><span class="s3">(</span><span class="s1">step</span><span class="s3">)</span>
+        <span class="s1">S_terms </span><span class="s3">= (</span><span class="s1">left</span><span class="s3">, </span><span class="s1">right</span><span class="s3">.</span><span class="s1">integral </span><span class="s3">- </span><span class="s1">log_step</span><span class="s3">, </span><span class="s1">fk </span><span class="s3">- </span><span class="s1">log2</span><span class="s3">, </span><span class="s1">fb </span><span class="s3">- </span><span class="s1">log2</span><span class="s3">)</span>
+        <span class="s1">S </span><span class="s3">= </span><span class="s1">_logsumexp</span><span class="s3">(</span><span class="s1">S_terms</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)</span>
+        <span class="s1">E_terms </span><span class="s3">= (</span><span class="s1">left_error</span><span class="s3">, </span><span class="s1">right</span><span class="s3">.</span><span class="s1">error </span><span class="s3">- </span><span class="s1">log_step</span><span class="s3">, </span><span class="s1">fk</span><span class="s3">-</span><span class="s1">log2</span><span class="s3">, </span><span class="s1">fb</span><span class="s3">-</span><span class="s1">log2</span><span class="s3">+</span><span class="s1">np</span><span class="s3">.</span><span class="s1">pi</span><span class="s3">*</span><span class="s4">1j</span><span class="s3">)</span>
+        <span class="s1">E </span><span class="s3">= </span><span class="s1">_logsumexp</span><span class="s3">(</span><span class="s1">E_terms</span><span class="s3">, </span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">).</span><span class="s1">real</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">S </span><span class="s3">= </span><span class="s1">left </span><span class="s3">+ </span><span class="s1">right</span><span class="s3">.</span><span class="s1">integral</span><span class="s3">/</span><span class="s1">step </span><span class="s3">+ </span><span class="s1">fk</span><span class="s3">/</span><span class="s4">2 </span><span class="s3">+ </span><span class="s1">fb</span><span class="s3">/</span><span class="s4">2</span>
+        <span class="s1">E </span><span class="s3">= </span><span class="s1">left_error </span><span class="s3">+ </span><span class="s1">right</span><span class="s3">.</span><span class="s1">error</span><span class="s3">/</span><span class="s1">step </span><span class="s3">+ </span><span class="s1">fk</span><span class="s3">/</span><span class="s4">2 </span><span class="s3">- </span><span class="s1">fb</span><span class="s3">/</span><span class="s4">2</span>
+    <span class="s1">status</span><span class="s3">[~</span><span class="s1">i_skip</span><span class="s3">] = </span><span class="s1">right</span><span class="s3">.</span><span class="s1">status</span><span class="s3">[~</span><span class="s1">i_skip</span><span class="s3">]</span>
+    <span class="s2">return </span><span class="s1">S</span><span class="s3">, </span><span class="s1">E</span><span class="s3">, </span><span class="s1">status</span><span class="s3">, </span><span class="s1">left_nfev </span><span class="s3">+ </span><span class="s1">right</span><span class="s3">.</span><span class="s1">nfev </span><span class="s3">+ </span><span class="s1">nfev </span><span class="s3">+ </span><span class="s1">lb</span><span class="s3">.</span><span class="s1">nfev</span>
+</pre>
+</body>
+</html>

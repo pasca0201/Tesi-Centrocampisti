@@ -1,0 +1,381 @@
+<html>
+<head>
+<title>_ndbspline.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_ndbspline.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">itertools</span>
+<span class="s0">import </span><span class="s1">functools</span>
+<span class="s0">import </span><span class="s1">operator</span>
+<span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">math </span><span class="s0">import </span><span class="s1">prod</span>
+
+<span class="s0">from </span><span class="s2">. </span><span class="s0">import </span><span class="s1">_bspl  </span><span class="s3"># type: ignore</span>
+
+<span class="s0">import </span><span class="s1">scipy</span><span class="s2">.</span><span class="s1">sparse</span><span class="s2">.</span><span class="s1">linalg </span><span class="s0">as </span><span class="s1">ssl</span>
+<span class="s0">from </span><span class="s1">scipy</span><span class="s2">.</span><span class="s1">sparse </span><span class="s0">import </span><span class="s1">csr_array</span>
+
+<span class="s0">from </span><span class="s2">.</span><span class="s1">_bsplines </span><span class="s0">import </span><span class="s1">_not_a_knot</span>
+
+<span class="s1">__all__ </span><span class="s2">= [</span><span class="s4">&quot;NdBSpline&quot;</span><span class="s2">]</span>
+
+
+<span class="s0">def </span><span class="s1">_get_dtype</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot;Return np.complex128 for complex dtypes, np.float64 otherwise.&quot;&quot;&quot;</span>
+    <span class="s0">if </span><span class="s1">np</span><span class="s2">.</span><span class="s1">issubdtype</span><span class="s2">(</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">complexfloating</span><span class="s2">):</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">complex128</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span>
+
+
+<span class="s0">class </span><span class="s1">NdBSpline</span><span class="s2">:</span>
+    <span class="s5">&quot;&quot;&quot;Tensor product spline object. 
+ 
+    The value at point ``xp = (x1, x2, ..., xN)`` is evaluated as a linear 
+    combination of products of one-dimensional b-splines in each of the ``N`` 
+    dimensions:: 
+ 
+       c[i1, i2, ..., iN] * B(x1; i1, t1) * B(x2; i2, t2) * ... * B(xN; iN, tN) 
+ 
+ 
+    Here ``B(x; i, t)`` is the ``i``-th b-spline defined by the knot vector 
+    ``t`` evaluated at ``x``. 
+ 
+    Parameters 
+    ---------- 
+    t : tuple of 1D ndarrays 
+        knot vectors in directions 1, 2, ... N, 
+        ``len(t[i]) == n[i] + k + 1`` 
+    c : ndarray, shape (n1, n2, ..., nN, ...) 
+        b-spline coefficients 
+    k : int or length-d tuple of integers 
+        spline degrees. 
+        A single integer is interpreted as having this degree for 
+        all dimensions. 
+    extrapolate : bool, optional 
+        Whether to extrapolate out-of-bounds inputs, or return `nan`. 
+        Default is to extrapolate. 
+ 
+    Attributes 
+    ---------- 
+    t : tuple of ndarrays 
+        Knots vectors. 
+    c : ndarray 
+        Coefficients of the tensor-produce spline. 
+    k : tuple of integers 
+        Degrees for each dimension. 
+    extrapolate : bool, optional 
+        Whether to extrapolate or return nans for out-of-bounds inputs. 
+        Defaults to true. 
+ 
+    Methods 
+    ------- 
+    __call__ 
+    design_matrix 
+ 
+    See Also 
+    -------- 
+    BSpline : a one-dimensional B-spline object 
+    NdPPoly : an N-dimensional piecewise tensor product polynomial 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">t</span><span class="s2">, </span><span class="s1">c</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, *, </span><span class="s1">extrapolate</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s1">ndim </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">t</span><span class="s2">)</span>
+
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">len</span><span class="s2">(</span><span class="s1">k</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">TypeError</span><span class="s2">:</span>
+            <span class="s3"># make k a tuple</span>
+            <span class="s1">k </span><span class="s2">= (</span><span class="s1">k</span><span class="s2">,)*</span><span class="s1">ndim</span>
+
+        <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">k</span><span class="s2">) != </span><span class="s1">ndim</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">len</span><span class="s2">(</span><span class="s1">t</span><span class="s2">) = </span><span class="s0">} </span><span class="s4">!= </span><span class="s0">{</span><span class="s1">len</span><span class="s2">(</span><span class="s1">k</span><span class="s2">) = </span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">k </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">operator</span><span class="s2">.</span><span class="s1">index</span><span class="s2">(</span><span class="s1">ki</span><span class="s2">) </span><span class="s0">for </span><span class="s1">ki </span><span class="s0">in </span><span class="s1">k</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">t </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">ascontiguousarray</span><span class="s2">(</span><span class="s1">ti</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">float</span><span class="s2">) </span><span class="s0">for </span><span class="s1">ti </span><span class="s0">in </span><span class="s1">t</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">c </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">c</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">extrapolate </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">extrapolate </span><span class="s2">= </span><span class="s0">True</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">extrapolate </span><span class="s2">= </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">extrapolate</span><span class="s2">)</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">c </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">c</span><span class="s2">)</span>
+
+        <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">):</span>
+            <span class="s1">td </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">[</span><span class="s1">d</span><span class="s2">]</span>
+            <span class="s1">kd </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">k</span><span class="s2">[</span><span class="s1">d</span><span class="s2">]</span>
+            <span class="s1">n </span><span class="s2">= </span><span class="s1">td</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] - </span><span class="s1">kd </span><span class="s2">- </span><span class="s6">1</span>
+            <span class="s0">if </span><span class="s1">kd </span><span class="s2">&lt; </span><span class="s6">0</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Spline degree in dimension </span><span class="s0">{</span><span class="s1">d</span><span class="s0">} </span><span class="s4">cannot be&quot;</span>
+                                 <span class="s4">f&quot; negative.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">td</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">!= </span><span class="s6">1</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Knot vector in dimension </span><span class="s0">{</span><span class="s1">d</span><span class="s0">} </span><span class="s4">must be&quot;</span>
+                                 <span class="s4">f&quot; one-dimensional.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">n </span><span class="s2">&lt; </span><span class="s1">kd </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Need at least </span><span class="s0">{</span><span class="s6">2</span><span class="s2">*</span><span class="s1">kd </span><span class="s2">+ </span><span class="s6">2</span><span class="s0">} </span><span class="s4">knots for degree&quot;</span>
+                                 <span class="s4">f&quot; </span><span class="s0">{</span><span class="s1">kd</span><span class="s0">} </span><span class="s4">in dimension </span><span class="s0">{</span><span class="s1">d</span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">diff</span><span class="s2">(</span><span class="s1">td</span><span class="s2">) &lt; </span><span class="s6">0</span><span class="s2">).</span><span class="s1">any</span><span class="s2">():</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Knots in dimension </span><span class="s0">{</span><span class="s1">d</span><span class="s0">} </span><span class="s4">must be in a&quot;</span>
+                                 <span class="s4">f&quot; non-decreasing order.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">unique</span><span class="s2">(</span><span class="s1">td</span><span class="s2">[</span><span class="s1">kd</span><span class="s2">:</span><span class="s1">n </span><span class="s2">+ </span><span class="s6">1</span><span class="s2">])) &lt; </span><span class="s6">2</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Need at least two internal knots in&quot;</span>
+                                 <span class="s4">f&quot; dimension </span><span class="s0">{</span><span class="s1">d</span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s2">)</span>
+            <span class="s0">if not </span><span class="s1">np</span><span class="s2">.</span><span class="s1">isfinite</span><span class="s2">(</span><span class="s1">td</span><span class="s2">).</span><span class="s1">all</span><span class="s2">():</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Knots in dimension </span><span class="s0">{</span><span class="s1">d</span><span class="s0">} </span><span class="s4">should not have&quot;</span>
+                                 <span class="s4">f&quot; nans or infs.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">&lt; </span><span class="s1">ndim</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Coefficients must be at least&quot;</span>
+                                 <span class="s4">f&quot; </span><span class="s0">{</span><span class="s1">d</span><span class="s0">}</span><span class="s4">-dimensional.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s1">d</span><span class="s2">] != </span><span class="s1">n</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Knots, coefficients and degree in dimension&quot;</span>
+                                 <span class="s4">f&quot; </span><span class="s0">{</span><span class="s1">d</span><span class="s0">} </span><span class="s4">are inconsistent:&quot;</span>
+                                 <span class="s4">f&quot; got </span><span class="s0">{</span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s1">d</span><span class="s2">]</span><span class="s0">} </span><span class="s4">coefficients for&quot;</span>
+                                 <span class="s4">f&quot; </span><span class="s0">{</span><span class="s1">len</span><span class="s2">(</span><span class="s1">td</span><span class="s2">)</span><span class="s0">} </span><span class="s4">knots, need at least </span><span class="s0">{</span><span class="s1">n</span><span class="s0">} </span><span class="s4">for&quot;</span>
+                                 <span class="s4">f&quot; k=</span><span class="s0">{</span><span class="s1">k</span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s2">)</span>
+
+        <span class="s1">dt </span><span class="s2">= </span><span class="s1">_get_dtype</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">c </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">ascontiguousarray</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">dt</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">__call__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">xi</span><span class="s2">, *, </span><span class="s1">nu</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">extrapolate</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot;Evaluate the tensor product b-spline at ``xi``. 
+ 
+        Parameters 
+        ---------- 
+        xi : array_like, shape(..., ndim) 
+            The coordinates to evaluate the interpolator at. 
+            This can be a list or tuple of ndim-dimensional points 
+            or an array with the shape (num_points, ndim). 
+        nu : array_like, optional, shape (ndim,) 
+            Orders of derivatives to evaluate. Each must be non-negative. 
+            Defaults to the zeroth derivivative. 
+        extrapolate : bool, optional 
+            Whether to exrapolate based on first and last intervals in each 
+            dimension, or return `nan`. Default is to ``self.extrapolate``. 
+ 
+        Returns 
+        ------- 
+        values : ndarray, shape ``xi.shape[:-1] + self.c.shape[ndim:]`` 
+            Interpolated values at ``xi`` 
+        &quot;&quot;&quot;</span>
+        <span class="s1">ndim </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">extrapolate </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">extrapolate </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">extrapolate</span>
+        <span class="s1">extrapolate </span><span class="s2">= </span><span class="s1">bool</span><span class="s2">(</span><span class="s1">extrapolate</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">nu </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">nu </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">((</span><span class="s1">ndim</span><span class="s2">,), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intc</span><span class="s2">)</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">nu </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">nu</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intc</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">nu</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">!= </span><span class="s6">1 </span><span class="s0">or </span><span class="s1">nu</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">0</span><span class="s2">] != </span><span class="s1">ndim</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                    <span class="s4">f&quot;invalid number of derivative orders </span><span class="s0">{</span><span class="s1">nu </span><span class="s2">= </span><span class="s0">} </span><span class="s4">for &quot;</span>
+                    <span class="s4">f&quot;ndim = </span><span class="s0">{</span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">)</span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">any</span><span class="s2">(</span><span class="s1">nu </span><span class="s2">&lt; </span><span class="s6">0</span><span class="s2">):</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;derivatives must be positive, got </span><span class="s0">{</span><span class="s1">nu </span><span class="s2">= </span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+
+        <span class="s3"># prepare xi : shape (..., m1, ..., md) -&gt; (1, m1, ..., md)</span>
+        <span class="s1">xi </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">xi</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">float</span><span class="s2">)</span>
+        <span class="s1">xi_shape </span><span class="s2">= </span><span class="s1">xi</span><span class="s2">.</span><span class="s1">shape</span>
+        <span class="s1">xi </span><span class="s2">= </span><span class="s1">xi</span><span class="s2">.</span><span class="s1">reshape</span><span class="s2">(-</span><span class="s6">1</span><span class="s2">, </span><span class="s1">xi_shape</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">])</span>
+        <span class="s1">xi </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">ascontiguousarray</span><span class="s2">(</span><span class="s1">xi</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">xi_shape</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">] != </span><span class="s1">ndim</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;Shapes: xi.shape=</span><span class="s0">{</span><span class="s1">xi_shape</span><span class="s0">} </span><span class="s4">and ndim=</span><span class="s0">{</span><span class="s1">ndim</span><span class="s0">}</span><span class="s4">&quot;</span><span class="s2">)</span>
+
+        <span class="s3"># prepare k &amp; t</span>
+        <span class="s1">_k </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">k</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s4">&quot;long&quot;</span><span class="s2">))</span>
+
+        <span class="s3"># pack the knots into a single array</span>
+        <span class="s1">len_t </span><span class="s2">= [</span><span class="s1">len</span><span class="s2">(</span><span class="s1">ti</span><span class="s2">) </span><span class="s0">for </span><span class="s1">ti </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">]</span>
+        <span class="s1">_t </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">((</span><span class="s1">ndim</span><span class="s2">, </span><span class="s1">max</span><span class="s2">(</span><span class="s1">len_t</span><span class="s2">)), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">float</span><span class="s2">)</span>
+        <span class="s1">_t</span><span class="s2">.</span><span class="s1">fill</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">nan</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">):</span>
+            <span class="s1">_t</span><span class="s2">[</span><span class="s1">d</span><span class="s2">, :</span><span class="s1">len</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">[</span><span class="s1">d</span><span class="s2">])] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">[</span><span class="s1">d</span><span class="s2">]</span>
+        <span class="s1">len_t </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">len_t</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">(</span><span class="s4">&quot;long&quot;</span><span class="s2">))</span>
+
+        <span class="s3"># tabulate the flat indices for iterating over the (k+1)**ndim subarray</span>
+        <span class="s1">shape </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">kd </span><span class="s2">+ </span><span class="s6">1 </span><span class="s0">for </span><span class="s1">kd </span><span class="s0">in </span><span class="s1">self</span><span class="s2">.</span><span class="s1">k</span><span class="s2">)</span>
+        <span class="s1">indices </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">unravel_index</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">prod</span><span class="s2">(</span><span class="s1">shape</span><span class="s2">)), </span><span class="s1">shape</span><span class="s2">)</span>
+        <span class="s1">_indices_k1d </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">indices</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">).</span><span class="s1">T</span>
+
+        <span class="s3"># prepare the coefficients: flatten the trailing dimensions</span>
+        <span class="s1">c1 </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">.</span><span class="s1">reshape</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[:</span><span class="s1">ndim</span><span class="s2">] + (-</span><span class="s6">1</span><span class="s2">,))</span>
+        <span class="s1">c1r </span><span class="s2">= </span><span class="s1">c1</span><span class="s2">.</span><span class="s1">ravel</span><span class="s2">()</span>
+
+        <span class="s3"># replacement for np.ravel_multi_index for indexing of `c1`:</span>
+        <span class="s1">_strides_c1 </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">([</span><span class="s1">s </span><span class="s2">// </span><span class="s1">c1</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">.</span><span class="s1">itemsize</span>
+                                  <span class="s0">for </span><span class="s1">s </span><span class="s0">in </span><span class="s1">c1</span><span class="s2">.</span><span class="s1">strides</span><span class="s2">], </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">intp</span><span class="s2">)</span>
+
+        <span class="s1">num_c_tr </span><span class="s2">= </span><span class="s1">c1</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]  </span><span class="s3"># # of trailing coefficients</span>
+        <span class="s1">out </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty</span><span class="s2">(</span><span class="s1">xi</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">] + (</span><span class="s1">num_c_tr</span><span class="s2">,), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">c1</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">)</span>
+
+        <span class="s1">_bspl</span><span class="s2">.</span><span class="s1">evaluate_ndbspline</span><span class="s2">(</span><span class="s1">xi</span><span class="s2">,</span>
+                                 <span class="s1">_t</span><span class="s2">,</span>
+                                 <span class="s1">len_t</span><span class="s2">,</span>
+                                 <span class="s1">_k</span><span class="s2">,</span>
+                                 <span class="s1">nu</span><span class="s2">,</span>
+                                 <span class="s1">extrapolate</span><span class="s2">,</span>
+                                 <span class="s1">c1r</span><span class="s2">,</span>
+                                 <span class="s1">num_c_tr</span><span class="s2">,</span>
+                                 <span class="s1">_strides_c1</span><span class="s2">,</span>
+                                 <span class="s1">_indices_k1d</span><span class="s2">,</span>
+                                 <span class="s1">out</span><span class="s2">,)</span>
+
+        <span class="s0">return </span><span class="s1">out</span><span class="s2">.</span><span class="s1">reshape</span><span class="s2">(</span><span class="s1">xi_shape</span><span class="s2">[:-</span><span class="s6">1</span><span class="s2">] + </span><span class="s1">self</span><span class="s2">.</span><span class="s1">c</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s1">ndim</span><span class="s2">:])</span>
+
+    <span class="s2">@</span><span class="s1">classmethod</span>
+    <span class="s0">def </span><span class="s1">design_matrix</span><span class="s2">(</span><span class="s1">cls</span><span class="s2">, </span><span class="s1">xvals</span><span class="s2">, </span><span class="s1">t</span><span class="s2">, </span><span class="s1">k</span><span class="s2">, </span><span class="s1">extrapolate</span><span class="s2">=</span><span class="s0">True</span><span class="s2">):</span>
+        <span class="s5">&quot;&quot;&quot;Construct the design matrix as a CSR format sparse array. 
+ 
+        Parameters 
+        ---------- 
+        xvals :  ndarray, shape(npts, ndim) 
+            Data points. ``xvals[j, :]`` gives the ``j``-th data point as an 
+            ``ndim``-dimensional array. 
+        t : tuple of 1D ndarrays, length-ndim 
+            Knot vectors in directions 1, 2, ... ndim, 
+        k : int 
+            B-spline degree. 
+        extrapolate : bool, optional 
+            Whether to extrapolate out-of-bounds values of raise a `ValueError` 
+ 
+        Returns 
+        ------- 
+        design_matrix : a CSR array 
+            Each row of the design matrix corresponds to a value in `xvals` and 
+            contains values of b-spline basis elements which are non-zero 
+            at this value. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s1">xvals </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">xvals</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">float</span><span class="s2">)</span>
+        <span class="s1">ndim </span><span class="s2">= </span><span class="s1">xvals</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[-</span><span class="s6">1</span><span class="s2">]</span>
+        <span class="s0">if </span><span class="s1">len</span><span class="s2">(</span><span class="s1">t</span><span class="s2">) != </span><span class="s1">ndim</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span>
+                <span class="s4">f&quot;Data and knots are inconsistent: len(t) = </span><span class="s0">{</span><span class="s1">len</span><span class="s2">(</span><span class="s1">t</span><span class="s2">)</span><span class="s0">} </span><span class="s4">for &quot;</span>
+                <span class="s4">f&quot; </span><span class="s0">{</span><span class="s1">ndim </span><span class="s2">= </span><span class="s0">}</span><span class="s4">.&quot;</span>
+            <span class="s2">)</span>
+        <span class="s0">try</span><span class="s2">:</span>
+            <span class="s1">len</span><span class="s2">(</span><span class="s1">k</span><span class="s2">)</span>
+        <span class="s0">except </span><span class="s1">TypeError</span><span class="s2">:</span>
+            <span class="s3"># make k a tuple</span>
+            <span class="s1">k </span><span class="s2">= (</span><span class="s1">k</span><span class="s2">,)*</span><span class="s1">ndim</span>
+
+        <span class="s1">kk </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">k</span><span class="s2">, </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">int32</span><span class="s2">)</span>
+        <span class="s1">data</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr </span><span class="s2">= </span><span class="s1">_bspl</span><span class="s2">.</span><span class="s1">_colloc_nd</span><span class="s2">(</span><span class="s1">xvals</span><span class="s2">, </span><span class="s1">t</span><span class="s2">, </span><span class="s1">kk</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">csr_array</span><span class="s2">((</span><span class="s1">data</span><span class="s2">, </span><span class="s1">indices</span><span class="s2">, </span><span class="s1">indptr</span><span class="s2">))</span>
+
+
+<span class="s0">def </span><span class="s1">_iter_solve</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">=</span><span class="s1">ssl</span><span class="s2">.</span><span class="s1">gcrotmk</span><span class="s2">, **</span><span class="s1">solver_args</span><span class="s2">):</span>
+    <span class="s3"># work around iterative solvers not accepting multiple r.h.s.</span>
+
+    <span class="s3"># also work around a.dtype == float64 and b.dtype == complex128</span>
+    <span class="s3"># cf https://github.com/scipy/scipy/issues/19644</span>
+    <span class="s0">if </span><span class="s1">np</span><span class="s2">.</span><span class="s1">issubdtype</span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">dtype</span><span class="s2">, </span><span class="s1">np</span><span class="s2">.</span><span class="s1">complexfloating</span><span class="s2">):</span>
+        <span class="s1">real </span><span class="s2">= </span><span class="s1">_iter_solve</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">.</span><span class="s1">real</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">, **</span><span class="s1">solver_args</span><span class="s2">)</span>
+        <span class="s1">imag </span><span class="s2">= </span><span class="s1">_iter_solve</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">.</span><span class="s1">imag</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">, **</span><span class="s1">solver_args</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">real </span><span class="s2">+ </span><span class="s6">1j</span><span class="s2">*</span><span class="s1">imag</span>
+
+    <span class="s0">if </span><span class="s1">b</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s6">2 </span><span class="s0">and </span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">1</span><span class="s2">] !=</span><span class="s6">1</span><span class="s2">:</span>
+        <span class="s1">res </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">empty_like</span><span class="s2">(</span><span class="s1">b</span><span class="s2">)</span>
+        <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">b</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s6">1</span><span class="s2">]):</span>
+            <span class="s1">res</span><span class="s2">[:, </span><span class="s1">j</span><span class="s2">], </span><span class="s1">info </span><span class="s2">= </span><span class="s1">solver</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">[:, </span><span class="s1">j</span><span class="s2">], **</span><span class="s1">solver_args</span><span class="s2">)</span>
+            <span class="s0">if </span><span class="s1">info </span><span class="s2">!= </span><span class="s6">0</span><span class="s2">:</span>
+                <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">solver </span><span class="s2">= </span><span class="s0">} </span><span class="s4">returns </span><span class="s0">{</span><span class="s1">info </span><span class="s2">=</span><span class="s0">} </span><span class="s4">for column </span><span class="s0">{</span><span class="s1">j</span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">res</span>
+    <span class="s0">else</span><span class="s2">:</span>
+        <span class="s1">res</span><span class="s2">, </span><span class="s1">info </span><span class="s2">= </span><span class="s1">solver</span><span class="s2">(</span><span class="s1">a</span><span class="s2">, </span><span class="s1">b</span><span class="s2">, **</span><span class="s1">solver_args</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s1">info </span><span class="s2">!= </span><span class="s6">0</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;</span><span class="s0">{</span><span class="s1">solver </span><span class="s2">= </span><span class="s0">} </span><span class="s4">returns </span><span class="s0">{</span><span class="s1">info </span><span class="s2">= </span><span class="s0">}</span><span class="s4">.&quot;</span><span class="s2">)</span>
+        <span class="s0">return </span><span class="s1">res</span>
+
+
+<span class="s0">def </span><span class="s1">make_ndbspl</span><span class="s2">(</span><span class="s1">points</span><span class="s2">, </span><span class="s1">values</span><span class="s2">, </span><span class="s1">k</span><span class="s2">=</span><span class="s6">3</span><span class="s2">, *, </span><span class="s1">solver</span><span class="s2">=</span><span class="s1">ssl</span><span class="s2">.</span><span class="s1">gcrotmk</span><span class="s2">, **</span><span class="s1">solver_args</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot;Construct an interpolating NdBspline. 
+ 
+    Parameters 
+    ---------- 
+    points : tuple of ndarrays of float, with shapes (m1,), ... (mN,) 
+        The points defining the regular grid in N dimensions. The points in 
+        each dimension (i.e. every element of the `points` tuple) must be 
+        strictly ascending or descending.       
+    values : ndarray of float, shape (m1, ..., mN, ...) 
+        The data on the regular grid in n dimensions. 
+    k : int, optional 
+        The spline degree. Must be odd. Default is cubic, k=3 
+    solver : a `scipy.sparse.linalg` solver (iterative or direct), optional. 
+        An iterative solver from `scipy.sparse.linalg` or a direct one, 
+        `sparse.sparse.linalg.spsolve`. 
+        Used to solve the sparse linear system 
+        ``design_matrix @ coefficients = rhs`` for the coefficients. 
+        Default is `scipy.sparse.linalg.gcrotmk` 
+    solver_args : dict, optional 
+        Additional arguments for the solver. The call signature is 
+        ``solver(csr_array, rhs_vector, **solver_args)`` 
+ 
+    Returns 
+    ------- 
+    spl : NdBSpline object 
+ 
+    Notes 
+    ----- 
+    Boundary conditions are not-a-knot in all dimensions. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">ndim </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">points</span><span class="s2">)</span>
+    <span class="s1">xi_shape </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">len</span><span class="s2">(</span><span class="s1">x</span><span class="s2">) </span><span class="s0">for </span><span class="s1">x </span><span class="s0">in </span><span class="s1">points</span><span class="s2">)</span>
+
+    <span class="s0">try</span><span class="s2">:</span>
+        <span class="s1">len</span><span class="s2">(</span><span class="s1">k</span><span class="s2">)</span>
+    <span class="s0">except </span><span class="s1">TypeError</span><span class="s2">:</span>
+        <span class="s3"># make k a tuple</span>
+        <span class="s1">k </span><span class="s2">= (</span><span class="s1">k</span><span class="s2">,)*</span><span class="s1">ndim</span>
+
+    <span class="s0">for </span><span class="s1">d</span><span class="s2">, </span><span class="s1">point </span><span class="s0">in </span><span class="s1">enumerate</span><span class="s2">(</span><span class="s1">points</span><span class="s2">):</span>
+        <span class="s1">numpts </span><span class="s2">= </span><span class="s1">len</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">atleast_1d</span><span class="s2">(</span><span class="s1">point</span><span class="s2">))</span>
+        <span class="s0">if </span><span class="s1">numpts </span><span class="s2">&lt;= </span><span class="s1">k</span><span class="s2">[</span><span class="s1">d</span><span class="s2">]:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s4">f&quot;There are </span><span class="s0">{</span><span class="s1">numpts</span><span class="s0">} </span><span class="s4">points in dimension </span><span class="s0">{</span><span class="s1">d</span><span class="s0">}</span><span class="s4">,&quot;</span>
+                             <span class="s4">f&quot; but order </span><span class="s0">{</span><span class="s1">k</span><span class="s2">[</span><span class="s1">d</span><span class="s2">]</span><span class="s0">} </span><span class="s4">requires at least &quot;</span>
+                             <span class="s4">f&quot; </span><span class="s0">{</span><span class="s1">k</span><span class="s2">[</span><span class="s1">d</span><span class="s2">]+</span><span class="s6">1</span><span class="s0">} </span><span class="s4">points per dimension.&quot;</span><span class="s2">)</span>
+
+    <span class="s1">t </span><span class="s2">= </span><span class="s1">tuple</span><span class="s2">(</span><span class="s1">_not_a_knot</span><span class="s2">(</span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">points</span><span class="s2">[</span><span class="s1">d</span><span class="s2">], </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">float</span><span class="s2">), </span><span class="s1">k</span><span class="s2">[</span><span class="s1">d</span><span class="s2">])</span>
+              <span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">ndim</span><span class="s2">))</span>
+    <span class="s1">xvals </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">([</span><span class="s1">xv </span><span class="s0">for </span><span class="s1">xv </span><span class="s0">in </span><span class="s1">itertools</span><span class="s2">.</span><span class="s1">product</span><span class="s2">(*</span><span class="s1">points</span><span class="s2">)], </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">float</span><span class="s2">)</span>
+
+    <span class="s3"># construct the colocation matrix</span>
+    <span class="s1">matr </span><span class="s2">= </span><span class="s1">NdBSpline</span><span class="s2">.</span><span class="s1">design_matrix</span><span class="s2">(</span><span class="s1">xvals</span><span class="s2">, </span><span class="s1">t</span><span class="s2">, </span><span class="s1">k</span><span class="s2">)</span>
+
+    <span class="s3"># Solve for the coefficients given `values`.</span>
+    <span class="s3"># Trailing dimensions: first ndim dimensions are data, the rest are batch</span>
+    <span class="s3"># dimensions, so stack `values` into a 2D array for `spsolve` to undestand.</span>
+    <span class="s1">v_shape </span><span class="s2">= </span><span class="s1">values</span><span class="s2">.</span><span class="s1">shape</span>
+    <span class="s1">vals_shape </span><span class="s2">= (</span><span class="s1">prod</span><span class="s2">(</span><span class="s1">v_shape</span><span class="s2">[:</span><span class="s1">ndim</span><span class="s2">]), </span><span class="s1">prod</span><span class="s2">(</span><span class="s1">v_shape</span><span class="s2">[</span><span class="s1">ndim</span><span class="s2">:]))</span>
+    <span class="s1">vals </span><span class="s2">= </span><span class="s1">values</span><span class="s2">.</span><span class="s1">reshape</span><span class="s2">(</span><span class="s1">vals_shape</span><span class="s2">)</span>
+
+    <span class="s0">if </span><span class="s1">solver </span><span class="s2">!= </span><span class="s1">ssl</span><span class="s2">.</span><span class="s1">spsolve</span><span class="s2">:</span>
+        <span class="s1">solver </span><span class="s2">= </span><span class="s1">functools</span><span class="s2">.</span><span class="s1">partial</span><span class="s2">(</span><span class="s1">_iter_solve</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">=</span><span class="s1">solver</span><span class="s2">)</span>
+        <span class="s0">if </span><span class="s4">&quot;atol&quot; </span><span class="s0">not in </span><span class="s1">solver_args</span><span class="s2">:</span>
+            <span class="s3"># avoid a DeprecationWarning, grumble grumble</span>
+            <span class="s1">solver_args</span><span class="s2">[</span><span class="s4">&quot;atol&quot;</span><span class="s2">] = </span><span class="s6">1e-6</span>
+
+    <span class="s1">coef </span><span class="s2">= </span><span class="s1">solver</span><span class="s2">(</span><span class="s1">matr</span><span class="s2">, </span><span class="s1">vals</span><span class="s2">, **</span><span class="s1">solver_args</span><span class="s2">)</span>
+    <span class="s1">coef </span><span class="s2">= </span><span class="s1">coef</span><span class="s2">.</span><span class="s1">reshape</span><span class="s2">(</span><span class="s1">xi_shape </span><span class="s2">+ </span><span class="s1">v_shape</span><span class="s2">[</span><span class="s1">ndim</span><span class="s2">:])</span>
+    <span class="s0">return </span><span class="s1">NdBSpline</span><span class="s2">(</span><span class="s1">t</span><span class="s2">, </span><span class="s1">coef</span><span class="s2">, </span><span class="s1">k</span><span class="s2">)</span>
+
+</pre>
+</body>
+</html>

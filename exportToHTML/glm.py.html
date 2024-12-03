@@ -1,0 +1,925 @@
+<html>
+<head>
+<title>glm.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+glm.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Authors: The scikit-learn developers</span>
+<span class="s0"># SPDX-License-Identifier: BSD-3-Clause</span>
+<span class="s2">&quot;&quot;&quot; 
+Generalized Linear Models with Exponential Dispersion Family 
+&quot;&quot;&quot;</span>
+
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">import </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">optimize</span>
+
+<span class="s3">from </span><span class="s4">...</span><span class="s1">_loss</span><span class="s4">.</span><span class="s1">loss </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">HalfGammaLoss</span><span class="s4">,</span>
+    <span class="s1">HalfPoissonLoss</span><span class="s4">,</span>
+    <span class="s1">HalfSquaredError</span><span class="s4">,</span>
+    <span class="s1">HalfTweedieLoss</span><span class="s4">,</span>
+    <span class="s1">HalfTweedieLossIdentity</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">...</span><span class="s1">base </span><span class="s3">import </span><span class="s1">BaseEstimator</span><span class="s4">, </span><span class="s1">RegressorMixin</span><span class="s4">, </span><span class="s1">_fit_context</span>
+<span class="s3">from </span><span class="s4">...</span><span class="s1">utils </span><span class="s3">import </span><span class="s1">check_array</span>
+<span class="s3">from </span><span class="s4">...</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_openmp_helpers </span><span class="s3">import </span><span class="s1">_openmp_effective_n_threads</span>
+<span class="s3">from </span><span class="s4">...</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s1">Hidden</span><span class="s4">, </span><span class="s1">Interval</span><span class="s4">, </span><span class="s1">StrOptions</span>
+<span class="s3">from </span><span class="s4">...</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">optimize </span><span class="s3">import </span><span class="s1">_check_optimize_result</span>
+<span class="s3">from </span><span class="s4">...</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">validation </span><span class="s3">import </span><span class="s1">_check_sample_weight</span><span class="s4">, </span><span class="s1">check_is_fitted</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">_linear_loss </span><span class="s3">import </span><span class="s1">LinearModelLoss</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_newton_solver </span><span class="s3">import </span><span class="s1">NewtonCholeskySolver</span><span class="s4">, </span><span class="s1">NewtonSolver</span>
+
+
+<span class="s3">class </span><span class="s1">_GeneralizedLinearRegressor</span><span class="s4">(</span><span class="s1">RegressorMixin</span><span class="s4">, </span><span class="s1">BaseEstimator</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Regression via a penalized Generalized Linear Model (GLM). 
+ 
+    GLMs based on a reproductive Exponential Dispersion Model (EDM) aim at fitting and 
+    predicting the mean of the target y as y_pred=h(X*w) with coefficients w. 
+    Therefore, the fit minimizes the following objective function with L2 priors as 
+    regularizer:: 
+ 
+        1/(2*sum(s_i)) * sum(s_i * deviance(y_i, h(x_i*w)) + 1/2 * alpha * ||w||_2^2 
+ 
+    with inverse link function h, s=sample_weight and per observation (unit) deviance 
+    deviance(y_i, h(x_i*w)). Note that for an EDM, 1/2 * deviance is the negative 
+    log-likelihood up to a constant (in w) term. 
+    The parameter ``alpha`` corresponds to the lambda parameter in glmnet. 
+ 
+    Instead of implementing the EDM family and a link function separately, we directly 
+    use the loss functions `from sklearn._loss` which have the link functions included 
+    in them for performance reasons. We pick the loss functions that implement 
+    (1/2 times) EDM deviances. 
+ 
+    Read more in the :ref:`User Guide &lt;Generalized_linear_models&gt;`. 
+ 
+    .. versionadded:: 0.23 
+ 
+    Parameters 
+    ---------- 
+    alpha : float, default=1 
+        Constant that multiplies the penalty term and thus determines the 
+        regularization strength. ``alpha = 0`` is equivalent to unpenalized 
+        GLMs. In this case, the design matrix `X` must have full column rank 
+        (no collinearities). 
+        Values must be in the range `[0.0, inf)`. 
+ 
+    fit_intercept : bool, default=True 
+        Specifies if a constant (a.k.a. bias or intercept) should be 
+        added to the linear predictor (X @ coef + intercept). 
+ 
+    solver : {'lbfgs', 'newton-cholesky'}, default='lbfgs' 
+        Algorithm to use in the optimization problem: 
+ 
+        'lbfgs' 
+            Calls scipy's L-BFGS-B optimizer. 
+ 
+        'newton-cholesky' 
+            Uses Newton-Raphson steps (in arbitrary precision arithmetic equivalent to 
+            iterated reweighted least squares) with an inner Cholesky based solver. 
+            This solver is a good choice for `n_samples` &gt;&gt; `n_features`, especially 
+            with one-hot encoded categorical features with rare categories. Be aware 
+            that the memory usage of this solver has a quadratic dependency on 
+            `n_features` because it explicitly computes the Hessian matrix. 
+ 
+            .. versionadded:: 1.2 
+ 
+    max_iter : int, default=100 
+        The maximal number of iterations for the solver. 
+        Values must be in the range `[1, inf)`. 
+ 
+    tol : float, default=1e-4 
+        Stopping criterion. For the lbfgs solver, 
+        the iteration will stop when ``max{|g_j|, j = 1, ..., d} &lt;= tol`` 
+        where ``g_j`` is the j-th component of the gradient (derivative) of 
+        the objective function. 
+        Values must be in the range `(0.0, inf)`. 
+ 
+    warm_start : bool, default=False 
+        If set to ``True``, reuse the solution of the previous call to ``fit`` 
+        as initialization for ``coef_`` and ``intercept_``. 
+ 
+    verbose : int, default=0 
+        For the lbfgs solver set verbose to any positive number for verbosity. 
+        Values must be in the range `[0, inf)`. 
+ 
+    Attributes 
+    ---------- 
+    coef_ : array of shape (n_features,) 
+        Estimated coefficients for the linear predictor (`X @ coef_ + 
+        intercept_`) in the GLM. 
+ 
+    intercept_ : float 
+        Intercept (a.k.a. bias) added to linear predictor. 
+ 
+    n_iter_ : int 
+        Actual number of iterations used in the solver. 
+ 
+    _base_loss : BaseLoss, default=HalfSquaredError() 
+        This is set during fit via `self._get_loss()`. 
+        A `_base_loss` contains a specific loss function as well as the link 
+        function. The loss to be minimized specifies the distributional assumption of 
+        the GLM, i.e. the distribution from the EDM. Here are some examples: 
+ 
+        =======================  ========  ========================== 
+        _base_loss               Link      Target Domain 
+        =======================  ========  ========================== 
+        HalfSquaredError         identity  y any real number 
+        HalfPoissonLoss          log       0 &lt;= y 
+        HalfGammaLoss            log       0 &lt; y 
+        HalfTweedieLoss          log       dependent on tweedie power 
+        HalfTweedieLossIdentity  identity  dependent on tweedie power 
+        =======================  ========  ========================== 
+ 
+        The link function of the GLM, i.e. mapping from linear predictor 
+        `X @ coeff + intercept` to prediction `y_pred`. For instance, with a log link, 
+        we have `y_pred = exp(X @ coeff + intercept)`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s0"># We allow for NewtonSolver classes for the &quot;solver&quot; parameter but do not</span>
+    <span class="s0"># make them public in the docstrings. This facilitates testing and</span>
+    <span class="s0"># benchmarking.</span>
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s5">&quot;alpha&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s6">0.0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;fit_intercept&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;solver&quot;</span><span class="s4">: [</span>
+            <span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">, </span><span class="s5">&quot;newton-cholesky&quot;</span><span class="s4">}),</span>
+            <span class="s1">Hidden</span><span class="s4">(</span><span class="s1">type</span><span class="s4">),</span>
+        <span class="s4">],</span>
+        <span class="s5">&quot;max_iter&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;tol&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s6">0.0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;neither&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;warm_start&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;verbose&quot;</span><span class="s4">: [</span><span class="s5">&quot;verbose&quot;</span><span class="s4">],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">alpha</span><span class="s4">=</span><span class="s6">1.0</span><span class="s4">,</span>
+        <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">solver</span><span class="s4">=</span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">100</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-4</span><span class="s4">,</span>
+        <span class="s1">warm_start</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s1">verbose</span><span class="s4">=</span><span class="s6">0</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">alpha </span><span class="s4">= </span><span class="s1">alpha</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">fit_intercept </span><span class="s4">= </span><span class="s1">fit_intercept</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">solver </span><span class="s4">= </span><span class="s1">solver</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter </span><span class="s4">= </span><span class="s1">max_iter</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">tol </span><span class="s4">= </span><span class="s1">tol</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">warm_start </span><span class="s4">= </span><span class="s1">warm_start</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">verbose </span><span class="s4">= </span><span class="s1">verbose</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s2">&quot;&quot;&quot;Fit a Generalized Linear Model. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+ 
+        y : array-like of shape (n_samples,) 
+            Target values. 
+ 
+        sample_weight : array-like of shape (n_samples,), default=None 
+            Sample weights. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted model. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X</span><span class="s4">, </span><span class="s1">y </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">y</span><span class="s4">,</span>
+            <span class="s1">accept_sparse</span><span class="s4">=[</span><span class="s5">&quot;csc&quot;</span><span class="s4">, </span><span class="s5">&quot;csr&quot;</span><span class="s4">],</span>
+            <span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">],</span>
+            <span class="s1">y_numeric</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">multi_output</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s0"># required by losses</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">solver </span><span class="s4">== </span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">:</span>
+            <span class="s0"># lbfgs will force coef and therefore raw_prediction to be float64. The</span>
+            <span class="s0"># base_loss needs y, X @ coef and sample_weight all of same dtype</span>
+            <span class="s0"># (and contiguous).</span>
+            <span class="s1">loss_dtype </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">loss_dtype </span><span class="s4">= </span><span class="s1">min</span><span class="s4">(</span><span class="s1">max</span><span class="s4">(</span><span class="s1">y</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">), </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">loss_dtype</span><span class="s4">, </span><span class="s1">order</span><span class="s4">=</span><span class="s5">&quot;C&quot;</span><span class="s4">, </span><span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">sample_weight </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s0"># Note that _check_sample_weight calls check_array(order=&quot;C&quot;) required by</span>
+            <span class="s0"># losses.</span>
+            <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">_check_sample_weight</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">loss_dtype</span><span class="s4">)</span>
+
+        <span class="s1">n_samples</span><span class="s4">, </span><span class="s1">n_features </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_base_loss </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_loss</span><span class="s4">()</span>
+
+        <span class="s1">linear_loss </span><span class="s4">= </span><span class="s1">LinearModelLoss</span><span class="s4">(</span>
+            <span class="s1">base_loss</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_base_loss</span><span class="s4">,</span>
+            <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">fit_intercept</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s3">if not </span><span class="s1">linear_loss</span><span class="s4">.</span><span class="s1">base_loss</span><span class="s4">.</span><span class="s1">in_y_true_range</span><span class="s4">(</span><span class="s1">y</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;Some value(s) of y are out of the valid range of the loss&quot;</span>
+                <span class="s5">f&quot; </span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_base_loss</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s3">!r}</span><span class="s5">.&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s0"># TODO: if alpha=0 check that X is not rank deficient</span>
+
+        <span class="s0"># NOTE: Rescaling of sample_weight:</span>
+        <span class="s0"># We want to minimize</span>
+        <span class="s0">#     obj = 1/(2 * sum(sample_weight)) * sum(sample_weight * deviance)</span>
+        <span class="s0">#         + 1/2 * alpha * L2,</span>
+        <span class="s0"># with</span>
+        <span class="s0">#     deviance = 2 * loss.</span>
+        <span class="s0"># The objective is invariant to multiplying sample_weight by a constant. We</span>
+        <span class="s0"># could choose this constant such that sum(sample_weight) = 1 in order to end</span>
+        <span class="s0"># up with</span>
+        <span class="s0">#     obj = sum(sample_weight * loss) + 1/2 * alpha * L2.</span>
+        <span class="s0"># But LinearModelLoss.loss() already computes</span>
+        <span class="s0">#     average(loss, weights=sample_weight)</span>
+        <span class="s0"># Thus, without rescaling, we have</span>
+        <span class="s0">#     obj = LinearModelLoss.loss(...)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">warm_start </span><span class="s3">and </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s5">&quot;coef_&quot;</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fit_intercept</span><span class="s4">:</span>
+                <span class="s0"># LinearModelLoss needs intercept at the end of coefficient array.</span>
+                <span class="s1">coef </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">concatenate</span><span class="s4">((</span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef_</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">([</span><span class="s1">self</span><span class="s4">.</span><span class="s1">intercept_</span><span class="s4">])))</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">coef </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef_</span>
+            <span class="s1">coef </span><span class="s4">= </span><span class="s1">coef</span><span class="s4">.</span><span class="s1">astype</span><span class="s4">(</span><span class="s1">loss_dtype</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">coef </span><span class="s4">= </span><span class="s1">linear_loss</span><span class="s4">.</span><span class="s1">init_zero_coef</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">loss_dtype</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fit_intercept</span><span class="s4">:</span>
+                <span class="s1">coef</span><span class="s4">[-</span><span class="s6">1</span><span class="s4">] = </span><span class="s1">linear_loss</span><span class="s4">.</span><span class="s1">base_loss</span><span class="s4">.</span><span class="s1">link</span><span class="s4">.</span><span class="s1">link</span><span class="s4">(</span>
+                    <span class="s1">np</span><span class="s4">.</span><span class="s1">average</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">)</span>
+                <span class="s4">)</span>
+
+        <span class="s1">l2_reg_strength </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">alpha</span>
+        <span class="s1">n_threads </span><span class="s4">= </span><span class="s1">_openmp_effective_n_threads</span><span class="s4">()</span>
+
+        <span class="s0"># Algorithms for optimization:</span>
+        <span class="s0"># Note again that our losses implement 1/2 * deviance.</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">solver </span><span class="s4">== </span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">:</span>
+            <span class="s1">func </span><span class="s4">= </span><span class="s1">linear_loss</span><span class="s4">.</span><span class="s1">loss_gradient</span>
+
+            <span class="s1">opt_res </span><span class="s4">= </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">optimize</span><span class="s4">.</span><span class="s1">minimize</span><span class="s4">(</span>
+                <span class="s1">func</span><span class="s4">,</span>
+                <span class="s1">coef</span><span class="s4">,</span>
+                <span class="s1">method</span><span class="s4">=</span><span class="s5">&quot;L-BFGS-B&quot;</span><span class="s4">,</span>
+                <span class="s1">jac</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+                <span class="s1">options</span><span class="s4">={</span>
+                    <span class="s5">&quot;maxiter&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter</span><span class="s4">,</span>
+                    <span class="s5">&quot;maxls&quot;</span><span class="s4">: </span><span class="s6">50</span><span class="s4">,  </span><span class="s0"># default is 20</span>
+                    <span class="s5">&quot;iprint&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">verbose </span><span class="s4">- </span><span class="s6">1</span><span class="s4">,</span>
+                    <span class="s5">&quot;gtol&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">tol</span><span class="s4">,</span>
+                    <span class="s0"># The constant 64 was found empirically to pass the test suite.</span>
+                    <span class="s0"># The point is that ftol is very small, but a bit larger than</span>
+                    <span class="s0"># machine precision for float64, which is the dtype used by lbfgs.</span>
+                    <span class="s5">&quot;ftol&quot;</span><span class="s4">: </span><span class="s6">64 </span><span class="s4">* </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">float</span><span class="s4">).</span><span class="s1">eps</span><span class="s4">,</span>
+                <span class="s4">},</span>
+                <span class="s1">args</span><span class="s4">=(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">l2_reg_strength</span><span class="s4">, </span><span class="s1">n_threads</span><span class="s4">),</span>
+            <span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">n_iter_ </span><span class="s4">= </span><span class="s1">_check_optimize_result</span><span class="s4">(</span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">, </span><span class="s1">opt_res</span><span class="s4">)</span>
+            <span class="s1">coef </span><span class="s4">= </span><span class="s1">opt_res</span><span class="s4">.</span><span class="s1">x</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">solver </span><span class="s4">== </span><span class="s5">&quot;newton-cholesky&quot;</span><span class="s4">:</span>
+            <span class="s1">sol </span><span class="s4">= </span><span class="s1">NewtonCholeskySolver</span><span class="s4">(</span>
+                <span class="s1">coef</span><span class="s4">=</span><span class="s1">coef</span><span class="s4">,</span>
+                <span class="s1">linear_loss</span><span class="s4">=</span><span class="s1">linear_loss</span><span class="s4">,</span>
+                <span class="s1">l2_reg_strength</span><span class="s4">=</span><span class="s1">l2_reg_strength</span><span class="s4">,</span>
+                <span class="s1">tol</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">tol</span><span class="s4">,</span>
+                <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter</span><span class="s4">,</span>
+                <span class="s1">n_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">,</span>
+                <span class="s1">verbose</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">verbose</span><span class="s4">,</span>
+            <span class="s4">)</span>
+            <span class="s1">coef </span><span class="s4">= </span><span class="s1">sol</span><span class="s4">.</span><span class="s1">solve</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">n_iter_ </span><span class="s4">= </span><span class="s1">sol</span><span class="s4">.</span><span class="s1">iteration</span>
+        <span class="s3">elif </span><span class="s1">issubclass</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">solver</span><span class="s4">, </span><span class="s1">NewtonSolver</span><span class="s4">):</span>
+            <span class="s1">sol </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">solver</span><span class="s4">(</span>
+                <span class="s1">coef</span><span class="s4">=</span><span class="s1">coef</span><span class="s4">,</span>
+                <span class="s1">linear_loss</span><span class="s4">=</span><span class="s1">linear_loss</span><span class="s4">,</span>
+                <span class="s1">l2_reg_strength</span><span class="s4">=</span><span class="s1">l2_reg_strength</span><span class="s4">,</span>
+                <span class="s1">tol</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">tol</span><span class="s4">,</span>
+                <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter</span><span class="s4">,</span>
+                <span class="s1">n_threads</span><span class="s4">=</span><span class="s1">n_threads</span><span class="s4">,</span>
+            <span class="s4">)</span>
+            <span class="s1">coef </span><span class="s4">= </span><span class="s1">sol</span><span class="s4">.</span><span class="s1">solve</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">n_iter_ </span><span class="s4">= </span><span class="s1">sol</span><span class="s4">.</span><span class="s1">iteration</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">f&quot;Invalid solver=</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">solver</span><span class="s3">}</span><span class="s5">.&quot;</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fit_intercept</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">intercept_ </span><span class="s4">= </span><span class="s1">coef</span><span class="s4">[-</span><span class="s6">1</span><span class="s4">]</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">coef_ </span><span class="s4">= </span><span class="s1">coef</span><span class="s4">[:-</span><span class="s6">1</span><span class="s4">]</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s0"># set intercept to zero as the other linear models do</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">intercept_ </span><span class="s4">= </span><span class="s6">0.0</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">coef_ </span><span class="s4">= </span><span class="s1">coef</span>
+
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">_linear_predictor</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s2">&quot;&quot;&quot;Compute the linear_predictor = `X @ coef_ + intercept_`. 
+ 
+        Note that we often use the term raw_prediction instead of linear predictor. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Samples. 
+ 
+        Returns 
+        ------- 
+        y_pred : array of shape (n_samples,) 
+            Returns predicted values of linear predictor. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">accept_sparse</span><span class="s4">=[</span><span class="s5">&quot;csr&quot;</span><span class="s4">, </span><span class="s5">&quot;csc&quot;</span><span class="s4">, </span><span class="s5">&quot;coo&quot;</span><span class="s4">],</span>
+            <span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">],</span>
+            <span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">allow_nd</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+            <span class="s1">reset</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">X </span><span class="s4">@ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef_ </span><span class="s4">+ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">intercept_</span>
+
+    <span class="s3">def </span><span class="s1">predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s2">&quot;&quot;&quot;Predict using GLM with feature matrix X. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Samples. 
+ 
+        Returns 
+        ------- 
+        y_pred : array of shape (n_samples,) 
+            Returns predicted values. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># check_array is done in _linear_predictor</span>
+        <span class="s1">raw_prediction </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_linear_predictor</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s1">y_pred </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_base_loss</span><span class="s4">.</span><span class="s1">link</span><span class="s4">.</span><span class="s1">inverse</span><span class="s4">(</span><span class="s1">raw_prediction</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">y_pred</span>
+
+    <span class="s3">def </span><span class="s1">score</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s2">&quot;&quot;&quot;Compute D^2, the percentage of deviance explained. 
+ 
+        D^2 is a generalization of the coefficient of determination R^2. 
+        R^2 uses squared error and D^2 uses the deviance of this GLM, see the 
+        :ref:`User Guide &lt;regression_metrics&gt;`. 
+ 
+        D^2 is defined as 
+        :math:`D^2 = 1-\\frac{D(y_{true},y_{pred})}{D_{null}}`, 
+        :math:`D_{null}` is the null deviance, i.e. the deviance of a model 
+        with intercept alone, which corresponds to :math:`y_{pred} = \\bar{y}`. 
+        The mean :math:`\\bar{y}` is averaged by sample_weight. 
+        Best possible score is 1.0 and it can be negative (because the model 
+        can be arbitrarily worse). 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Test samples. 
+ 
+        y : array-like of shape (n_samples,) 
+            True values of target. 
+ 
+        sample_weight : array-like of shape (n_samples,), default=None 
+            Sample weights. 
+ 
+        Returns 
+        ------- 
+        score : float 
+            D^2 of self.predict(X) w.r.t. y. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># TODO: Adapt link to User Guide in the docstring, once</span>
+        <span class="s0"># https://github.com/scikit-learn/scikit-learn/pull/22118 is merged.</span>
+        <span class="s0">#</span>
+        <span class="s0"># Note, default score defined in RegressorMixin is R^2 score.</span>
+        <span class="s0"># TODO: make D^2 a score function in module metrics (and thereby get</span>
+        <span class="s0">#       input validation and so on)</span>
+        <span class="s1">raw_prediction </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_linear_predictor</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)  </span><span class="s0"># validates X</span>
+        <span class="s0"># required by losses</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">raw_prediction</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">, </span><span class="s1">order</span><span class="s4">=</span><span class="s5">&quot;C&quot;</span><span class="s4">, </span><span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">sample_weight </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s0"># Note that _check_sample_weight calls check_array(order=&quot;C&quot;) required by</span>
+            <span class="s0"># losses.</span>
+            <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">_check_sample_weight</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">y</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+
+        <span class="s1">base_loss </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_base_loss</span>
+
+        <span class="s3">if not </span><span class="s1">base_loss</span><span class="s4">.</span><span class="s1">in_y_true_range</span><span class="s4">(</span><span class="s1">y</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;Some value(s) of y are out of the valid range of the loss&quot;</span>
+                <span class="s5">f&quot; </span><span class="s3">{</span><span class="s1">base_loss</span><span class="s4">.</span><span class="s1">__name__</span><span class="s3">}</span><span class="s5">.&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s1">constant </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">average</span><span class="s4">(</span>
+            <span class="s1">base_loss</span><span class="s4">.</span><span class="s1">constant_to_optimal_zero</span><span class="s4">(</span><span class="s1">y_true</span><span class="s4">=</span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span><span class="s4">),</span>
+            <span class="s1">weights</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s0"># Missing factor of 2 in deviance cancels out.</span>
+        <span class="s1">deviance </span><span class="s4">= </span><span class="s1">base_loss</span><span class="s4">(</span>
+            <span class="s1">y_true</span><span class="s4">=</span><span class="s1">y</span><span class="s4">,</span>
+            <span class="s1">raw_prediction</span><span class="s4">=</span><span class="s1">raw_prediction</span><span class="s4">,</span>
+            <span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">,</span>
+            <span class="s1">n_threads</span><span class="s4">=</span><span class="s6">1</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">y_mean </span><span class="s4">= </span><span class="s1">base_loss</span><span class="s4">.</span><span class="s1">link</span><span class="s4">.</span><span class="s1">link</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">average</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">))</span>
+        <span class="s1">deviance_null </span><span class="s4">= </span><span class="s1">base_loss</span><span class="s4">(</span>
+            <span class="s1">y_true</span><span class="s4">=</span><span class="s1">y</span><span class="s4">,</span>
+            <span class="s1">raw_prediction</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">tile</span><span class="s4">(</span><span class="s1">y_mean</span><span class="s4">, </span><span class="s1">y</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]),</span>
+            <span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">,</span>
+            <span class="s1">n_threads</span><span class="s4">=</span><span class="s6">1</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s3">return </span><span class="s6">1 </span><span class="s4">- (</span><span class="s1">deviance </span><span class="s4">+ </span><span class="s1">constant</span><span class="s4">) / (</span><span class="s1">deviance_null </span><span class="s4">+ </span><span class="s1">constant</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s0"># Create instance of BaseLoss if fit wasn't called yet. This is necessary as</span>
+            <span class="s0"># TweedieRegressor might set the used loss during fit different from</span>
+            <span class="s0"># self._base_loss.</span>
+            <span class="s1">base_loss </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_loss</span><span class="s4">()</span>
+            <span class="s3">return </span><span class="s4">{</span><span class="s5">&quot;requires_positive_y&quot;</span><span class="s4">: </span><span class="s3">not </span><span class="s1">base_loss</span><span class="s4">.</span><span class="s1">in_y_true_range</span><span class="s4">(-</span><span class="s6">1.0</span><span class="s4">)}</span>
+        <span class="s3">except </span><span class="s4">(</span><span class="s1">ValueError</span><span class="s4">, </span><span class="s1">AttributeError</span><span class="s4">, </span><span class="s1">TypeError</span><span class="s4">):</span>
+            <span class="s0"># This happens when the link or power parameter of TweedieRegressor is</span>
+            <span class="s0"># invalid. We fallback on the default tags in that case.</span>
+            <span class="s3">return </span><span class="s4">{}</span>
+
+    <span class="s3">def </span><span class="s1">_get_loss</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2">&quot;&quot;&quot;This is only necessary because of the link and power arguments of the 
+        TweedieRegressor. 
+ 
+        Note that we do not need to pass sample_weight to the loss class as this is 
+        only needed to set loss.constant_hessian on which GLMs do not rely. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">HalfSquaredError</span><span class="s4">()</span>
+
+
+<span class="s3">class </span><span class="s1">PoissonRegressor</span><span class="s4">(</span><span class="s1">_GeneralizedLinearRegressor</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Generalized Linear Model with a Poisson distribution. 
+ 
+    This regressor uses the 'log' link function. 
+ 
+    Read more in the :ref:`User Guide &lt;Generalized_linear_models&gt;`. 
+ 
+    .. versionadded:: 0.23 
+ 
+    Parameters 
+    ---------- 
+    alpha : float, default=1 
+        Constant that multiplies the L2 penalty term and determines the 
+        regularization strength. ``alpha = 0`` is equivalent to unpenalized 
+        GLMs. In this case, the design matrix `X` must have full column rank 
+        (no collinearities). 
+        Values of `alpha` must be in the range `[0.0, inf)`. 
+ 
+    fit_intercept : bool, default=True 
+        Specifies if a constant (a.k.a. bias or intercept) should be 
+        added to the linear predictor (`X @ coef + intercept`). 
+ 
+    solver : {'lbfgs', 'newton-cholesky'}, default='lbfgs' 
+        Algorithm to use in the optimization problem: 
+ 
+        'lbfgs' 
+            Calls scipy's L-BFGS-B optimizer. 
+ 
+        'newton-cholesky' 
+            Uses Newton-Raphson steps (in arbitrary precision arithmetic equivalent to 
+            iterated reweighted least squares) with an inner Cholesky based solver. 
+            This solver is a good choice for `n_samples` &gt;&gt; `n_features`, especially 
+            with one-hot encoded categorical features with rare categories. Be aware 
+            that the memory usage of this solver has a quadratic dependency on 
+            `n_features` because it explicitly computes the Hessian matrix. 
+ 
+            .. versionadded:: 1.2 
+ 
+    max_iter : int, default=100 
+        The maximal number of iterations for the solver. 
+        Values must be in the range `[1, inf)`. 
+ 
+    tol : float, default=1e-4 
+        Stopping criterion. For the lbfgs solver, 
+        the iteration will stop when ``max{|g_j|, j = 1, ..., d} &lt;= tol`` 
+        where ``g_j`` is the j-th component of the gradient (derivative) of 
+        the objective function. 
+        Values must be in the range `(0.0, inf)`. 
+ 
+    warm_start : bool, default=False 
+        If set to ``True``, reuse the solution of the previous call to ``fit`` 
+        as initialization for ``coef_`` and ``intercept_`` . 
+ 
+    verbose : int, default=0 
+        For the lbfgs solver set verbose to any positive number for verbosity. 
+        Values must be in the range `[0, inf)`. 
+ 
+    Attributes 
+    ---------- 
+    coef_ : array of shape (n_features,) 
+        Estimated coefficients for the linear predictor (`X @ coef_ + 
+        intercept_`) in the GLM. 
+ 
+    intercept_ : float 
+        Intercept (a.k.a. bias) added to linear predictor. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    n_iter_ : int 
+        Actual number of iterations used in the solver. 
+ 
+    See Also 
+    -------- 
+    TweedieRegressor : Generalized Linear Model with a Tweedie distribution. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn import linear_model 
+    &gt;&gt;&gt; clf = linear_model.PoissonRegressor() 
+    &gt;&gt;&gt; X = [[1, 2], [2, 3], [3, 4], [4, 3]] 
+    &gt;&gt;&gt; y = [12, 17, 22, 21] 
+    &gt;&gt;&gt; clf.fit(X, y) 
+    PoissonRegressor() 
+    &gt;&gt;&gt; clf.score(X, y) 
+    np.float64(0.990...) 
+    &gt;&gt;&gt; clf.coef_ 
+    array([0.121..., 0.158...]) 
+    &gt;&gt;&gt; clf.intercept_ 
+    np.float64(2.088...) 
+    &gt;&gt;&gt; clf.predict([[1, 1], [3, 4]]) 
+    array([10.676..., 21.875...]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s4">**</span><span class="s1">_GeneralizedLinearRegressor</span><span class="s4">.</span><span class="s1">_parameter_constraints</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">alpha</span><span class="s4">=</span><span class="s6">1.0</span><span class="s4">,</span>
+        <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">solver</span><span class="s4">=</span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">100</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-4</span><span class="s4">,</span>
+        <span class="s1">warm_start</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s1">verbose</span><span class="s4">=</span><span class="s6">0</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">alpha</span><span class="s4">=</span><span class="s1">alpha</span><span class="s4">,</span>
+            <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s1">fit_intercept</span><span class="s4">,</span>
+            <span class="s1">solver</span><span class="s4">=</span><span class="s1">solver</span><span class="s4">,</span>
+            <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s1">warm_start</span><span class="s4">=</span><span class="s1">warm_start</span><span class="s4">,</span>
+            <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_get_loss</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">HalfPoissonLoss</span><span class="s4">()</span>
+
+
+<span class="s3">class </span><span class="s1">GammaRegressor</span><span class="s4">(</span><span class="s1">_GeneralizedLinearRegressor</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Generalized Linear Model with a Gamma distribution. 
+ 
+    This regressor uses the 'log' link function. 
+ 
+    Read more in the :ref:`User Guide &lt;Generalized_linear_models&gt;`. 
+ 
+    .. versionadded:: 0.23 
+ 
+    Parameters 
+    ---------- 
+    alpha : float, default=1 
+        Constant that multiplies the L2 penalty term and determines the 
+        regularization strength. ``alpha = 0`` is equivalent to unpenalized 
+        GLMs. In this case, the design matrix `X` must have full column rank 
+        (no collinearities). 
+        Values of `alpha` must be in the range `[0.0, inf)`. 
+ 
+    fit_intercept : bool, default=True 
+        Specifies if a constant (a.k.a. bias or intercept) should be 
+        added to the linear predictor `X @ coef_ + intercept_`. 
+ 
+    solver : {'lbfgs', 'newton-cholesky'}, default='lbfgs' 
+        Algorithm to use in the optimization problem: 
+ 
+        'lbfgs' 
+            Calls scipy's L-BFGS-B optimizer. 
+ 
+        'newton-cholesky' 
+            Uses Newton-Raphson steps (in arbitrary precision arithmetic equivalent to 
+            iterated reweighted least squares) with an inner Cholesky based solver. 
+            This solver is a good choice for `n_samples` &gt;&gt; `n_features`, especially 
+            with one-hot encoded categorical features with rare categories. Be aware 
+            that the memory usage of this solver has a quadratic dependency on 
+            `n_features` because it explicitly computes the Hessian matrix. 
+ 
+            .. versionadded:: 1.2 
+ 
+    max_iter : int, default=100 
+        The maximal number of iterations for the solver. 
+        Values must be in the range `[1, inf)`. 
+ 
+    tol : float, default=1e-4 
+        Stopping criterion. For the lbfgs solver, 
+        the iteration will stop when ``max{|g_j|, j = 1, ..., d} &lt;= tol`` 
+        where ``g_j`` is the j-th component of the gradient (derivative) of 
+        the objective function. 
+        Values must be in the range `(0.0, inf)`. 
+ 
+    warm_start : bool, default=False 
+        If set to ``True``, reuse the solution of the previous call to ``fit`` 
+        as initialization for `coef_` and `intercept_`. 
+ 
+    verbose : int, default=0 
+        For the lbfgs solver set verbose to any positive number for verbosity. 
+        Values must be in the range `[0, inf)`. 
+ 
+    Attributes 
+    ---------- 
+    coef_ : array of shape (n_features,) 
+        Estimated coefficients for the linear predictor (`X @ coef_ + 
+        intercept_`) in the GLM. 
+ 
+    intercept_ : float 
+        Intercept (a.k.a. bias) added to linear predictor. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    n_iter_ : int 
+        Actual number of iterations used in the solver. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PoissonRegressor : Generalized Linear Model with a Poisson distribution. 
+    TweedieRegressor : Generalized Linear Model with a Tweedie distribution. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn import linear_model 
+    &gt;&gt;&gt; clf = linear_model.GammaRegressor() 
+    &gt;&gt;&gt; X = [[1, 2], [2, 3], [3, 4], [4, 3]] 
+    &gt;&gt;&gt; y = [19, 26, 33, 30] 
+    &gt;&gt;&gt; clf.fit(X, y) 
+    GammaRegressor() 
+    &gt;&gt;&gt; clf.score(X, y) 
+    np.float64(0.773...) 
+    &gt;&gt;&gt; clf.coef_ 
+    array([0.072..., 0.066...]) 
+    &gt;&gt;&gt; clf.intercept_ 
+    np.float64(2.896...) 
+    &gt;&gt;&gt; clf.predict([[1, 0], [2, 8]]) 
+    array([19.483..., 35.795...]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s4">**</span><span class="s1">_GeneralizedLinearRegressor</span><span class="s4">.</span><span class="s1">_parameter_constraints</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">alpha</span><span class="s4">=</span><span class="s6">1.0</span><span class="s4">,</span>
+        <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">solver</span><span class="s4">=</span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">100</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-4</span><span class="s4">,</span>
+        <span class="s1">warm_start</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s1">verbose</span><span class="s4">=</span><span class="s6">0</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">alpha</span><span class="s4">=</span><span class="s1">alpha</span><span class="s4">,</span>
+            <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s1">fit_intercept</span><span class="s4">,</span>
+            <span class="s1">solver</span><span class="s4">=</span><span class="s1">solver</span><span class="s4">,</span>
+            <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s1">warm_start</span><span class="s4">=</span><span class="s1">warm_start</span><span class="s4">,</span>
+            <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_get_loss</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">HalfGammaLoss</span><span class="s4">()</span>
+
+
+<span class="s3">class </span><span class="s1">TweedieRegressor</span><span class="s4">(</span><span class="s1">_GeneralizedLinearRegressor</span><span class="s4">):</span>
+    <span class="s2">&quot;&quot;&quot;Generalized Linear Model with a Tweedie distribution. 
+ 
+    This estimator can be used to model different GLMs depending on the 
+    ``power`` parameter, which determines the underlying distribution. 
+ 
+    Read more in the :ref:`User Guide &lt;Generalized_linear_models&gt;`. 
+ 
+    .. versionadded:: 0.23 
+ 
+    Parameters 
+    ---------- 
+    power : float, default=0 
+            The power determines the underlying target distribution according 
+            to the following table: 
+ 
+            +-------+------------------------+ 
+            | Power | Distribution           | 
+            +=======+========================+ 
+            | 0     | Normal                 | 
+            +-------+------------------------+ 
+            | 1     | Poisson                | 
+            +-------+------------------------+ 
+            | (1,2) | Compound Poisson Gamma | 
+            +-------+------------------------+ 
+            | 2     | Gamma                  | 
+            +-------+------------------------+ 
+            | 3     | Inverse Gaussian       | 
+            +-------+------------------------+ 
+ 
+            For ``0 &lt; power &lt; 1``, no distribution exists. 
+ 
+    alpha : float, default=1 
+        Constant that multiplies the L2 penalty term and determines the 
+        regularization strength. ``alpha = 0`` is equivalent to unpenalized 
+        GLMs. In this case, the design matrix `X` must have full column rank 
+        (no collinearities). 
+        Values of `alpha` must be in the range `[0.0, inf)`. 
+ 
+    fit_intercept : bool, default=True 
+        Specifies if a constant (a.k.a. bias or intercept) should be 
+        added to the linear predictor (`X @ coef + intercept`). 
+ 
+    link : {'auto', 'identity', 'log'}, default='auto' 
+        The link function of the GLM, i.e. mapping from linear predictor 
+        `X @ coeff + intercept` to prediction `y_pred`. Option 'auto' sets 
+        the link depending on the chosen `power` parameter as follows: 
+ 
+        - 'identity' for ``power &lt;= 0``, e.g. for the Normal distribution 
+        - 'log' for ``power &gt; 0``, e.g. for Poisson, Gamma and Inverse Gaussian 
+          distributions 
+ 
+    solver : {'lbfgs', 'newton-cholesky'}, default='lbfgs' 
+        Algorithm to use in the optimization problem: 
+ 
+        'lbfgs' 
+            Calls scipy's L-BFGS-B optimizer. 
+ 
+        'newton-cholesky' 
+            Uses Newton-Raphson steps (in arbitrary precision arithmetic equivalent to 
+            iterated reweighted least squares) with an inner Cholesky based solver. 
+            This solver is a good choice for `n_samples` &gt;&gt; `n_features`, especially 
+            with one-hot encoded categorical features with rare categories. Be aware 
+            that the memory usage of this solver has a quadratic dependency on 
+            `n_features` because it explicitly computes the Hessian matrix. 
+ 
+            .. versionadded:: 1.2 
+ 
+    max_iter : int, default=100 
+        The maximal number of iterations for the solver. 
+        Values must be in the range `[1, inf)`. 
+ 
+    tol : float, default=1e-4 
+        Stopping criterion. For the lbfgs solver, 
+        the iteration will stop when ``max{|g_j|, j = 1, ..., d} &lt;= tol`` 
+        where ``g_j`` is the j-th component of the gradient (derivative) of 
+        the objective function. 
+        Values must be in the range `(0.0, inf)`. 
+ 
+    warm_start : bool, default=False 
+        If set to ``True``, reuse the solution of the previous call to ``fit`` 
+        as initialization for ``coef_`` and ``intercept_`` . 
+ 
+    verbose : int, default=0 
+        For the lbfgs solver set verbose to any positive number for verbosity. 
+        Values must be in the range `[0, inf)`. 
+ 
+    Attributes 
+    ---------- 
+    coef_ : array of shape (n_features,) 
+        Estimated coefficients for the linear predictor (`X @ coef_ + 
+        intercept_`) in the GLM. 
+ 
+    intercept_ : float 
+        Intercept (a.k.a. bias) added to linear predictor. 
+ 
+    n_iter_ : int 
+        Actual number of iterations used in the solver. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PoissonRegressor : Generalized Linear Model with a Poisson distribution. 
+    GammaRegressor : Generalized Linear Model with a Gamma distribution. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn import linear_model 
+    &gt;&gt;&gt; clf = linear_model.TweedieRegressor() 
+    &gt;&gt;&gt; X = [[1, 2], [2, 3], [3, 4], [4, 3]] 
+    &gt;&gt;&gt; y = [2, 3.5, 5, 5.5] 
+    &gt;&gt;&gt; clf.fit(X, y) 
+    TweedieRegressor() 
+    &gt;&gt;&gt; clf.score(X, y) 
+    np.float64(0.839...) 
+    &gt;&gt;&gt; clf.coef_ 
+    array([0.599..., 0.299...]) 
+    &gt;&gt;&gt; clf.intercept_ 
+    np.float64(1.600...) 
+    &gt;&gt;&gt; clf.predict([[1, 1], [3, 4]]) 
+    array([2.500..., 4.599...]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s4">**</span><span class="s1">_GeneralizedLinearRegressor</span><span class="s4">.</span><span class="s1">_parameter_constraints</span><span class="s4">,</span>
+        <span class="s5">&quot;power&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;neither&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;link&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;auto&quot;</span><span class="s4">, </span><span class="s5">&quot;identity&quot;</span><span class="s4">, </span><span class="s5">&quot;log&quot;</span><span class="s4">})],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">power</span><span class="s4">=</span><span class="s6">0.0</span><span class="s4">,</span>
+        <span class="s1">alpha</span><span class="s4">=</span><span class="s6">1.0</span><span class="s4">,</span>
+        <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">link</span><span class="s4">=</span><span class="s5">&quot;auto&quot;</span><span class="s4">,</span>
+        <span class="s1">solver</span><span class="s4">=</span><span class="s5">&quot;lbfgs&quot;</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">100</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-4</span><span class="s4">,</span>
+        <span class="s1">warm_start</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s1">verbose</span><span class="s4">=</span><span class="s6">0</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">alpha</span><span class="s4">=</span><span class="s1">alpha</span><span class="s4">,</span>
+            <span class="s1">fit_intercept</span><span class="s4">=</span><span class="s1">fit_intercept</span><span class="s4">,</span>
+            <span class="s1">solver</span><span class="s4">=</span><span class="s1">solver</span><span class="s4">,</span>
+            <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s1">warm_start</span><span class="s4">=</span><span class="s1">warm_start</span><span class="s4">,</span>
+            <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">link </span><span class="s4">= </span><span class="s1">link</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">power </span><span class="s4">= </span><span class="s1">power</span>
+
+    <span class="s3">def </span><span class="s1">_get_loss</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">link </span><span class="s4">== </span><span class="s5">&quot;auto&quot;</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">power </span><span class="s4">&lt;= </span><span class="s6">0</span><span class="s4">:</span>
+                <span class="s0"># identity link</span>
+                <span class="s3">return </span><span class="s1">HalfTweedieLossIdentity</span><span class="s4">(</span><span class="s1">power</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">power</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s0"># log link</span>
+                <span class="s3">return </span><span class="s1">HalfTweedieLoss</span><span class="s4">(</span><span class="s1">power</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">power</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">link </span><span class="s4">== </span><span class="s5">&quot;log&quot;</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">HalfTweedieLoss</span><span class="s4">(</span><span class="s1">power</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">power</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">link </span><span class="s4">== </span><span class="s5">&quot;identity&quot;</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">HalfTweedieLossIdentity</span><span class="s4">(</span><span class="s1">power</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">power</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

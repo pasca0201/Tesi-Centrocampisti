@@ -1,0 +1,863 @@
+<html>
+<head>
+<title>wright_bessel.h</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #6aab73;}
+.s4 { color: #c77dbb;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+wright_bessel.h</font>
+</center></td></tr></table>
+<pre><span class="s0">/* Translated from Cython into C++ by SciPy developers in 2023. 
+ * Original header with Copyright information appears below. 
+ */</span>
+
+<span class="s0">/* Implementation of Wright's generalized Bessel function Phi, see 
+ * https://dlmf.nist.gov/10.46.E1 
+ * 
+ * Copyright: Christian Lorentzen 
+ * 
+ * Distributed under the same license as SciPy 
+ * 
+ * 
+ * Implementation Overview: 
+ * 
+ * First, different functions are implemented valid for certain domains of the 
+ * three arguments. 
+ * Finally they are put together in wright_bessel. See the docstring of 
+ * that function for more details. 
+ */</span>
+
+<span class="s1">#pragma once</span>
+
+<span class="s2">#include </span><span class="s3">&quot;cephes/lanczos.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;cephes/polevl.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;cephes/rgamma.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;config.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;digamma.h&quot;</span>
+<span class="s2">#include </span><span class="s3">&quot;error.h&quot;</span>
+
+<span class="s4">namespace </span><span class="s1">special {</span>
+
+<span class="s4">namespace </span><span class="s1">detail {</span>
+    <span class="s0">// rgamma_zero: smallest value x for which rgamma(x) == 0 as x gets large</span>
+    <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">rgamma_zero = </span><span class="s5">178.47241115886637</span><span class="s1">;</span>
+
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">exp_rgamma(</span><span class="s2">double </span><span class="s1">x, </span><span class="s2">double </span><span class="s1">y) {</span>
+        <span class="s0">/* Compute exp(x) / gamma(y) = exp(x) * rgamma(y). 
+         * 
+         * This helper function avoids overflow by using the lanczos 
+         * approximation of the gamma function. 
+         */</span>
+        <span class="s2">return </span><span class="s1">std::exp(x + (</span><span class="s5">1 </span><span class="s1">- std::log(y + cephes::lanczos_g - </span><span class="s5">0.5</span><span class="s1">)) * (y - </span><span class="s5">0.5</span><span class="s1">)) /</span>
+               <span class="s1">cephes::lanczos_sum_expg_scaled(y);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wb_series(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x, </span><span class="s2">unsigned int </span><span class="s1">nstart, </span><span class="s2">unsigned int </span><span class="s1">nstop) {</span>
+        <span class="s0">/* 1. Taylor series expansion in x=0 for x &lt;= 1. 
+         * 
+         * Phi(a, b, x) = sum_k x^k / k! / Gamma(a*k + b) 
+         * 
+         * Note that every term, and therefore also Phi(a, b, x) is 
+         * monotone decreasing with increasing a or b. 
+         */</span>
+        <span class="s2">double </span><span class="s1">xk_k = std::pow(x, nstart) * cephes::rgamma(nstart + </span><span class="s5">1</span><span class="s1">); </span><span class="s0">// x^k/k!</span>
+        <span class="s2">double </span><span class="s1">res = xk_k * cephes::rgamma(nstart * a + b);</span>
+        <span class="s0">// term k=nstart+1, +2, +3, ...</span>
+        <span class="s2">if </span><span class="s1">(nstop &gt; nstart) {</span>
+            <span class="s0">// series expansion until term k such that a*k+b &lt;= rgamma_zero</span>
+            <span class="s2">unsigned int </span><span class="s1">k_max = std::floor((rgamma_zero - b) / a);</span>
+            <span class="s2">if </span><span class="s1">(nstop &gt; k_max) {</span>
+                <span class="s1">nstop = k_max;</span>
+            <span class="s1">}</span>
+            <span class="s2">for </span><span class="s1">(</span><span class="s2">unsigned int </span><span class="s1">k = nstart + </span><span class="s5">1</span><span class="s1">; k &lt; nstop; k++) {</span>
+                <span class="s1">xk_k *= x / k;</span>
+                <span class="s1">res += xk_k * cephes::rgamma(a * k + b);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">res;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">template&lt;</span><span class="s2">bool </span><span class="s1">log_wb&gt;</span>
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wb_large_a(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x, </span><span class="s2">int </span><span class="s1">n) {</span>
+        <span class="s0">/* 2. Taylor series expansion in x=0, for large a. 
+         * 
+         * Phi(a, b, x) = sum_k x^k / k! / Gamma(a*k + b) 
+         * 
+         * Use Stirling's formula to find k=k_max, the maximum term. 
+         * Then use n terms of Taylor series around k_max. 
+         */</span>
+        <span class="s2">int </span><span class="s1">k_max = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">int</span><span class="s1">&gt;(std::pow(std::pow(a, -a) * x, </span><span class="s5">1.0 </span><span class="s1">/ (</span><span class="s5">1 </span><span class="s1">+ a)));</span>
+
+        <span class="s2">int </span><span class="s1">nstart = k_max - n / </span><span class="s5">2</span><span class="s1">;</span>
+        <span class="s2">if </span><span class="s1">(nstart &lt; </span><span class="s5">0</span><span class="s1">) {</span>
+            <span class="s1">nstart = </span><span class="s5">0</span><span class="s1">;</span>
+        <span class="s1">}</span>
+
+        <span class="s2">double </span><span class="s1">res = </span><span class="s5">0</span><span class="s1">;</span>
+        <span class="s2">double </span><span class="s1">lnx = std::log(x);</span>
+        <span class="s0">// For numerical stability, we factor out the maximum term exp(..) with k=k_max</span>
+        <span class="s0">// but only if it is larger than 0.</span>
+        <span class="s2">double </span><span class="s1">max_exponent = std::fmax(</span><span class="s5">0</span><span class="s1">, k_max * lnx - cephes::lgam(k_max + </span><span class="s5">1</span><span class="s1">) - cephes::lgam(a * k_max + b));</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">k = nstart; k &lt; nstart + n; k++) {</span>
+            <span class="s1">res += std::exp(k * lnx - cephes::lgam(k + </span><span class="s5">1</span><span class="s1">) - cephes::lgam(a * k + b) - max_exponent);</span>
+        <span class="s1">}</span>
+
+        <span class="s2">if </span><span class="s1">(!log_wb) {</span>
+            <span class="s1">res *= std::exp(max_exponent);</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">// logarithm of Wright's function</span>
+            <span class="s1">res = max_exponent + std::log(res);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">res;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">template&lt;</span><span class="s2">bool </span><span class="s1">log_wb&gt;</span>
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wb_small_a(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x, </span><span class="s2">int </span><span class="s1">order) {</span>
+        <span class="s0">/* 3. Taylor series in a=0 up to order 5, for tiny a and not too large x 
+         * 
+         * Phi(a, b, x) = exp(x)/Gamma(b) 
+                          * (1 - a*x * Psi(b) + a^2/2*x*(1+x) * (Psi(b)^2 - Psi'(b) 
+                             + ... ) 
+                          + O(a^6)) 
+         * 
+         * where Psi is the digamma function. 
+         * 
+         * Parameter order takes effect only when b &gt; 1e-3 and 2 &lt;= order &lt;= 5, 
+         * otherwise it defaults to 2, or if b &lt;= 1e-3, to 5. The lower order is, 
+         * the fewer polygamma functions have to be computed. 
+         * 
+         * Call: python _precompute/wright_bessel.py 1 
+         * 
+         * For small b, i.e. b &lt;= 1e-3, cancellation of poles of digamma(b)/Gamma(b) 
+         * and polygamma needs to be carried out =&gt; series expansion in a=0 to order 5 
+         * and in b=0 to order 4. 
+         * Call: python _precompute/wright_bessel.py 2 
+         */</span>
+        <span class="s2">double </span><span class="s1">A[</span><span class="s5">6</span><span class="s1">]; </span><span class="s0">// coefficients of a^k  (1, -x * Psi(b), ...)</span>
+        <span class="s2">double </span><span class="s1">B[</span><span class="s5">6</span><span class="s1">]; </span><span class="s0">// powers of b^k/k! or terms in polygamma functions</span>
+        <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">C[</span><span class="s5">5</span><span class="s1">] = {  </span><span class="s0">// coefficients of a^k1 * b^k2</span>
+            <span class="s5">1.0000000000000000</span><span class="s1">,   </span><span class="s0">// C[0]</span>
+            <span class="s5">1.1544313298030657</span><span class="s1">,   </span><span class="s0">// C[1]</span>
+            <span class="s1">-</span><span class="s5">3.9352684291215233</span><span class="s1">,  </span><span class="s0">// C[2]</span>
+            <span class="s1">-</span><span class="s5">1.0080632408182857</span><span class="s1">,  </span><span class="s0">// C[3]</span>
+            <span class="s5">19.984633365874979</span><span class="s1">,   </span><span class="s0">// C[4]</span>
+        <span class="s1">};</span>
+        <span class="s2">double </span><span class="s1">X[</span><span class="s5">6</span><span class="s1">] = {  </span><span class="s0">// polynomials in x;</span>
+            <span class="s5">1</span><span class="s1">,  </span><span class="s0">// X[0]</span>
+            <span class="s1">x,  </span><span class="s0">// X[1]</span>
+            <span class="s1">x * (x + </span><span class="s5">1</span><span class="s1">),  </span><span class="s0">// X[2]</span>
+            <span class="s1">x * (x * (x + </span><span class="s5">3</span><span class="s1">) + </span><span class="s5">1</span><span class="s1">),  </span><span class="s0">// X[3]</span>
+            <span class="s1">x * (x * (x * (x + </span><span class="s5">6</span><span class="s1">) + </span><span class="s5">7</span><span class="s1">) + </span><span class="s5">1</span><span class="s1">),  </span><span class="s0">// X[4]</span>
+            <span class="s1">x * (x * (x * (x * (x + </span><span class="s5">10</span><span class="s1">) + </span><span class="s5">25</span><span class="s1">) + </span><span class="s5">15</span><span class="s1">) + </span><span class="s5">1</span><span class="s1">),  </span><span class="s0">// X[5]</span>
+        <span class="s1">};</span>
+        <span class="s2">double </span><span class="s1">res;</span>
+
+        <span class="s2">if </span><span class="s1">(b &lt;= </span><span class="s5">1</span><span class="s1">E-3) {</span>
+            <span class="s0">/* Series expansion of both a and b up to order 5: 
+             * M_PI = pi 
+             * M_EG = Euler Gamma aka Euler Mascheroni constant 
+             * M_Z3 = zeta(3) 
+             * C[0] = 1 
+             * C[1] = 2*M_EG 
+             * C[2] = 3*M_EG^2 - M_PI^2/2 
+             * C[3] = 4*M_EG^3 - 2*M_EG*M_PI^2 + 8*M_Z3 
+             * C[4] = 5*M_EG^4 - 5*M_EG^2*M_PI^2 + 40*M_EG*M_Z3 + M_PI^4/12 
+             */</span>
+            <span class="s1">B[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span><span class="s1">.;</span>
+            <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">k = </span><span class="s5">1</span><span class="s1">; k &lt; </span><span class="s5">5</span><span class="s1">; k++) {</span>
+                <span class="s1">B[k] = b / k * B[k - </span><span class="s5">1</span><span class="s1">];</span>
+            <span class="s1">}</span>
+            <span class="s0">// Note that polevl assumes inverse ordering =&gt; A[5] = 0th term</span>
+            <span class="s1">A[</span><span class="s5">5</span><span class="s1">] = cephes::rgamma(b);</span>
+            <span class="s1">A[</span><span class="s5">4</span><span class="s1">] = X[</span><span class="s5">1</span><span class="s1">]        * (C[</span><span class="s5">0</span><span class="s1">] + C[</span><span class="s5">1</span><span class="s1">] * b + C[</span><span class="s5">2</span><span class="s1">] * B[</span><span class="s5">2</span><span class="s1">] + C[</span><span class="s5">3</span><span class="s1">] * B[</span><span class="s5">3</span><span class="s1">] + C[</span><span class="s5">4</span><span class="s1">] * B[</span><span class="s5">4</span><span class="s1">]);</span>
+            <span class="s1">A[</span><span class="s5">3</span><span class="s1">] = X[</span><span class="s5">2</span><span class="s1">] / </span><span class="s5">2</span><span class="s1">.   * (C[</span><span class="s5">1</span><span class="s1">] + C[</span><span class="s5">2</span><span class="s1">] * b + C[</span><span class="s5">3</span><span class="s1">] * B[</span><span class="s5">2</span><span class="s1">] + C[</span><span class="s5">4</span><span class="s1">] * B[</span><span class="s5">3</span><span class="s1">]);</span>
+            <span class="s1">A[</span><span class="s5">2</span><span class="s1">] = X[</span><span class="s5">3</span><span class="s1">] / </span><span class="s5">6</span><span class="s1">.   * (C[</span><span class="s5">2</span><span class="s1">] + C[</span><span class="s5">3</span><span class="s1">] * b + C[</span><span class="s5">4</span><span class="s1">] * B[</span><span class="s5">2</span><span class="s1">]);</span>
+            <span class="s1">A[</span><span class="s5">1</span><span class="s1">] = X[</span><span class="s5">4</span><span class="s1">] / </span><span class="s5">24</span><span class="s1">.  * (C[</span><span class="s5">3</span><span class="s1">] + C[</span><span class="s5">4</span><span class="s1">] * b);</span>
+            <span class="s1">A[</span><span class="s5">0</span><span class="s1">] = X[</span><span class="s5">5</span><span class="s1">] / </span><span class="s5">120</span><span class="s1">. * C[</span><span class="s5">4</span><span class="s1">];</span>
+            <span class="s0">// res = exp(x) * (A[5] + A[4] * a + A[3] * a^2 + A[2] * a^3 + ...)</span>
+            <span class="s2">if </span><span class="s1">(!log_wb) {</span>
+                <span class="s1">res = exp(x) * cephes::polevl(a, A, </span><span class="s5">5</span><span class="s1">);</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                <span class="s0">// logarithm of Wright's function</span>
+                <span class="s1">res = x + std::log(cephes::polevl(a, A, </span><span class="s5">5</span><span class="s1">));</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">/* Phi(a, b, x) = exp(x)/gamma(b) * sum(A[i] * X[i] * B[i], i=0..5) 
+             * A[n] = a^n/n! 
+             * But here, we repurpose A[n] = X[n] * B[n] / n! 
+             * Note that polevl assumes inverse ordering =&gt; A[order] = 0th term */</span>
+            <span class="s2">double </span><span class="s1">dg = digamma(b);</span>
+            <span class="s0">// pg1 = polygamma(1, b)</span>
+            <span class="s2">double </span><span class="s1">pg1 = cephes::zeta(</span><span class="s5">2</span><span class="s1">, b);</span>
+            <span class="s2">if </span><span class="s1">(order &lt;= </span><span class="s5">2</span><span class="s1">) {</span>
+                <span class="s1">res = </span><span class="s5">1 </span><span class="s1">+ a * x * (-dg + </span><span class="s5">0.5 </span><span class="s1">* a * (</span><span class="s5">1 </span><span class="s1">+ x) * (dg * dg - pg1));</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                <span class="s2">if </span><span class="s1">(order &gt; </span><span class="s5">5</span><span class="s1">) {</span>
+                    <span class="s1">order = </span><span class="s5">5</span><span class="s1">;</span>
+                <span class="s1">}</span>
+                <span class="s0">// pg2 = polygamma(2, b)</span>
+                <span class="s2">double </span><span class="s1">pg2 = -</span><span class="s5">2 </span><span class="s1">* cephes::zeta(</span><span class="s5">3</span><span class="s1">, b);</span>
+                <span class="s1">B[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span><span class="s1">;</span>
+                <span class="s1">B[</span><span class="s5">1</span><span class="s1">] = -dg;</span>
+                <span class="s1">B[</span><span class="s5">2</span><span class="s1">] = dg * dg - pg1;</span>
+                <span class="s1">B[</span><span class="s5">3</span><span class="s1">] = (-dg * dg + </span><span class="s5">3 </span><span class="s1">* pg1) * dg - pg2;</span>
+                <span class="s1">A[order] = </span><span class="s5">1</span><span class="s1">;</span>
+                <span class="s1">A[order - </span><span class="s5">1</span><span class="s1">] = X[</span><span class="s5">1</span><span class="s1">] * B[</span><span class="s5">1</span><span class="s1">];</span>
+                <span class="s1">A[order - </span><span class="s5">2</span><span class="s1">] = X[</span><span class="s5">2</span><span class="s1">] * B[</span><span class="s5">2</span><span class="s1">] / </span><span class="s5">2</span><span class="s1">.;</span>
+                <span class="s1">A[order - </span><span class="s5">3</span><span class="s1">] = X[</span><span class="s5">3</span><span class="s1">] * B[</span><span class="s5">3</span><span class="s1">] / </span><span class="s5">6</span><span class="s1">.;</span>
+                <span class="s2">if </span><span class="s1">(order &gt;= </span><span class="s5">4</span><span class="s1">) {</span>
+                    <span class="s0">// double pg3 = polygamma(3, b)</span>
+                    <span class="s2">double </span><span class="s1">pg3 = </span><span class="s5">6 </span><span class="s1">* cephes::zeta(</span><span class="s5">4</span><span class="s1">, b);</span>
+                    <span class="s1">B[</span><span class="s5">4</span><span class="s1">] = ((dg * dg - </span><span class="s5">6 </span><span class="s1">* pg1) * dg + </span><span class="s5">4 </span><span class="s1">* pg2) * dg + </span><span class="s5">3 </span><span class="s1">* pg1 * pg1 - pg3;</span>
+                    <span class="s1">A[order - </span><span class="s5">4</span><span class="s1">] = X[</span><span class="s5">4</span><span class="s1">] * B[</span><span class="s5">4</span><span class="s1">] / </span><span class="s5">24</span><span class="s1">.;</span>
+                    <span class="s2">if </span><span class="s1">(order &gt;= </span><span class="s5">5</span><span class="s1">) {</span>
+                        <span class="s0">// pg4 = polygamma(4, b)</span>
+                        <span class="s2">double </span><span class="s1">pg4 = -</span><span class="s5">24 </span><span class="s1">* cephes::zeta(</span><span class="s5">5</span><span class="s1">, b);</span>
+                        <span class="s1">B[</span><span class="s5">5</span><span class="s1">] =</span>
+                            <span class="s1">((((-dg * dg + </span><span class="s5">10 </span><span class="s1">* pg1) * dg - </span><span class="s5">10 </span><span class="s1">* pg2) * dg - </span><span class="s5">15 </span><span class="s1">* pg1 * pg1 + </span><span class="s5">5 </span><span class="s1">* pg3) * dg +</span>
+                             <span class="s5">10 </span><span class="s1">* pg1 * pg2 - pg4);</span>
+                        <span class="s1">A[order - </span><span class="s5">5</span><span class="s1">] = X[</span><span class="s5">5</span><span class="s1">] * B[</span><span class="s5">5</span><span class="s1">] / </span><span class="s5">120</span><span class="s1">.;</span>
+                    <span class="s1">}</span>
+                <span class="s1">}</span>
+                <span class="s1">res = cephes::polevl(a, A, order);</span>
+            <span class="s1">}</span>
+            <span class="s0">// res *= exp(x) * rgamma(b)</span>
+            <span class="s2">if </span><span class="s1">(!log_wb) {</span>
+                <span class="s1">res *= exp_rgamma(x, b);</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                <span class="s0">// logarithm of Wright's function</span>
+                <span class="s1">res = x - cephes::lgam(b) + std::log(res);</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">res;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">template&lt;</span><span class="s2">bool </span><span class="s1">log_wb&gt;</span>
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wb_asymptotic(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x) {</span>
+        <span class="s0">/* 4. Asymptotic expansion for large x up to order 8 
+         * 
+         * Phi(a, b, x) ~ Z^(1/2-b) * exp((1+a)/a * Z) * sum_k (-1)^k * C_k / Z^k 
+         * 
+         * with Z = (a*x)^(1/(1+a)). 
+         * Call: python _precompute/wright_bessel.py 3 
+         */</span>
+        <span class="s2">double </span><span class="s1">A[</span><span class="s5">15</span><span class="s1">];  </span><span class="s0">// powers of a</span>
+        <span class="s2">double </span><span class="s1">B[</span><span class="s5">17</span><span class="s1">];  </span><span class="s0">// powers of b</span>
+        <span class="s2">double </span><span class="s1">Ap1[</span><span class="s5">9</span><span class="s1">]; </span><span class="s0">// powers of (1+a)</span>
+        <span class="s2">double </span><span class="s1">C[</span><span class="s5">9</span><span class="s1">];   </span><span class="s0">// coefficients of asymptotic series a_k</span>
+
+        <span class="s1">A[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span><span class="s1">.;</span>
+        <span class="s1">B[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span><span class="s1">.;</span>
+        <span class="s1">Ap1[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span><span class="s1">.;</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">k = </span><span class="s5">1</span><span class="s1">; k &lt; </span><span class="s5">15</span><span class="s1">; k++) {</span>
+            <span class="s1">A[k] = A[k - </span><span class="s5">1</span><span class="s1">] * a;</span>
+        <span class="s1">}</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">k = </span><span class="s5">1</span><span class="s1">; k &lt; </span><span class="s5">17</span><span class="s1">; k++) {</span>
+            <span class="s1">B[k] = B[k - </span><span class="s5">1</span><span class="s1">] * b;</span>
+        <span class="s1">}</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">k = </span><span class="s5">1</span><span class="s1">; k &lt; </span><span class="s5">9</span><span class="s1">; k++) {</span>
+            <span class="s1">Ap1[k] = Ap1[k - </span><span class="s5">1</span><span class="s1">] * (</span><span class="s5">1 </span><span class="s1">+ a);</span>
+        <span class="s1">}</span>
+
+        <span class="s1">C[</span><span class="s5">0</span><span class="s1">] = </span><span class="s5">1</span><span class="s1">. / std::sqrt(</span><span class="s5">2</span><span class="s1">. * M_PI * Ap1[</span><span class="s5">1</span><span class="s1">]);</span>
+
+        <span class="s1">C[</span><span class="s5">1</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">24 </span><span class="s1">* Ap1[</span><span class="s5">1</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">1</span><span class="s1">] *= (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">+ a) - </span><span class="s5">12 </span><span class="s1">* b * (</span><span class="s5">1 </span><span class="s1">+ a - b);</span>
+
+        <span class="s1">C[</span><span class="s5">2</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">1152 </span><span class="s1">* Ap1[</span><span class="s5">2</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">2</span><span class="s1">] *=</span>
+            <span class="s1">(</span><span class="s5">144 </span><span class="s1">* B[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">96 </span><span class="s1">* B[</span><span class="s5">3</span><span class="s1">] * (</span><span class="s5">5 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) + </span><span class="s5">24 </span><span class="s1">* B[</span><span class="s5">2</span><span class="s1">] * (</span><span class="s5">20 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">5 </span><span class="s1">* a - </span><span class="s5">4</span><span class="s1">) -</span>
+             <span class="s5">24 </span><span class="s1">* b * Ap1[</span><span class="s5">1</span><span class="s1">] * (</span><span class="s5">6 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">7 </span><span class="s1">* a - </span><span class="s5">2</span><span class="s1">) + (a + </span><span class="s5">2</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">19 </span><span class="s1">* a + </span><span class="s5">2</span><span class="s1">));</span>
+
+        <span class="s1">C[</span><span class="s5">3</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">414720 </span><span class="s1">* Ap1[</span><span class="s5">3</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">3</span><span class="s1">] *=</span>
+            <span class="s1">(</span><span class="s5">8640 </span><span class="s1">* B[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">8640 </span><span class="s1">* B[</span><span class="s5">5</span><span class="s1">] * (</span><span class="s5">7 </span><span class="s1">* a - </span><span class="s5">1</span><span class="s1">) + </span><span class="s5">10800 </span><span class="s1">* B[</span><span class="s5">4</span><span class="s1">] * (</span><span class="s5">14 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">7 </span><span class="s1">* a - </span><span class="s5">2</span><span class="s1">) -</span>
+             <span class="s5">1440 </span><span class="s1">* B[</span><span class="s5">3</span><span class="s1">] * (</span><span class="s5">112 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">147 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">63 </span><span class="s1">* a + </span><span class="s5">8</span><span class="s1">) +</span>
+             <span class="s5">180 </span><span class="s1">* B[</span><span class="s5">2</span><span class="s1">] * (</span><span class="s5">364 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">1288 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">567 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">392 </span><span class="s1">* a + </span><span class="s5">76</span><span class="s1">) -</span>
+             <span class="s5">180 </span><span class="s1">* b * Ap1[</span><span class="s5">1</span><span class="s1">] * (</span><span class="s5">20 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">516 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">417 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">172 </span><span class="s1">* a - </span><span class="s5">12</span><span class="s1">) -</span>
+             <span class="s1">(a + </span><span class="s5">2</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) * (</span><span class="s5">556 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">1628 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">9093 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">1628 </span><span class="s1">* a + </span><span class="s5">556</span><span class="s1">));</span>
+
+        <span class="s1">C[</span><span class="s5">4</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">39813120 </span><span class="s1">* Ap1[</span><span class="s5">4</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">4</span><span class="s1">] *=</span>
+            <span class="s1">(</span><span class="s5">103680 </span><span class="s1">* B[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">414720 </span><span class="s1">* B[</span><span class="s5">7</span><span class="s1">] * (</span><span class="s5">3 </span><span class="s1">* a - </span><span class="s5">1</span><span class="s1">) + </span><span class="s5">725760 </span><span class="s1">* B[</span><span class="s5">6</span><span class="s1">] * a * (</span><span class="s5">8 </span><span class="s1">* a - </span><span class="s5">7</span><span class="s1">) -</span>
+             <span class="s5">48384 </span><span class="s1">* B[</span><span class="s5">5</span><span class="s1">] * (</span><span class="s5">274 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">489 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">39 </span><span class="s1">* a + </span><span class="s5">26</span><span class="s1">) +</span>
+             <span class="s5">30240 </span><span class="s1">* B[</span><span class="s5">4</span><span class="s1">] * (</span><span class="s5">500 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">1740 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">495 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">340 </span><span class="s1">* a - </span><span class="s5">12</span><span class="s1">) -</span>
+             <span class="s5">2880 </span><span class="s1">* B[</span><span class="s5">3</span><span class="s1">] * (</span><span class="s5">2588 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">19780 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">14453 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">9697 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">1892 </span><span class="s1">* a - </span><span class="s5">404</span><span class="s1">) +</span>
+             <span class="s5">48 </span><span class="s1">* B[</span><span class="s5">2</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">11488 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">547836 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">1007484 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">593353 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">411276 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">114396 </span><span class="s1">* a + </span><span class="s5">4288</span><span class="s1">) +</span>
+             <span class="s5">48 </span><span class="s1">* b * Ap1[</span><span class="s5">1</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">7784 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">48180 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">491202 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">336347 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">163734 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">28908 </span><span class="s1">* a - </span><span class="s5">5560</span><span class="s1">) -</span>
+             <span class="s1">(a + </span><span class="s5">2</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) *</span>
+                 <span class="s1">(</span><span class="s5">4568 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">226668 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">465702 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">2013479 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">465702 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">226668 </span><span class="s1">* a + </span><span class="s5">4568</span><span class="s1">));</span>
+
+        <span class="s1">C[</span><span class="s5">5</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">6688604160</span><span class="s1">. * Ap1[</span><span class="s5">5</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">5</span><span class="s1">] *=</span>
+            <span class="s1">(</span><span class="s5">1741824 </span><span class="s1">* B[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">2903040 </span><span class="s1">* B[</span><span class="s5">9</span><span class="s1">] * (</span><span class="s5">11 </span><span class="s1">* a - </span><span class="s5">5</span><span class="s1">) + </span><span class="s5">2177280 </span><span class="s1">* B[</span><span class="s5">8</span><span class="s1">] * (</span><span class="s5">110 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">121 </span><span class="s1">* a + </span><span class="s5">14</span><span class="s1">) -</span>
+             <span class="s5">580608 </span><span class="s1">* B[</span><span class="s5">7</span><span class="s1">] * (</span><span class="s5">1628 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">3333 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">1023 </span><span class="s1">* a + </span><span class="s5">52</span><span class="s1">) +</span>
+             <span class="s5">169344 </span><span class="s1">* B[</span><span class="s5">6</span><span class="s1">] * (</span><span class="s5">12364 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">43648 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">26763 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">1232 </span><span class="s1">* a - </span><span class="s5">788</span><span class="s1">) -</span>
+             <span class="s5">24192 </span><span class="s1">* B[</span><span class="s5">5</span><span class="s1">] * (</span><span class="s5">104852 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">646624 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">721391 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">16841 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">74096 </span><span class="s1">* a + </span><span class="s5">148</span><span class="s1">) +</span>
+             <span class="s5">2016 </span><span class="s1">* B[</span><span class="s5">4</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">710248 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">8878716 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">17928834 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">3333407 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">4339566 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">287364 </span><span class="s1">* a +</span>
+                  <span class="s5">89128</span><span class="s1">) -</span>
+             <span class="s5">1344 </span><span class="s1">* B[</span><span class="s5">3</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">87824 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">7150220 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">29202756 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">15113527 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">14223011 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">3462492 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] +</span>
+                  <span class="s5">1137092 </span><span class="s1">* a - </span><span class="s5">18896</span><span class="s1">) -</span>
+             <span class="s5">84 </span><span class="s1">* B[</span><span class="s5">2</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">1690480 </span><span class="s1">* A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">14139136 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">232575464 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">296712592 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">215856619 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] -</span>
+                  <span class="s5">152181392 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">47718440 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">5813632 </span><span class="s1">* a + </span><span class="s5">943216</span><span class="s1">) +</span>
+             <span class="s5">84 </span><span class="s1">* b * Ap1[</span><span class="s5">1</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">82224 </span><span class="s1">* A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">5628896 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">26466520 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">168779208 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">104808005 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] -</span>
+                  <span class="s5">56259736 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">15879912 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">4020640 </span><span class="s1">* a - </span><span class="s5">63952</span><span class="s1">) +</span>
+             <span class="s1">(a + </span><span class="s5">2</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) *</span>
+                 <span class="s1">(</span><span class="s5">2622064 </span><span class="s1">* A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">12598624 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">167685080 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">302008904 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">1115235367</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] -</span>
+                  <span class="s5">302008904 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">167685080 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">12598624 </span><span class="s1">* a + </span><span class="s5">2622064</span><span class="s1">));</span>
+
+        <span class="s1">C[</span><span class="s5">6</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">4815794995200</span><span class="s1">. * Ap1[</span><span class="s5">6</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">6</span><span class="s1">] *=</span>
+            <span class="s1">(</span><span class="s5">104509440 </span><span class="s1">* B[</span><span class="s5">12</span><span class="s1">] - </span><span class="s5">209018880 </span><span class="s1">* B[</span><span class="s5">11</span><span class="s1">] * (</span><span class="s5">13 </span><span class="s1">* a - </span><span class="s5">7</span><span class="s1">) + </span><span class="s5">574801920 </span><span class="s1">* B[</span><span class="s5">10</span><span class="s1">] * (</span><span class="s5">52 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">65 </span><span class="s1">* a + </span><span class="s5">12</span><span class="s1">) -</span>
+             <span class="s5">63866880 </span><span class="s1">* B[</span><span class="s5">9</span><span class="s1">] * (</span><span class="s5">2834 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">6279 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">2769 </span><span class="s1">* a - </span><span class="s5">134</span><span class="s1">) +</span>
+             <span class="s5">23950080 </span><span class="s1">* B[</span><span class="s5">8</span><span class="s1">] * (</span><span class="s5">27404 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">98228 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">78663 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">10868 </span><span class="s1">* a - </span><span class="s5">1012</span><span class="s1">) -</span>
+             <span class="s5">13685760 </span><span class="s1">* B[</span><span class="s5">7</span><span class="s1">] * (</span><span class="s5">105612 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">599196 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">791843 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">224913 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">27612 </span><span class="s1">* a + </span><span class="s5">4540</span><span class="s1">) +</span>
+             <span class="s5">2661120 </span><span class="s1">* B[</span><span class="s5">6</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">693680 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">6473532 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">13736424 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">7047469 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">723840 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">471588 </span><span class="s1">* a + </span><span class="s5">7376</span>
+                 <span class="s1">) -</span>
+             <span class="s5">2661120 </span><span class="s1">* B[</span><span class="s5">5</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">432536 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">7850804 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">27531114 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">24234457 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">703001 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">3633474 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] -</span>
+                  <span class="s5">36244 </span><span class="s1">* a - </span><span class="s5">45128</span><span class="s1">) +</span>
+             <span class="s5">166320 </span><span class="s1">* B[</span><span class="s5">4</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">548912 </span><span class="s1">* A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">75660832 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">502902712 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">764807992 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">91248287 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] +</span>
+                  <span class="s5">217811464 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">20365384 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">9776416 </span><span class="s1">* a + </span><span class="s5">37936</span><span class="s1">) +</span>
+             <span class="s5">10080 </span><span class="s1">* B[</span><span class="s5">3</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">18759728 </span><span class="s1">* A[</span><span class="s5">9</span><span class="s1">] + </span><span class="s5">165932208 </span><span class="s1">* A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">4710418440</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">13686052536</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">5456818809</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] -</span>
+                  <span class="s5">6834514245</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">1919299512</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">752176152 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">45661200 </span><span class="s1">* a - </span><span class="s5">8616848</span><span class="s1">) -</span>
+             <span class="s5">360 </span><span class="s1">* B[</span><span class="s5">2</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">32743360 </span><span class="s1">* A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">3381871792</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">21488827776</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">200389923864</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] -</span>
+                  <span class="s5">198708005340</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">171633799779</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">123124874028</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">40072774872</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] -</span>
+                  <span class="s5">9137993280</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">1895843248</span><span class="s1">. * a + </span><span class="s5">18929728</span><span class="s1">) -</span>
+             <span class="s5">360 </span><span class="s1">* b * Ap1[</span><span class="s5">1</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">57685408 </span><span class="s1">* A[</span><span class="s5">10</span><span class="s1">] + </span><span class="s5">406929456 </span><span class="s1">* A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">6125375760</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">27094918920</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] +</span>
+                  <span class="s5">128752249410</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">74866710561</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">42917416470</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">16256951352</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] +</span>
+                  <span class="s5">4375268400</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">316500688 </span><span class="s1">* a - </span><span class="s5">47197152</span><span class="s1">) +</span>
+             <span class="s1">(a + </span><span class="s5">2</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) *</span>
+                 <span class="s1">(</span><span class="s5">167898208 </span><span class="s1">* A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">22774946512</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">88280004528</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">611863976472</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] +</span>
+                  <span class="s5">1041430242126</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">3446851131657</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">1041430242126</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">611863976472</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] -</span>
+                  <span class="s5">88280004528</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">22774946512</span><span class="s1">. * a + </span><span class="s5">167898208</span><span class="s1">));</span>
+
+        <span class="s1">C[</span><span class="s5">7</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">115579079884800</span><span class="s1">. * Ap1[</span><span class="s5">7</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">7</span><span class="s1">] *=</span>
+            <span class="s1">(</span><span class="s5">179159040 </span><span class="s1">* B[</span><span class="s5">14</span><span class="s1">] - </span><span class="s5">1254113280</span><span class="s1">. * B[</span><span class="s5">13</span><span class="s1">] * (</span><span class="s5">5 </span><span class="s1">* a - </span><span class="s5">3</span><span class="s1">) + </span><span class="s5">1358622720</span><span class="s1">. * B[</span><span class="s5">12</span><span class="s1">] * (</span><span class="s5">70 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">95 </span><span class="s1">* a + </span><span class="s5">22</span><span class="s1">) -</span>
+             <span class="s5">905748480 </span><span class="s1">* B[</span><span class="s5">11</span><span class="s1">] * (</span><span class="s5">904 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">2109 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">1119 </span><span class="s1">* a - </span><span class="s5">112</span><span class="s1">) +</span>
+             <span class="s5">1245404160</span><span class="s1">. * B[</span><span class="s5">10</span><span class="s1">] * (</span><span class="s5">3532 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">12824 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">11829 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">2824 </span><span class="s1">* a + </span><span class="s5">44</span><span class="s1">) -</span>
+             <span class="s5">59304960 </span><span class="s1">* B[</span><span class="s5">9</span><span class="s1">] * (</span><span class="s5">256820 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">1397680 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">2025545 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">869495 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">52000 </span><span class="s1">* a + </span><span class="s5">8788</span><span class="s1">) +</span>
+             <span class="s5">14826240 </span><span class="s1">* B[</span><span class="s5">8</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">2274536 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">18601572 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">40698318 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">28230079 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">3916398 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">832668 </span><span class="s1">* a -</span>
+                  <span class="s5">65176</span><span class="s1">) -</span>
+             <span class="s5">59304960 </span><span class="s1">* B[</span><span class="s5">7</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">760224 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">9849164 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">32495784 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">34813869 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">9175207 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">1898688 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] -</span>
+                  <span class="s5">469788 </span><span class="s1">* a - </span><span class="s5">13184</span><span class="s1">) +</span>
+             <span class="s5">25945920 </span><span class="s1">* B[</span><span class="s5">6</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">1167504 </span><span class="s1">* A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">28779840 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">149752856 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">246026112 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">111944073 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] +</span>
+                  <span class="s5">18341600 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">12131496 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">274368 </span><span class="s1">* a + </span><span class="s5">102800</span><span class="s1">) -</span>
+             <span class="s5">157248 </span><span class="s1">* B[</span><span class="s5">5</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">12341872 </span><span class="s1">* A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">3122991216</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">29900054232</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">78024816720</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] +</span>
+                  <span class="s5">58914656739</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">4637150811</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">11523402480</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">236218968 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">337923216 </span><span class="s1">* a +</span>
+                  <span class="s5">1592048</span><span class="s1">) -</span>
+             <span class="s5">28080 </span><span class="s1">* B[</span><span class="s5">4</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">265154912 </span><span class="s1">* A[</span><span class="s5">10</span><span class="s1">] + </span><span class="s5">2276098704</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">105569461008</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">496560666360</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] -</span>
+                  <span class="s5">627891462858</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">41935358025</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">203913875814</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">23984801544</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] -</span>
+                  <span class="s5">13869306000</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">372786832 </span><span class="s1">* a + </span><span class="s5">103532640</span><span class="s1">) +</span>
+             <span class="s5">1440 </span><span class="s1">* B[</span><span class="s5">3</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">310292864 </span><span class="s1">* A[</span><span class="s5">11</span><span class="s1">] - </span><span class="s5">55169117872</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">358957020112</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] + </span><span class="s5">5714152556088</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] -</span>
+                  <span class="s5">13241597459352</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">4220720097141</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">6845418090249</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">2129559215808</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] -</span>
+                  <span class="s5">909225098472</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">107518582576</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">25619444368</span><span class="s1">. * a - </span><span class="s5">113832704</span><span class="s1">) +</span>
+             <span class="s5">12 </span><span class="s1">* B[</span><span class="s5">2</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">135319651136</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] + </span><span class="s5">1119107842176</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] - </span><span class="s5">22193518174320</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">133421793595520</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] +</span>
+                  <span class="s5">860103051087996</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">703353374803080</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">704240127687381</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] +</span>
+                  <span class="s5">513111704637960</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">166909061348316</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">57671564069120</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">12453426246000</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] +</span>
+                  <span class="s5">695901207936</span><span class="s1">. * a + </span><span class="s5">93786157376</span><span class="s1">.) -</span>
+             <span class="s5">12 </span><span class="s1">* b * Ap1[</span><span class="s5">1</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">4365353408</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] - </span><span class="s5">720248637504</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] - </span><span class="s5">4222331152560</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] + </span><span class="s5">29413934270560</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] +</span>
+                  <span class="s5">132123980710980</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">511247376962820</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">283403639131779</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] +</span>
+                  <span class="s5">170415792320940</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">79274388426588</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">21009953050400</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">3284035340880</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] +</span>
+                  <span class="s5">589294339776</span><span class="s1">. * a - </span><span class="s5">3693760576</span><span class="s1">.) -</span>
+             <span class="s1">(a + </span><span class="s5">2</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) *</span>
+                 <span class="s1">(</span><span class="s5">34221025984</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] + </span><span class="s5">226022948160</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] - </span><span class="s5">5067505612464</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">18868361443936</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] +</span>
+                  <span class="s5">86215425028308</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">143500920544692</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">437682618704613</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">143500920544692</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] +</span>
+                  <span class="s5">86215425028308</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">18868361443936</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">5067505612464</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">226022948160</span><span class="s1">. * a +</span>
+                  <span class="s5">34221025984</span><span class="s1">.));</span>
+
+        <span class="s1">C[</span><span class="s5">8</span><span class="s1">] = C[</span><span class="s5">0</span><span class="s1">] / (</span><span class="s5">22191183337881600</span><span class="s1">. * Ap1[</span><span class="s5">8</span><span class="s1">]);</span>
+        <span class="s1">C[</span><span class="s5">8</span><span class="s1">] *=</span>
+            <span class="s1">(</span><span class="s5">2149908480</span><span class="s1">. * B[</span><span class="s5">16</span><span class="s1">] - </span><span class="s5">5733089280</span><span class="s1">. * B[</span><span class="s5">15</span><span class="s1">] * (</span><span class="s5">17 </span><span class="s1">* a - </span><span class="s5">11</span><span class="s1">) +</span>
+             <span class="s5">7166361600</span><span class="s1">. * B[</span><span class="s5">14</span><span class="s1">] * (</span><span class="s5">272 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">391 </span><span class="s1">* a + </span><span class="s5">104</span><span class="s1">) -</span>
+             <span class="s5">3344302080</span><span class="s1">. * B[</span><span class="s5">13</span><span class="s1">] * (</span><span class="s5">6766 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">16371 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">9741 </span><span class="s1">* a - </span><span class="s5">1306</span><span class="s1">) +</span>
+             <span class="s5">1811496960</span><span class="s1">. * B[</span><span class="s5">12</span><span class="s1">] * (</span><span class="s5">93092 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">341564 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">344199 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">104924 </span><span class="s1">* a + </span><span class="s5">6308</span><span class="s1">) -</span>
+             <span class="s5">517570560 </span><span class="s1">* B[</span><span class="s5">11</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">1626220 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">8641508 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">13274773 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">6952303 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">1007420 </span><span class="s1">* a + </span><span class="s5">5564</span><span class="s1">) +</span>
+             <span class="s5">284663808 </span><span class="s1">* B[</span><span class="s5">10</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">9979136 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">75766892 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">169256148 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">136824959 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">35714348 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] -</span>
+                  <span class="s5">463692 </span><span class="s1">* a - </span><span class="s5">293664</span><span class="s1">) -</span>
+             <span class="s5">1423319040</span><span class="s1">. * B[</span><span class="s5">9</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">4466648 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">49231116 </span><span class="s1">* A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">157507414 </span><span class="s1">* A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">187114257 </span><span class="s1">* A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">78372295 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] -</span>
+                  <span class="s5">4470082 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">1913996 </span><span class="s1">* a + </span><span class="s5">82424</span><span class="s1">) +</span>
+             <span class="s5">266872320 </span><span class="s1">* B[</span><span class="s5">8</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">33133136 </span><span class="s1">* A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">564264544 </span><span class="s1">* A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">2618606424</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">4491310104</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">2853943765</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] -</span>
+                  <span class="s5">374694552 </span><span class="s1">* A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">135365288 </span><span class="s1">* A[</span><span class="s5">2</span><span class="s1">] + </span><span class="s5">17623968 </span><span class="s1">* a + </span><span class="s5">696912</span><span class="s1">) -</span>
+             <span class="s5">2156544 </span><span class="s1">* B[</span><span class="s5">7</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">2914256144</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">93491712432</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">664876176984</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">1661362937880</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] +</span>
+                  <span class="s5">1563719627313</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">382840842843</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] - </span><span class="s5">115399415640</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">34565562936</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] +</span>
+                  <span class="s5">1609337232</span><span class="s1">. * a - </span><span class="s5">217321904</span><span class="s1">) +</span>
+             <span class="s5">179712 </span><span class="s1">* B[</span><span class="s5">6</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">1266018560</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">789261834512</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] + </span><span class="s5">10186841596896</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] - </span><span class="s5">38877799073352</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] +</span>
+                  <span class="s5">54334425968952</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">22529574889533</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">5132942328000</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">3438377465592</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] +</span>
+                  <span class="s5">84287641248</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">72493479440</span><span class="s1">. * a - </span><span class="s5">807415936</span><span class="s1">) +</span>
+             <span class="s5">13824 </span><span class="s1">* B[</span><span class="s5">5</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">156356794976</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] + </span><span class="s5">1180898077328</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">90615270907936</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] + </span><span class="s5">609258947056248</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] -</span>
+                  <span class="s5">1312655191366722</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">885900509321745</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] + </span><span class="s5">112162151855265</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] -</span>
+                  <span class="s5">212803071513258</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">6805217831352</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">10051742651296</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">55035924848</span><span class="s1">. * a -</span>
+                  <span class="s5">52946379296</span><span class="s1">.) -</span>
+             <span class="s5">576 </span><span class="s1">* B[</span><span class="s5">4</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">143943926464</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] - </span><span class="s5">60115486481856</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] - </span><span class="s5">376366989757200</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] +</span>
+                  <span class="s5">9534223075576160</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">35603777465262396</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">39375990156664980</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] -</span>
+                  <span class="s5">868175004137259</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">14279180718355020</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">1985747535239364</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] +</span>
+                  <span class="s5">1264001337603680</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] - </span><span class="s5">75972792514320</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">23855850572736</span><span class="s1">. * a - </span><span class="s5">4996648256</span><span class="s1">.) -</span>
+             <span class="s5">384 </span><span class="s1">* B[</span><span class="s5">3</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">2038525473856</span><span class="s1">. * A[</span><span class="s5">13</span><span class="s1">] + </span><span class="s5">16057322146112</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] - </span><span class="s5">502133360559024</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] -</span>
+                  <span class="s5">2985686417468080</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] + </span><span class="s5">32418922182093292</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] - </span><span class="s5">63665380623022452</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] +</span>
+                  <span class="s5">16481208821092575</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">34161547357596099</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] - </span><span class="s5">11490298497454932</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] -</span>
+                  <span class="s5">5117272758337156</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">933703210750480</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] + </span><span class="s5">234855186762000</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">7860524600000</span><span class="s1">. * a -</span>
+                  <span class="s5">1226607567040</span><span class="s1">.) +</span>
+             <span class="s5">96 </span><span class="s1">* B[</span><span class="s5">2</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">324439754752</span><span class="s1">. * A[</span><span class="s5">14</span><span class="s1">] - </span><span class="s5">77231415197120</span><span class="s1">. * A[</span><span class="s5">13</span><span class="s1">] - </span><span class="s5">539102931841856</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] +</span>
+                  <span class="s5">4618258299956336</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] + </span><span class="s5">28588485529469792</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">141383982651179428</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] +</span>
+                  <span class="s5">98783147840417772</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">112831723492305801</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">83329761150975036</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] -</span>
+                  <span class="s5">26553582937192900</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">12469117738765952</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">2587165396642160</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] -</span>
+                  <span class="s5">340406368038080</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">53659641606080</span><span class="s1">. * a + </span><span class="s5">219671272960</span><span class="s1">.) +</span>
+             <span class="s5">96 </span><span class="s1">* b * Ap1[</span><span class="s5">1</span><span class="s1">] *</span>
+                 <span class="s1">(</span><span class="s5">1026630779520</span><span class="s1">. * A[</span><span class="s5">14</span><span class="s1">] + </span><span class="s5">8781958472768</span><span class="s1">. * A[</span><span class="s5">13</span><span class="s1">] - </span><span class="s5">210659786204384</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] -</span>
+                  <span class="s5">1222283505284208</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] + </span><span class="s5">5064251967491416</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] + </span><span class="s5">24013052207628140</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] -</span>
+                  <span class="s5">79710880160087370</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">42596558293213227</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] + </span><span class="s5">26570293386695790</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] -</span>
+                  <span class="s5">14407831324576884</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] - </span><span class="s5">3617322833922440</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">950664948554384</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] +</span>
+                  <span class="s5">172358006894496</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">7430887938496</span><span class="s1">. * a - </span><span class="s5">889746675584</span><span class="s1">.) -</span>
+             <span class="s1">(a + </span><span class="s5">2</span><span class="s1">) * (</span><span class="s5">2 </span><span class="s1">* a + </span><span class="s5">1</span><span class="s1">) *</span>
+                 <span class="s1">(</span><span class="s5">573840801152</span><span class="s1">. * A[</span><span class="s5">14</span><span class="s1">] - </span><span class="s5">156998277198784</span><span class="s1">. * A[</span><span class="s5">13</span><span class="s1">] - </span><span class="s5">898376974770592</span><span class="s1">. * A[</span><span class="s5">12</span><span class="s1">] +</span>
+                  <span class="s5">8622589006459984</span><span class="s1">. * A[</span><span class="s5">11</span><span class="s1">] + </span><span class="s5">32874204024803560</span><span class="s1">. * A[</span><span class="s5">10</span><span class="s1">] - </span><span class="s5">111492707520083828</span><span class="s1">. * A[</span><span class="s5">9</span><span class="s1">] -</span>
+                  <span class="s5">184768503480287646</span><span class="s1">. * A[</span><span class="s5">8</span><span class="s1">] + </span><span class="s5">528612016938984183</span><span class="s1">. * A[</span><span class="s5">7</span><span class="s1">] - </span><span class="s5">184768503480287646</span><span class="s1">. * A[</span><span class="s5">6</span><span class="s1">] -</span>
+                  <span class="s5">111492707520083828</span><span class="s1">. * A[</span><span class="s5">5</span><span class="s1">] + </span><span class="s5">32874204024803560</span><span class="s1">. * A[</span><span class="s5">4</span><span class="s1">] + </span><span class="s5">8622589006459984</span><span class="s1">. * A[</span><span class="s5">3</span><span class="s1">] -</span>
+                  <span class="s5">898376974770592</span><span class="s1">. * A[</span><span class="s5">2</span><span class="s1">] - </span><span class="s5">156998277198784</span><span class="s1">. * a + </span><span class="s5">573840801152</span><span class="s1">.));</span>
+
+        <span class="s2">double </span><span class="s1">Z = std::pow(a * x, </span><span class="s5">1 </span><span class="s1">/ Ap1[</span><span class="s5">1</span><span class="s1">]);</span>
+        <span class="s2">double </span><span class="s1">Zp = </span><span class="s5">1</span><span class="s1">.;</span>
+        <span class="s2">double </span><span class="s1">res = C[</span><span class="s5">0</span><span class="s1">];</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">k = </span><span class="s5">1</span><span class="s1">; k &lt; </span><span class="s5">9</span><span class="s1">; k++) {</span>
+            <span class="s1">Zp /= Z;</span>
+            <span class="s1">res += (k % </span><span class="s5">2 </span><span class="s1">== </span><span class="s5">0 </span><span class="s1">? </span><span class="s5">1 </span><span class="s1">: -</span><span class="s5">1</span><span class="s1">) * C[k] * Zp;</span>
+        <span class="s1">}</span>
+        <span class="s2">if </span><span class="s1">(!log_wb) {</span>
+            <span class="s1">res *= std::pow(Z, </span><span class="s5">0.5 </span><span class="s1">- b) * std::exp(Ap1[</span><span class="s5">1</span><span class="s1">] / a * Z);</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">// logarithm of Wright's function</span>
+            <span class="s1">res = std::log(Z) * (</span><span class="s5">0.5 </span><span class="s1">- b) + Ap1[</span><span class="s5">1</span><span class="s1">] / a * Z + std::log(res);</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">res;</span>
+    <span class="s1">}</span>
+
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wb_Kmod(</span><span class="s2">double </span><span class="s1">exp_term, </span><span class="s2">double </span><span class="s1">eps, </span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x, </span><span class="s2">double </span><span class="s1">r) {</span>
+        <span class="s0">/* Compute integrand Kmod(eps, a, b, x, r) for Gauss-Laguerre quadrature. 
+         * 
+         * K(a, b, x, r+eps) = exp(-r-eps) * Kmod(eps, a, b, x, r) 
+         *  
+         * Kmod(eps, a, b, x, r) = exp(x * (r+eps)^(-a) * cos(pi*a)) * (r+eps)^(-b) 
+         *                       * sin(x * (r+eps)^(-a) * sin(pi*a) + pi * b) 
+         *  
+         * Note that we additionally factor out exp(exp_term) which helps with large 
+         * terms in the exponent of exp(...) 
+         */</span>
+        <span class="s2">double </span><span class="s1">x_r_a = x * std::pow(r + eps, -a);</span>
+        <span class="s2">return </span><span class="s1">std::exp(x_r_a * cephes::cospi(a) + exp_term) * std::pow(r + eps, -b) *</span>
+               <span class="s1">std::sin(x_r_a * cephes::sinpi(a) + M_PI * b);</span>
+    <span class="s1">}</span>
+
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wb_P(</span><span class="s2">double </span><span class="s1">exp_term, </span><span class="s2">double </span><span class="s1">eps, </span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x, </span><span class="s2">double </span><span class="s1">phi) {</span>
+        <span class="s0">/* Compute integrand P for Gauss-Legendre quadrature. 
+         * 
+         * P(eps, a, b, x, phi) = exp(eps * cos(phi) + x * eps^(-a) * cos(a*phi)) 
+         *                      * cos(eps * sin(phi) - x * eps^(-a) * sin(a*phi) 
+         *                            + (1-b)*phi) 
+         *  
+         * Note that we additionally factor out exp(exp_term) which helps with large 
+         * terms in the exponent of exp(...) 
+         */</span>
+        <span class="s2">double </span><span class="s1">x_eps_a = x * std::pow(eps, -a);</span>
+        <span class="s2">return </span><span class="s1">std::exp(eps * std::cos(phi) + x_eps_a * std::cos(a * phi) + exp_term) *</span>
+               <span class="s1">std::cos(eps * std::sin(phi) - x_eps_a * std::sin(a * phi) + (</span><span class="s5">1 </span><span class="s1">- b) * phi);</span>
+    <span class="s1">}</span>
+
+    <span class="s0">/* roots of laguerre polynomial of order 50 
+     * scipy.special.roots_laguerre(50)[0] or 
+     * sympy.integrals.quadrature.import gauss_laguerre(50, 16)[0] */</span>
+    <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">wb_x_laguerre[] = {</span>
+        <span class="s5">0.02863051833937908</span><span class="s1">, </span><span class="s5">0.1508829356769337</span><span class="s1">, </span><span class="s5">0.3709487815348964</span><span class="s1">, </span><span class="s5">0.6890906998810479</span><span class="s1">, </span><span class="s5">1.105625023539913</span><span class="s1">,</span>
+        <span class="s5">1.620961751102501</span><span class="s1">,   </span><span class="s5">2.23561037591518</span><span class="s1">,   </span><span class="s5">2.950183366641835</span><span class="s1">,  </span><span class="s5">3.765399774405782</span><span class="s1">,  </span><span class="s5">4.682089387559285</span><span class="s1">,</span>
+        <span class="s5">5.70119757478489</span><span class="s1">,    </span><span class="s5">6.823790909794551</span><span class="s1">,  </span><span class="s5">8.051063669390792</span><span class="s1">,  </span><span class="s5">9.384345308258407</span><span class="s1">,  </span><span class="s5">10.82510903154915</span><span class="s1">,</span>
+        <span class="s5">12.37498160875746</span><span class="s1">,   </span><span class="s5">14.03575459982991</span><span class="s1">,  </span><span class="s5">15.80939719784467</span><span class="s1">,  </span><span class="s5">17.69807093335025</span><span class="s1">,  </span><span class="s5">19.70414653546156</span><span class="s1">,</span>
+        <span class="s5">21.83022330657825</span><span class="s1">,   </span><span class="s5">24.0791514444115</span><span class="s1">,   </span><span class="s5">26.45405784125298</span><span class="s1">,  </span><span class="s5">28.95837601193738</span><span class="s1">,  </span><span class="s5">31.59588095662286</span><span class="s1">,</span>
+        <span class="s5">34.37072996309045</span><span class="s1">,   </span><span class="s5">37.28751061055049</span><span class="s1">,  </span><span class="s5">40.35129757358607</span><span class="s1">,  </span><span class="s5">43.56772026999502</span><span class="s1">,  </span><span class="s5">46.94304399160304</span><span class="s1">,</span>
+        <span class="s5">50.48426796312992</span><span class="s1">,   </span><span class="s5">54.19924488016862</span><span class="s1">,  </span><span class="s5">58.09682801724853</span><span class="s1">,  </span><span class="s5">62.18705417568891</span><span class="s1">,  </span><span class="s5">66.48137387844482</span><span class="s1">,</span>
+        <span class="s5">70.99294482661949</span><span class="s1">,   </span><span class="s5">75.73701154772731</span><span class="s1">,  </span><span class="s5">80.73140480247769</span><span class="s1">,  </span><span class="s5">85.99721113646323</span><span class="s1">,  </span><span class="s5">91.55969041253388</span><span class="s1">,</span>
+        <span class="s5">97.44956561485056</span><span class="s1">,   </span><span class="s5">103.7048912366923</span><span class="s1">,  </span><span class="s5">110.3738588076403</span><span class="s1">,  </span><span class="s5">117.5191982031112</span><span class="s1">,  </span><span class="s5">125.2254701334734</span><span class="s1">,</span>
+        <span class="s5">133.6120279227287</span><span class="s1">,   </span><span class="s5">142.8583254892541</span><span class="s1">,  </span><span class="s5">153.2603719726036</span><span class="s1">,  </span><span class="s5">165.3856433166825</span><span class="s1">,  </span><span class="s5">180.6983437092145</span>
+    <span class="s1">};</span>
+    <span class="s0">/* weights for laguerre polynomial of order 50 
+     * sympy.integrals.quadrature.import gauss_laguerre(50, 16)[1] */</span>
+    <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">wb_w_laguerre[] = {</span>
+        <span class="s5">0.07140472613518988</span><span class="s1">,   </span><span class="s5">0.1471486069645884</span><span class="s1">,    </span><span class="s5">0.1856716275748313</span><span class="s1">,    </span><span class="s5">0.1843853825273539</span><span class="s1">,</span>
+        <span class="s5">0.1542011686063556</span><span class="s1">,    </span><span class="s5">0.1116853699022688</span><span class="s1">,    </span><span class="s5">0.07105288549019586</span><span class="s1">,   </span><span class="s5">0.04002027691150833</span><span class="s1">,</span>
+        <span class="s5">0.02005062308007171</span><span class="s1">,   </span><span class="s5">0.008960851203646281</span><span class="s1">,  </span><span class="s5">0.00357811241531566</span><span class="s1">,   </span><span class="s5">0.00127761715678905</span><span class="s1">,</span>
+        <span class="s5">0.0004080302449837189</span><span class="s1">, </span><span class="s5">0.0001165288322309724</span><span class="s1">, </span><span class="s5">2</span><span class="s1">.</span><span class="s5">974170493694165</span><span class="s1">e-5,  </span><span class="s5">6</span><span class="s1">.</span><span class="s5">777842526542028</span><span class="s1">e-6,</span>
+        <span class="s5">1</span><span class="s1">.</span><span class="s5">37747950317136</span><span class="s1">e-6,   </span><span class="s5">2</span><span class="s1">.</span><span class="s5">492886181720092</span><span class="s1">e-7,  </span><span class="s5">4</span><span class="s1">.</span><span class="s5">010354350427827</span><span class="s1">e-8,  </span><span class="s5">5</span><span class="s1">.</span><span class="s5">723331748141425</span><span class="s1">e-9,</span>
+        <span class="s5">7</span><span class="s1">.</span><span class="s5">229434249182665</span><span class="s1">e-10, </span><span class="s5">8</span><span class="s1">.</span><span class="s5">061710142281779</span><span class="s1">e-11, </span><span class="s5">7</span><span class="s1">.</span><span class="s5">913393099943723</span><span class="s1">e-12, </span><span class="s5">6</span><span class="s1">.</span><span class="s5">81573661767678</span><span class="s1">e-13,</span>
+        <span class="s5">5</span><span class="s1">.</span><span class="s5">13242671658949</span><span class="s1">e-14,  </span><span class="s5">3</span><span class="s1">.</span><span class="s5">365624762437814</span><span class="s1">e-15, </span><span class="s5">1</span><span class="s1">.</span><span class="s5">913476326965035</span><span class="s1">e-16, </span><span class="s5">9</span><span class="s1">.</span><span class="s5">385589781827253</span><span class="s1">e-18,</span>
+        <span class="s5">3</span><span class="s1">.</span><span class="s5">950069964503411</span><span class="s1">e-19, </span><span class="s5">1</span><span class="s1">.</span><span class="s5">417749517827512</span><span class="s1">e-20, </span><span class="s5">4</span><span class="s1">.</span><span class="s5">309970276292175</span><span class="s1">e-22, </span><span class="s5">1</span><span class="s1">.</span><span class="s5">101257519845548</span><span class="s1">e-23,</span>
+        <span class="s5">2</span><span class="s1">.</span><span class="s5">344617755608987</span><span class="s1">e-25, </span><span class="s5">4</span><span class="s1">.</span><span class="s5">11854415463823</span><span class="s1">e-27,  </span><span class="s5">5</span><span class="s1">.</span><span class="s5">902246763596448</span><span class="s1">e-29, </span><span class="s5">6</span><span class="s1">.</span><span class="s5">812008916553065</span><span class="s1">e-31,</span>
+        <span class="s5">6</span><span class="s1">.</span><span class="s5">237449498812102</span><span class="s1">e-33, </span><span class="s5">4</span><span class="s1">.</span><span class="s5">452440579683377</span><span class="s1">e-35, </span><span class="s5">2</span><span class="s1">.</span><span class="s5">426862352250487</span><span class="s1">e-37, </span><span class="s5">9</span><span class="s1">.</span><span class="s5">852971481049686</span><span class="s1">e-40,</span>
+        <span class="s5">2</span><span class="s1">.</span><span class="s5">891078872318428</span><span class="s1">e-42, </span><span class="s5">5</span><span class="s1">.</span><span class="s5">906162708112361</span><span class="s1">e-45, </span><span class="s5">8</span><span class="s1">.</span><span class="s5">01287459750397</span><span class="s1">e-48,  </span><span class="s5">6</span><span class="s1">.</span><span class="s5">789575424396417</span><span class="s1">e-51,</span>
+        <span class="s5">3</span><span class="s1">.</span><span class="s5">308173010849252</span><span class="s1">e-54, </span><span class="s5">8</span><span class="s1">.</span><span class="s5">250964876440456</span><span class="s1">e-58, </span><span class="s5">8</span><span class="s1">.</span><span class="s5">848728128298018</span><span class="s1">e-62, </span><span class="s5">3</span><span class="s1">.</span><span class="s5">064894889844417</span><span class="s1">e-66,</span>
+        <span class="s5">1</span><span class="s1">.</span><span class="s5">988708229330752</span><span class="s1">e-71, </span><span class="s5">6</span><span class="s1">.</span><span class="s5">049567152238783</span><span class="s1">e-78</span>
+    <span class="s1">};</span>
+    <span class="s0">/* roots of legendre polynomial of order 50 
+     * sympy.integrals.quadrature.import gauss_legendre(50, 16)[0] */</span>
+    <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">wb_x_legendre[] = {</span>
+        <span class="s1">-</span><span class="s5">0.998866404420071</span><span class="s1">,  -</span><span class="s5">0.9940319694320907</span><span class="s1">, -</span><span class="s5">0.9853540840480059</span><span class="s1">, -</span><span class="s5">0.9728643851066921</span><span class="s1">,  -</span><span class="s5">0.9566109552428079</span><span class="s1">,</span>
+        <span class="s1">-</span><span class="s5">0.9366566189448779</span><span class="s1">, -</span><span class="s5">0.9130785566557919</span><span class="s1">, -</span><span class="s5">0.885967979523613</span><span class="s1">,  -</span><span class="s5">0.8554297694299461</span><span class="s1">,  -</span><span class="s5">0.8215820708593359</span><span class="s1">,</span>
+        <span class="s1">-</span><span class="s5">0.7845558329003993</span><span class="s1">, -</span><span class="s5">0.7444943022260685</span><span class="s1">, -</span><span class="s5">0.7015524687068223</span><span class="s1">, -</span><span class="s5">0.6558964656854394</span><span class="s1">,  -</span><span class="s5">0.6077029271849502</span><span class="s1">,</span>
+        <span class="s1">-</span><span class="s5">0.5571583045146501</span><span class="s1">, -</span><span class="s5">0.5044581449074642</span><span class="s1">, -</span><span class="s5">0.4498063349740388</span><span class="s1">, -</span><span class="s5">0.3934143118975651</span><span class="s1">,  -</span><span class="s5">0.3355002454194374</span><span class="s1">,</span>
+        <span class="s1">-</span><span class="s5">0.276288193779532</span><span class="s1">,  -</span><span class="s5">0.2160072368760418</span><span class="s1">, -</span><span class="s5">0.1548905899981459</span><span class="s1">, -</span><span class="s5">0.09317470156008614</span><span class="s1">, -</span><span class="s5">0.03109833832718888</span><span class="s1">,</span>
+        <span class="s5">0.03109833832718888</span><span class="s1">, </span><span class="s5">0.09317470156008614</span><span class="s1">, </span><span class="s5">0.1548905899981459</span><span class="s1">,  </span><span class="s5">0.2160072368760418</span><span class="s1">,   </span><span class="s5">0.276288193779532</span><span class="s1">,</span>
+        <span class="s5">0.3355002454194374</span><span class="s1">,  </span><span class="s5">0.3934143118975651</span><span class="s1">,  </span><span class="s5">0.4498063349740388</span><span class="s1">,  </span><span class="s5">0.5044581449074642</span><span class="s1">,   </span><span class="s5">0.5571583045146501</span><span class="s1">,</span>
+        <span class="s5">0.6077029271849502</span><span class="s1">,  </span><span class="s5">0.6558964656854394</span><span class="s1">,  </span><span class="s5">0.7015524687068223</span><span class="s1">,  </span><span class="s5">0.7444943022260685</span><span class="s1">,   </span><span class="s5">0.7845558329003993</span><span class="s1">,</span>
+        <span class="s5">0.8215820708593359</span><span class="s1">,  </span><span class="s5">0.8554297694299461</span><span class="s1">,  </span><span class="s5">0.885967979523613</span><span class="s1">,   </span><span class="s5">0.9130785566557919</span><span class="s1">,   </span><span class="s5">0.9366566189448779</span><span class="s1">,</span>
+        <span class="s5">0.9566109552428079</span><span class="s1">,  </span><span class="s5">0.9728643851066921</span><span class="s1">,  </span><span class="s5">0.9853540840480059</span><span class="s1">,  </span><span class="s5">0.9940319694320907</span><span class="s1">,   </span><span class="s5">0.998866404420071</span>
+    <span class="s1">};</span>
+    <span class="s0">/* weights for legendre polynomial of order 50 
+     * sympy.integrals.quadrature.import gauss_legendre(50, 16)[1] */</span>
+    <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">wb_w_legendre[] = {</span>
+        <span class="s5">0.002908622553155141</span><span class="s1">, </span><span class="s5">0.006759799195745401</span><span class="s1">, </span><span class="s5">0.01059054838365097</span><span class="s1">, </span><span class="s5">0.01438082276148557</span><span class="s1">,  </span><span class="s5">0.01811556071348939</span><span class="s1">,</span>
+        <span class="s5">0.02178024317012479</span><span class="s1">,  </span><span class="s5">0.02536067357001239</span><span class="s1">,  </span><span class="s5">0.0288429935805352</span><span class="s1">,  </span><span class="s5">0.03221372822357802</span><span class="s1">,  </span><span class="s5">0.03545983561514615</span><span class="s1">,</span>
+        <span class="s5">0.03856875661258768</span><span class="s1">,  </span><span class="s5">0.0415284630901477</span><span class="s1">,   </span><span class="s5">0.04432750433880328</span><span class="s1">, </span><span class="s5">0.04695505130394843</span><span class="s1">,  </span><span class="s5">0.04940093844946632</span><span class="s1">,</span>
+        <span class="s5">0.05165570306958114</span><span class="s1">,  </span><span class="s5">0.05371062188899625</span><span class="s1">,  </span><span class="s5">0.05555774480621252</span><span class="s1">, </span><span class="s5">0.05718992564772838</span><span class="s1">,  </span><span class="s5">0.05860084981322245</span><span class="s1">,</span>
+        <span class="s5">0.05978505870426546</span><span class="s1">,  </span><span class="s5">0.06073797084177022</span><span class="s1">,  </span><span class="s5">0.06145589959031666</span><span class="s1">, </span><span class="s5">0.06193606742068324</span><span class="s1">,  </span><span class="s5">0.06217661665534726</span><span class="s1">,</span>
+        <span class="s5">0.06217661665534726</span><span class="s1">,  </span><span class="s5">0.06193606742068324</span><span class="s1">,  </span><span class="s5">0.06145589959031666</span><span class="s1">, </span><span class="s5">0.06073797084177022</span><span class="s1">,  </span><span class="s5">0.05978505870426546</span><span class="s1">,</span>
+        <span class="s5">0.05860084981322245</span><span class="s1">,  </span><span class="s5">0.05718992564772838</span><span class="s1">,  </span><span class="s5">0.05555774480621252</span><span class="s1">, </span><span class="s5">0.05371062188899625</span><span class="s1">,  </span><span class="s5">0.05165570306958114</span><span class="s1">,</span>
+        <span class="s5">0.04940093844946632</span><span class="s1">,  </span><span class="s5">0.04695505130394843</span><span class="s1">,  </span><span class="s5">0.04432750433880328</span><span class="s1">, </span><span class="s5">0.0415284630901477</span><span class="s1">,   </span><span class="s5">0.03856875661258768</span><span class="s1">,</span>
+        <span class="s5">0.03545983561514615</span><span class="s1">,  </span><span class="s5">0.03221372822357802</span><span class="s1">,  </span><span class="s5">0.0288429935805352</span><span class="s1">,  </span><span class="s5">0.02536067357001239</span><span class="s1">,  </span><span class="s5">0.02178024317012479</span><span class="s1">,</span>
+        <span class="s5">0.01811556071348939</span><span class="s1">,  </span><span class="s5">0.01438082276148557</span><span class="s1">,  </span><span class="s5">0.01059054838365097</span><span class="s1">, </span><span class="s5">0.006759799195745401</span><span class="s1">, </span><span class="s5">0.002908622553155141</span>
+    <span class="s1">};</span>
+    <span class="s0">/* Fitted parameters for optimal choice of eps 
+     * Call: python _precompute/wright_bessel.py 4 */</span>
+    <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">wb_A[] = {</span><span class="s5">0.41037</span><span class="s1">, </span><span class="s5">0.30833</span><span class="s1">, </span><span class="s5">6.9952</span><span class="s1">, </span><span class="s5">18.382</span><span class="s1">, -</span><span class="s5">2.8566</span><span class="s1">, </span><span class="s5">2.1122</span><span class="s1">};</span>
+
+    <span class="s1">template&lt;</span><span class="s2">bool </span><span class="s1">log_wb&gt;</span>
+    <span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wright_bessel_integral(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x) {</span>
+        <span class="s0">/* 5. Integral representation 
+         * 
+         * K(a, b, x, r) = exp(-r + x * r^(-a) * cos(pi*a)) * r^(-b) 
+         *               * sin(x * r^(-a) * sin(pi*a) + pi * b) 
+         * P(eps, a, b, x, phi) = exp(eps * cos(phi) + x * eps^(-a) * cos(a*phi)) 
+         *                      * cos(eps * sin(phi) - x * eps^(-a) * sin(a*phi) 
+         *                        + (1-b)*phi) 
+         * 
+         * Phi(a, b, x) = 1/pi * int_eps^inf K(a, b, x, r) * dr 
+         *              + eps^(1-b)/pi * int_0^pi P(eps, a, b, x, phi) * dphi 
+         * 
+         * for any eps &gt; 0. 
+         * 
+         * Note that P has a misprint in Luchko (2008) Eq. 9, the cos(phi(beta-1)) at 
+         * the end of the first line should be removed and the −sin(phi(beta−1)) at 
+         * the end of the second line should read +(1-b)*phi. 
+         * This integral representation introduced the free parameter eps (from the 
+         * radius of complex contour integration). We try to choose eps such that 
+         * the integrand behaves smoothly. Note that this is quite diffrent from how 
+         * Luchko (2008) deals with eps: he is either looking for the limit eps -&gt; 0 
+         * or he sets (silently) eps=1. But having the freedom to set eps is much more 
+         * powerful for numerical evaluation. 
+         * 
+         * As K has a leading exp(-r), we factor this out and apply Gauss-Laguerre 
+         * quadrature rule: 
+         * 
+         * int_0^inf K(a, b, x, r+eps) dr = exp(-eps) int_0^inf exp(-r) Kmod(.., r) dr 
+         * 
+         * Note the shift r -&gt; r+eps to have integation from 0 to infinity. 
+         * The integral over P is done via a Gauss-Legendre quadrature rule. 
+         * 
+         * Note: Hardest argument range is large z, large b and small eps. 
+         */</span>
+
+        <span class="s0">/* We use the free choice of eps to make the integral better behaved. 
+         * 1. Concern is oscillatory behaviour of P. Therefore, we'd like to 
+         *    make the change in the argument of cosine small, i.e. make arc length 
+         *    int_0^phi sqrt(1 + f'(phi)^2) dphi small, with 
+         *    f(phi) = eps * sin(phi) - x * eps^(-a) * sin(a*phi) + (1-b)*phi 
+         *    Proxy, make |f'(phi)| small. 
+         * 2. Concern is int_0 K ~ int_0 (r+eps)^(-b) .. dr 
+         *    This is difficult as r -&gt; 0  for large b. It behaves better for larger 
+         *    values of eps. 
+         */</span>
+
+        <span class="s0">// Minimize oscillatory behavoir of P</span>
+        <span class="s2">double </span><span class="s1">eps =</span>
+            <span class="s1">(wb_A[</span><span class="s5">0</span><span class="s1">] * b * std::exp(-</span><span class="s5">0.5 </span><span class="s1">* a) +</span>
+             <span class="s1">std::exp(</span>
+                 <span class="s1">wb_A[</span><span class="s5">1</span><span class="s1">] + </span><span class="s5">1 </span><span class="s1">/ (</span><span class="s5">1 </span><span class="s1">+ a) * std::log(x) - wb_A[</span><span class="s5">2</span><span class="s1">] * std::exp(-wb_A[</span><span class="s5">3</span><span class="s1">] * a) +</span>
+                 <span class="s1">wb_A[</span><span class="s5">4</span><span class="s1">] / (</span><span class="s5">1 </span><span class="s1">+ std::exp(wb_A[</span><span class="s5">5</span><span class="s1">] * a))</span>
+             <span class="s1">));</span>
+
+        <span class="s2">if </span><span class="s1">(a &gt;= </span><span class="s5">4 </span><span class="s1">&amp;&amp; x &gt;= </span><span class="s5">100</span><span class="s1">) {</span>
+            <span class="s1">eps += </span><span class="s5">1</span><span class="s1">; </span><span class="s0">// This part is hard to fit</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// Large b</span>
+        <span class="s2">if </span><span class="s1">(b &gt;= </span><span class="s5">8</span><span class="s1">) {</span>
+            <span class="s0">/* Make P small compared to K by setting eps large enough. 
+             * int K ~ exp(-eps) and int P ~ eps^(1-b) */</span>
+            <span class="s1">eps = std::fmax(eps, std::pow(b, -b / (</span><span class="s5">1</span><span class="s1">. - b)) + </span><span class="s5">0.1 </span><span class="s1">* b);</span>
+        <span class="s1">}</span>
+
+        <span class="s0">// safeguard, higher better for larger a, lower better for tiny a.</span>
+        <span class="s1">eps = std::fmin(eps, </span><span class="s5">150</span><span class="s1">.);</span>
+        <span class="s1">eps = std::fmax(eps, </span><span class="s5">3</span><span class="s1">.); </span><span class="s0">// 3 seems to be a pretty good choice in general.</span>
+
+        <span class="s0">// We factor out exp(-exp_term) from wb_Kmod and wb_P to avoid overflow of</span>
+        <span class="s0">// exp(..).</span>
+        <span class="s2">double </span><span class="s1">exp_term = </span><span class="s5">0</span><span class="s1">;</span>
+        <span class="s0">// From the exponent of K:</span>
+        <span class="s2">double </span><span class="s1">r = wb_x_laguerre[</span><span class="s5">50</span><span class="s1">-</span><span class="s5">1</span><span class="s1">];  </span><span class="s0">// largest value of x used in wb_Kmod</span>
+        <span class="s2">double </span><span class="s1">x_r_a = x * std::pow(r + eps, -a);</span>
+        <span class="s1">exp_term = std::fmax(exp_term, x_r_a * cephes::cospi(a));</span>
+        <span class="s0">// From the exponent of P:</span>
+        <span class="s2">double </span><span class="s1">x_eps_a = x * std::pow(eps, -a);</span>
+        <span class="s0">// phi = 0  =&gt;  cos(phi) = cos(a * phi) = 1</span>
+        <span class="s1">exp_term = std::fmax(exp_term, eps + x_eps_a);</span>
+        <span class="s0">// phi = pi  =&gt; cos(phi) = -1</span>
+        <span class="s1">exp_term = std::fmax(exp_term, -eps + x_eps_a * cephes::cospi(a));</span>
+
+        <span class="s2">double </span><span class="s1">res1 = </span><span class="s5">0</span><span class="s1">;</span>
+        <span class="s2">double </span><span class="s1">res2 = </span><span class="s5">0</span><span class="s1">;</span>
+
+        <span class="s2">double </span><span class="s1">y;</span>
+        <span class="s2">for </span><span class="s1">(</span><span class="s2">int </span><span class="s1">k = </span><span class="s5">0</span><span class="s1">; k &lt; </span><span class="s5">50</span><span class="s1">; k++) {</span>
+            <span class="s1">res1 += wb_w_laguerre[k] * wb_Kmod(-exp_term, eps, a, b, x, wb_x_laguerre[k]);</span>
+            <span class="s0">// y = (b-a)*(x+1)/2.0 + a  for integration from a=0 to b=pi</span>
+            <span class="s1">y = M_PI * (wb_x_legendre[k] + </span><span class="s5">1</span><span class="s1">) / </span><span class="s5">2.0</span><span class="s1">;</span>
+            <span class="s1">res2 += wb_w_legendre[k] * wb_P(-exp_term, eps, a, b, x, y);</span>
+        <span class="s1">}</span>
+        <span class="s1">res1 *= std::exp(-eps);</span>
+        <span class="s0">// (b-a)/2.0 * np.sum(w*func(y, *args), axis=-1)</span>
+        <span class="s1">res2 *= M_PI / </span><span class="s5">2.0</span><span class="s1">;</span>
+        <span class="s1">res2 *= std::pow(eps, </span><span class="s5">1 </span><span class="s1">- b);</span>
+
+        <span class="s2">if </span><span class="s1">(!log_wb) {</span>
+            <span class="s0">// Remember the factored out exp_term from wb_Kmod and wb_P</span>
+            <span class="s2">return </span><span class="s1">std::exp(exp_term) / M_PI * (res1 + res2);</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">// logarithm of Wright's function</span>
+            <span class="s2">return </span><span class="s1">exp_term + std::log((res1 + res2) / M_PI);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+<span class="s1">} </span><span class="s0">// namespace detail</span>
+
+<span class="s1">template&lt;</span><span class="s2">bool </span><span class="s1">log_wb&gt;</span>
+<span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wright_bessel_t(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x) {</span>
+    <span class="s0">/* Compute Wright's generalized Bessel function for scalar arguments. 
+     * 
+     * According to [1], it is an entire function defined as 
+     * 
+     * .. math:: \Phi(a, b; x) = \sum_{k=0}^\infty \frac{x^k}{k! \Gamma(a k + b)} 
+     * 
+     * So far, only non-negative values of rho=a, beta=b and z=x are implemented. 
+     * There are 5 different approaches depending on the ranges of the arguments: 
+     * 
+     * 1. Taylor series expansion in x=0 [1], for x &lt;= 1. 
+     *    Involves gamma funtions in each term. 
+     * 2. Taylor series expansion in x=0 [2], for large a. 
+     * 3. Taylor series in a=0, for tiny a and not too large x. 
+     * 4. Asymptotic expansion for large x [3, 4]. 
+     *    Suitable for large x while still small a and b. 
+     * 5. Integral representation [5], in principle for all arguments. 
+     * 
+     * References 
+     * ---------- 
+     * [1] https://dlmf.nist.gov/10.46.E1 
+     * [2] P. K. Dunn, G. K. Smyth (2005), Series evaluation of Tweedie exponential 
+     *     dispersion model densities. Statistics and Computing 15 (2005): 267-280. 
+     * [3] E. M. Wright (1935), The asymptotic expansion of the generalized Bessel 
+     *     function. Proc. London Math. Soc. (2) 38, pp. 257-270. 
+     *     https://doi.org/10.1112/plms/s2-38.1.257 
+     * [4] R. B. Paris (2017), The asymptotics of the generalised Bessel function, 
+     *     Mathematica Aeterna, Vol. 7, 2017, no. 4, 381 - 406, 
+     *     https://arxiv.org/abs/1711.03006 
+     * [5] Y. F. Luchko (2008), Algorithms for Evaluation of the Wright Function for 
+     *     the Real Arguments' Values, Fractional Calculus and Applied Analysis 11(1) 
+     *     http://sci-gems.math.bas.bg/jspui/bitstream/10525/1298/1/fcaa-vol11-num1-2008-57p-75p.pdf 
+     */</span>
+    <span class="s2">if </span><span class="s1">(std::isnan(a) || std::isnan(b) || std::isnan(x)) {</span>
+        <span class="s2">return </span><span class="s1">std::numeric_limits&lt;</span><span class="s2">double</span><span class="s1">&gt;::quiet_NaN();</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(a &lt; </span><span class="s5">0 </span><span class="s1">|| b &lt; </span><span class="s5">0 </span><span class="s1">|| x &lt; </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s1">set_error(</span><span class="s3">&quot;wright_bessel&quot;</span><span class="s1">, SF_ERROR_DOMAIN, NULL);</span>
+        <span class="s2">return </span><span class="s1">std::numeric_limits&lt;</span><span class="s2">double</span><span class="s1">&gt;::quiet_NaN();</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(std::isinf(x)) {</span>
+        <span class="s2">if </span><span class="s1">(std::isinf(a) || std::isinf(b)) {</span>
+            <span class="s2">return </span><span class="s1">std::numeric_limits&lt;</span><span class="s2">double</span><span class="s1">&gt;::quiet_NaN();</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">std::numeric_limits&lt;</span><span class="s2">double</span><span class="s1">&gt;::infinity();</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(std::isinf(a) || std::isinf(b)) {</span>
+        <span class="s2">return </span><span class="s1">std::numeric_limits&lt;</span><span class="s2">double</span><span class="s1">&gt;::quiet_NaN(); </span><span class="s0">// or 0</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(a &gt;= detail::rgamma_zero || b &gt;= detail::rgamma_zero) {</span>
+        <span class="s1">set_error(</span><span class="s3">&quot;wright_bessel&quot;</span><span class="s1">, SF_ERROR_OVERFLOW, NULL);</span>
+        <span class="s2">return </span><span class="s1">std::numeric_limits&lt;</span><span class="s2">double</span><span class="s1">&gt;::quiet_NaN();</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(x == </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s0">// return rgamma(b)</span>
+        <span class="s2">if </span><span class="s1">(!log_wb) {</span>
+            <span class="s2">return </span><span class="s1">cephes::rgamma(b);</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">// logarithm of Wright's function</span>
+            <span class="s2">return </span><span class="s1">-cephes::lgam(b);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(a == </span><span class="s5">0</span><span class="s1">) {</span>
+        <span class="s0">// return exp(x) * rgamma(b)</span>
+        <span class="s2">if </span><span class="s1">(!log_wb) {</span>
+            <span class="s2">return </span><span class="s1">detail::exp_rgamma(x, b);</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s0">// logarithm of Wright's function</span>
+            <span class="s2">return </span><span class="s1">x - cephes::lgam(b);</span>
+        <span class="s1">}</span>
+    <span class="s1">}</span>
+
+    <span class="s1">constexpr </span><span class="s2">double </span><span class="s1">exp_inf = </span><span class="s5">709.78271289338403</span><span class="s1">;</span>
+    <span class="s2">int </span><span class="s1">order;</span>
+    <span class="s2">if </span><span class="s1">((a &lt;= </span><span class="s5">1</span><span class="s1">e-3 &amp;&amp; b &lt;= </span><span class="s5">50 </span><span class="s1">&amp;&amp; x &lt;= </span><span class="s5">9</span><span class="s1">) || (a &lt;= </span><span class="s5">1</span><span class="s1">e-4 &amp;&amp; b &lt;= </span><span class="s5">70 </span><span class="s1">&amp;&amp; x &lt;= </span><span class="s5">100</span><span class="s1">) ||</span>
+        <span class="s1">(a &lt;= </span><span class="s5">1</span><span class="s1">e-5 &amp;&amp; b &lt;= </span><span class="s5">170 </span><span class="s1">&amp;&amp; (x &lt; exp_inf || (log_wb &amp;&amp; x &lt;= </span><span class="s5">1</span><span class="s1">e3)))) {</span>
+        <span class="s0">/* Taylor Series expansion in a=0 to order=order =&gt; precision &lt;= 1e-11 
+         * If beta is also small =&gt; precision &lt;= 1e-11. 
+         * max order = 5 */</span>
+        <span class="s2">if </span><span class="s1">(a &lt;= </span><span class="s5">1</span><span class="s1">e-5) {</span>
+            <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">) {</span>
+                <span class="s1">order = </span><span class="s5">2</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">10</span><span class="s1">) {</span>
+                <span class="s1">order = </span><span class="s5">3</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">100</span><span class="s1">) {</span>
+                <span class="s1">order = </span><span class="s5">4</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{ </span><span class="s0">// x &lt; exp_inf</span>
+                <span class="s1">order = </span><span class="s5">5</span><span class="s1">;</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s2">else if </span><span class="s1">(a &lt;= </span><span class="s5">1</span><span class="s1">e-4) {</span>
+            <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">e-2) {</span>
+                <span class="s1">order = </span><span class="s5">2</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">) {</span>
+                <span class="s1">order = </span><span class="s5">3</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">10</span><span class="s1">) {</span>
+                <span class="s1">order = </span><span class="s5">4</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{ </span><span class="s0">// x &lt;= 100</span>
+                <span class="s1">order = </span><span class="s5">5</span><span class="s1">;</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{ </span><span class="s0">// a &lt;= 1e-3</span>
+            <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">e-5) {</span>
+                <span class="s1">order = </span><span class="s5">2</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">e-1) {</span>
+                <span class="s1">order = </span><span class="s5">3</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">) {</span>
+                <span class="s1">order = </span><span class="s5">4</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{ </span><span class="s0">// x &lt;= 9</span>
+                <span class="s1">order = </span><span class="s5">5</span><span class="s1">;</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+
+        <span class="s2">return </span><span class="s1">detail::wb_small_a&lt;log_wb&gt;(a, b, x, order);</span>
+    <span class="s1">}</span>
+
+    <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">) {</span>
+        <span class="s0">// 18 term Taylor Series =&gt; error mostly smaller 5e-14</span>
+        <span class="s2">double </span><span class="s1">res = detail::wb_series(a, b, x, </span><span class="s5">0</span><span class="s1">, </span><span class="s5">18</span><span class="s1">);</span>
+        <span class="s2">if </span><span class="s1">(log_wb) res = std::log(res);</span>
+        <span class="s2">return </span><span class="s1">res;</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s5">2</span><span class="s1">) {</span>
+        <span class="s0">// 20 term Taylor Series =&gt; error mostly smaller 1e-12 to 1e-13</span>
+        <span class="s2">return </span><span class="s1">detail::wb_series(a, b, x, </span><span class="s5">0</span><span class="s1">, </span><span class="s5">20</span><span class="s1">);</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(a &gt;= </span><span class="s5">5</span><span class="s1">) {</span>
+        <span class="s0">/* Taylor series around the approximate maximum term. 
+         * Set number of terms=order. */</span>
+        <span class="s2">if </span><span class="s1">(a &gt;= </span><span class="s5">10</span><span class="s1">) {</span>
+            <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">e11) {</span>
+                <span class="s1">order = </span><span class="s5">6</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                <span class="s1">order = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">int</span><span class="s1">&gt;(std::fmin(std::log10(x) - </span><span class="s5">5 </span><span class="s1">+ b / </span><span class="s5">10</span><span class="s1">, </span><span class="s5">30</span><span class="s1">));</span>
+            <span class="s1">}</span>
+        <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+            <span class="s2">if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">e4) {</span>
+                <span class="s1">order = </span><span class="s5">6</span><span class="s1">;</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">e8) {</span>
+                <span class="s1">order = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">int</span><span class="s1">&gt;(</span><span class="s5">2 </span><span class="s1">* std::log10(x));</span>
+            <span class="s1">} </span><span class="s2">else if </span><span class="s1">(x &lt;= </span><span class="s5">1</span><span class="s1">e10) {</span>
+                <span class="s1">order = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">int</span><span class="s1">&gt;(</span><span class="s5">4 </span><span class="s1">* std::log10(x) - </span><span class="s5">16</span><span class="s1">);</span>
+            <span class="s1">} </span><span class="s2">else </span><span class="s1">{</span>
+                <span class="s1">order = </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">int</span><span class="s1">&gt;(std::fmin(</span><span class="s5">6 </span><span class="s1">* std::log10(x) - </span><span class="s5">36</span><span class="s1">, </span><span class="s5">100</span><span class="s1">));</span>
+            <span class="s1">}</span>
+        <span class="s1">}</span>
+        <span class="s2">return </span><span class="s1">detail::wb_large_a&lt;log_wb&gt;(a, b, x, order);</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(std::pow(a * x, </span><span class="s5">1 </span><span class="s1">/ (</span><span class="s5">1</span><span class="s1">. + a)) &gt;= </span><span class="s5">14 </span><span class="s1">+ b * b / (</span><span class="s5">2 </span><span class="s1">* (</span><span class="s5">1 </span><span class="s1">+ a))) {</span>
+        <span class="s0">/* Asymptotic expansion in Z = (a*x)^(1/(1+a)) up to 8th term 1/Z^8. 
+         * For 1/Z^k, the highest term in b is b^(2*k) * a0 / (2^k k! (1+a)^k). 
+         * As a0 is a common factor to all orders, this explains a bit the 
+         * domain of good convergence set above. 
+         * =&gt; precision ~ 1e-11 but can go down to ~1e-8 or 1e-7 
+         * Note: We ensured a &lt;= 5 as this is a bad approximation for large a. */</span>
+        <span class="s2">return </span><span class="s1">detail::wb_asymptotic&lt;log_wb&gt;(a, b, x);</span>
+    <span class="s1">}</span>
+    <span class="s2">if </span><span class="s1">(</span><span class="s5">0.5 </span><span class="s1">&lt;= a &amp;&amp; a &lt;= </span><span class="s5">1.8 </span><span class="s1">&amp;&amp; </span><span class="s5">100 </span><span class="s1">&lt;= b &amp;&amp; </span><span class="s5">1</span><span class="s1">e5 &lt;= x) {</span>
+        <span class="s0">// This is a very hard domain. This condition is placed after wb_asymptotic.</span>
+        <span class="s0">// TODO: Explore ways to cover this domain.</span>
+        <span class="s2">return </span><span class="s1">std::numeric_limits&lt;</span><span class="s2">double</span><span class="s1">&gt;::quiet_NaN();</span>
+    <span class="s1">}</span>
+    <span class="s2">return </span><span class="s1">detail::wright_bessel_integral&lt;log_wb&gt;(a, b, x);</span>
+<span class="s1">}</span>
+
+
+<span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">wright_bessel(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x) {</span>
+    <span class="s2">return </span><span class="s1">wright_bessel_t&lt;</span><span class="s2">false</span><span class="s1">&gt;(a, b, x);</span>
+<span class="s1">}</span>
+
+<span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">float </span><span class="s1">wright_bessel(</span><span class="s2">float </span><span class="s1">a, </span><span class="s2">float </span><span class="s1">b, </span><span class="s2">float </span><span class="s1">x) {</span>
+    <span class="s2">return </span><span class="s1">wright_bessel(</span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">double</span><span class="s1">&gt;(a), </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">double</span><span class="s1">&gt;(b), </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">double</span><span class="s1">&gt;(x));</span>
+<span class="s1">}</span>
+
+<span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">double </span><span class="s1">log_wright_bessel(</span><span class="s2">double </span><span class="s1">a, </span><span class="s2">double </span><span class="s1">b, </span><span class="s2">double </span><span class="s1">x) {</span>
+    <span class="s2">return </span><span class="s1">wright_bessel_t&lt;</span><span class="s4">true</span><span class="s1">&gt;(a, b, x);</span>
+<span class="s1">}</span>
+
+<span class="s1">SPECFUN_HOST_DEVICE </span><span class="s4">inline </span><span class="s2">float </span><span class="s1">log_wright_bessel(</span><span class="s2">float </span><span class="s1">a, </span><span class="s2">float </span><span class="s1">b, </span><span class="s2">float </span><span class="s1">x) {</span>
+    <span class="s2">return </span><span class="s1">log_wright_bessel(</span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">double</span><span class="s1">&gt;(a), </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">double</span><span class="s1">&gt;(b), </span><span class="s4">static_cast</span><span class="s1">&lt;</span><span class="s2">double</span><span class="s1">&gt;(x));</span>
+<span class="s1">}</span>
+
+<span class="s1">} </span><span class="s0">// namespace special</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<html>
+<head>
+<title>_utils.pyx</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #2aacb8;}
+.s4 { color: #7a7e85;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_utils.pyx</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+
+<span class="s0">from </span><span class="s1">libc </span><span class="s0">cimport </span><span class="s1">math</span>
+<span class="s0">from </span><span class="s1">libc</span><span class="s2">.</span><span class="s1">math </span><span class="s0">cimport </span><span class="s1">INFINITY</span>
+
+<span class="s0">from </span><span class="s2">..</span><span class="s1">utils</span><span class="s2">.</span><span class="s1">_typedefs </span><span class="s0">cimport </span><span class="s1">float32_t</span><span class="s2">, </span><span class="s1">float64_t</span>
+
+
+<span class="s0">cdef </span><span class="s1">float EPSILON_DBL </span><span class="s2">= </span><span class="s3">1e-8</span>
+<span class="s0">cdef </span><span class="s1">float PERPLEXITY_TOLERANCE </span><span class="s2">= </span><span class="s3">1e-5</span>
+
+
+<span class="s4"># TODO: have this function support float32 and float64 and preserve inputs' dtypes.</span>
+<span class="s0">def </span><span class="s1">_binary_search_perplexity</span><span class="s2">(</span>
+        <span class="s1">const float32_t</span><span class="s2">[:, :] </span><span class="s1">sqdistances</span><span class="s2">,</span>
+        <span class="s1">float desired_perplexity</span><span class="s2">,</span>
+        <span class="s1">int verbose</span><span class="s2">):</span>
+    <span class="s5">&quot;&quot;&quot;Binary search for sigmas of conditional Gaussians. 
+ 
+    This approximation reduces the computational complexity from O(N^2) to 
+    O(uN). 
+ 
+    Parameters 
+    ---------- 
+    sqdistances : ndarray of shape (n_samples, n_neighbors), dtype=np.float32 
+        Distances between training samples and their k nearest neighbors. 
+        When using the exact method, this is a square (n_samples, n_samples) 
+        distance matrix. The TSNE default metric is &quot;euclidean&quot; which is 
+        interpreted as squared euclidean distance. 
+ 
+    desired_perplexity : float 
+        Desired perplexity (2^entropy) of the conditional Gaussians. 
+ 
+    verbose : int 
+        Verbosity level. 
+ 
+    Returns 
+    ------- 
+    P : ndarray of shape (n_samples, n_samples), dtype=np.float64 
+        Probabilities of conditional Gaussian distributions p_i|j. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># Maximum number of binary search steps</span>
+    <span class="s0">cdef </span><span class="s1">long n_steps </span><span class="s2">= </span><span class="s3">100</span>
+
+    <span class="s0">cdef </span><span class="s1">long n_samples </span><span class="s2">= </span><span class="s1">sqdistances</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s3">0</span><span class="s2">]</span>
+    <span class="s0">cdef </span><span class="s1">long n_neighbors </span><span class="s2">= </span><span class="s1">sqdistances</span><span class="s2">.</span><span class="s1">shape</span><span class="s2">[</span><span class="s3">1</span><span class="s2">]</span>
+    <span class="s0">cdef </span><span class="s1">int using_neighbors </span><span class="s2">= </span><span class="s1">n_neighbors </span><span class="s2">&lt; </span><span class="s1">n_samples</span>
+    <span class="s4"># Precisions of conditional Gaussian distributions</span>
+    <span class="s0">cdef </span><span class="s1">double beta</span>
+    <span class="s0">cdef </span><span class="s1">double beta_min</span>
+    <span class="s0">cdef </span><span class="s1">double beta_max</span>
+    <span class="s0">cdef </span><span class="s1">double beta_sum </span><span class="s2">= </span><span class="s3">0.0</span>
+
+    <span class="s4"># Use log scale</span>
+    <span class="s0">cdef </span><span class="s1">double desired_entropy </span><span class="s2">= </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log</span><span class="s2">(</span><span class="s1">desired_perplexity</span><span class="s2">)</span>
+    <span class="s0">cdef </span><span class="s1">double entropy_diff</span>
+
+    <span class="s0">cdef </span><span class="s1">double entropy</span>
+    <span class="s0">cdef </span><span class="s1">double sum_Pi</span>
+    <span class="s0">cdef </span><span class="s1">double sum_disti_Pi</span>
+    <span class="s0">cdef </span><span class="s1">long i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">, </span><span class="s1">l</span>
+
+    <span class="s4"># This array is later used as a 32bit array. It has multiple intermediate</span>
+    <span class="s4"># floating point additions that benefit from the extra precision</span>
+    <span class="s0">cdef </span><span class="s1">float64_t</span><span class="s2">[:, :] </span><span class="s1">P </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">zeros</span><span class="s2">(</span>
+        <span class="s2">(</span><span class="s1">n_samples</span><span class="s2">, </span><span class="s1">n_neighbors</span><span class="s2">), </span><span class="s1">dtype</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">float64</span><span class="s2">)</span>
+
+    <span class="s0">for </span><span class="s1">i </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n_samples</span><span class="s2">):</span>
+        <span class="s1">beta_min </span><span class="s2">= -</span><span class="s1">INFINITY</span>
+        <span class="s1">beta_max </span><span class="s2">= </span><span class="s1">INFINITY</span>
+        <span class="s1">beta </span><span class="s2">= </span><span class="s3">1.0</span>
+
+        <span class="s4"># Binary search of precision for i-th conditional distribution</span>
+        <span class="s0">for </span><span class="s1">l </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n_steps</span><span class="s2">):</span>
+            <span class="s4"># Compute current entropy and corresponding probabilities</span>
+            <span class="s4"># computed just over the nearest neighbors or over all data</span>
+            <span class="s4"># if we're not using neighbors</span>
+            <span class="s1">sum_Pi </span><span class="s2">= </span><span class="s3">0.0</span>
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n_neighbors</span><span class="s2">):</span>
+                <span class="s0">if </span><span class="s1">j </span><span class="s2">!= </span><span class="s1">i </span><span class="s0">or </span><span class="s1">using_neighbors</span><span class="s2">:</span>
+                    <span class="s1">P</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">] = </span><span class="s1">math</span><span class="s2">.</span><span class="s1">exp</span><span class="s2">(-</span><span class="s1">sqdistances</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">] * </span><span class="s1">beta</span><span class="s2">)</span>
+                    <span class="s1">sum_Pi </span><span class="s2">+= </span><span class="s1">P</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">]</span>
+
+            <span class="s0">if </span><span class="s1">sum_Pi </span><span class="s2">== </span><span class="s3">0.0</span><span class="s2">:</span>
+                <span class="s1">sum_Pi </span><span class="s2">= </span><span class="s1">EPSILON_DBL</span>
+            <span class="s1">sum_disti_Pi </span><span class="s2">= </span><span class="s3">0.0</span>
+
+            <span class="s0">for </span><span class="s1">j </span><span class="s0">in </span><span class="s1">range</span><span class="s2">(</span><span class="s1">n_neighbors</span><span class="s2">):</span>
+                <span class="s1">P</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">] /= </span><span class="s1">sum_Pi</span>
+                <span class="s1">sum_disti_Pi </span><span class="s2">+= </span><span class="s1">sqdistances</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">] * </span><span class="s1">P</span><span class="s2">[</span><span class="s1">i</span><span class="s2">, </span><span class="s1">j</span><span class="s2">]</span>
+
+            <span class="s1">entropy </span><span class="s2">= </span><span class="s1">math</span><span class="s2">.</span><span class="s1">log</span><span class="s2">(</span><span class="s1">sum_Pi</span><span class="s2">) + </span><span class="s1">beta </span><span class="s2">* </span><span class="s1">sum_disti_Pi</span>
+            <span class="s1">entropy_diff </span><span class="s2">= </span><span class="s1">entropy </span><span class="s2">- </span><span class="s1">desired_entropy</span>
+
+            <span class="s0">if </span><span class="s1">math</span><span class="s2">.</span><span class="s1">fabs</span><span class="s2">(</span><span class="s1">entropy_diff</span><span class="s2">) &lt;= </span><span class="s1">PERPLEXITY_TOLERANCE</span><span class="s2">:</span>
+                <span class="s0">break</span>
+
+            <span class="s0">if </span><span class="s1">entropy_diff </span><span class="s2">&gt; </span><span class="s3">0.0</span><span class="s2">:</span>
+                <span class="s1">beta_min </span><span class="s2">= </span><span class="s1">beta</span>
+                <span class="s0">if </span><span class="s1">beta_max </span><span class="s2">== </span><span class="s1">INFINITY</span><span class="s2">:</span>
+                    <span class="s1">beta </span><span class="s2">*= </span><span class="s3">2.0</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">beta </span><span class="s2">= (</span><span class="s1">beta </span><span class="s2">+ </span><span class="s1">beta_max</span><span class="s2">) / </span><span class="s3">2.0</span>
+            <span class="s0">else</span><span class="s2">:</span>
+                <span class="s1">beta_max </span><span class="s2">= </span><span class="s1">beta</span>
+                <span class="s0">if </span><span class="s1">beta_min </span><span class="s2">== -</span><span class="s1">INFINITY</span><span class="s2">:</span>
+                    <span class="s1">beta </span><span class="s2">/= </span><span class="s3">2.0</span>
+                <span class="s0">else</span><span class="s2">:</span>
+                    <span class="s1">beta </span><span class="s2">= (</span><span class="s1">beta </span><span class="s2">+ </span><span class="s1">beta_min</span><span class="s2">) / </span><span class="s3">2.0</span>
+
+        <span class="s1">beta_sum </span><span class="s2">+= </span><span class="s1">beta</span>
+
+        <span class="s0">if </span><span class="s1">verbose </span><span class="s0">and </span><span class="s2">((</span><span class="s1">i </span><span class="s2">+ </span><span class="s3">1</span><span class="s2">) % </span><span class="s3">1000 </span><span class="s2">== </span><span class="s3">0 </span><span class="s0">or </span><span class="s1">i </span><span class="s2">+ </span><span class="s3">1 </span><span class="s2">== </span><span class="s1">n_samples</span><span class="s2">):</span>
+            <span class="s1">print</span><span class="s2">(</span><span class="s6">&quot;[t-SNE] Computed conditional probabilities for sample &quot;</span>
+                  <span class="s6">&quot;%d / %d&quot; </span><span class="s2">% (</span><span class="s1">i </span><span class="s2">+ </span><span class="s3">1</span><span class="s2">, </span><span class="s1">n_samples</span><span class="s2">))</span>
+
+    <span class="s0">if </span><span class="s1">verbose</span><span class="s2">:</span>
+        <span class="s1">print</span><span class="s2">(</span><span class="s6">&quot;[t-SNE] Mean sigma: %f&quot;</span>
+              <span class="s2">% </span><span class="s1">np</span><span class="s2">.</span><span class="s1">mean</span><span class="s2">(</span><span class="s1">math</span><span class="s2">.</span><span class="s1">sqrt</span><span class="s2">(</span><span class="s1">n_samples </span><span class="s2">/ </span><span class="s1">beta_sum</span><span class="s2">)))</span>
+    <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">asarray</span><span class="s2">(</span><span class="s1">P</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

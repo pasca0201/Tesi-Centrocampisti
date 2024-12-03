@@ -1,0 +1,1301 @@
+<html>
+<head>
+<title>_weight_boosting.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_weight_boosting.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Weight Boosting. 
+ 
+This module contains weight boosting estimators for both classification and 
+regression. 
+ 
+The module structure is the following: 
+ 
+- The `BaseWeightBoosting` base class implements a common ``fit`` method 
+  for all the estimators in the module. Regression and classification 
+  only differ from each other in the loss function that is optimized. 
+ 
+- :class:`~sklearn.ensemble.AdaBoostClassifier` implements adaptive boosting 
+  (AdaBoost-SAMME) for classification problems. 
+ 
+- :class:`~sklearn.ensemble.AdaBoostRegressor` implements adaptive boosting 
+  (AdaBoost.R2) for regression problems. 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Authors: Noel Dawe &lt;noel@dawe.me&gt;</span>
+<span class="s2">#          Gilles Louppe &lt;g.louppe@gmail.com&gt;</span>
+<span class="s2">#          Hamzeh Alsalhi &lt;ha258@cornell.edu&gt;</span>
+<span class="s2">#          Arnaud Joly &lt;arnaud.v.joly@gmail.com&gt;</span>
+<span class="s2">#</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">abc </span><span class="s3">import </span><span class="s1">ABCMeta</span><span class="s4">, </span><span class="s1">abstractmethod</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">special </span><span class="s3">import </span><span class="s1">xlogy</span>
+
+<span class="s3">from </span><span class="s4">..</span><span class="s1">base </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">ClassifierMixin</span><span class="s4">,</span>
+    <span class="s1">RegressorMixin</span><span class="s4">,</span>
+    <span class="s1">_fit_context</span><span class="s4">,</span>
+    <span class="s1">is_classifier</span><span class="s4">,</span>
+    <span class="s1">is_regressor</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">metrics </span><span class="s3">import </span><span class="s1">accuracy_score</span><span class="s4">, </span><span class="s1">r2_score</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">tree </span><span class="s3">import </span><span class="s1">DecisionTreeClassifier</span><span class="s4">, </span><span class="s1">DecisionTreeRegressor</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils </span><span class="s3">import </span><span class="s1">_safe_indexing</span><span class="s4">, </span><span class="s1">check_random_state</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s1">HasMethods</span><span class="s4">, </span><span class="s1">Interval</span><span class="s4">, </span><span class="s1">StrOptions</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">extmath </span><span class="s3">import </span><span class="s1">softmax</span><span class="s4">, </span><span class="s1">stable_cumsum</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">metadata_routing </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">_raise_for_unsupported_routing</span><span class="s4">,</span>
+    <span class="s1">_RoutingNotSupportedMixin</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">validation </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">_check_sample_weight</span><span class="s4">,</span>
+    <span class="s1">_num_samples</span><span class="s4">,</span>
+    <span class="s1">check_is_fitted</span><span class="s4">,</span>
+    <span class="s1">has_fit_parameter</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_base </span><span class="s3">import </span><span class="s1">BaseEnsemble</span>
+
+<span class="s1">__all__ </span><span class="s4">= [</span>
+    <span class="s5">&quot;AdaBoostClassifier&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;AdaBoostRegressor&quot;</span><span class="s4">,</span>
+<span class="s4">]</span>
+
+
+<span class="s3">class </span><span class="s1">BaseWeightBoosting</span><span class="s4">(</span><span class="s1">BaseEnsemble</span><span class="s4">, </span><span class="s1">metaclass</span><span class="s4">=</span><span class="s1">ABCMeta</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for AdaBoost estimators. 
+ 
+    Warning: This class should not be used directly. Use derived classes 
+    instead. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s5">&quot;estimator&quot;</span><span class="s4">: [</span><span class="s1">HasMethods</span><span class="s4">([</span><span class="s5">&quot;fit&quot;</span><span class="s4">, </span><span class="s5">&quot;predict&quot;</span><span class="s4">]), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;n_estimators&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;learning_rate&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;neither&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;random_state&quot;</span><span class="s4">: [</span><span class="s5">&quot;random_state&quot;</span><span class="s4">],</span>
+    <span class="s4">}</span>
+
+    <span class="s4">@</span><span class="s1">abstractmethod</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">estimator</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">n_estimators</span><span class="s4">=</span><span class="s6">50</span><span class="s4">,</span>
+        <span class="s1">estimator_params</span><span class="s4">=</span><span class="s1">tuple</span><span class="s4">(),</span>
+        <span class="s1">learning_rate</span><span class="s4">=</span><span class="s6">1.0</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">estimator</span><span class="s4">=</span><span class="s1">estimator</span><span class="s4">,</span>
+            <span class="s1">n_estimators</span><span class="s4">=</span><span class="s1">n_estimators</span><span class="s4">,</span>
+            <span class="s1">estimator_params</span><span class="s4">=</span><span class="s1">estimator_params</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">learning_rate </span><span class="s4">= </span><span class="s1">learning_rate</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">random_state </span><span class="s4">= </span><span class="s1">random_state</span>
+
+    <span class="s3">def </span><span class="s1">_check_X</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s2"># Only called to validate X in non-fit methods, therefore reset=False</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">accept_sparse</span><span class="s4">=[</span><span class="s5">&quot;csr&quot;</span><span class="s4">, </span><span class="s5">&quot;csc&quot;</span><span class="s4">],</span>
+            <span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">allow_nd</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">dtype</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+            <span class="s1">reset</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span>
+        <span class="s2"># AdaBoost*.estimator is not validated yet</span>
+        <span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">False</span>
+    <span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Build a boosted classifier/regressor from the training set (X, y). 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        y : array-like of shape (n_samples,) 
+            The target values. 
+ 
+        sample_weight : array-like of shape (n_samples,), default=None 
+            Sample weights. If None, the sample weights are initialized to 
+            1 / n_samples. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted estimator. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">_raise_for_unsupported_routing</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s5">&quot;fit&quot;</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">)</span>
+        <span class="s1">X</span><span class="s4">, </span><span class="s1">y </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">y</span><span class="s4">,</span>
+            <span class="s1">accept_sparse</span><span class="s4">=[</span><span class="s5">&quot;csr&quot;</span><span class="s4">, </span><span class="s5">&quot;csc&quot;</span><span class="s4">],</span>
+            <span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">allow_nd</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">dtype</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+            <span class="s1">y_numeric</span><span class="s4">=</span><span class="s1">is_regressor</span><span class="s4">(</span><span class="s1">self</span><span class="s4">),</span>
+        <span class="s4">)</span>
+
+        <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">_check_sample_weight</span><span class="s4">(</span>
+            <span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">only_non_negative</span><span class="s4">=</span><span class="s3">True</span>
+        <span class="s4">)</span>
+        <span class="s1">sample_weight </span><span class="s4">/= </span><span class="s1">sample_weight</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">()</span>
+
+        <span class="s2"># Check parameters</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_estimator</span><span class="s4">()</span>
+
+        <span class="s2"># Clear any previous fit results</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_ </span><span class="s4">= []</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_estimators</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_errors_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_estimators</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+
+        <span class="s2"># Initialization of the random number instance that will be used to</span>
+        <span class="s2"># generate a seed at each iteration</span>
+        <span class="s1">random_state </span><span class="s4">= </span><span class="s1">check_random_state</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">random_state</span><span class="s4">)</span>
+        <span class="s1">epsilon </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">).</span><span class="s1">eps</span>
+
+        <span class="s1">zero_weight_mask </span><span class="s4">= </span><span class="s1">sample_weight </span><span class="s4">== </span><span class="s6">0.0</span>
+        <span class="s3">for </span><span class="s1">iboost </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_estimators</span><span class="s4">):</span>
+            <span class="s2"># avoid extremely small sample weight, for details see issue #20320</span>
+            <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">clip</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">a_min</span><span class="s4">=</span><span class="s1">epsilon</span><span class="s4">, </span><span class="s1">a_max</span><span class="s4">=</span><span class="s3">None</span><span class="s4">)</span>
+            <span class="s2"># do not clip sample weights that were exactly zero originally</span>
+            <span class="s1">sample_weight</span><span class="s4">[</span><span class="s1">zero_weight_mask</span><span class="s4">] = </span><span class="s6">0.0</span>
+
+            <span class="s2"># Boosting step</span>
+            <span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">estimator_weight</span><span class="s4">, </span><span class="s1">estimator_error </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_boost</span><span class="s4">(</span>
+                <span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span>
+            <span class="s4">)</span>
+
+            <span class="s2"># Early termination</span>
+            <span class="s3">if </span><span class="s1">sample_weight </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s3">break</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_</span><span class="s4">[</span><span class="s1">iboost</span><span class="s4">] = </span><span class="s1">estimator_weight</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_errors_</span><span class="s4">[</span><span class="s1">iboost</span><span class="s4">] = </span><span class="s1">estimator_error</span>
+
+            <span class="s2"># Stop if error is zero</span>
+            <span class="s3">if </span><span class="s1">estimator_error </span><span class="s4">== </span><span class="s6">0</span><span class="s4">:</span>
+                <span class="s3">break</span>
+
+            <span class="s1">sample_weight_sum </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">)</span>
+
+            <span class="s3">if not </span><span class="s1">np</span><span class="s4">.</span><span class="s1">isfinite</span><span class="s4">(</span><span class="s1">sample_weight_sum</span><span class="s4">):</span>
+                <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                    <span class="s4">(</span>
+                        <span class="s5">&quot;Sample weights have reached infinite values,&quot;</span>
+                        <span class="s5">f&quot; at iteration </span><span class="s3">{</span><span class="s1">iboost</span><span class="s3">}</span><span class="s5">, causing overflow. &quot;</span>
+                        <span class="s5">&quot;Iterations stopped. Try lowering the learning rate.&quot;</span>
+                    <span class="s4">),</span>
+                    <span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">2</span><span class="s4">,</span>
+                <span class="s4">)</span>
+                <span class="s3">break</span>
+
+            <span class="s2"># Stop if the sum of sample weights has become non-positive</span>
+            <span class="s3">if </span><span class="s1">sample_weight_sum </span><span class="s4">&lt;= </span><span class="s6">0</span><span class="s4">:</span>
+                <span class="s3">break</span>
+
+            <span class="s3">if </span><span class="s1">iboost </span><span class="s4">&lt; </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_estimators </span><span class="s4">- </span><span class="s6">1</span><span class="s4">:</span>
+                <span class="s2"># Normalize</span>
+                <span class="s1">sample_weight </span><span class="s4">/= </span><span class="s1">sample_weight_sum</span>
+
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s4">@</span><span class="s1">abstractmethod</span>
+    <span class="s3">def </span><span class="s1">_boost</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Implement a single boost. 
+ 
+        Warning: This method needs to be overridden by subclasses. 
+ 
+        Parameters 
+        ---------- 
+        iboost : int 
+            The index of the current boost iteration. 
+ 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        y : array-like of shape (n_samples,) 
+            The target values (class labels). 
+ 
+        sample_weight : array-like of shape (n_samples,) 
+            The current sample weights. 
+ 
+        random_state : RandomState 
+            The current random number generator 
+ 
+        Returns 
+        ------- 
+        sample_weight : array-like of shape (n_samples,) or None 
+            The reweighted sample weights. 
+            If None then boosting has terminated early. 
+ 
+        estimator_weight : float 
+            The weight for the current boost. 
+            If None then boosting has terminated early. 
+ 
+        error : float 
+            The classification error for the current boost. 
+            If None then boosting has terminated early. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">pass</span>
+
+    <span class="s3">def </span><span class="s1">staged_score</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Return staged scores for X, y. 
+ 
+        This generator method yields the ensemble score after each iteration of 
+        boosting and therefore allows monitoring, such as to determine the 
+        score on a test set after each boost. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        y : array-like of shape (n_samples,) 
+            Labels for X. 
+ 
+        sample_weight : array-like of shape (n_samples,), default=None 
+            Sample weights. 
+ 
+        Yields 
+        ------ 
+        z : float 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_X</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">y_pred </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">staged_predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">is_classifier</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+                <span class="s3">yield </span><span class="s1">accuracy_score</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">y_pred</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">yield </span><span class="s1">r2_score</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">y_pred</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">feature_importances_</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;The impurity-based feature importances. 
+ 
+        The higher, the more important the feature. 
+        The importance of a feature is computed as the (normalized) 
+        total reduction of the criterion brought by that feature.  It is also 
+        known as the Gini importance. 
+ 
+        Warning: impurity-based feature importances can be misleading for 
+        high cardinality features (many unique values). See 
+        :func:`sklearn.inspection.permutation_importance` as an alternative. 
+ 
+        Returns 
+        ------- 
+        feature_importances_ : ndarray of shape (n_features,) 
+            The feature importances. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_ </span><span class="s3">is None or </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">) == </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;Estimator not fitted, call `fit` before `feature_importances_`.&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">norm </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">()</span>
+            <span class="s3">return </span><span class="s4">(</span>
+                <span class="s1">sum</span><span class="s4">(</span>
+                    <span class="s1">weight </span><span class="s4">* </span><span class="s1">clf</span><span class="s4">.</span><span class="s1">feature_importances_</span>
+                    <span class="s3">for </span><span class="s1">weight</span><span class="s4">, </span><span class="s1">clf </span><span class="s3">in </span><span class="s1">zip</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">)</span>
+                <span class="s4">)</span>
+                <span class="s4">/ </span><span class="s1">norm</span>
+            <span class="s4">)</span>
+
+        <span class="s3">except </span><span class="s1">AttributeError </span><span class="s3">as </span><span class="s1">e</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span>
+                <span class="s5">&quot;Unable to compute feature importances &quot;</span>
+                <span class="s5">&quot;since estimator does not have a &quot;</span>
+                <span class="s5">&quot;feature_importances_ attribute&quot;</span>
+            <span class="s4">) </span><span class="s3">from </span><span class="s1">e</span>
+
+
+<span class="s3">def </span><span class="s1">_samme_proba</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">, </span><span class="s1">n_classes</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Calculate algorithm 4, step 2, equation c) of Zhu et al [1]. 
+ 
+    References 
+    ---------- 
+    .. [1] J. Zhu, H. Zou, S. Rosset, T. Hastie, &quot;Multi-class AdaBoost&quot;, 2009. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">proba </span><span class="s4">= </span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">predict_proba</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+    <span class="s2"># Displace zero probabilities so the log is defined.</span>
+    <span class="s2"># Also fix negative elements which may occur with</span>
+    <span class="s2"># negative sample weights.</span>
+    <span class="s1">np</span><span class="s4">.</span><span class="s1">clip</span><span class="s4">(</span><span class="s1">proba</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">proba</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">).</span><span class="s1">eps</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">out</span><span class="s4">=</span><span class="s1">proba</span><span class="s4">)</span>
+    <span class="s1">log_proba </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">log</span><span class="s4">(</span><span class="s1">proba</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s4">(</span><span class="s1">n_classes </span><span class="s4">- </span><span class="s6">1</span><span class="s4">) * (</span>
+        <span class="s1">log_proba </span><span class="s4">- (</span><span class="s6">1.0 </span><span class="s4">/ </span><span class="s1">n_classes</span><span class="s4">) * </span><span class="s1">log_proba</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)[:, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">newaxis</span><span class="s4">]</span>
+    <span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">AdaBoostClassifier</span><span class="s4">(</span>
+    <span class="s1">_RoutingNotSupportedMixin</span><span class="s4">, </span><span class="s1">ClassifierMixin</span><span class="s4">, </span><span class="s1">BaseWeightBoosting</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;An AdaBoost classifier. 
+ 
+    An AdaBoost [1]_ classifier is a meta-estimator that begins by fitting a 
+    classifier on the original dataset and then fits additional copies of the 
+    classifier on the same dataset but where the weights of incorrectly 
+    classified instances are adjusted such that subsequent classifiers focus 
+    more on difficult cases. 
+ 
+    This class implements the algorithm based on [2]_. 
+ 
+    Read more in the :ref:`User Guide &lt;adaboost&gt;`. 
+ 
+    .. versionadded:: 0.14 
+ 
+    Parameters 
+    ---------- 
+    estimator : object, default=None 
+        The base estimator from which the boosted ensemble is built. 
+        Support for sample weighting is required, as well as proper 
+        ``classes_`` and ``n_classes_`` attributes. If ``None``, then 
+        the base estimator is :class:`~sklearn.tree.DecisionTreeClassifier` 
+        initialized with `max_depth=1`. 
+ 
+        .. versionadded:: 1.2 
+           `base_estimator` was renamed to `estimator`. 
+ 
+    n_estimators : int, default=50 
+        The maximum number of estimators at which boosting is terminated. 
+        In case of perfect fit, the learning procedure is stopped early. 
+        Values must be in the range `[1, inf)`. 
+ 
+    learning_rate : float, default=1.0 
+        Weight applied to each classifier at each boosting iteration. A higher 
+        learning rate increases the contribution of each classifier. There is 
+        a trade-off between the `learning_rate` and `n_estimators` parameters. 
+        Values must be in the range `(0.0, inf)`. 
+ 
+    algorithm : {'SAMME', 'SAMME.R'}, default='SAMME.R' 
+        If 'SAMME.R' then use the SAMME.R real boosting algorithm. 
+        ``estimator`` must support calculation of class probabilities. 
+        If 'SAMME' then use the SAMME discrete boosting algorithm. 
+        The SAMME.R algorithm typically converges faster than SAMME, 
+        achieving a lower test error with fewer boosting iterations. 
+ 
+        .. deprecated:: 1.4 
+            `&quot;SAMME.R&quot;` is deprecated and will be removed in version 1.6. 
+            '&quot;SAMME&quot;' will become the default. 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        Controls the random seed given at each `estimator` at each 
+        boosting iteration. 
+        Thus, it is only used when `estimator` exposes a `random_state`. 
+        Pass an int for reproducible output across multiple function calls. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+    Attributes 
+    ---------- 
+    estimator_ : estimator 
+        The base estimator from which the ensemble is grown. 
+ 
+        .. versionadded:: 1.2 
+           `base_estimator_` was renamed to `estimator_`. 
+ 
+    estimators_ : list of classifiers 
+        The collection of fitted sub-estimators. 
+ 
+    classes_ : ndarray of shape (n_classes,) 
+        The classes labels. 
+ 
+    n_classes_ : int 
+        The number of classes. 
+ 
+    estimator_weights_ : ndarray of floats 
+        Weights for each estimator in the boosted ensemble. 
+ 
+    estimator_errors_ : ndarray of floats 
+        Classification error for each estimator in the boosted 
+        ensemble. 
+ 
+    feature_importances_ : ndarray of shape (n_features,) 
+        The impurity-based feature importances if supported by the 
+        ``estimator`` (when based on decision trees). 
+ 
+        Warning: impurity-based feature importances can be misleading for 
+        high cardinality features (many unique values). See 
+        :func:`sklearn.inspection.permutation_importance` as an alternative. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    AdaBoostRegressor : An AdaBoost regressor that begins by fitting a 
+        regressor on the original dataset and then fits additional copies of 
+        the regressor on the same dataset but where the weights of instances 
+        are adjusted according to the error of the current prediction. 
+ 
+    GradientBoostingClassifier : GB builds an additive model in a forward 
+        stage-wise fashion. Regression trees are fit on the negative gradient 
+        of the binomial or multinomial deviance loss function. Binary 
+        classification is a special case where only a single regression tree is 
+        induced. 
+ 
+    sklearn.tree.DecisionTreeClassifier : A non-parametric supervised learning 
+        method used for classification. 
+        Creates a model that predicts the value of a target variable by 
+        learning simple decision rules inferred from the data features. 
+ 
+    References 
+    ---------- 
+    .. [1] Y. Freund, R. Schapire, &quot;A Decision-Theoretic Generalization of 
+           on-Line Learning and an Application to Boosting&quot;, 1995. 
+ 
+    .. [2] :doi:`J. Zhu, H. Zou, S. Rosset, T. Hastie, &quot;Multi-class adaboost.&quot; 
+           Statistics and its Interface 2.3 (2009): 349-360. 
+           &lt;10.4310/SII.2009.v2.n3.a8&gt;` 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.ensemble import AdaBoostClassifier 
+    &gt;&gt;&gt; from sklearn.datasets import make_classification 
+    &gt;&gt;&gt; X, y = make_classification(n_samples=1000, n_features=4, 
+    ...                            n_informative=2, n_redundant=0, 
+    ...                            random_state=0, shuffle=False) 
+    &gt;&gt;&gt; clf = AdaBoostClassifier(n_estimators=100, algorithm=&quot;SAMME&quot;, random_state=0) 
+    &gt;&gt;&gt; clf.fit(X, y) 
+    AdaBoostClassifier(algorithm='SAMME', n_estimators=100, random_state=0) 
+    &gt;&gt;&gt; clf.predict([[0, 0, 0, 0]]) 
+    array([1]) 
+    &gt;&gt;&gt; clf.score(X, y) 
+    0.96... 
+ 
+    For a detailed example of using AdaBoost to fit a sequence of DecisionTrees 
+    as weaklearners, please refer to 
+    :ref:`sphx_glr_auto_examples_ensemble_plot_adaboost_multiclass.py`. 
+ 
+    For a detailed example of using AdaBoost to fit a non-linearly seperable 
+    classification dataset composed of two Gaussian quantiles clusters, please 
+    refer to :ref:`sphx_glr_auto_examples_ensemble_plot_adaboost_twoclass.py`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2"># TODO(1.6): Modify _parameter_constraints for &quot;algorithm&quot; to only check</span>
+    <span class="s2"># for &quot;SAMME&quot;</span>
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s4">**</span><span class="s1">BaseWeightBoosting</span><span class="s4">.</span><span class="s1">_parameter_constraints</span><span class="s4">,</span>
+        <span class="s5">&quot;algorithm&quot;</span><span class="s4">: [</span>
+            <span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;SAMME&quot;</span><span class="s4">, </span><span class="s5">&quot;SAMME.R&quot;</span><span class="s4">}),</span>
+        <span class="s4">],</span>
+    <span class="s4">}</span>
+
+    <span class="s2"># TODO(1.6): Change default &quot;algorithm&quot; value to &quot;SAMME&quot;</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">estimator</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">n_estimators</span><span class="s4">=</span><span class="s6">50</span><span class="s4">,</span>
+        <span class="s1">learning_rate</span><span class="s4">=</span><span class="s6">1.0</span><span class="s4">,</span>
+        <span class="s1">algorithm</span><span class="s4">=</span><span class="s5">&quot;SAMME.R&quot;</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">estimator</span><span class="s4">=</span><span class="s1">estimator</span><span class="s4">,</span>
+            <span class="s1">n_estimators</span><span class="s4">=</span><span class="s1">n_estimators</span><span class="s4">,</span>
+            <span class="s1">learning_rate</span><span class="s4">=</span><span class="s1">learning_rate</span><span class="s4">,</span>
+            <span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">= </span><span class="s1">algorithm</span>
+
+    <span class="s3">def </span><span class="s1">_validate_estimator</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check the estimator and set the estimator_ attribute.&quot;&quot;&quot;</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">_validate_estimator</span><span class="s4">(</span><span class="s1">default</span><span class="s4">=</span><span class="s1">DecisionTreeClassifier</span><span class="s4">(</span><span class="s1">max_depth</span><span class="s4">=</span><span class="s6">1</span><span class="s4">))</span>
+
+        <span class="s2"># TODO(1.6): Remove, as &quot;SAMME.R&quot; value for &quot;algorithm&quot; param will be</span>
+        <span class="s2"># removed in 1.6</span>
+        <span class="s2"># SAMME-R requires predict_proba-enabled base estimators</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">!= </span><span class="s5">&quot;SAMME&quot;</span><span class="s4">:</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                <span class="s4">(</span>
+                    <span class="s5">&quot;The SAMME.R algorithm (the default) is deprecated and will be&quot;</span>
+                    <span class="s5">&quot; removed in 1.6. Use the SAMME algorithm to circumvent this&quot;</span>
+                    <span class="s5">&quot; warning.&quot;</span>
+                <span class="s4">),</span>
+                <span class="s1">FutureWarning</span><span class="s4">,</span>
+            <span class="s4">)</span>
+            <span class="s3">if not </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_</span><span class="s4">, </span><span class="s5">&quot;predict_proba&quot;</span><span class="s4">):</span>
+                <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span>
+                    <span class="s5">&quot;AdaBoostClassifier with algorithm='SAMME.R' requires &quot;</span>
+                    <span class="s5">&quot;that the weak learner supports the calculation of class &quot;</span>
+                    <span class="s5">&quot;probabilities with a predict_proba method.</span><span class="s3">\n</span><span class="s5">&quot;</span>
+                    <span class="s5">&quot;Please change the base estimator or set &quot;</span>
+                    <span class="s5">&quot;algorithm='SAMME' instead.&quot;</span>
+                <span class="s4">)</span>
+
+        <span class="s3">if not </span><span class="s1">has_fit_parameter</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_</span><span class="s4">, </span><span class="s5">&quot;sample_weight&quot;</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s3">} </span><span class="s5">doesn't support sample_weight.&quot;</span>
+            <span class="s4">)</span>
+
+    <span class="s2"># TODO(1.6): Redefine the scope of the `_boost` and `_boost_discrete`</span>
+    <span class="s2"># functions to be the same since SAMME will be the default value for the</span>
+    <span class="s2"># &quot;algorithm&quot; parameter in version 1.6. Thus, a distinguishing function is</span>
+    <span class="s2"># no longer needed. (Or adjust code here, if another algorithm, shall be</span>
+    <span class="s2"># used instead of SAMME.R.)</span>
+    <span class="s3">def </span><span class="s1">_boost</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Implement a single boost. 
+ 
+        Perform a single boost according to the real multi-class SAMME.R 
+        algorithm or to the discrete SAMME algorithm and return the updated 
+        sample weights. 
+ 
+        Parameters 
+        ---------- 
+        iboost : int 
+            The index of the current boost iteration. 
+ 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. 
+ 
+        y : array-like of shape (n_samples,) 
+            The target values (class labels). 
+ 
+        sample_weight : array-like of shape (n_samples,) 
+            The current sample weights. 
+ 
+        random_state : RandomState instance 
+            The RandomState instance used if the base estimator accepts a 
+            `random_state` attribute. 
+ 
+        Returns 
+        ------- 
+        sample_weight : array-like of shape (n_samples,) or None 
+            The reweighted sample weights. 
+            If None then boosting has terminated early. 
+ 
+        estimator_weight : float 
+            The weight for the current boost. 
+            If None then boosting has terminated early. 
+ 
+        estimator_error : float 
+            The classification error for the current boost. 
+            If None then boosting has terminated early. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s5">&quot;SAMME.R&quot;</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_boost_real</span><span class="s4">(</span><span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">)</span>
+
+        <span class="s3">else</span><span class="s4">:  </span><span class="s2"># elif self.algorithm == &quot;SAMME&quot;:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_boost_discrete</span><span class="s4">(</span><span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">)</span>
+
+    <span class="s2"># TODO(1.6): Remove function. The `_boost_real` function won't be used any</span>
+    <span class="s2"># longer, because the SAMME.R algorithm will be deprecated in 1.6.</span>
+    <span class="s3">def </span><span class="s1">_boost_real</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Implement a single boost using the SAMME.R real algorithm.&quot;&quot;&quot;</span>
+        <span class="s1">estimator </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_make_estimator</span><span class="s4">(</span><span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">)</span>
+
+        <span class="s1">estimator</span><span class="s4">.</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">)</span>
+
+        <span class="s1">y_predict_proba </span><span class="s4">= </span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">predict_proba</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">iboost </span><span class="s4">== </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">classes_ </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">, </span><span class="s5">&quot;classes_&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_ </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">)</span>
+
+        <span class="s1">y_predict </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">.</span><span class="s1">take</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">argmax</span><span class="s4">(</span><span class="s1">y_predict_proba</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">), </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">)</span>
+
+        <span class="s2"># Instances incorrectly classified</span>
+        <span class="s1">incorrect </span><span class="s4">= </span><span class="s1">y_predict </span><span class="s4">!= </span><span class="s1">y</span>
+
+        <span class="s2"># Error fraction</span>
+        <span class="s1">estimator_error </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">average</span><span class="s4">(</span><span class="s1">incorrect</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">))</span>
+
+        <span class="s2"># Stop if classification is perfect</span>
+        <span class="s3">if </span><span class="s1">estimator_error </span><span class="s4">&lt;= </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s6">1.0</span><span class="s4">, </span><span class="s6">0.0</span>
+
+        <span class="s2"># Construct y coding as described in Zhu et al [2]:</span>
+        <span class="s2">#</span>
+        <span class="s2">#    y_k = 1 if c == k else -1 / (K - 1)</span>
+        <span class="s2">#</span>
+        <span class="s2"># where K == n_classes_ and c, k in [0, K) are indices along the second</span>
+        <span class="s2"># axis of the y coding with c being the index corresponding to the true</span>
+        <span class="s2"># class label.</span>
+        <span class="s1">n_classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_</span>
+        <span class="s1">classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span>
+        <span class="s1">y_codes </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">([-</span><span class="s6">1.0 </span><span class="s4">/ (</span><span class="s1">n_classes </span><span class="s4">- </span><span class="s6">1</span><span class="s4">), </span><span class="s6">1.0</span><span class="s4">])</span>
+        <span class="s1">y_coding </span><span class="s4">= </span><span class="s1">y_codes</span><span class="s4">.</span><span class="s1">take</span><span class="s4">(</span><span class="s1">classes </span><span class="s4">== </span><span class="s1">y</span><span class="s4">[:, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">newaxis</span><span class="s4">])</span>
+
+        <span class="s2"># Displace zero probabilities so the log is defined.</span>
+        <span class="s2"># Also fix negative elements which may occur with</span>
+        <span class="s2"># negative sample weights.</span>
+        <span class="s1">proba </span><span class="s4">= </span><span class="s1">y_predict_proba  </span><span class="s2"># alias for readability</span>
+        <span class="s1">np</span><span class="s4">.</span><span class="s1">clip</span><span class="s4">(</span><span class="s1">proba</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">proba</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">).</span><span class="s1">eps</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">out</span><span class="s4">=</span><span class="s1">proba</span><span class="s4">)</span>
+
+        <span class="s2"># Boost weight using multi-class AdaBoost SAMME.R alg</span>
+        <span class="s1">estimator_weight </span><span class="s4">= (</span>
+            <span class="s4">-</span><span class="s6">1.0</span>
+            <span class="s4">* </span><span class="s1">self</span><span class="s4">.</span><span class="s1">learning_rate</span>
+            <span class="s4">* ((</span><span class="s1">n_classes </span><span class="s4">- </span><span class="s6">1.0</span><span class="s4">) / </span><span class="s1">n_classes</span><span class="s4">)</span>
+            <span class="s4">* </span><span class="s1">xlogy</span><span class="s4">(</span><span class="s1">y_coding</span><span class="s4">, </span><span class="s1">y_predict_proba</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s4">)</span>
+
+        <span class="s2"># Only boost the weights if it will fit again</span>
+        <span class="s3">if not </span><span class="s1">iboost </span><span class="s4">== </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_estimators </span><span class="s4">- </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s2"># Only boost positive weights</span>
+            <span class="s1">sample_weight </span><span class="s4">*= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">exp</span><span class="s4">(</span>
+                <span class="s1">estimator_weight </span><span class="s4">* ((</span><span class="s1">sample_weight </span><span class="s4">&gt; </span><span class="s6">0</span><span class="s4">) | (</span><span class="s1">estimator_weight </span><span class="s4">&lt; </span><span class="s6">0</span><span class="s4">))</span>
+            <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s6">1.0</span><span class="s4">, </span><span class="s1">estimator_error</span>
+
+    <span class="s3">def </span><span class="s1">_boost_discrete</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Implement a single boost using the SAMME discrete algorithm.&quot;&quot;&quot;</span>
+        <span class="s1">estimator </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_make_estimator</span><span class="s4">(</span><span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">)</span>
+
+        <span class="s1">estimator</span><span class="s4">.</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">)</span>
+
+        <span class="s1">y_predict </span><span class="s4">= </span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">iboost </span><span class="s4">== </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">classes_ </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">, </span><span class="s5">&quot;classes_&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_ </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">)</span>
+
+        <span class="s2"># Instances incorrectly classified</span>
+        <span class="s1">incorrect </span><span class="s4">= </span><span class="s1">y_predict </span><span class="s4">!= </span><span class="s1">y</span>
+
+        <span class="s2"># Error fraction</span>
+        <span class="s1">estimator_error </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">average</span><span class="s4">(</span><span class="s1">incorrect</span><span class="s4">, </span><span class="s1">weights</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">))</span>
+
+        <span class="s2"># Stop if classification is perfect</span>
+        <span class="s3">if </span><span class="s1">estimator_error </span><span class="s4">&lt;= </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s6">1.0</span><span class="s4">, </span><span class="s6">0.0</span>
+
+        <span class="s1">n_classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_</span>
+
+        <span class="s2"># Stop if the error is at least as bad as random guessing</span>
+        <span class="s3">if </span><span class="s1">estimator_error </span><span class="s4">&gt;= </span><span class="s6">1.0 </span><span class="s4">- (</span><span class="s6">1.0 </span><span class="s4">/ </span><span class="s1">n_classes</span><span class="s4">):</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">) == </span><span class="s6">0</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">&quot;BaseClassifier in AdaBoostClassifier &quot;</span>
+                    <span class="s5">&quot;ensemble is worse than random, ensemble &quot;</span>
+                    <span class="s5">&quot;can not be fit.&quot;</span>
+                <span class="s4">)</span>
+            <span class="s3">return None</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s3">None</span>
+
+        <span class="s2"># Boost weight using multi-class AdaBoost SAMME alg</span>
+        <span class="s1">estimator_weight </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">learning_rate </span><span class="s4">* (</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">log</span><span class="s4">((</span><span class="s6">1.0 </span><span class="s4">- </span><span class="s1">estimator_error</span><span class="s4">) / </span><span class="s1">estimator_error</span><span class="s4">) + </span><span class="s1">np</span><span class="s4">.</span><span class="s1">log</span><span class="s4">(</span><span class="s1">n_classes </span><span class="s4">- </span><span class="s6">1.0</span><span class="s4">)</span>
+        <span class="s4">)</span>
+
+        <span class="s2"># Only boost the weights if it will fit again</span>
+        <span class="s3">if not </span><span class="s1">iboost </span><span class="s4">== </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_estimators </span><span class="s4">- </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s2"># Only boost positive weights</span>
+            <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">exp</span><span class="s4">(</span>
+                <span class="s1">np</span><span class="s4">.</span><span class="s1">log</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">)</span>
+                <span class="s4">+ </span><span class="s1">estimator_weight </span><span class="s4">* </span><span class="s1">incorrect </span><span class="s4">* (</span><span class="s1">sample_weight </span><span class="s4">&gt; </span><span class="s6">0</span><span class="s4">)</span>
+            <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">estimator_weight</span><span class="s4">, </span><span class="s1">estimator_error</span>
+
+    <span class="s3">def </span><span class="s1">predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict classes for X. 
+ 
+        The predicted class of an input sample is computed as the weighted mean 
+        prediction of the classifiers in the ensemble. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Returns 
+        ------- 
+        y : ndarray of shape (n_samples,) 
+            The predicted classes. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">pred </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">decision_function</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_ </span><span class="s4">== </span><span class="s6">2</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">.</span><span class="s1">take</span><span class="s4">(</span><span class="s1">pred </span><span class="s4">&gt; </span><span class="s6">0</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">.</span><span class="s1">take</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">argmax</span><span class="s4">(</span><span class="s1">pred</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">), </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">staged_predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Return staged predictions for X. 
+ 
+        The predicted class of an input sample is computed as the weighted mean 
+        prediction of the classifiers in the ensemble. 
+ 
+        This generator method yields the ensemble prediction after each 
+        iteration of boosting and therefore allows monitoring, such as to 
+        determine the prediction on a test set after each boost. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            The input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Yields 
+        ------ 
+        y : generator of ndarray of shape (n_samples,) 
+            The predicted classes. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_X</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s1">n_classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_</span>
+        <span class="s1">classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span>
+
+        <span class="s3">if </span><span class="s1">n_classes </span><span class="s4">== </span><span class="s6">2</span><span class="s4">:</span>
+            <span class="s3">for </span><span class="s1">pred </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">staged_decision_function</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+                <span class="s3">yield </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">classes</span><span class="s4">.</span><span class="s1">take</span><span class="s4">(</span><span class="s1">pred </span><span class="s4">&gt; </span><span class="s6">0</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">))</span>
+
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">for </span><span class="s1">pred </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">staged_decision_function</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+                <span class="s3">yield </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">(</span><span class="s1">classes</span><span class="s4">.</span><span class="s1">take</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">argmax</span><span class="s4">(</span><span class="s1">pred</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">), </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">decision_function</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the decision function of ``X``. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Returns 
+        ------- 
+        score : ndarray of shape of (n_samples, k) 
+            The decision function of the input samples. The order of 
+            outputs is the same as that of the :term:`classes_` attribute. 
+            Binary classification is a special cases with ``k == 1``, 
+            otherwise ``k==n_classes``. For binary classification, 
+            values closer to -1 or 1 mean more like the first or second 
+            class in ``classes_``, respectively. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_X</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s1">n_classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_</span>
+        <span class="s1">classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">[:, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">newaxis</span><span class="s4">]</span>
+
+        <span class="s2"># TODO(1.6): Remove, because &quot;algorithm&quot; param will be deprecated in 1.6</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s5">&quot;SAMME.R&quot;</span><span class="s4">:</span>
+            <span class="s2"># The weights are all 1. for SAMME.R</span>
+            <span class="s1">pred </span><span class="s4">= </span><span class="s1">sum</span><span class="s4">(</span>
+                <span class="s1">_samme_proba</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">, </span><span class="s1">n_classes</span><span class="s4">, </span><span class="s1">X</span><span class="s4">) </span><span class="s3">for </span><span class="s1">estimator </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span>
+            <span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:  </span><span class="s2"># self.algorithm == &quot;SAMME&quot;</span>
+            <span class="s1">pred </span><span class="s4">= </span><span class="s1">sum</span><span class="s4">(</span>
+                <span class="s1">np</span><span class="s4">.</span><span class="s1">where</span><span class="s4">(</span>
+                    <span class="s4">(</span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">) == </span><span class="s1">classes</span><span class="s4">).</span><span class="s1">T</span><span class="s4">,</span>
+                    <span class="s1">w</span><span class="s4">,</span>
+                    <span class="s4">-</span><span class="s6">1 </span><span class="s4">/ (</span><span class="s1">n_classes </span><span class="s4">- </span><span class="s6">1</span><span class="s4">) * </span><span class="s1">w</span><span class="s4">,</span>
+                <span class="s4">)</span>
+                <span class="s3">for </span><span class="s1">estimator</span><span class="s4">, </span><span class="s1">w </span><span class="s3">in </span><span class="s1">zip</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_</span><span class="s4">)</span>
+            <span class="s4">)</span>
+
+        <span class="s1">pred </span><span class="s4">/= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">n_classes </span><span class="s4">== </span><span class="s6">2</span><span class="s4">:</span>
+            <span class="s1">pred</span><span class="s4">[:, </span><span class="s6">0</span><span class="s4">] *= -</span><span class="s6">1</span>
+            <span class="s3">return </span><span class="s1">pred</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">pred</span>
+
+    <span class="s3">def </span><span class="s1">staged_decision_function</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute decision function of ``X`` for each boosting iteration. 
+ 
+        This method allows monitoring (i.e. determine error on testing set) 
+        after each boosting iteration. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Yields 
+        ------ 
+        score : generator of ndarray of shape (n_samples, k) 
+            The decision function of the input samples. The order of 
+            outputs is the same of that of the :term:`classes_` attribute. 
+            Binary classification is a special cases with ``k == 1``, 
+            otherwise ``k==n_classes``. For binary classification, 
+            values closer to -1 or 1 mean more like the first or second 
+            class in ``classes_``, respectively. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_X</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s1">n_classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_</span>
+        <span class="s1">classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">classes_</span><span class="s4">[:, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">newaxis</span><span class="s4">]</span>
+        <span class="s1">pred </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">norm </span><span class="s4">= </span><span class="s6">0.0</span>
+
+        <span class="s3">for </span><span class="s1">weight</span><span class="s4">, </span><span class="s1">estimator </span><span class="s3">in </span><span class="s1">zip</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">):</span>
+            <span class="s1">norm </span><span class="s4">+= </span><span class="s1">weight</span>
+
+            <span class="s2"># TODO(1.6): Remove, because &quot;algorithm&quot; param will be deprecated in</span>
+            <span class="s2"># 1.6</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s5">&quot;SAMME.R&quot;</span><span class="s4">:</span>
+                <span class="s2"># The weights are all 1. for SAMME.R</span>
+                <span class="s1">current_pred </span><span class="s4">= </span><span class="s1">_samme_proba</span><span class="s4">(</span><span class="s1">estimator</span><span class="s4">, </span><span class="s1">n_classes</span><span class="s4">, </span><span class="s1">X</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:  </span><span class="s2"># elif self.algorithm == &quot;SAMME&quot;:</span>
+                <span class="s1">current_pred </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">where</span><span class="s4">(</span>
+                    <span class="s4">(</span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">) == </span><span class="s1">classes</span><span class="s4">).</span><span class="s1">T</span><span class="s4">,</span>
+                    <span class="s1">weight</span><span class="s4">,</span>
+                    <span class="s4">-</span><span class="s6">1 </span><span class="s4">/ (</span><span class="s1">n_classes </span><span class="s4">- </span><span class="s6">1</span><span class="s4">) * </span><span class="s1">weight</span><span class="s4">,</span>
+                <span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">pred </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s1">pred </span><span class="s4">= </span><span class="s1">current_pred</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">pred </span><span class="s4">+= </span><span class="s1">current_pred</span>
+
+            <span class="s3">if </span><span class="s1">n_classes </span><span class="s4">== </span><span class="s6">2</span><span class="s4">:</span>
+                <span class="s1">tmp_pred </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">(</span><span class="s1">pred</span><span class="s4">)</span>
+                <span class="s1">tmp_pred</span><span class="s4">[:, </span><span class="s6">0</span><span class="s4">] *= -</span><span class="s6">1</span>
+                <span class="s3">yield </span><span class="s4">(</span><span class="s1">tmp_pred </span><span class="s4">/ </span><span class="s1">norm</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">yield </span><span class="s1">pred </span><span class="s4">/ </span><span class="s1">norm</span>
+
+    <span class="s4">@</span><span class="s1">staticmethod</span>
+    <span class="s3">def </span><span class="s1">_compute_proba_from_decision</span><span class="s4">(</span><span class="s1">decision</span><span class="s4">, </span><span class="s1">n_classes</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute probabilities from the decision function. 
+ 
+        This is based eq. (15) of [1] where: 
+            p(y=c|X) = exp((1 / K-1) f_c(X)) / sum_k(exp((1 / K-1) f_k(X))) 
+                     = softmax((1 / K-1) * f(X)) 
+ 
+        References 
+        ---------- 
+        .. [1] J. Zhu, H. Zou, S. Rosset, T. Hastie, &quot;Multi-class AdaBoost&quot;, 
+               2009. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">n_classes </span><span class="s4">== </span><span class="s6">2</span><span class="s4">:</span>
+            <span class="s1">decision </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">vstack</span><span class="s4">([-</span><span class="s1">decision</span><span class="s4">, </span><span class="s1">decision</span><span class="s4">]).</span><span class="s1">T </span><span class="s4">/ </span><span class="s6">2</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">decision </span><span class="s4">/= </span><span class="s1">n_classes </span><span class="s4">- </span><span class="s6">1</span>
+        <span class="s3">return </span><span class="s1">softmax</span><span class="s4">(</span><span class="s1">decision</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">predict_proba</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict class probabilities for X. 
+ 
+        The predicted class probabilities of an input sample is computed as 
+        the weighted mean predicted class probabilities of the classifiers 
+        in the ensemble. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Returns 
+        ------- 
+        p : ndarray of shape (n_samples, n_classes) 
+            The class probabilities of the input samples. The order of 
+            outputs is the same of that of the :term:`classes_` attribute. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">n_classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_</span>
+
+        <span class="s3">if </span><span class="s1">n_classes </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">((</span><span class="s1">_num_samples</span><span class="s4">(</span><span class="s1">X</span><span class="s4">), </span><span class="s6">1</span><span class="s4">))</span>
+
+        <span class="s1">decision </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">decision_function</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_compute_proba_from_decision</span><span class="s4">(</span><span class="s1">decision</span><span class="s4">, </span><span class="s1">n_classes</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">staged_predict_proba</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict class probabilities for X. 
+ 
+        The predicted class probabilities of an input sample is computed as 
+        the weighted mean predicted class probabilities of the classifiers 
+        in the ensemble. 
+ 
+        This generator method yields the ensemble predicted class probabilities 
+        after each iteration of boosting and therefore allows monitoring, such 
+        as to determine the predicted class probabilities on a test set after 
+        each boost. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Yields 
+        ------ 
+        p : generator of ndarray of shape (n_samples,) 
+            The class probabilities of the input samples. The order of 
+            outputs is the same of that of the :term:`classes_` attribute. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">n_classes </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_classes_</span>
+
+        <span class="s3">for </span><span class="s1">decision </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">staged_decision_function</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+            <span class="s3">yield </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_compute_proba_from_decision</span><span class="s4">(</span><span class="s1">decision</span><span class="s4">, </span><span class="s1">n_classes</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">predict_log_proba</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict class log-probabilities for X. 
+ 
+        The predicted class log-probabilities of an input sample is computed as 
+        the weighted mean predicted class log-probabilities of the classifiers 
+        in the ensemble. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Returns 
+        ------- 
+        p : ndarray of shape (n_samples, n_classes) 
+            The class probabilities of the input samples. The order of 
+            outputs is the same of that of the :term:`classes_` attribute. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">log</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">predict_proba</span><span class="s4">(</span><span class="s1">X</span><span class="s4">))</span>
+
+
+<span class="s3">class </span><span class="s1">AdaBoostRegressor</span><span class="s4">(</span><span class="s1">_RoutingNotSupportedMixin</span><span class="s4">, </span><span class="s1">RegressorMixin</span><span class="s4">, </span><span class="s1">BaseWeightBoosting</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;An AdaBoost regressor. 
+ 
+    An AdaBoost [1] regressor is a meta-estimator that begins by fitting a 
+    regressor on the original dataset and then fits additional copies of the 
+    regressor on the same dataset but where the weights of instances are 
+    adjusted according to the error of the current prediction. As such, 
+    subsequent regressors focus more on difficult cases. 
+ 
+    This class implements the algorithm known as AdaBoost.R2 [2]. 
+ 
+    Read more in the :ref:`User Guide &lt;adaboost&gt;`. 
+ 
+    .. versionadded:: 0.14 
+ 
+    Parameters 
+    ---------- 
+    estimator : object, default=None 
+        The base estimator from which the boosted ensemble is built. 
+        If ``None``, then the base estimator is 
+        :class:`~sklearn.tree.DecisionTreeRegressor` initialized with 
+        `max_depth=3`. 
+ 
+        .. versionadded:: 1.2 
+           `base_estimator` was renamed to `estimator`. 
+ 
+    n_estimators : int, default=50 
+        The maximum number of estimators at which boosting is terminated. 
+        In case of perfect fit, the learning procedure is stopped early. 
+        Values must be in the range `[1, inf)`. 
+ 
+    learning_rate : float, default=1.0 
+        Weight applied to each regressor at each boosting iteration. A higher 
+        learning rate increases the contribution of each regressor. There is 
+        a trade-off between the `learning_rate` and `n_estimators` parameters. 
+        Values must be in the range `(0.0, inf)`. 
+ 
+    loss : {'linear', 'square', 'exponential'}, default='linear' 
+        The loss function to use when updating the weights after each 
+        boosting iteration. 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        Controls the random seed given at each `estimator` at each 
+        boosting iteration. 
+        Thus, it is only used when `estimator` exposes a `random_state`. 
+        In addition, it controls the bootstrap of the weights used to train the 
+        `estimator` at each boosting iteration. 
+        Pass an int for reproducible output across multiple function calls. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+    Attributes 
+    ---------- 
+    estimator_ : estimator 
+        The base estimator from which the ensemble is grown. 
+ 
+        .. versionadded:: 1.2 
+           `base_estimator_` was renamed to `estimator_`. 
+ 
+    estimators_ : list of regressors 
+        The collection of fitted sub-estimators. 
+ 
+    estimator_weights_ : ndarray of floats 
+        Weights for each estimator in the boosted ensemble. 
+ 
+    estimator_errors_ : ndarray of floats 
+        Regression error for each estimator in the boosted ensemble. 
+ 
+    feature_importances_ : ndarray of shape (n_features,) 
+        The impurity-based feature importances if supported by the 
+        ``estimator`` (when based on decision trees). 
+ 
+        Warning: impurity-based feature importances can be misleading for 
+        high cardinality features (many unique values). See 
+        :func:`sklearn.inspection.permutation_importance` as an alternative. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    AdaBoostClassifier : An AdaBoost classifier. 
+    GradientBoostingRegressor : Gradient Boosting Classification Tree. 
+    sklearn.tree.DecisionTreeRegressor : A decision tree regressor. 
+ 
+    References 
+    ---------- 
+    .. [1] Y. Freund, R. Schapire, &quot;A Decision-Theoretic Generalization of 
+           on-Line Learning and an Application to Boosting&quot;, 1995. 
+ 
+    .. [2] H. Drucker, &quot;Improving Regressors using Boosting Techniques&quot;, 1997. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.ensemble import AdaBoostRegressor 
+    &gt;&gt;&gt; from sklearn.datasets import make_regression 
+    &gt;&gt;&gt; X, y = make_regression(n_features=4, n_informative=2, 
+    ...                        random_state=0, shuffle=False) 
+    &gt;&gt;&gt; regr = AdaBoostRegressor(random_state=0, n_estimators=100) 
+    &gt;&gt;&gt; regr.fit(X, y) 
+    AdaBoostRegressor(n_estimators=100, random_state=0) 
+    &gt;&gt;&gt; regr.predict([[0, 0, 0, 0]]) 
+    array([4.7972...]) 
+    &gt;&gt;&gt; regr.score(X, y) 
+    0.9771... 
+ 
+    For a detailed example of utilizing :class:`~sklearn.ensemble.AdaBoostRegressor` 
+    to fit a sequence of decision trees as weak learners, please refer to 
+    :ref:`sphx_glr_auto_examples_ensemble_plot_adaboost_regression.py`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s4">**</span><span class="s1">BaseWeightBoosting</span><span class="s4">.</span><span class="s1">_parameter_constraints</span><span class="s4">,</span>
+        <span class="s5">&quot;loss&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;linear&quot;</span><span class="s4">, </span><span class="s5">&quot;square&quot;</span><span class="s4">, </span><span class="s5">&quot;exponential&quot;</span><span class="s4">})],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">estimator</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">n_estimators</span><span class="s4">=</span><span class="s6">50</span><span class="s4">,</span>
+        <span class="s1">learning_rate</span><span class="s4">=</span><span class="s6">1.0</span><span class="s4">,</span>
+        <span class="s1">loss</span><span class="s4">=</span><span class="s5">&quot;linear&quot;</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">estimator</span><span class="s4">=</span><span class="s1">estimator</span><span class="s4">,</span>
+            <span class="s1">n_estimators</span><span class="s4">=</span><span class="s1">n_estimators</span><span class="s4">,</span>
+            <span class="s1">learning_rate</span><span class="s4">=</span><span class="s1">learning_rate</span><span class="s4">,</span>
+            <span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">loss </span><span class="s4">= </span><span class="s1">loss</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">random_state </span><span class="s4">= </span><span class="s1">random_state</span>
+
+    <span class="s3">def </span><span class="s1">_validate_estimator</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check the estimator and set the estimator_ attribute.&quot;&quot;&quot;</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">_validate_estimator</span><span class="s4">(</span><span class="s1">default</span><span class="s4">=</span><span class="s1">DecisionTreeRegressor</span><span class="s4">(</span><span class="s1">max_depth</span><span class="s4">=</span><span class="s6">3</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">_boost</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">iboost</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">random_state</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Implement a single boost for regression 
+ 
+        Perform a single boost according to the AdaBoost.R2 algorithm and 
+        return the updated sample weights. 
+ 
+        Parameters 
+        ---------- 
+        iboost : int 
+            The index of the current boost iteration. 
+ 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. 
+ 
+        y : array-like of shape (n_samples,) 
+            The target values (class labels in classification, real numbers in 
+            regression). 
+ 
+        sample_weight : array-like of shape (n_samples,) 
+            The current sample weights. 
+ 
+        random_state : RandomState 
+            The RandomState instance used if the base estimator accepts a 
+            `random_state` attribute. 
+            Controls also the bootstrap of the weights used to train the weak 
+            learner. 
+            replacement. 
+ 
+        Returns 
+        ------- 
+        sample_weight : array-like of shape (n_samples,) or None 
+            The reweighted sample weights. 
+            If None then boosting has terminated early. 
+ 
+        estimator_weight : float 
+            The weight for the current boost. 
+            If None then boosting has terminated early. 
+ 
+        estimator_error : float 
+            The regression error for the current boost. 
+            If None then boosting has terminated early. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">estimator </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_make_estimator</span><span class="s4">(</span><span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">)</span>
+
+        <span class="s2"># Weighted sampling of the training set with replacement</span>
+        <span class="s1">bootstrap_idx </span><span class="s4">= </span><span class="s1">random_state</span><span class="s4">.</span><span class="s1">choice</span><span class="s4">(</span>
+            <span class="s1">np</span><span class="s4">.</span><span class="s1">arange</span><span class="s4">(</span><span class="s1">_num_samples</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)),</span>
+            <span class="s1">size</span><span class="s4">=</span><span class="s1">_num_samples</span><span class="s4">(</span><span class="s1">X</span><span class="s4">),</span>
+            <span class="s1">replace</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">p</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s2"># Fit on the bootstrapped sample and obtain a prediction</span>
+        <span class="s2"># for all samples in the training set</span>
+        <span class="s1">X_ </span><span class="s4">= </span><span class="s1">_safe_indexing</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">bootstrap_idx</span><span class="s4">)</span>
+        <span class="s1">y_ </span><span class="s4">= </span><span class="s1">_safe_indexing</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">bootstrap_idx</span><span class="s4">)</span>
+        <span class="s1">estimator</span><span class="s4">.</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X_</span><span class="s4">, </span><span class="s1">y_</span><span class="s4">)</span>
+        <span class="s1">y_predict </span><span class="s4">= </span><span class="s1">estimator</span><span class="s4">.</span><span class="s1">predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s1">error_vect </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">y_predict </span><span class="s4">- </span><span class="s1">y</span><span class="s4">)</span>
+        <span class="s1">sample_mask </span><span class="s4">= </span><span class="s1">sample_weight </span><span class="s4">&gt; </span><span class="s6">0</span>
+        <span class="s1">masked_sample_weight </span><span class="s4">= </span><span class="s1">sample_weight</span><span class="s4">[</span><span class="s1">sample_mask</span><span class="s4">]</span>
+        <span class="s1">masked_error_vector </span><span class="s4">= </span><span class="s1">error_vect</span><span class="s4">[</span><span class="s1">sample_mask</span><span class="s4">]</span>
+
+        <span class="s1">error_max </span><span class="s4">= </span><span class="s1">masked_error_vector</span><span class="s4">.</span><span class="s1">max</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">error_max </span><span class="s4">!= </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s1">masked_error_vector </span><span class="s4">/= </span><span class="s1">error_max</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">loss </span><span class="s4">== </span><span class="s5">&quot;square&quot;</span><span class="s4">:</span>
+            <span class="s1">masked_error_vector </span><span class="s4">**= </span><span class="s6">2</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">loss </span><span class="s4">== </span><span class="s5">&quot;exponential&quot;</span><span class="s4">:</span>
+            <span class="s1">masked_error_vector </span><span class="s4">= </span><span class="s6">1.0 </span><span class="s4">- </span><span class="s1">np</span><span class="s4">.</span><span class="s1">exp</span><span class="s4">(-</span><span class="s1">masked_error_vector</span><span class="s4">)</span>
+
+        <span class="s2"># Calculate the average loss</span>
+        <span class="s1">estimator_error </span><span class="s4">= (</span><span class="s1">masked_sample_weight </span><span class="s4">* </span><span class="s1">masked_error_vector</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">()</span>
+
+        <span class="s3">if </span><span class="s1">estimator_error </span><span class="s4">&lt;= </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s2"># Stop if fit is perfect</span>
+            <span class="s3">return </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s6">1.0</span><span class="s4">, </span><span class="s6">0.0</span>
+
+        <span class="s3">elif </span><span class="s1">estimator_error </span><span class="s4">&gt;= </span><span class="s6">0.5</span><span class="s4">:</span>
+            <span class="s2"># Discard current estimator only if it isn't the only one</span>
+            <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">) &gt; </span><span class="s6">1</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s3">return None</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s3">None</span>
+
+        <span class="s1">beta </span><span class="s4">= </span><span class="s1">estimator_error </span><span class="s4">/ (</span><span class="s6">1.0 </span><span class="s4">- </span><span class="s1">estimator_error</span><span class="s4">)</span>
+
+        <span class="s2"># Boost weight using AdaBoost.R2 alg</span>
+        <span class="s1">estimator_weight </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">learning_rate </span><span class="s4">* </span><span class="s1">np</span><span class="s4">.</span><span class="s1">log</span><span class="s4">(</span><span class="s6">1.0 </span><span class="s4">/ </span><span class="s1">beta</span><span class="s4">)</span>
+
+        <span class="s3">if not </span><span class="s1">iboost </span><span class="s4">== </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_estimators </span><span class="s4">- </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">sample_weight</span><span class="s4">[</span><span class="s1">sample_mask</span><span class="s4">] *= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">power</span><span class="s4">(</span>
+                <span class="s1">beta</span><span class="s4">, (</span><span class="s6">1.0 </span><span class="s4">- </span><span class="s1">masked_error_vector</span><span class="s4">) * </span><span class="s1">self</span><span class="s4">.</span><span class="s1">learning_rate</span>
+            <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">estimator_weight</span><span class="s4">, </span><span class="s1">estimator_error</span>
+
+    <span class="s3">def </span><span class="s1">_get_median_predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">limit</span><span class="s4">):</span>
+        <span class="s2"># Evaluate predictions of all estimators</span>
+        <span class="s1">predictions </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">array</span><span class="s4">([</span><span class="s1">est</span><span class="s4">.</span><span class="s1">predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">) </span><span class="s3">for </span><span class="s1">est </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">[:</span><span class="s1">limit</span><span class="s4">]]).</span><span class="s1">T</span>
+
+        <span class="s2"># Sort the predictions</span>
+        <span class="s1">sorted_idx </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">argsort</span><span class="s4">(</span><span class="s1">predictions</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+
+        <span class="s2"># Find index of median prediction for each sample</span>
+        <span class="s1">weight_cdf </span><span class="s4">= </span><span class="s1">stable_cumsum</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimator_weights_</span><span class="s4">[</span><span class="s1">sorted_idx</span><span class="s4">], </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s1">median_or_above </span><span class="s4">= </span><span class="s1">weight_cdf </span><span class="s4">&gt;= </span><span class="s6">0.5 </span><span class="s4">* </span><span class="s1">weight_cdf</span><span class="s4">[:, -</span><span class="s6">1</span><span class="s4">][:, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">newaxis</span><span class="s4">]</span>
+        <span class="s1">median_idx </span><span class="s4">= </span><span class="s1">median_or_above</span><span class="s4">.</span><span class="s1">argmax</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+
+        <span class="s1">median_estimators </span><span class="s4">= </span><span class="s1">sorted_idx</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arange</span><span class="s4">(</span><span class="s1">_num_samples</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)), </span><span class="s1">median_idx</span><span class="s4">]</span>
+
+        <span class="s2"># Return median predictions</span>
+        <span class="s3">return </span><span class="s1">predictions</span><span class="s4">[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arange</span><span class="s4">(</span><span class="s1">_num_samples</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)), </span><span class="s1">median_estimators</span><span class="s4">]</span>
+
+    <span class="s3">def </span><span class="s1">predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict regression value for X. 
+ 
+        The predicted regression value of an input sample is computed 
+        as the weighted median prediction of the regressors in the ensemble. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. Sparse matrix can be CSC, CSR, COO, 
+            DOK, or LIL. COO, DOK, and LIL are converted to CSR. 
+ 
+        Returns 
+        ------- 
+        y : ndarray of shape (n_samples,) 
+            The predicted regression values. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_X</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_median_predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">staged_predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Return staged predictions for X. 
+ 
+        The predicted regression value of an input sample is computed 
+        as the weighted median prediction of the regressors in the ensemble. 
+ 
+        This generator method yields the ensemble prediction after each 
+        iteration of boosting and therefore allows monitoring, such as to 
+        determine the prediction on a test set after each boost. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            The training input samples. 
+ 
+        Yields 
+        ------ 
+        y : generator of ndarray of shape (n_samples,) 
+            The predicted regression values. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_X</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">i</span><span class="s4">, </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">estimators_</span><span class="s4">, </span><span class="s6">1</span><span class="s4">):</span>
+            <span class="s3">yield </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_median_predict</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">limit</span><span class="s4">=</span><span class="s1">i</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

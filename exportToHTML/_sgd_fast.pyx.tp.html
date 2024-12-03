@@ -1,0 +1,797 @@
+<html>
+<head>
+<title>_sgd_fast.pyx.tp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_sgd_fast.pyx.tp</font>
+</center></td></tr></table>
+<pre><span class="s0">{{py:</span>
+
+<span class="s0">&quot;&quot;&quot;</span>
+<span class="s0">Template file to easily generate fused types consistent code using Tempita</span>
+<span class="s0">(https://github.com/cython/cython/blob/master/Cython/Tempita/_tempita.py).</span>
+
+<span class="s0">Generated file: _sgd_fast.pyx</span>
+
+<span class="s0">Each relevant function is duplicated for the dtypes float and double.</span>
+<span class="s0">The keywords between double braces are substituted in setup.py.</span>
+
+<span class="s0">Authors: Peter Prettenhofer &lt;peter.prettenhofer@gmail.com&gt;</span>
+         <span class="s0">Mathieu Blondel (partial_fit support)</span>
+         <span class="s0">Rob Zinkov (passive-aggressive)</span>
+         <span class="s0">Lars Buitinck</span>
+
+<span class="s0">License: BSD 3 clause</span>
+<span class="s0">&quot;&quot;&quot;</span>
+
+<span class="s0"># The dtypes are defined as follows (name_suffix, c_type, np_type)</span>
+<span class="s0">dtypes = [</span>
+    <span class="s0">(&quot;64&quot;, &quot;double&quot;, &quot;np.float64&quot;),</span>
+    <span class="s0">(&quot;32&quot;, &quot;float&quot;, &quot;np.float32&quot;),</span>
+<span class="s0">]</span>
+
+<span class="s0">}}</span>
+<span class="s0">&quot;&quot;&quot;SGD implementation&quot;&quot;&quot;</span>
+
+<span class="s0">import numpy as np</span>
+<span class="s0">from time import time</span>
+
+<span class="s0">from cython cimport floating</span>
+<span class="s0">from libc.math cimport exp, fabs, isfinite, log, pow, INFINITY</span>
+
+<span class="s0">from ..utils._typedefs cimport uint32_t</span>
+<span class="s0">from ..utils._weight_vector cimport WeightVector32, WeightVector64</span>
+<span class="s0">from ..utils._seq_dataset cimport SequentialDataset32, SequentialDataset64</span>
+
+
+<span class="s0">cdef extern from *:</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">/* Penalty constants */</span>
+    <span class="s0">#define NO_PENALTY 0</span>
+    <span class="s0">#define L1 1</span>
+    <span class="s0">#define L2 2</span>
+    <span class="s0">#define ELASTICNET 3</span>
+
+    <span class="s0">/* Learning rate constants */</span>
+    <span class="s0">#define CONSTANT 1</span>
+    <span class="s0">#define OPTIMAL 2</span>
+    <span class="s0">#define INVSCALING 3</span>
+    <span class="s0">#define ADAPTIVE 4</span>
+    <span class="s0">#define PA1 5</span>
+    <span class="s0">#define PA2 6</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">int NO_PENALTY = 0</span>
+    <span class="s0">int L1 = 1</span>
+    <span class="s0">int L2 = 2</span>
+    <span class="s0">int ELASTICNET = 3</span>
+
+    <span class="s0">int CONSTANT = 1</span>
+    <span class="s0">int OPTIMAL = 2</span>
+    <span class="s0">int INVSCALING = 3</span>
+    <span class="s0">int ADAPTIVE = 4</span>
+    <span class="s0">int PA1 = 5</span>
+    <span class="s0">int PA2 = 6</span>
+
+
+<span class="s0"># ----------------------------------------</span>
+<span class="s0"># Extension Types for Loss Functions</span>
+<span class="s0"># ----------------------------------------</span>
+
+<span class="s0">cdef class LossFunction:</span>
+    <span class="s0">&quot;&quot;&quot;Base class for convex loss functions&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Evaluate the loss function.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">y : double</span>
+            <span class="s0">The true value (aka target).</span>
+        <span class="s0">p : double</span>
+            <span class="s0">The prediction, `p = w^T x + intercept`.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">double</span>
+            <span class="s0">The loss evaluated at `p` and `y`.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return 0.</span>
+
+    <span class="s0">def py_dloss(self, double p, double y):</span>
+        <span class="s0">&quot;&quot;&quot;Python version of `dloss` for testing.</span>
+
+        <span class="s0">Pytest needs a python function and can't use cdef functions.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">p : double</span>
+            <span class="s0">The prediction, `p = w^T x`.</span>
+        <span class="s0">y : double</span>
+            <span class="s0">The true value (aka target).</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">double</span>
+            <span class="s0">The derivative of the loss function with regards to `p`.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return self.dloss(y, p)</span>
+
+    <span class="s0">def py_loss(self, double p, double y):</span>
+        <span class="s0">&quot;&quot;&quot;Python version of `loss` for testing.</span>
+
+        <span class="s0">Pytest needs a python function and can't use cdef functions.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">p : double</span>
+            <span class="s0">The prediction, `p = w^T x + intercept`.</span>
+        <span class="s0">y : double</span>
+            <span class="s0">The true value (aka target).</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">double</span>
+            <span class="s0">The loss evaluated at `p` and `y`.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return self.loss(y, p)</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">&quot;&quot;&quot;Evaluate the derivative of the loss function with respect to</span>
+        <span class="s0">the prediction `p`.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">y : double</span>
+            <span class="s0">The true value (aka target).</span>
+        <span class="s0">p : double</span>
+            <span class="s0">The prediction, `p = w^T x`.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">double</span>
+            <span class="s0">The derivative of the loss function with regards to `p`.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">return 0.</span>
+
+
+<span class="s0">cdef class Regression(LossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for loss functions for regression&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">return 0.</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">return 0.</span>
+
+
+<span class="s0">cdef class Classification(LossFunction):</span>
+    <span class="s0">&quot;&quot;&quot;Base class for loss functions for classification&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">return 0.</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">return 0.</span>
+
+
+<span class="s0">cdef class ModifiedHuber(Classification):</span>
+    <span class="s0">&quot;&quot;&quot;Modified Huber loss for binary classification with y in {-1, 1}</span>
+
+    <span class="s0">This is equivalent to quadratically smoothed SVM with gamma = 2.</span>
+
+    <span class="s0">See T. Zhang 'Solving Large Scale Linear Prediction Problems Using</span>
+    <span class="s0">Stochastic Gradient Descent', ICML'04.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = p * y</span>
+        <span class="s0">if z &gt;= 1.0:</span>
+            <span class="s0">return 0.0</span>
+        <span class="s0">elif z &gt;= -1.0:</span>
+            <span class="s0">return (1.0 - z) * (1.0 - z)</span>
+        <span class="s0">else:</span>
+            <span class="s0">return -4.0 * z</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = p * y</span>
+        <span class="s0">if z &gt;= 1.0:</span>
+            <span class="s0">return 0.0</span>
+        <span class="s0">elif z &gt;= -1.0:</span>
+            <span class="s0">return 2.0 * (1.0 - z) * -y</span>
+        <span class="s0">else:</span>
+            <span class="s0">return -4.0 * y</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return ModifiedHuber, ()</span>
+
+
+<span class="s0">cdef class Hinge(Classification):</span>
+    <span class="s0">&quot;&quot;&quot;Hinge loss for binary classification tasks with y in {-1,1}</span>
+
+    <span class="s0">Parameters</span>
+    <span class="s0">----------</span>
+
+    <span class="s0">threshold : float &gt; 0.0</span>
+        <span class="s0">Margin threshold. When threshold=1.0, one gets the loss used by SVM.</span>
+        <span class="s0">When threshold=0.0, one gets the loss used by the Perceptron.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double threshold</span>
+
+    <span class="s0">def __init__(self, double threshold=1.0):</span>
+        <span class="s0">self.threshold = threshold</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = p * y</span>
+        <span class="s0">if z &lt;= self.threshold:</span>
+            <span class="s0">return self.threshold - z</span>
+        <span class="s0">return 0.0</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = p * y</span>
+        <span class="s0">if z &lt;= self.threshold:</span>
+            <span class="s0">return -y</span>
+        <span class="s0">return 0.0</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return Hinge, (self.threshold,)</span>
+
+
+<span class="s0">cdef class SquaredHinge(Classification):</span>
+    <span class="s0">&quot;&quot;&quot;Squared Hinge loss for binary classification tasks with y in {-1,1}</span>
+
+    <span class="s0">Parameters</span>
+    <span class="s0">----------</span>
+
+    <span class="s0">threshold : float &gt; 0.0</span>
+        <span class="s0">Margin threshold. When threshold=1.0, one gets the loss used by</span>
+        <span class="s0">(quadratically penalized) SVM.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double threshold</span>
+
+    <span class="s0">def __init__(self, double threshold=1.0):</span>
+        <span class="s0">self.threshold = threshold</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = self.threshold - p * y</span>
+        <span class="s0">if z &gt; 0:</span>
+            <span class="s0">return z * z</span>
+        <span class="s0">return 0.0</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = self.threshold - p * y</span>
+        <span class="s0">if z &gt; 0:</span>
+            <span class="s0">return -2 * y * z</span>
+        <span class="s0">return 0.0</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return SquaredHinge, (self.threshold,)</span>
+
+
+<span class="s0">cdef class Log(Classification):</span>
+    <span class="s0">&quot;&quot;&quot;Logistic regression loss for binary classification with y in {-1, 1}&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = p * y</span>
+        <span class="s0"># approximately equal and saves the computation of the log</span>
+        <span class="s0">if z &gt; 18:</span>
+            <span class="s0">return exp(-z)</span>
+        <span class="s0">if z &lt; -18:</span>
+            <span class="s0">return -z</span>
+        <span class="s0">return log(1.0 + exp(-z))</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z = p * y</span>
+        <span class="s0"># approximately equal and saves the computation of the log</span>
+        <span class="s0">if z &gt; 18.0:</span>
+            <span class="s0">return exp(-z) * -y</span>
+        <span class="s0">if z &lt; -18.0:</span>
+            <span class="s0">return -y</span>
+        <span class="s0">return -y / (exp(z) + 1.0)</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return Log, ()</span>
+
+
+<span class="s0">cdef class SquaredLoss(Regression):</span>
+    <span class="s0">&quot;&quot;&quot;Squared loss traditional used in linear regression.&quot;&quot;&quot;</span>
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">return 0.5 * (p - y) * (p - y)</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">return p - y</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return SquaredLoss, ()</span>
+
+
+<span class="s0">cdef class Huber(Regression):</span>
+    <span class="s0">&quot;&quot;&quot;Huber regression loss</span>
+
+    <span class="s0">Variant of the SquaredLoss that is robust to outliers (quadratic near zero,</span>
+    <span class="s0">linear in for large errors).</span>
+
+    <span class="s0">https://en.wikipedia.org/wiki/Huber_Loss_Function</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double c</span>
+
+    <span class="s0">def __init__(self, double c):</span>
+        <span class="s0">self.c = c</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double r = p - y</span>
+        <span class="s0">cdef double abs_r = fabs(r)</span>
+        <span class="s0">if abs_r &lt;= self.c:</span>
+            <span class="s0">return 0.5 * r * r</span>
+        <span class="s0">else:</span>
+            <span class="s0">return self.c * abs_r - (0.5 * self.c * self.c)</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double r = p - y</span>
+        <span class="s0">cdef double abs_r = fabs(r)</span>
+        <span class="s0">if abs_r &lt;= self.c:</span>
+            <span class="s0">return r</span>
+        <span class="s0">elif r &gt; 0.0:</span>
+            <span class="s0">return self.c</span>
+        <span class="s0">else:</span>
+            <span class="s0">return -self.c</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return Huber, (self.c,)</span>
+
+
+<span class="s0">cdef class EpsilonInsensitive(Regression):</span>
+    <span class="s0">&quot;&quot;&quot;Epsilon-Insensitive loss (used by SVR).</span>
+
+    <span class="s0">loss = max(0, |y - p| - epsilon)</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double epsilon</span>
+
+    <span class="s0">def __init__(self, double epsilon):</span>
+        <span class="s0">self.epsilon = epsilon</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double ret = fabs(y - p) - self.epsilon</span>
+        <span class="s0">return ret if ret &gt; 0 else 0</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">if y - p &gt; self.epsilon:</span>
+            <span class="s0">return -1</span>
+        <span class="s0">elif p - y &gt; self.epsilon:</span>
+            <span class="s0">return 1</span>
+        <span class="s0">else:</span>
+            <span class="s0">return 0</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return EpsilonInsensitive, (self.epsilon,)</span>
+
+
+<span class="s0">cdef class SquaredEpsilonInsensitive(Regression):</span>
+    <span class="s0">&quot;&quot;&quot;Epsilon-Insensitive loss.</span>
+
+    <span class="s0">loss = max(0, |y - p| - epsilon)^2</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">cdef double epsilon</span>
+
+    <span class="s0">def __init__(self, double epsilon):</span>
+        <span class="s0">self.epsilon = epsilon</span>
+
+    <span class="s0">cdef double loss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double ret = fabs(y - p) - self.epsilon</span>
+        <span class="s0">return ret * ret if ret &gt; 0 else 0</span>
+
+    <span class="s0">cdef double dloss(self, double y, double p) noexcept nogil:</span>
+        <span class="s0">cdef double z</span>
+        <span class="s0">z = y - p</span>
+        <span class="s0">if z &gt; self.epsilon:</span>
+            <span class="s0">return -2 * (z - self.epsilon)</span>
+        <span class="s0">elif z &lt; -self.epsilon:</span>
+            <span class="s0">return 2 * (-z - self.epsilon)</span>
+        <span class="s0">else:</span>
+            <span class="s0">return 0</span>
+
+    <span class="s0">def __reduce__(self):</span>
+        <span class="s0">return SquaredEpsilonInsensitive, (self.epsilon,)</span>
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">def _plain_sgd{{name_suffix}}(</span>
+    <span class="s0">const {{c_type}}[::1] weights,</span>
+    <span class="s0">double intercept,</span>
+    <span class="s0">const {{c_type}}[::1] average_weights,</span>
+    <span class="s0">double average_intercept,</span>
+    <span class="s0">LossFunction loss,</span>
+    <span class="s0">int penalty_type,</span>
+    <span class="s0">double alpha,</span>
+    <span class="s0">double C,</span>
+    <span class="s0">double l1_ratio,</span>
+    <span class="s0">SequentialDataset{{name_suffix}} dataset,</span>
+    <span class="s0">const unsigned char[::1] validation_mask,</span>
+    <span class="s0">bint early_stopping,</span>
+    <span class="s0">validation_score_cb,</span>
+    <span class="s0">int n_iter_no_change,</span>
+    <span class="s0">unsigned int max_iter,</span>
+    <span class="s0">double tol,</span>
+    <span class="s0">int fit_intercept,</span>
+    <span class="s0">int verbose,</span>
+    <span class="s0">bint shuffle,</span>
+    <span class="s0">uint32_t seed,</span>
+    <span class="s0">double weight_pos,</span>
+    <span class="s0">double weight_neg,</span>
+    <span class="s0">int learning_rate,</span>
+    <span class="s0">double eta0,</span>
+    <span class="s0">double power_t,</span>
+    <span class="s0">bint one_class,</span>
+    <span class="s0">double t=1.0,</span>
+    <span class="s0">double intercept_decay=1.0,</span>
+    <span class="s0">int average=0,</span>
+<span class="s0">):</span>
+    <span class="s0">&quot;&quot;&quot;SGD for generic loss functions and penalties with optional averaging</span>
+
+    <span class="s0">Parameters</span>
+    <span class="s0">----------</span>
+    <span class="s0">weights : ndarray[{{c_type}}, ndim=1]</span>
+        <span class="s0">The allocated vector of weights.</span>
+    <span class="s0">intercept : double</span>
+        <span class="s0">The initial intercept.</span>
+    <span class="s0">average_weights : ndarray[{{c_type}}, ndim=1]</span>
+        <span class="s0">The average weights as computed for ASGD. Should be None if average</span>
+        <span class="s0">is 0.</span>
+    <span class="s0">average_intercept : double</span>
+        <span class="s0">The average intercept for ASGD. Should be 0 if average is 0.</span>
+    <span class="s0">loss : LossFunction</span>
+        <span class="s0">A concrete ``LossFunction`` object.</span>
+    <span class="s0">penalty_type : int</span>
+        <span class="s0">The penalty 2 for L2, 1 for L1, and 3 for Elastic-Net.</span>
+    <span class="s0">alpha : float</span>
+        <span class="s0">The regularization parameter.</span>
+    <span class="s0">C : float</span>
+        <span class="s0">Maximum step size for passive aggressive.</span>
+    <span class="s0">l1_ratio : float</span>
+        <span class="s0">The Elastic Net mixing parameter, with 0 &lt;= l1_ratio &lt;= 1.</span>
+        <span class="s0">l1_ratio=0 corresponds to L2 penalty, l1_ratio=1 to L1.</span>
+    <span class="s0">dataset : SequentialDataset</span>
+        <span class="s0">A concrete ``SequentialDataset`` object.</span>
+    <span class="s0">validation_mask : ndarray[unsigned char, ndim=1]</span>
+        <span class="s0">Equal to True on the validation set.</span>
+    <span class="s0">early_stopping : boolean</span>
+        <span class="s0">Whether to use a stopping criterion based on the validation set.</span>
+    <span class="s0">validation_score_cb : callable</span>
+        <span class="s0">A callable to compute a validation score given the current</span>
+        <span class="s0">coefficients and intercept values.</span>
+        <span class="s0">Used only if early_stopping is True.</span>
+    <span class="s0">n_iter_no_change : int</span>
+        <span class="s0">Number of iteration with no improvement to wait before stopping.</span>
+    <span class="s0">max_iter : int</span>
+        <span class="s0">The maximum number of iterations (epochs).</span>
+    <span class="s0">tol: double</span>
+        <span class="s0">The tolerance for the stopping criterion.</span>
+    <span class="s0">fit_intercept : int</span>
+        <span class="s0">Whether or not to fit the intercept (1 or 0).</span>
+    <span class="s0">verbose : int</span>
+        <span class="s0">Print verbose output; 0 for quite.</span>
+    <span class="s0">shuffle : boolean</span>
+        <span class="s0">Whether to shuffle the training data before each epoch.</span>
+    <span class="s0">weight_pos : float</span>
+        <span class="s0">The weight of the positive class.</span>
+    <span class="s0">weight_neg : float</span>
+        <span class="s0">The weight of the negative class.</span>
+    <span class="s0">seed : uint32_t</span>
+        <span class="s0">Seed of the pseudorandom number generator used to shuffle the data.</span>
+    <span class="s0">learning_rate : int</span>
+        <span class="s0">The learning rate:</span>
+        <span class="s0">(1) constant, eta = eta0</span>
+        <span class="s0">(2) optimal, eta = 1.0/(alpha * t).</span>
+        <span class="s0">(3) inverse scaling, eta = eta0 / pow(t, power_t)</span>
+        <span class="s0">(4) adaptive decrease</span>
+        <span class="s0">(5) Passive Aggressive-I, eta = min(alpha, loss/norm(x))</span>
+        <span class="s0">(6) Passive Aggressive-II, eta = 1.0 / (norm(x) + 0.5*alpha)</span>
+    <span class="s0">eta0 : double</span>
+        <span class="s0">The initial learning rate.</span>
+    <span class="s0">power_t : double</span>
+        <span class="s0">The exponent for inverse scaling learning rate.</span>
+    <span class="s0">one_class : boolean</span>
+        <span class="s0">Whether to solve the One-Class SVM optimization problem.</span>
+    <span class="s0">t : double</span>
+        <span class="s0">Initial state of the learning rate. This value is equal to the</span>
+        <span class="s0">iteration count except when the learning rate is set to `optimal`.</span>
+        <span class="s0">Default: 1.0.</span>
+    <span class="s0">average : int</span>
+        <span class="s0">The number of iterations before averaging starts. average=1 is</span>
+        <span class="s0">equivalent to averaging for all iterations.</span>
+
+
+    <span class="s0">Returns</span>
+    <span class="s0">-------</span>
+    <span class="s0">weights : array, shape=[n_features]</span>
+        <span class="s0">The fitted weight vector.</span>
+    <span class="s0">intercept : float</span>
+        <span class="s0">The fitted intercept term.</span>
+    <span class="s0">average_weights : array shape=[n_features]</span>
+        <span class="s0">The averaged weights across iterations. Values are valid only if</span>
+        <span class="s0">average &gt; 0.</span>
+    <span class="s0">average_intercept : float</span>
+        <span class="s0">The averaged intercept across iterations.</span>
+        <span class="s0">Values are valid only if average &gt; 0.</span>
+    <span class="s0">n_iter_ : int</span>
+        <span class="s0">The actual number of iter (epochs).</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0"># get the data information into easy vars</span>
+    <span class="s0">cdef Py_ssize_t n_samples = dataset.n_samples</span>
+    <span class="s0">cdef Py_ssize_t n_features = weights.shape[0]</span>
+
+    <span class="s0">cdef WeightVector{{name_suffix}} w = WeightVector{{name_suffix}}(weights, average_weights)</span>
+    <span class="s0">cdef {{c_type}} *x_data_ptr = NULL</span>
+    <span class="s0">cdef int *x_ind_ptr = NULL</span>
+
+    <span class="s0"># helper variables</span>
+    <span class="s0">cdef int no_improvement_count = 0</span>
+    <span class="s0">cdef bint infinity = False</span>
+    <span class="s0">cdef int xnnz</span>
+    <span class="s0">cdef double eta = 0.0</span>
+    <span class="s0">cdef double p = 0.0</span>
+    <span class="s0">cdef double update = 0.0</span>
+    <span class="s0">cdef double intercept_update = 0.0</span>
+    <span class="s0">cdef double sumloss = 0.0</span>
+    <span class="s0">cdef double score = 0.0</span>
+    <span class="s0">cdef double best_loss = INFINITY</span>
+    <span class="s0">cdef double best_score = -INFINITY</span>
+    <span class="s0">cdef {{c_type}} y = 0.0</span>
+    <span class="s0">cdef {{c_type}} sample_weight</span>
+    <span class="s0">cdef {{c_type}} class_weight = 1.0</span>
+    <span class="s0">cdef unsigned int count = 0</span>
+    <span class="s0">cdef unsigned int train_count = n_samples - np.sum(validation_mask)</span>
+    <span class="s0">cdef unsigned int epoch = 0</span>
+    <span class="s0">cdef unsigned int i = 0</span>
+    <span class="s0">cdef int is_hinge = isinstance(loss, Hinge)</span>
+    <span class="s0">cdef double optimal_init = 0.0</span>
+    <span class="s0">cdef double dloss = 0.0</span>
+    <span class="s0">cdef double MAX_DLOSS = 1e12</span>
+
+    <span class="s0">cdef long long sample_index</span>
+
+    <span class="s0"># q vector is only used for L1 regularization</span>
+    <span class="s0">cdef {{c_type}}[::1] q = None</span>
+    <span class="s0">cdef {{c_type}} * q_data_ptr = NULL</span>
+    <span class="s0">if penalty_type == L1 or penalty_type == ELASTICNET:</span>
+        <span class="s0">q = np.zeros((n_features,), dtype={{np_type}}, order=&quot;c&quot;)</span>
+        <span class="s0">q_data_ptr = &amp;q[0]</span>
+    <span class="s0">cdef double u = 0.0</span>
+
+    <span class="s0">if penalty_type == L2:</span>
+        <span class="s0">l1_ratio = 0.0</span>
+    <span class="s0">elif penalty_type == L1:</span>
+        <span class="s0">l1_ratio = 1.0</span>
+
+    <span class="s0">eta = eta0</span>
+
+    <span class="s0">if learning_rate == OPTIMAL:</span>
+        <span class="s0">typw = np.sqrt(1.0 / np.sqrt(alpha))</span>
+        <span class="s0"># computing eta0, the initial learning rate</span>
+        <span class="s0">initial_eta0 = typw / max(1.0, loss.dloss(1.0, -typw))</span>
+        <span class="s0"># initialize t such that eta at first sample equals eta0</span>
+        <span class="s0">optimal_init = 1.0 / (initial_eta0 * alpha)</span>
+
+    <span class="s0">t_start = time()</span>
+    <span class="s0">with nogil:</span>
+        <span class="s0">for epoch in range(max_iter):</span>
+            <span class="s0">sumloss = 0</span>
+            <span class="s0">if verbose &gt; 0:</span>
+                <span class="s0">with gil:</span>
+                    <span class="s0">print(&quot;-- Epoch %d&quot; % (epoch + 1))</span>
+            <span class="s0">if shuffle:</span>
+                <span class="s0">dataset.shuffle(seed)</span>
+            <span class="s0">for i in range(n_samples):</span>
+                <span class="s0">dataset.next(&amp;x_data_ptr, &amp;x_ind_ptr, &amp;xnnz,</span>
+                             <span class="s0">&amp;y, &amp;sample_weight)</span>
+
+                <span class="s0">sample_index = dataset.index_data_ptr[dataset.current_index]</span>
+                <span class="s0">if validation_mask[sample_index]:</span>
+                    <span class="s0"># do not learn on the validation set</span>
+                    <span class="s0">continue</span>
+
+                <span class="s0">p = w.dot(x_data_ptr, x_ind_ptr, xnnz) + intercept</span>
+                <span class="s0">if learning_rate == OPTIMAL:</span>
+                    <span class="s0">eta = 1.0 / (alpha * (optimal_init + t - 1))</span>
+                <span class="s0">elif learning_rate == INVSCALING:</span>
+                    <span class="s0">eta = eta0 / pow(t, power_t)</span>
+
+                <span class="s0">if verbose or not early_stopping:</span>
+                    <span class="s0">sumloss += loss.loss(y, p)</span>
+
+                <span class="s0">if y &gt; 0.0:</span>
+                    <span class="s0">class_weight = weight_pos</span>
+                <span class="s0">else:</span>
+                    <span class="s0">class_weight = weight_neg</span>
+
+                <span class="s0">if learning_rate == PA1:</span>
+                    <span class="s0">update = sqnorm(x_data_ptr, x_ind_ptr, xnnz)</span>
+                    <span class="s0">if update == 0:</span>
+                        <span class="s0">continue</span>
+                    <span class="s0">update = min(C, loss.loss(y, p) / update)</span>
+                <span class="s0">elif learning_rate == PA2:</span>
+                    <span class="s0">update = sqnorm(x_data_ptr, x_ind_ptr, xnnz)</span>
+                    <span class="s0">update = loss.loss(y, p) / (update + 0.5 / C)</span>
+                <span class="s0">else:</span>
+                    <span class="s0">dloss = loss.dloss(y, p)</span>
+                    <span class="s0"># clip dloss with large values to avoid numerical</span>
+                    <span class="s0"># instabilities</span>
+                    <span class="s0">if dloss &lt; -MAX_DLOSS:</span>
+                        <span class="s0">dloss = -MAX_DLOSS</span>
+                    <span class="s0">elif dloss &gt; MAX_DLOSS:</span>
+                        <span class="s0">dloss = MAX_DLOSS</span>
+                    <span class="s0">update = -eta * dloss</span>
+
+                <span class="s0">if learning_rate &gt;= PA1:</span>
+                    <span class="s0">if is_hinge:</span>
+                        <span class="s0"># classification</span>
+                        <span class="s0">update *= y</span>
+                    <span class="s0">elif y - p &lt; 0:</span>
+                        <span class="s0"># regression</span>
+                        <span class="s0">update *= -1</span>
+
+                <span class="s0">update *= class_weight * sample_weight</span>
+
+                <span class="s0">if penalty_type &gt;= L2:</span>
+                    <span class="s0"># do not scale to negative values when eta or alpha are too</span>
+                    <span class="s0"># big: instead set the weights to zero</span>
+                    <span class="s0">w.scale(max(0, 1.0 - ((1.0 - l1_ratio) * eta * alpha)))</span>
+
+                <span class="s0">if update != 0.0:</span>
+                    <span class="s0">w.add(x_data_ptr, x_ind_ptr, xnnz, update)</span>
+                <span class="s0">if fit_intercept == 1:</span>
+                    <span class="s0">intercept_update = update</span>
+                    <span class="s0">if one_class:  # specific for One-Class SVM</span>
+                        <span class="s0">intercept_update -= 2. * eta * alpha</span>
+                    <span class="s0">if intercept_update != 0:</span>
+                        <span class="s0">intercept += intercept_update * intercept_decay</span>
+
+                <span class="s0">if 0 &lt; average &lt;= t:</span>
+                    <span class="s0"># compute the average for the intercept and update the</span>
+                    <span class="s0"># average weights, this is done regardless as to whether</span>
+                    <span class="s0"># the update is 0</span>
+
+                    <span class="s0">w.add_average(x_data_ptr, x_ind_ptr, xnnz,</span>
+                                  <span class="s0">update, (t - average + 1))</span>
+                    <span class="s0">average_intercept += ((intercept - average_intercept) /</span>
+                                          <span class="s0">(t - average + 1))</span>
+
+                <span class="s0">if penalty_type == L1 or penalty_type == ELASTICNET:</span>
+                    <span class="s0">u += (l1_ratio * eta * alpha)</span>
+                    <span class="s0">l1penalty{{name_suffix}}(w, q_data_ptr, x_ind_ptr, xnnz, u)</span>
+
+                <span class="s0">t += 1</span>
+                <span class="s0">count += 1</span>
+
+            <span class="s0"># report epoch information</span>
+            <span class="s0">if verbose &gt; 0:</span>
+                <span class="s0">with gil:</span>
+                    <span class="s0">print(&quot;Norm: %.2f, NNZs: %d, Bias: %.6f, T: %d, &quot;</span>
+                          <span class="s0">&quot;Avg. loss: %f&quot;</span>
+                          <span class="s0">% (w.norm(), np.nonzero(weights)[0].shape[0],</span>
+                             <span class="s0">intercept, count, sumloss / train_count))</span>
+                    <span class="s0">print(&quot;Total training time: %.2f seconds.&quot;</span>
+                          <span class="s0">% (time() - t_start))</span>
+
+            <span class="s0"># floating-point under-/overflow check.</span>
+            <span class="s0">if (not isfinite(intercept) or any_nonfinite(weights)):</span>
+                <span class="s0">infinity = True</span>
+                <span class="s0">break</span>
+
+            <span class="s0"># evaluate the score on the validation set</span>
+            <span class="s0">if early_stopping:</span>
+                <span class="s0">with gil:</span>
+                    <span class="s0">score = validation_score_cb(weights.base, intercept)</span>
+                <span class="s0">if tol &gt; -INFINITY and score &lt; best_score + tol:</span>
+                    <span class="s0">no_improvement_count += 1</span>
+                <span class="s0">else:</span>
+                    <span class="s0">no_improvement_count = 0</span>
+                <span class="s0">if score &gt; best_score:</span>
+                    <span class="s0">best_score = score</span>
+            <span class="s0"># or evaluate the loss on the training set</span>
+            <span class="s0">else:</span>
+                <span class="s0">if tol &gt; -INFINITY and sumloss &gt; best_loss - tol * train_count:</span>
+                    <span class="s0">no_improvement_count += 1</span>
+                <span class="s0">else:</span>
+                    <span class="s0">no_improvement_count = 0</span>
+                <span class="s0">if sumloss &lt; best_loss:</span>
+                    <span class="s0">best_loss = sumloss</span>
+
+            <span class="s0"># if there is no improvement several times in a row</span>
+            <span class="s0">if no_improvement_count &gt;= n_iter_no_change:</span>
+                <span class="s0">if learning_rate == ADAPTIVE and eta &gt; 1e-6:</span>
+                    <span class="s0">eta = eta / 5</span>
+                    <span class="s0">no_improvement_count = 0</span>
+                <span class="s0">else:</span>
+                    <span class="s0">if verbose:</span>
+                        <span class="s0">with gil:</span>
+                            <span class="s0">print(&quot;Convergence after %d epochs took %.2f &quot;</span>
+                                  <span class="s0">&quot;seconds&quot; % (epoch + 1, time() - t_start))</span>
+                    <span class="s0">break</span>
+
+    <span class="s0">if infinity:</span>
+        <span class="s0">raise ValueError((&quot;Floating-point under-/overflow occurred at epoch&quot;</span>
+                          <span class="s0">&quot; #%d. Scaling input data with StandardScaler or&quot;</span>
+                          <span class="s0">&quot; MinMaxScaler might help.&quot;) % (epoch + 1))</span>
+
+    <span class="s0">w.reset_wscale()</span>
+
+    <span class="s0">return (</span>
+        <span class="s0">weights.base,</span>
+        <span class="s0">intercept,</span>
+        <span class="s0">None if average_weights is None else average_weights.base,</span>
+        <span class="s0">average_intercept,</span>
+        <span class="s0">epoch + 1</span>
+    <span class="s0">)</span>
+
+<span class="s0">{{endfor}}</span>
+
+
+<span class="s0">cdef inline bint any_nonfinite(const floating[::1] w) noexcept nogil:</span>
+    <span class="s0">for i in range(w.shape[0]):</span>
+        <span class="s0">if not isfinite(w[i]):</span>
+            <span class="s0">return True</span>
+    <span class="s0">return 0</span>
+
+
+<span class="s0">cdef inline double sqnorm(</span>
+    <span class="s0">floating * x_data_ptr,</span>
+    <span class="s0">int * x_ind_ptr,</span>
+    <span class="s0">int xnnz,</span>
+<span class="s0">) noexcept nogil:</span>
+    <span class="s0">cdef double x_norm = 0.0</span>
+    <span class="s0">cdef int j</span>
+    <span class="s0">cdef double z</span>
+    <span class="s0">for j in range(xnnz):</span>
+        <span class="s0">z = x_data_ptr[j]</span>
+        <span class="s0">x_norm += z * z</span>
+    <span class="s0">return x_norm</span>
+
+
+<span class="s0">{{for name_suffix, c_type, np_type in dtypes}}</span>
+
+<span class="s0">cdef void l1penalty{{name_suffix}}(</span>
+    <span class="s0">WeightVector{{name_suffix}} w,</span>
+    <span class="s0">{{c_type}} * q_data_ptr,</span>
+    <span class="s0">int *x_ind_ptr,</span>
+    <span class="s0">int xnnz,</span>
+    <span class="s0">double u,</span>
+<span class="s0">) noexcept nogil:</span>
+    <span class="s0">&quot;&quot;&quot;Apply the L1 penalty to each updated feature</span>
+
+    <span class="s0">This implements the truncated gradient approach by</span>
+    <span class="s0">[Tsuruoka, Y., Tsujii, J., and Ananiadou, S., 2009].</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+    <span class="s0">cdef double z = 0.0</span>
+    <span class="s0">cdef int j = 0</span>
+    <span class="s0">cdef int idx = 0</span>
+    <span class="s0">cdef double wscale = w.wscale</span>
+    <span class="s0">cdef {{c_type}} *w_data_ptr = w.w_data_ptr</span>
+    <span class="s0">for j in range(xnnz):</span>
+        <span class="s0">idx = x_ind_ptr[j]</span>
+        <span class="s0">z = w_data_ptr[idx]</span>
+        <span class="s0">if wscale * z &gt; 0.0:</span>
+            <span class="s0">w_data_ptr[idx] = max(</span>
+                <span class="s0">0.0, w_data_ptr[idx] - ((u + q_data_ptr[idx]) / wscale))</span>
+
+        <span class="s0">elif wscale * z &lt; 0.0:</span>
+            <span class="s0">w_data_ptr[idx] = min(</span>
+                <span class="s0">0.0, w_data_ptr[idx] + ((u - q_data_ptr[idx]) / wscale))</span>
+
+        <span class="s0">q_data_ptr[idx] += wscale * (w_data_ptr[idx] - z)</span>
+
+<span class="s0">{{endfor}}</span>
+</pre>
+</body>
+</html>

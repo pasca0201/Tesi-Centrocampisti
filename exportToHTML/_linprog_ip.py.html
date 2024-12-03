@@ -1,0 +1,1149 @@
+<html>
+<head>
+<title>_linprog_ip.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_linprog_ip.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Interior-point method for linear programming 
+ 
+The *interior-point* method uses the primal-dual path following algorithm 
+outlined in [1]_. This algorithm supports sparse constraint matrices and 
+is typically faster than the simplex methods, especially for large, sparse 
+problems. Note, however, that the solution returned may be slightly less 
+accurate than those of the simplex methods and will not, in general, 
+correspond with a vertex of the polytope defined by the constraints. 
+ 
+    .. versionadded:: 1.0.0 
+ 
+References 
+---------- 
+.. [1] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+       optimizer for linear programming: an implementation of the 
+       homogeneous algorithm.&quot; High performance optimization. Springer US, 
+       2000. 197-232. 
+&quot;&quot;&quot;</span>
+<span class="s2"># Author: Matt Haberland</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">import </span><span class="s1">scipy </span><span class="s3">as </span><span class="s1">sp</span>
+<span class="s3">import </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">sparse </span><span class="s3">as </span><span class="s1">sps</span>
+<span class="s3">from </span><span class="s1">warnings </span><span class="s3">import </span><span class="s1">warn</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg </span><span class="s3">import </span><span class="s1">LinAlgError</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_optimize </span><span class="s3">import </span><span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">OptimizeResult</span><span class="s4">, </span><span class="s1">_check_unknown_options</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_linprog_util </span><span class="s3">import </span><span class="s1">_postsolve</span>
+<span class="s1">has_umfpack </span><span class="s4">= </span><span class="s3">True</span>
+<span class="s1">has_cholmod </span><span class="s4">= </span><span class="s3">True</span>
+<span class="s3">try</span><span class="s4">:</span>
+    <span class="s3">import </span><span class="s1">sksparse  </span><span class="s2"># noqa: F401</span>
+    <span class="s3">from </span><span class="s1">sksparse</span><span class="s4">.</span><span class="s1">cholmod </span><span class="s3">import </span><span class="s1">cholesky </span><span class="s3">as </span><span class="s1">cholmod  </span><span class="s2"># noqa: F401</span>
+    <span class="s3">from </span><span class="s1">sksparse</span><span class="s4">.</span><span class="s1">cholmod </span><span class="s3">import </span><span class="s1">analyze </span><span class="s3">as </span><span class="s1">cholmod_analyze</span>
+<span class="s3">except </span><span class="s1">ImportError</span><span class="s4">:</span>
+    <span class="s1">has_cholmod </span><span class="s4">= </span><span class="s3">False</span>
+<span class="s3">try</span><span class="s4">:</span>
+    <span class="s3">import </span><span class="s1">scikits</span><span class="s4">.</span><span class="s1">umfpack  </span><span class="s2"># test whether to use factorized  # noqa: F401</span>
+<span class="s3">except </span><span class="s1">ImportError</span><span class="s4">:</span>
+    <span class="s1">has_umfpack </span><span class="s4">= </span><span class="s3">False</span>
+
+
+<span class="s3">def </span><span class="s1">_get_solver</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">lstsq</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+                <span class="s1">cholesky</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">permc_spec</span><span class="s4">=</span><span class="s5">'MMD_AT_PLUS_A'</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given solver options, return a handle to the appropriate linear system 
+    solver. 
+ 
+    Parameters 
+    ---------- 
+    M : 2-D array 
+        As defined in [4] Equation 8.31 
+    sparse : bool (default = False) 
+        True if the system to be solved is sparse. This is typically set 
+        True when the original ``A_ub`` and ``A_eq`` arrays are sparse. 
+    lstsq : bool (default = False) 
+        True if the system is ill-conditioned and/or (nearly) singular and 
+        thus a more robust least-squares solver is desired. This is sometimes 
+        needed as the solution is approached. 
+    sym_pos : bool (default = True) 
+        True if the system matrix is symmetric positive definite 
+        Sometimes this needs to be set false as the solution is approached, 
+        even when the system should be symmetric positive definite, due to 
+        numerical difficulties. 
+    cholesky : bool (default = True) 
+        True if the system is to be solved by Cholesky, rather than LU, 
+        decomposition. This is typically faster unless the problem is very 
+        small or prone to numerical difficulties. 
+    permc_spec : str (default = 'MMD_AT_PLUS_A') 
+        Sparsity preservation strategy used by SuperLU. Acceptable values are: 
+ 
+        - ``NATURAL``: natural ordering. 
+        - ``MMD_ATA``: minimum degree ordering on the structure of A^T A. 
+        - ``MMD_AT_PLUS_A``: minimum degree ordering on the structure of A^T+A. 
+        - ``COLAMD``: approximate minimum degree column ordering. 
+ 
+        See SuperLU documentation. 
+ 
+    Returns 
+    ------- 
+    solve : function 
+        Handle to the appropriate solver function 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">sparse</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">lstsq</span><span class="s4">:</span>
+                <span class="s3">def </span><span class="s1">solve</span><span class="s4">(</span><span class="s1">r</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+                    <span class="s3">return </span><span class="s1">sps</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">lsqr</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">r</span><span class="s4">)[</span><span class="s6">0</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">cholesky</span><span class="s4">:</span>
+                <span class="s3">try</span><span class="s4">:</span>
+                    <span class="s2"># Will raise an exception in the first call,</span>
+                    <span class="s2"># or when the matrix changes due to a new problem</span>
+                    <span class="s1">_get_solver</span><span class="s4">.</span><span class="s1">cholmod_factor</span><span class="s4">.</span><span class="s1">cholesky_inplace</span><span class="s4">(</span><span class="s1">M</span><span class="s4">)</span>
+                <span class="s3">except </span><span class="s1">Exception</span><span class="s4">:</span>
+                    <span class="s1">_get_solver</span><span class="s4">.</span><span class="s1">cholmod_factor </span><span class="s4">= </span><span class="s1">cholmod_analyze</span><span class="s4">(</span><span class="s1">M</span><span class="s4">)</span>
+                    <span class="s1">_get_solver</span><span class="s4">.</span><span class="s1">cholmod_factor</span><span class="s4">.</span><span class="s1">cholesky_inplace</span><span class="s4">(</span><span class="s1">M</span><span class="s4">)</span>
+                <span class="s1">solve </span><span class="s4">= </span><span class="s1">_get_solver</span><span class="s4">.</span><span class="s1">cholmod_factor</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">if </span><span class="s1">has_umfpack </span><span class="s3">and </span><span class="s1">sym_pos</span><span class="s4">:</span>
+                    <span class="s1">solve </span><span class="s4">= </span><span class="s1">sps</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">factorized</span><span class="s4">(</span><span class="s1">M</span><span class="s4">)</span>
+                <span class="s3">else</span><span class="s4">:  </span><span class="s2"># factorized doesn't pass permc_spec</span>
+                    <span class="s1">solve </span><span class="s4">= </span><span class="s1">sps</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">splu</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">permc_spec</span><span class="s4">=</span><span class="s1">permc_spec</span><span class="s4">).</span><span class="s1">solve</span>
+
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">lstsq</span><span class="s4">:  </span><span class="s2"># sometimes necessary as solution is approached</span>
+                <span class="s3">def </span><span class="s1">solve</span><span class="s4">(</span><span class="s1">r</span><span class="s4">):</span>
+                    <span class="s3">return </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">lstsq</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">r</span><span class="s4">)[</span><span class="s6">0</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">cholesky</span><span class="s4">:</span>
+                <span class="s1">L </span><span class="s4">= </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">cho_factor</span><span class="s4">(</span><span class="s1">M</span><span class="s4">)</span>
+
+                <span class="s3">def </span><span class="s1">solve</span><span class="s4">(</span><span class="s1">r</span><span class="s4">):</span>
+                    <span class="s3">return </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">cho_solve</span><span class="s4">(</span><span class="s1">L</span><span class="s4">, </span><span class="s1">r</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s2"># this seems to cache the matrix factorization, so solving</span>
+                <span class="s2"># with multiple right hand sides is much faster</span>
+                <span class="s3">def </span><span class="s1">solve</span><span class="s4">(</span><span class="s1">r</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">=</span><span class="s1">sym_pos</span><span class="s4">):</span>
+                    <span class="s3">if </span><span class="s1">sym_pos</span><span class="s4">:</span>
+                        <span class="s3">return </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">solve</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">r</span><span class="s4">, </span><span class="s1">assume_a</span><span class="s4">=</span><span class="s5">&quot;pos&quot;</span><span class="s4">)</span>
+                    <span class="s3">else</span><span class="s4">:</span>
+                        <span class="s3">return </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">solve</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">r</span><span class="s4">)</span>
+    <span class="s2"># There are many things that can go wrong here, and it's hard to say</span>
+    <span class="s2"># what all of them are. It doesn't really matter: if the matrix can't be</span>
+    <span class="s2"># factorized, return None. get_solver will be called again with different</span>
+    <span class="s2"># inputs, and a new routine will try to factorize the matrix.</span>
+    <span class="s3">except </span><span class="s1">KeyboardInterrupt</span><span class="s4">:</span>
+        <span class="s3">raise</span>
+    <span class="s3">except </span><span class="s1">Exception</span><span class="s4">:</span>
+        <span class="s3">return None</span>
+    <span class="s3">return </span><span class="s1">solve</span>
+
+
+<span class="s3">def </span><span class="s1">_get_delta</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">gamma</span><span class="s4">, </span><span class="s1">eta</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+               <span class="s1">lstsq</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">cholesky</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">pc</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">ip</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+               <span class="s1">permc_spec</span><span class="s4">=</span><span class="s5">'MMD_AT_PLUS_A'</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given standard form problem defined by ``A``, ``b``, and ``c``; 
+    current variable estimates ``x``, ``y``, ``z``, ``tau``, and ``kappa``; 
+    algorithmic parameters ``gamma and ``eta; 
+    and options ``sparse``, ``lstsq``, ``sym_pos``, ``cholesky``, ``pc`` 
+    (predictor-corrector), and ``ip`` (initial point improvement), 
+    get the search direction for increments to the variable estimates. 
+ 
+    Parameters 
+    ---------- 
+    As defined in [4], except: 
+    sparse : bool 
+        True if the system to be solved is sparse. This is typically set 
+        True when the original ``A_ub`` and ``A_eq`` arrays are sparse. 
+    lstsq : bool 
+        True if the system is ill-conditioned and/or (nearly) singular and 
+        thus a more robust least-squares solver is desired. This is sometimes 
+        needed as the solution is approached. 
+    sym_pos : bool 
+        True if the system matrix is symmetric positive definite 
+        Sometimes this needs to be set false as the solution is approached, 
+        even when the system should be symmetric positive definite, due to 
+        numerical difficulties. 
+    cholesky : bool 
+        True if the system is to be solved by Cholesky, rather than LU, 
+        decomposition. This is typically faster unless the problem is very 
+        small or prone to numerical difficulties. 
+    pc : bool 
+        True if the predictor-corrector method of Mehrota is to be used. This 
+        is almost always (if not always) beneficial. Even though it requires 
+        the solution of an additional linear system, the factorization 
+        is typically (implicitly) reused so solution is efficient, and the 
+        number of algorithm iterations is typically reduced. 
+    ip : bool 
+        True if the improved initial point suggestion due to [4] section 4.3 
+        is desired. It's unclear whether this is beneficial. 
+    permc_spec : str (default = 'MMD_AT_PLUS_A') 
+        (Has effect only with ``sparse = True``, ``lstsq = False``, ``sym_pos = 
+        True``.) A matrix is factorized in each iteration of the algorithm. 
+        This option specifies how to permute the columns of the matrix for 
+        sparsity preservation. Acceptable values are: 
+ 
+        - ``NATURAL``: natural ordering. 
+        - ``MMD_ATA``: minimum degree ordering on the structure of A^T A. 
+        - ``MMD_AT_PLUS_A``: minimum degree ordering on the structure of A^T+A. 
+        - ``COLAMD``: approximate minimum degree column ordering. 
+ 
+        This option can impact the convergence of the 
+        interior point algorithm; test different values to determine which 
+        performs best for your problem. For more information, refer to 
+        ``scipy.sparse.linalg.splu``. 
+ 
+    Returns 
+    ------- 
+    Search directions as defined in [4] 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">] == </span><span class="s6">0</span><span class="s4">:</span>
+        <span class="s2"># If there are no constraints, some solvers fail (understandably)</span>
+        <span class="s2"># rather than returning empty solution. This gets the job done.</span>
+        <span class="s1">sparse</span><span class="s4">, </span><span class="s1">lstsq</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">, </span><span class="s1">cholesky </span><span class="s4">= </span><span class="s3">False</span><span class="s4">, </span><span class="s3">False</span><span class="s4">, </span><span class="s3">True</span><span class="s4">, </span><span class="s3">False</span>
+    <span class="s1">n_x </span><span class="s4">= </span><span class="s1">len</span><span class="s4">(</span><span class="s1">x</span><span class="s4">)</span>
+
+    <span class="s2"># [4] Equation 8.8</span>
+    <span class="s1">r_P </span><span class="s4">= </span><span class="s1">b </span><span class="s4">* </span><span class="s1">tau </span><span class="s4">- </span><span class="s1">A</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x</span><span class="s4">)</span>
+    <span class="s1">r_D </span><span class="s4">= </span><span class="s1">c </span><span class="s4">* </span><span class="s1">tau </span><span class="s4">- </span><span class="s1">A</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">) - </span><span class="s1">z</span>
+    <span class="s1">r_G </span><span class="s4">= </span><span class="s1">c</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x</span><span class="s4">) - </span><span class="s1">b</span><span class="s4">.</span><span class="s1">transpose</span><span class="s4">().</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">) + </span><span class="s1">kappa</span>
+    <span class="s1">mu </span><span class="s4">= (</span><span class="s1">x</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">z</span><span class="s4">) + </span><span class="s1">tau </span><span class="s4">* </span><span class="s1">kappa</span><span class="s4">) / (</span><span class="s1">n_x </span><span class="s4">+ </span><span class="s6">1</span><span class="s4">)</span>
+
+    <span class="s2">#  Assemble M from [4] Equation 8.31</span>
+    <span class="s1">Dinv </span><span class="s4">= </span><span class="s1">x </span><span class="s4">/ </span><span class="s1">z</span>
+
+    <span class="s3">if </span><span class="s1">sparse</span><span class="s4">:</span>
+        <span class="s1">M </span><span class="s4">= </span><span class="s1">A</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">sps</span><span class="s4">.</span><span class="s1">diags</span><span class="s4">(</span><span class="s1">Dinv</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s1">format</span><span class="s4">=</span><span class="s5">&quot;csc&quot;</span><span class="s4">).</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">A</span><span class="s4">.</span><span class="s1">T</span><span class="s4">))</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">M </span><span class="s4">= </span><span class="s1">A</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">Dinv</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">, </span><span class="s6">1</span><span class="s4">) * </span><span class="s1">A</span><span class="s4">.</span><span class="s1">T</span><span class="s4">)</span>
+    <span class="s1">solve </span><span class="s4">= </span><span class="s1">_get_solver</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">, </span><span class="s1">lstsq</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">, </span><span class="s1">cholesky</span><span class="s4">, </span><span class="s1">permc_spec</span><span class="s4">)</span>
+
+    <span class="s2"># pc: &quot;predictor-corrector&quot; [4] Section 4.1</span>
+    <span class="s2"># In development this option could be turned off</span>
+    <span class="s2"># but it always seems to improve performance substantially</span>
+    <span class="s1">n_corrections </span><span class="s4">= </span><span class="s6">1 </span><span class="s3">if </span><span class="s1">pc </span><span class="s3">else </span><span class="s6">0</span>
+
+    <span class="s1">i </span><span class="s4">= </span><span class="s6">0</span>
+    <span class="s1">alpha</span><span class="s4">, </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">d_kappa </span><span class="s4">= </span><span class="s6">0</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s6">0</span>
+    <span class="s3">while </span><span class="s1">i </span><span class="s4">&lt;= </span><span class="s1">n_corrections</span><span class="s4">:</span>
+        <span class="s2"># Reference [4] Eq. 8.6</span>
+        <span class="s1">rhatp </span><span class="s4">= </span><span class="s1">eta</span><span class="s4">(</span><span class="s1">gamma</span><span class="s4">) * </span><span class="s1">r_P</span>
+        <span class="s1">rhatd </span><span class="s4">= </span><span class="s1">eta</span><span class="s4">(</span><span class="s1">gamma</span><span class="s4">) * </span><span class="s1">r_D</span>
+        <span class="s1">rhatg </span><span class="s4">= </span><span class="s1">eta</span><span class="s4">(</span><span class="s1">gamma</span><span class="s4">) * </span><span class="s1">r_G</span>
+
+        <span class="s2"># Reference [4] Eq. 8.7</span>
+        <span class="s1">rhatxs </span><span class="s4">= </span><span class="s1">gamma </span><span class="s4">* </span><span class="s1">mu </span><span class="s4">- </span><span class="s1">x </span><span class="s4">* </span><span class="s1">z</span>
+        <span class="s1">rhattk </span><span class="s4">= </span><span class="s1">gamma </span><span class="s4">* </span><span class="s1">mu </span><span class="s4">- </span><span class="s1">tau </span><span class="s4">* </span><span class="s1">kappa</span>
+
+        <span class="s3">if </span><span class="s1">i </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">ip</span><span class="s4">:  </span><span class="s2"># if the correction is to get &quot;initial point&quot;</span>
+                <span class="s2"># Reference [4] Eq. 8.23</span>
+                <span class="s1">rhatxs </span><span class="s4">= ((</span><span class="s6">1 </span><span class="s4">- </span><span class="s1">alpha</span><span class="s4">) * </span><span class="s1">gamma </span><span class="s4">* </span><span class="s1">mu </span><span class="s4">-</span>
+                          <span class="s1">x </span><span class="s4">* </span><span class="s1">z </span><span class="s4">- </span><span class="s1">alpha</span><span class="s4">**</span><span class="s6">2 </span><span class="s4">* </span><span class="s1">d_x </span><span class="s4">* </span><span class="s1">d_z</span><span class="s4">)</span>
+                <span class="s1">rhattk </span><span class="s4">= ((</span><span class="s6">1 </span><span class="s4">- </span><span class="s1">alpha</span><span class="s4">) * </span><span class="s1">gamma </span><span class="s4">* </span><span class="s1">mu </span><span class="s4">-</span>
+                    <span class="s1">tau </span><span class="s4">* </span><span class="s1">kappa </span><span class="s4">-</span>
+                    <span class="s1">alpha</span><span class="s4">**</span><span class="s6">2 </span><span class="s4">* </span><span class="s1">d_tau </span><span class="s4">* </span><span class="s1">d_kappa</span><span class="s4">)</span>
+            <span class="s3">else</span><span class="s4">:  </span><span class="s2"># if the correction is for &quot;predictor-corrector&quot;</span>
+                <span class="s2"># Reference [4] Eq. 8.13</span>
+                <span class="s1">rhatxs </span><span class="s4">-= </span><span class="s1">d_x </span><span class="s4">* </span><span class="s1">d_z</span>
+                <span class="s1">rhattk </span><span class="s4">-= </span><span class="s1">d_tau </span><span class="s4">* </span><span class="s1">d_kappa</span>
+
+        <span class="s2"># sometimes numerical difficulties arise as the solution is approached</span>
+        <span class="s2"># this loop tries to solve the equations using a sequence of functions</span>
+        <span class="s2"># for solve. For dense systems, the order is:</span>
+        <span class="s2"># 1. scipy.linalg.cho_factor/scipy.linalg.cho_solve,</span>
+        <span class="s2"># 2. scipy.linalg.solve w/ sym_pos = True,</span>
+        <span class="s2"># 3. scipy.linalg.solve w/ sym_pos = False, and if all else fails</span>
+        <span class="s2"># 4. scipy.linalg.lstsq</span>
+        <span class="s2"># For sparse systems, the order is:</span>
+        <span class="s2"># 1. sksparse.cholmod.cholesky (if available)</span>
+        <span class="s2"># 2. scipy.sparse.linalg.factorized (if umfpack available)</span>
+        <span class="s2"># 3. scipy.sparse.linalg.splu</span>
+        <span class="s2"># 4. scipy.sparse.linalg.lsqr</span>
+        <span class="s1">solved </span><span class="s4">= </span><span class="s3">False</span>
+        <span class="s3">while not </span><span class="s1">solved</span><span class="s4">:</span>
+            <span class="s3">try</span><span class="s4">:</span>
+                <span class="s2"># [4] Equation 8.28</span>
+                <span class="s1">p</span><span class="s4">, </span><span class="s1">q </span><span class="s4">= </span><span class="s1">_sym_solve</span><span class="s4">(</span><span class="s1">Dinv</span><span class="s4">, </span><span class="s1">A</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">solve</span><span class="s4">)</span>
+                <span class="s2"># [4] Equation 8.29</span>
+                <span class="s1">u</span><span class="s4">, </span><span class="s1">v </span><span class="s4">= </span><span class="s1">_sym_solve</span><span class="s4">(</span><span class="s1">Dinv</span><span class="s4">, </span><span class="s1">A</span><span class="s4">, </span><span class="s1">rhatd </span><span class="s4">-</span>
+                                  <span class="s4">(</span><span class="s6">1 </span><span class="s4">/ </span><span class="s1">x</span><span class="s4">) * </span><span class="s1">rhatxs</span><span class="s4">, </span><span class="s1">rhatp</span><span class="s4">, </span><span class="s1">solve</span><span class="s4">)</span>
+                <span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">isnan</span><span class="s4">(</span><span class="s1">p</span><span class="s4">)) </span><span class="s3">or </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">isnan</span><span class="s4">(</span><span class="s1">q</span><span class="s4">)):</span>
+                    <span class="s3">raise </span><span class="s1">LinAlgError</span>
+                <span class="s1">solved </span><span class="s4">= </span><span class="s3">True</span>
+            <span class="s3">except </span><span class="s4">(</span><span class="s1">LinAlgError</span><span class="s4">, </span><span class="s1">ValueError</span><span class="s4">, </span><span class="s1">TypeError</span><span class="s4">) </span><span class="s3">as </span><span class="s1">e</span><span class="s4">:</span>
+                <span class="s2"># Usually this doesn't happen. If it does, it happens when</span>
+                <span class="s2"># there are redundant constraints or when approaching the</span>
+                <span class="s2"># solution. If so, change solver.</span>
+                <span class="s3">if </span><span class="s1">cholesky</span><span class="s4">:</span>
+                    <span class="s1">cholesky </span><span class="s4">= </span><span class="s3">False</span>
+                    <span class="s1">warn</span><span class="s4">(</span>
+                        <span class="s5">&quot;Solving system with option 'cholesky':True &quot;</span>
+                        <span class="s5">&quot;failed. It is normal for this to happen &quot;</span>
+                        <span class="s5">&quot;occasionally, especially as the solution is &quot;</span>
+                        <span class="s5">&quot;approached. However, if you see this frequently, &quot;</span>
+                        <span class="s5">&quot;consider setting option 'cholesky' to False.&quot;</span><span class="s4">,</span>
+                        <span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">5</span><span class="s4">)</span>
+                <span class="s3">elif </span><span class="s1">sym_pos</span><span class="s4">:</span>
+                    <span class="s1">sym_pos </span><span class="s4">= </span><span class="s3">False</span>
+                    <span class="s1">warn</span><span class="s4">(</span>
+                        <span class="s5">&quot;Solving system with option 'sym_pos':True &quot;</span>
+                        <span class="s5">&quot;failed. It is normal for this to happen &quot;</span>
+                        <span class="s5">&quot;occasionally, especially as the solution is &quot;</span>
+                        <span class="s5">&quot;approached. However, if you see this frequently, &quot;</span>
+                        <span class="s5">&quot;consider setting option 'sym_pos' to False.&quot;</span><span class="s4">,</span>
+                        <span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">5</span><span class="s4">)</span>
+                <span class="s3">elif not </span><span class="s1">lstsq</span><span class="s4">:</span>
+                    <span class="s1">lstsq </span><span class="s4">= </span><span class="s3">True</span>
+                    <span class="s1">warn</span><span class="s4">(</span>
+                        <span class="s5">&quot;Solving system with option 'sym_pos':False &quot;</span>
+                        <span class="s5">&quot;failed. This may happen occasionally, &quot;</span>
+                        <span class="s5">&quot;especially as the solution is &quot;</span>
+                        <span class="s5">&quot;approached. However, if you see this frequently, &quot;</span>
+                        <span class="s5">&quot;your problem may be numerically challenging. &quot;</span>
+                        <span class="s5">&quot;If you cannot improve the formulation, consider &quot;</span>
+                        <span class="s5">&quot;setting 'lstsq' to True. Consider also setting &quot;</span>
+                        <span class="s5">&quot;`presolve` to True, if it is not already.&quot;</span><span class="s4">,</span>
+                        <span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">5</span><span class="s4">)</span>
+                <span class="s3">else</span><span class="s4">:</span>
+                    <span class="s3">raise </span><span class="s1">e</span>
+                <span class="s1">solve </span><span class="s4">= </span><span class="s1">_get_solver</span><span class="s4">(</span><span class="s1">M</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">, </span><span class="s1">lstsq</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">,</span>
+                                    <span class="s1">cholesky</span><span class="s4">, </span><span class="s1">permc_spec</span><span class="s4">)</span>
+        <span class="s2"># [4] Results after 8.29</span>
+        <span class="s1">d_tau </span><span class="s4">= ((</span><span class="s1">rhatg </span><span class="s4">+ </span><span class="s6">1 </span><span class="s4">/ </span><span class="s1">tau </span><span class="s4">* </span><span class="s1">rhattk </span><span class="s4">- (-</span><span class="s1">c</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">u</span><span class="s4">) + </span><span class="s1">b</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">v</span><span class="s4">))) /</span>
+                 <span class="s4">(</span><span class="s6">1 </span><span class="s4">/ </span><span class="s1">tau </span><span class="s4">* </span><span class="s1">kappa </span><span class="s4">+ (-</span><span class="s1">c</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">p</span><span class="s4">) + </span><span class="s1">b</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">q</span><span class="s4">))))</span>
+        <span class="s1">d_x </span><span class="s4">= </span><span class="s1">u </span><span class="s4">+ </span><span class="s1">p </span><span class="s4">* </span><span class="s1">d_tau</span>
+        <span class="s1">d_y </span><span class="s4">= </span><span class="s1">v </span><span class="s4">+ </span><span class="s1">q </span><span class="s4">* </span><span class="s1">d_tau</span>
+
+        <span class="s2"># [4] Relations between  after 8.25 and 8.26</span>
+        <span class="s1">d_z </span><span class="s4">= (</span><span class="s6">1 </span><span class="s4">/ </span><span class="s1">x</span><span class="s4">) * (</span><span class="s1">rhatxs </span><span class="s4">- </span><span class="s1">z </span><span class="s4">* </span><span class="s1">d_x</span><span class="s4">)</span>
+        <span class="s1">d_kappa </span><span class="s4">= </span><span class="s6">1 </span><span class="s4">/ </span><span class="s1">tau </span><span class="s4">* (</span><span class="s1">rhattk </span><span class="s4">- </span><span class="s1">kappa </span><span class="s4">* </span><span class="s1">d_tau</span><span class="s4">)</span>
+
+        <span class="s2"># [4] 8.12 and &quot;Let alpha be the maximal possible step...&quot; before 8.23</span>
+        <span class="s1">alpha </span><span class="s4">= </span><span class="s1">_get_step</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">d_kappa</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">ip</span><span class="s4">:  </span><span class="s2"># initial point - see [4] 4.4</span>
+            <span class="s1">gamma </span><span class="s4">= </span><span class="s6">10</span>
+        <span class="s3">else</span><span class="s4">:  </span><span class="s2"># predictor-corrector, [4] definition after 8.12</span>
+            <span class="s1">beta1 </span><span class="s4">= </span><span class="s6">0.1  </span><span class="s2"># [4] pg. 220 (Table 8.1)</span>
+            <span class="s1">gamma </span><span class="s4">= (</span><span class="s6">1 </span><span class="s4">- </span><span class="s1">alpha</span><span class="s4">)**</span><span class="s6">2 </span><span class="s4">* </span><span class="s1">min</span><span class="s4">(</span><span class="s1">beta1</span><span class="s4">, (</span><span class="s6">1 </span><span class="s4">- </span><span class="s1">alpha</span><span class="s4">))</span>
+        <span class="s1">i </span><span class="s4">+= </span><span class="s6">1</span>
+
+    <span class="s3">return </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">d_y</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">d_kappa</span>
+
+
+<span class="s3">def </span><span class="s1">_sym_solve</span><span class="s4">(</span><span class="s1">Dinv</span><span class="s4">, </span><span class="s1">A</span><span class="s4">, </span><span class="s1">r1</span><span class="s4">, </span><span class="s1">r2</span><span class="s4">, </span><span class="s1">solve</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    An implementation of [4] equation 8.31 and 8.32 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># [4] 8.31</span>
+    <span class="s1">r </span><span class="s4">= </span><span class="s1">r2 </span><span class="s4">+ </span><span class="s1">A</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">Dinv </span><span class="s4">* </span><span class="s1">r1</span><span class="s4">)</span>
+    <span class="s1">v </span><span class="s4">= </span><span class="s1">solve</span><span class="s4">(</span><span class="s1">r</span><span class="s4">)</span>
+    <span class="s2"># [4] 8.32</span>
+    <span class="s1">u </span><span class="s4">= </span><span class="s1">Dinv </span><span class="s4">* (</span><span class="s1">A</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">v</span><span class="s4">) - </span><span class="s1">r1</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">u</span><span class="s4">, </span><span class="s1">v</span>
+
+
+<span class="s3">def </span><span class="s1">_get_step</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">d_kappa</span><span class="s4">, </span><span class="s1">alpha0</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    An implementation of [4] equation 8.21 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># [4] 4.3 Equation 8.21, ignoring 8.20 requirement</span>
+    <span class="s2"># same step is taken in primal and dual spaces</span>
+    <span class="s2"># alpha0 is basically beta3 from [4] Table 8.1, but instead of beta3</span>
+    <span class="s2"># the value 1 is used in Mehrota corrector and initial point correction</span>
+    <span class="s1">i_x </span><span class="s4">= </span><span class="s1">d_x </span><span class="s4">&lt; </span><span class="s6">0</span>
+    <span class="s1">i_z </span><span class="s4">= </span><span class="s1">d_z </span><span class="s4">&lt; </span><span class="s6">0</span>
+    <span class="s1">alpha_x </span><span class="s4">= </span><span class="s1">alpha0 </span><span class="s4">* </span><span class="s1">np</span><span class="s4">.</span><span class="s1">min</span><span class="s4">(</span><span class="s1">x</span><span class="s4">[</span><span class="s1">i_x</span><span class="s4">] / -</span><span class="s1">d_x</span><span class="s4">[</span><span class="s1">i_x</span><span class="s4">]) </span><span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">i_x</span><span class="s4">) </span><span class="s3">else </span><span class="s6">1</span>
+    <span class="s1">alpha_tau </span><span class="s4">= </span><span class="s1">alpha0 </span><span class="s4">* </span><span class="s1">tau </span><span class="s4">/ -</span><span class="s1">d_tau </span><span class="s3">if </span><span class="s1">d_tau </span><span class="s4">&lt; </span><span class="s6">0 </span><span class="s3">else </span><span class="s6">1</span>
+    <span class="s1">alpha_z </span><span class="s4">= </span><span class="s1">alpha0 </span><span class="s4">* </span><span class="s1">np</span><span class="s4">.</span><span class="s1">min</span><span class="s4">(</span><span class="s1">z</span><span class="s4">[</span><span class="s1">i_z</span><span class="s4">] / -</span><span class="s1">d_z</span><span class="s4">[</span><span class="s1">i_z</span><span class="s4">]) </span><span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">i_z</span><span class="s4">) </span><span class="s3">else </span><span class="s6">1</span>
+    <span class="s1">alpha_kappa </span><span class="s4">= </span><span class="s1">alpha0 </span><span class="s4">* </span><span class="s1">kappa </span><span class="s4">/ -</span><span class="s1">d_kappa </span><span class="s3">if </span><span class="s1">d_kappa </span><span class="s4">&lt; </span><span class="s6">0 </span><span class="s3">else </span><span class="s6">1</span>
+    <span class="s1">alpha </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">min</span><span class="s4">([</span><span class="s6">1</span><span class="s4">, </span><span class="s1">alpha_x</span><span class="s4">, </span><span class="s1">alpha_tau</span><span class="s4">, </span><span class="s1">alpha_z</span><span class="s4">, </span><span class="s1">alpha_kappa</span><span class="s4">])</span>
+    <span class="s3">return </span><span class="s1">alpha</span>
+
+
+<span class="s3">def </span><span class="s1">_get_message</span><span class="s4">(</span><span class="s1">status</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Given problem status code, return a more detailed message. 
+ 
+    Parameters 
+    ---------- 
+    status : int 
+        An integer representing the exit status of the optimization:: 
+ 
+         0 : Optimization terminated successfully 
+         1 : Iteration limit reached 
+         2 : Problem appears to be infeasible 
+         3 : Problem appears to be unbounded 
+         4 : Serious numerical difficulties encountered 
+ 
+    Returns 
+    ------- 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">messages </span><span class="s4">= (</span>
+        <span class="s4">[</span><span class="s5">&quot;Optimization terminated successfully.&quot;</span><span class="s4">,</span>
+         <span class="s5">&quot;The iteration limit was reached before the algorithm converged.&quot;</span><span class="s4">,</span>
+         <span class="s5">&quot;The algorithm terminated successfully and determined that the &quot;</span>
+         <span class="s5">&quot;problem is infeasible.&quot;</span><span class="s4">,</span>
+         <span class="s5">&quot;The algorithm terminated successfully and determined that the &quot;</span>
+         <span class="s5">&quot;problem is unbounded.&quot;</span><span class="s4">,</span>
+         <span class="s5">&quot;Numerical difficulties were encountered before the problem &quot;</span>
+         <span class="s5">&quot;converged. Please check your problem formulation for errors, &quot;</span>
+         <span class="s5">&quot;independence of linear equality constraints, and reasonable &quot;</span>
+         <span class="s5">&quot;scaling and matrix condition numbers. If you continue to &quot;</span>
+         <span class="s5">&quot;encounter this error, please submit a bug report.&quot;</span>
+         <span class="s4">])</span>
+    <span class="s3">return </span><span class="s1">messages</span><span class="s4">[</span><span class="s1">status</span><span class="s4">]</span>
+
+
+<span class="s3">def </span><span class="s1">_do_step</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">d_y</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">d_kappa</span><span class="s4">, </span><span class="s1">alpha</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    An implementation of [4] Equation 8.9 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">x </span><span class="s4">= </span><span class="s1">x </span><span class="s4">+ </span><span class="s1">alpha </span><span class="s4">* </span><span class="s1">d_x</span>
+    <span class="s1">tau </span><span class="s4">= </span><span class="s1">tau </span><span class="s4">+ </span><span class="s1">alpha </span><span class="s4">* </span><span class="s1">d_tau</span>
+    <span class="s1">z </span><span class="s4">= </span><span class="s1">z </span><span class="s4">+ </span><span class="s1">alpha </span><span class="s4">* </span><span class="s1">d_z</span>
+    <span class="s1">kappa </span><span class="s4">= </span><span class="s1">kappa </span><span class="s4">+ </span><span class="s1">alpha </span><span class="s4">* </span><span class="s1">d_kappa</span>
+    <span class="s1">y </span><span class="s4">= </span><span class="s1">y </span><span class="s4">+ </span><span class="s1">alpha </span><span class="s4">* </span><span class="s1">d_y</span>
+    <span class="s3">return </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span>
+
+
+<span class="s3">def </span><span class="s1">_get_blind_start</span><span class="s4">(</span><span class="s1">shape</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Return the starting point from [4] 4.4 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">m</span><span class="s4">, </span><span class="s1">n </span><span class="s4">= </span><span class="s1">shape</span>
+    <span class="s1">x0 </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">y0 </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">(</span><span class="s1">m</span><span class="s4">)</span>
+    <span class="s1">z0 </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">n</span><span class="s4">)</span>
+    <span class="s1">tau0 </span><span class="s4">= </span><span class="s6">1</span>
+    <span class="s1">kappa0 </span><span class="s4">= </span><span class="s6">1</span>
+    <span class="s3">return </span><span class="s1">x0</span><span class="s4">, </span><span class="s1">y0</span><span class="s4">, </span><span class="s1">z0</span><span class="s4">, </span><span class="s1">tau0</span><span class="s4">, </span><span class="s1">kappa0</span>
+
+
+<span class="s3">def </span><span class="s1">_indicators</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">c0</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Implementation of several equations from [4] used as indicators of 
+    the status of optimization. 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2"># residuals for termination are relative to initial values</span>
+    <span class="s1">x0</span><span class="s4">, </span><span class="s1">y0</span><span class="s4">, </span><span class="s1">z0</span><span class="s4">, </span><span class="s1">tau0</span><span class="s4">, </span><span class="s1">kappa0 </span><span class="s4">= </span><span class="s1">_get_blind_start</span><span class="s4">(</span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">)</span>
+
+    <span class="s2"># See [4], Section 4 - The Homogeneous Algorithm, Equation 8.8</span>
+    <span class="s3">def </span><span class="s1">r_p</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">b </span><span class="s4">* </span><span class="s1">tau </span><span class="s4">- </span><span class="s1">A</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">r_d</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">c </span><span class="s4">* </span><span class="s1">tau </span><span class="s4">- </span><span class="s1">A</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">) - </span><span class="s1">z</span>
+
+    <span class="s3">def </span><span class="s1">r_g</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">kappa </span><span class="s4">+ </span><span class="s1">c</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x</span><span class="s4">) - </span><span class="s1">b</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">)</span>
+
+    <span class="s2"># np.dot unpacks if they are arrays of size one</span>
+    <span class="s3">def </span><span class="s1">mu</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s4">(</span><span class="s1">x</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">z</span><span class="s4">) + </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">)) / (</span><span class="s1">len</span><span class="s4">(</span><span class="s1">x</span><span class="s4">) + </span><span class="s6">1</span><span class="s4">)</span>
+
+    <span class="s1">obj </span><span class="s4">= </span><span class="s1">c</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x </span><span class="s4">/ </span><span class="s1">tau</span><span class="s4">) + </span><span class="s1">c0</span>
+
+    <span class="s3">def </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">a</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">norm</span><span class="s4">(</span><span class="s1">a</span><span class="s4">)</span>
+
+    <span class="s2"># See [4], Section 4.5 - The Stopping Criteria</span>
+    <span class="s1">r_p0 </span><span class="s4">= </span><span class="s1">r_p</span><span class="s4">(</span><span class="s1">x0</span><span class="s4">, </span><span class="s1">tau0</span><span class="s4">)</span>
+    <span class="s1">r_d0 </span><span class="s4">= </span><span class="s1">r_d</span><span class="s4">(</span><span class="s1">y0</span><span class="s4">, </span><span class="s1">z0</span><span class="s4">, </span><span class="s1">tau0</span><span class="s4">)</span>
+    <span class="s1">r_g0 </span><span class="s4">= </span><span class="s1">r_g</span><span class="s4">(</span><span class="s1">x0</span><span class="s4">, </span><span class="s1">y0</span><span class="s4">, </span><span class="s1">kappa0</span><span class="s4">)</span>
+    <span class="s1">mu_0 </span><span class="s4">= </span><span class="s1">mu</span><span class="s4">(</span><span class="s1">x0</span><span class="s4">, </span><span class="s1">tau0</span><span class="s4">, </span><span class="s1">z0</span><span class="s4">, </span><span class="s1">kappa0</span><span class="s4">)</span>
+    <span class="s1">rho_A </span><span class="s4">= </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">c</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x</span><span class="s4">) - </span><span class="s1">b</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">)) / (</span><span class="s1">tau </span><span class="s4">+ </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">b</span><span class="s4">.</span><span class="s1">T</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">)))</span>
+    <span class="s1">rho_p </span><span class="s4">= </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">r_p</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">)) / </span><span class="s1">max</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">r_p0</span><span class="s4">))</span>
+    <span class="s1">rho_d </span><span class="s4">= </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">r_d</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">)) / </span><span class="s1">max</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">r_d0</span><span class="s4">))</span>
+    <span class="s1">rho_g </span><span class="s4">= </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">r_g</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">)) / </span><span class="s1">max</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s1">norm</span><span class="s4">(</span><span class="s1">r_g0</span><span class="s4">))</span>
+    <span class="s1">rho_mu </span><span class="s4">= </span><span class="s1">mu</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">) / </span><span class="s1">mu_0</span>
+    <span class="s3">return </span><span class="s1">rho_p</span><span class="s4">, </span><span class="s1">rho_d</span><span class="s4">, </span><span class="s1">rho_A</span><span class="s4">, </span><span class="s1">rho_g</span><span class="s4">, </span><span class="s1">rho_mu</span><span class="s4">, </span><span class="s1">obj</span>
+
+
+<span class="s3">def </span><span class="s1">_display_iter</span><span class="s4">(</span><span class="s1">rho_p</span><span class="s4">, </span><span class="s1">rho_d</span><span class="s4">, </span><span class="s1">rho_g</span><span class="s4">, </span><span class="s1">alpha</span><span class="s4">, </span><span class="s1">rho_mu</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">, </span><span class="s1">header</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Print indicators of optimization status to the console. 
+ 
+    Parameters 
+    ---------- 
+    rho_p : float 
+        The (normalized) primal feasibility, see [4] 4.5 
+    rho_d : float 
+        The (normalized) dual feasibility, see [4] 4.5 
+    rho_g : float 
+        The (normalized) duality gap, see [4] 4.5 
+    alpha : float 
+        The step size, see [4] 4.3 
+    rho_mu : float 
+        The (normalized) path parameter, see [4] 4.5 
+    obj : float 
+        The objective function value of the current iterate 
+    header : bool 
+        True if a header is to be printed 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">header</span><span class="s4">:</span>
+        <span class="s1">print</span><span class="s4">(</span><span class="s5">&quot;Primal Feasibility &quot;</span><span class="s4">,</span>
+              <span class="s5">&quot;Dual Feasibility   &quot;</span><span class="s4">,</span>
+              <span class="s5">&quot;Duality Gap        &quot;</span><span class="s4">,</span>
+              <span class="s5">&quot;Step            &quot;</span><span class="s4">,</span>
+              <span class="s5">&quot;Path Parameter     &quot;</span><span class="s4">,</span>
+              <span class="s5">&quot;Objective          &quot;</span><span class="s4">)</span>
+
+    <span class="s2"># no clue why this works</span>
+    <span class="s1">fmt </span><span class="s4">= </span><span class="s5">'{0:&lt;20.13}{1:&lt;20.13}{2:&lt;20.13}{3:&lt;17.13}{4:&lt;20.13}{5:&lt;20.13}'</span>
+    <span class="s1">print</span><span class="s4">(</span><span class="s1">fmt</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span>
+        <span class="s1">float</span><span class="s4">(</span><span class="s1">rho_p</span><span class="s4">),</span>
+        <span class="s1">float</span><span class="s4">(</span><span class="s1">rho_d</span><span class="s4">),</span>
+        <span class="s1">float</span><span class="s4">(</span><span class="s1">rho_g</span><span class="s4">),</span>
+        <span class="s1">alpha </span><span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">alpha</span><span class="s4">, </span><span class="s1">str</span><span class="s4">) </span><span class="s3">else </span><span class="s1">float</span><span class="s4">(</span><span class="s1">alpha</span><span class="s4">),</span>
+        <span class="s1">float</span><span class="s4">(</span><span class="s1">rho_mu</span><span class="s4">),</span>
+        <span class="s1">float</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)))</span>
+
+
+<span class="s3">def </span><span class="s1">_ip_hsd</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">c0</span><span class="s4">, </span><span class="s1">alpha0</span><span class="s4">, </span><span class="s1">beta</span><span class="s4">, </span><span class="s1">maxiter</span><span class="s4">, </span><span class="s1">disp</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">, </span><span class="s1">lstsq</span><span class="s4">,</span>
+            <span class="s1">sym_pos</span><span class="s4">, </span><span class="s1">cholesky</span><span class="s4">, </span><span class="s1">pc</span><span class="s4">, </span><span class="s1">ip</span><span class="s4">, </span><span class="s1">permc_spec</span><span class="s4">, </span><span class="s1">callback</span><span class="s4">, </span><span class="s1">postsolve_args</span><span class="s4">):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Solve a linear programming problem in standard form: 
+ 
+    Minimize:: 
+ 
+        c @ x 
+ 
+    Subject to:: 
+ 
+        A @ x == b 
+            x &gt;= 0 
+ 
+    using the interior point method of [4]. 
+ 
+    Parameters 
+    ---------- 
+    A : 2-D array 
+        2-D array such that ``A @ x``, gives the values of the equality 
+        constraints at ``x``. 
+    b : 1-D array 
+        1-D array of values representing the RHS of each equality constraint 
+        (row) in ``A`` (for standard form problem). 
+    c : 1-D array 
+        Coefficients of the linear objective function to be minimized (for 
+        standard form problem). 
+    c0 : float 
+        Constant term in objective function due to fixed (and eliminated) 
+        variables. (Purely for display.) 
+    alpha0 : float 
+        The maximal step size for Mehrota's predictor-corrector search 
+        direction; see :math:`\beta_3`of [4] Table 8.1 
+    beta : float 
+        The desired reduction of the path parameter :math:`\mu` (see  [6]_) 
+    maxiter : int 
+        The maximum number of iterations of the algorithm. 
+    disp : bool 
+        Set to ``True`` if indicators of optimization status are to be printed 
+        to the console each iteration. 
+    tol : float 
+        Termination tolerance; see [4]_ Section 4.5. 
+    sparse : bool 
+        Set to ``True`` if the problem is to be treated as sparse. However, 
+        the inputs ``A_eq`` and ``A_ub`` should nonetheless be provided as 
+        (dense) arrays rather than sparse matrices. 
+    lstsq : bool 
+        Set to ``True`` if the problem is expected to be very poorly 
+        conditioned. This should always be left as ``False`` unless severe 
+        numerical difficulties are frequently encountered, and a better option 
+        would be to improve the formulation of the problem. 
+    sym_pos : bool 
+        Leave ``True`` if the problem is expected to yield a well conditioned 
+        symmetric positive definite normal equation matrix (almost always). 
+    cholesky : bool 
+        Set to ``True`` if the normal equations are to be solved by explicit 
+        Cholesky decomposition followed by explicit forward/backward 
+        substitution. This is typically faster for moderate, dense problems 
+        that are numerically well-behaved. 
+    pc : bool 
+        Leave ``True`` if the predictor-corrector method of Mehrota is to be 
+        used. This is almost always (if not always) beneficial. 
+    ip : bool 
+        Set to ``True`` if the improved initial point suggestion due to [4]_ 
+        Section 4.3 is desired. It's unclear whether this is beneficial. 
+    permc_spec : str (default = 'MMD_AT_PLUS_A') 
+        (Has effect only with ``sparse = True``, ``lstsq = False``, ``sym_pos = 
+        True``.) A matrix is factorized in each iteration of the algorithm. 
+        This option specifies how to permute the columns of the matrix for 
+        sparsity preservation. Acceptable values are: 
+ 
+        - ``NATURAL``: natural ordering. 
+        - ``MMD_ATA``: minimum degree ordering on the structure of A^T A. 
+        - ``MMD_AT_PLUS_A``: minimum degree ordering on the structure of A^T+A. 
+        - ``COLAMD``: approximate minimum degree column ordering. 
+ 
+        This option can impact the convergence of the 
+        interior point algorithm; test different values to determine which 
+        performs best for your problem. For more information, refer to 
+        ``scipy.sparse.linalg.splu``. 
+    callback : callable, optional 
+        If a callback function is provided, it will be called within each 
+        iteration of the algorithm. The callback function must accept a single 
+        `scipy.optimize.OptimizeResult` consisting of the following fields: 
+ 
+            x : 1-D array 
+                Current solution vector 
+            fun : float 
+                Current value of the objective function 
+            success : bool 
+                True only when an algorithm has completed successfully, 
+                so this is always False as the callback function is called 
+                only while the algorithm is still iterating. 
+            slack : 1-D array 
+                The values of the slack variables. Each slack variable 
+                corresponds to an inequality constraint. If the slack is zero, 
+                the corresponding constraint is active. 
+            con : 1-D array 
+                The (nominally zero) residuals of the equality constraints, 
+                that is, ``b - A_eq @ x`` 
+            phase : int 
+                The phase of the algorithm being executed. This is always 
+                1 for the interior-point method because it has only one phase. 
+            status : int 
+                For revised simplex, this is always 0 because if a different 
+                status is detected, the algorithm terminates. 
+            nit : int 
+                The number of iterations performed. 
+            message : str 
+                A string descriptor of the exit status of the optimization. 
+    postsolve_args : tuple 
+        Data needed by _postsolve to convert the solution to the standard-form 
+        problem into the solution to the original problem. 
+ 
+    Returns 
+    ------- 
+    x_hat : float 
+        Solution vector (for standard form problem). 
+    status : int 
+        An integer representing the exit status of the optimization:: 
+ 
+         0 : Optimization terminated successfully 
+         1 : Iteration limit reached 
+         2 : Problem appears to be infeasible 
+         3 : Problem appears to be unbounded 
+         4 : Serious numerical difficulties encountered 
+ 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+    iteration : int 
+        The number of iterations taken to solve the problem 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+    .. [6] Freund, Robert M. &quot;Primal-Dual Interior-Point Methods for Linear 
+           Programming based on Newton's Method.&quot; Unpublished Course Notes, 
+           March 2004. Available 2/25/2017 at: 
+           https://ocw.mit.edu/courses/sloan-school-of-management/15-084j-nonlinear-programming-spring-2004/lecture-notes/lec14_int_pt_mthd.pdf 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">iteration </span><span class="s4">= </span><span class="s6">0</span>
+
+    <span class="s2"># default initial point</span>
+    <span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa </span><span class="s4">= </span><span class="s1">_get_blind_start</span><span class="s4">(</span><span class="s1">A</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">)</span>
+
+    <span class="s2"># first iteration is special improvement of initial point</span>
+    <span class="s1">ip </span><span class="s4">= </span><span class="s1">ip </span><span class="s3">if </span><span class="s1">pc </span><span class="s3">else False</span>
+
+    <span class="s2"># [4] 4.5</span>
+    <span class="s1">rho_p</span><span class="s4">, </span><span class="s1">rho_d</span><span class="s4">, </span><span class="s1">rho_A</span><span class="s4">, </span><span class="s1">rho_g</span><span class="s4">, </span><span class="s1">rho_mu</span><span class="s4">, </span><span class="s1">obj </span><span class="s4">= </span><span class="s1">_indicators</span><span class="s4">(</span>
+        <span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">c0</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">)</span>
+    <span class="s1">go </span><span class="s4">= </span><span class="s1">rho_p </span><span class="s4">&gt; </span><span class="s1">tol </span><span class="s3">or </span><span class="s1">rho_d </span><span class="s4">&gt; </span><span class="s1">tol </span><span class="s3">or </span><span class="s1">rho_A </span><span class="s4">&gt; </span><span class="s1">tol  </span><span class="s2"># we might get lucky : )</span>
+
+    <span class="s3">if </span><span class="s1">disp</span><span class="s4">:</span>
+        <span class="s1">_display_iter</span><span class="s4">(</span><span class="s1">rho_p</span><span class="s4">, </span><span class="s1">rho_d</span><span class="s4">, </span><span class="s1">rho_g</span><span class="s4">, </span><span class="s5">&quot;-&quot;</span><span class="s4">, </span><span class="s1">rho_mu</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">, </span><span class="s1">header</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">x_o</span><span class="s4">, </span><span class="s1">fun</span><span class="s4">, </span><span class="s1">slack</span><span class="s4">, </span><span class="s1">con </span><span class="s4">= </span><span class="s1">_postsolve</span><span class="s4">(</span><span class="s1">x</span><span class="s4">/</span><span class="s1">tau</span><span class="s4">, </span><span class="s1">postsolve_args</span><span class="s4">)</span>
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">OptimizeResult</span><span class="s4">({</span><span class="s5">'x'</span><span class="s4">: </span><span class="s1">x_o</span><span class="s4">, </span><span class="s5">'fun'</span><span class="s4">: </span><span class="s1">fun</span><span class="s4">, </span><span class="s5">'slack'</span><span class="s4">: </span><span class="s1">slack</span><span class="s4">,</span>
+                              <span class="s5">'con'</span><span class="s4">: </span><span class="s1">con</span><span class="s4">, </span><span class="s5">'nit'</span><span class="s4">: </span><span class="s1">iteration</span><span class="s4">, </span><span class="s5">'phase'</span><span class="s4">: </span><span class="s6">1</span><span class="s4">,</span>
+                              <span class="s5">'complete'</span><span class="s4">: </span><span class="s3">False</span><span class="s4">, </span><span class="s5">'status'</span><span class="s4">: </span><span class="s6">0</span><span class="s4">,</span>
+                              <span class="s5">'message'</span><span class="s4">: </span><span class="s5">&quot;&quot;</span><span class="s4">, </span><span class="s5">'success'</span><span class="s4">: </span><span class="s3">False</span><span class="s4">})</span>
+        <span class="s1">callback</span><span class="s4">(</span><span class="s1">res</span><span class="s4">)</span>
+
+    <span class="s1">status </span><span class="s4">= </span><span class="s6">0</span>
+    <span class="s1">message </span><span class="s4">= </span><span class="s5">&quot;Optimization terminated successfully.&quot;</span>
+
+    <span class="s3">if </span><span class="s1">sparse</span><span class="s4">:</span>
+        <span class="s1">A </span><span class="s4">= </span><span class="s1">sps</span><span class="s4">.</span><span class="s1">csc_matrix</span><span class="s4">(</span><span class="s1">A</span><span class="s4">)</span>
+
+    <span class="s3">while </span><span class="s1">go</span><span class="s4">:</span>
+
+        <span class="s1">iteration </span><span class="s4">+= </span><span class="s6">1</span>
+
+        <span class="s3">if </span><span class="s1">ip</span><span class="s4">:  </span><span class="s2"># initial point</span>
+            <span class="s2"># [4] Section 4.4</span>
+            <span class="s1">gamma </span><span class="s4">= </span><span class="s6">1</span>
+
+            <span class="s3">def </span><span class="s1">eta</span><span class="s4">(</span><span class="s1">g</span><span class="s4">):</span>
+                <span class="s3">return </span><span class="s6">1</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s2"># gamma = 0 in predictor step according to [4] 4.1</span>
+            <span class="s2"># if predictor/corrector is off, use mean of complementarity [6]</span>
+            <span class="s2"># 5.1 / [4] Below Figure 10-4</span>
+            <span class="s1">gamma </span><span class="s4">= </span><span class="s6">0 </span><span class="s3">if </span><span class="s1">pc </span><span class="s3">else </span><span class="s1">beta </span><span class="s4">* </span><span class="s1">np</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">z </span><span class="s4">* </span><span class="s1">x</span><span class="s4">)</span>
+            <span class="s2"># [4] Section 4.1</span>
+
+            <span class="s3">def </span><span class="s1">eta</span><span class="s4">(</span><span class="s1">g</span><span class="s4">=</span><span class="s1">gamma</span><span class="s4">):</span>
+                <span class="s3">return </span><span class="s6">1 </span><span class="s4">- </span><span class="s1">g</span>
+
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s2"># Solve [4] 8.6 and 8.7/8.13/8.23</span>
+            <span class="s1">d_x</span><span class="s4">, </span><span class="s1">d_y</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">d_kappa </span><span class="s4">= </span><span class="s1">_get_delta</span><span class="s4">(</span>
+                <span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">gamma</span><span class="s4">, </span><span class="s1">eta</span><span class="s4">,</span>
+                <span class="s1">sparse</span><span class="s4">, </span><span class="s1">lstsq</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">, </span><span class="s1">cholesky</span><span class="s4">, </span><span class="s1">pc</span><span class="s4">, </span><span class="s1">ip</span><span class="s4">, </span><span class="s1">permc_spec</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">ip</span><span class="s4">:  </span><span class="s2"># initial point</span>
+                <span class="s2"># [4] 4.4</span>
+                <span class="s2"># Formula after 8.23 takes a full step regardless if this will</span>
+                <span class="s2"># take it negative</span>
+                <span class="s1">alpha </span><span class="s4">= </span><span class="s6">1.0</span>
+                <span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa </span><span class="s4">= </span><span class="s1">_do_step</span><span class="s4">(</span>
+                    <span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">d_y</span><span class="s4">,</span>
+                    <span class="s1">d_z</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">d_kappa</span><span class="s4">, </span><span class="s1">alpha</span><span class="s4">)</span>
+                <span class="s1">x</span><span class="s4">[</span><span class="s1">x </span><span class="s4">&lt; </span><span class="s6">1</span><span class="s4">] = </span><span class="s6">1</span>
+                <span class="s1">z</span><span class="s4">[</span><span class="s1">z </span><span class="s4">&lt; </span><span class="s6">1</span><span class="s4">] = </span><span class="s6">1</span>
+                <span class="s1">tau </span><span class="s4">= </span><span class="s1">max</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">)</span>
+                <span class="s1">kappa </span><span class="s4">= </span><span class="s1">max</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">)</span>
+                <span class="s1">ip </span><span class="s4">= </span><span class="s3">False  </span><span class="s2"># done with initial point</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s2"># [4] Section 4.3</span>
+                <span class="s1">alpha </span><span class="s4">= </span><span class="s1">_get_step</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">,</span>
+                                  <span class="s1">d_tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">d_kappa</span><span class="s4">, </span><span class="s1">alpha0</span><span class="s4">)</span>
+                <span class="s2"># [4] Equation 8.9</span>
+                <span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa </span><span class="s4">= </span><span class="s1">_do_step</span><span class="s4">(</span>
+                    <span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">, </span><span class="s1">d_x</span><span class="s4">, </span><span class="s1">d_y</span><span class="s4">, </span><span class="s1">d_z</span><span class="s4">, </span><span class="s1">d_tau</span><span class="s4">, </span><span class="s1">d_kappa</span><span class="s4">, </span><span class="s1">alpha</span><span class="s4">)</span>
+
+        <span class="s3">except </span><span class="s4">(</span><span class="s1">LinAlgError</span><span class="s4">, </span><span class="s1">FloatingPointError</span><span class="s4">,</span>
+                <span class="s1">ValueError</span><span class="s4">, </span><span class="s1">ZeroDivisionError</span><span class="s4">):</span>
+            <span class="s2"># this can happen when sparse solver is used and presolve</span>
+            <span class="s2"># is turned off. Also observed ValueError in AppVeyor Python 3.6</span>
+            <span class="s2"># Win32 build (PR #8676). I've never seen it otherwise.</span>
+            <span class="s1">status </span><span class="s4">= </span><span class="s6">4</span>
+            <span class="s1">message </span><span class="s4">= </span><span class="s1">_get_message</span><span class="s4">(</span><span class="s1">status</span><span class="s4">)</span>
+            <span class="s3">break</span>
+
+        <span class="s2"># [4] 4.5</span>
+        <span class="s1">rho_p</span><span class="s4">, </span><span class="s1">rho_d</span><span class="s4">, </span><span class="s1">rho_A</span><span class="s4">, </span><span class="s1">rho_g</span><span class="s4">, </span><span class="s1">rho_mu</span><span class="s4">, </span><span class="s1">obj </span><span class="s4">= </span><span class="s1">_indicators</span><span class="s4">(</span>
+            <span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">c0</span><span class="s4">, </span><span class="s1">x</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">z</span><span class="s4">, </span><span class="s1">tau</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">)</span>
+        <span class="s1">go </span><span class="s4">= </span><span class="s1">rho_p </span><span class="s4">&gt; </span><span class="s1">tol </span><span class="s3">or </span><span class="s1">rho_d </span><span class="s4">&gt; </span><span class="s1">tol </span><span class="s3">or </span><span class="s1">rho_A </span><span class="s4">&gt; </span><span class="s1">tol</span>
+
+        <span class="s3">if </span><span class="s1">disp</span><span class="s4">:</span>
+            <span class="s1">_display_iter</span><span class="s4">(</span><span class="s1">rho_p</span><span class="s4">, </span><span class="s1">rho_d</span><span class="s4">, </span><span class="s1">rho_g</span><span class="s4">, </span><span class="s1">alpha</span><span class="s4">, </span><span class="s1">rho_mu</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">callback </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">x_o</span><span class="s4">, </span><span class="s1">fun</span><span class="s4">, </span><span class="s1">slack</span><span class="s4">, </span><span class="s1">con </span><span class="s4">= </span><span class="s1">_postsolve</span><span class="s4">(</span><span class="s1">x</span><span class="s4">/</span><span class="s1">tau</span><span class="s4">, </span><span class="s1">postsolve_args</span><span class="s4">)</span>
+            <span class="s1">res </span><span class="s4">= </span><span class="s1">OptimizeResult</span><span class="s4">({</span><span class="s5">'x'</span><span class="s4">: </span><span class="s1">x_o</span><span class="s4">, </span><span class="s5">'fun'</span><span class="s4">: </span><span class="s1">fun</span><span class="s4">, </span><span class="s5">'slack'</span><span class="s4">: </span><span class="s1">slack</span><span class="s4">,</span>
+                                  <span class="s5">'con'</span><span class="s4">: </span><span class="s1">con</span><span class="s4">, </span><span class="s5">'nit'</span><span class="s4">: </span><span class="s1">iteration</span><span class="s4">, </span><span class="s5">'phase'</span><span class="s4">: </span><span class="s6">1</span><span class="s4">,</span>
+                                  <span class="s5">'complete'</span><span class="s4">: </span><span class="s3">False</span><span class="s4">, </span><span class="s5">'status'</span><span class="s4">: </span><span class="s6">0</span><span class="s4">,</span>
+                                  <span class="s5">'message'</span><span class="s4">: </span><span class="s5">&quot;&quot;</span><span class="s4">, </span><span class="s5">'success'</span><span class="s4">: </span><span class="s3">False</span><span class="s4">})</span>
+            <span class="s1">callback</span><span class="s4">(</span><span class="s1">res</span><span class="s4">)</span>
+
+        <span class="s2"># [4] 4.5</span>
+        <span class="s1">inf1 </span><span class="s4">= (</span><span class="s1">rho_p </span><span class="s4">&lt; </span><span class="s1">tol </span><span class="s3">and </span><span class="s1">rho_d </span><span class="s4">&lt; </span><span class="s1">tol </span><span class="s3">and </span><span class="s1">rho_g </span><span class="s4">&lt; </span><span class="s1">tol </span><span class="s3">and </span><span class="s1">tau </span><span class="s4">&lt; </span><span class="s1">tol </span><span class="s4">*</span>
+                <span class="s1">max</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">))</span>
+        <span class="s1">inf2 </span><span class="s4">= </span><span class="s1">rho_mu </span><span class="s4">&lt; </span><span class="s1">tol </span><span class="s3">and </span><span class="s1">tau </span><span class="s4">&lt; </span><span class="s1">tol </span><span class="s4">* </span><span class="s1">min</span><span class="s4">(</span><span class="s6">1</span><span class="s4">, </span><span class="s1">kappa</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">inf1 </span><span class="s3">or </span><span class="s1">inf2</span><span class="s4">:</span>
+            <span class="s2"># [4] Lemma 8.4 / Theorem 8.3</span>
+            <span class="s3">if </span><span class="s1">b</span><span class="s4">.</span><span class="s1">transpose</span><span class="s4">().</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">) &gt; </span><span class="s1">tol</span><span class="s4">:</span>
+                <span class="s1">status </span><span class="s4">= </span><span class="s6">2</span>
+            <span class="s3">else</span><span class="s4">:  </span><span class="s2"># elif c.T.dot(x) &lt; tol: ? Probably not necessary.</span>
+                <span class="s1">status </span><span class="s4">= </span><span class="s6">3</span>
+            <span class="s1">message </span><span class="s4">= </span><span class="s1">_get_message</span><span class="s4">(</span><span class="s1">status</span><span class="s4">)</span>
+            <span class="s3">break</span>
+        <span class="s3">elif </span><span class="s1">iteration </span><span class="s4">&gt;= </span><span class="s1">maxiter</span><span class="s4">:</span>
+            <span class="s1">status </span><span class="s4">= </span><span class="s6">1</span>
+            <span class="s1">message </span><span class="s4">= </span><span class="s1">_get_message</span><span class="s4">(</span><span class="s1">status</span><span class="s4">)</span>
+            <span class="s3">break</span>
+
+    <span class="s1">x_hat </span><span class="s4">= </span><span class="s1">x </span><span class="s4">/ </span><span class="s1">tau</span>
+    <span class="s2"># [4] Statement after Theorem 8.2</span>
+    <span class="s3">return </span><span class="s1">x_hat</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">iteration</span>
+
+
+<span class="s3">def </span><span class="s1">_linprog_ip</span><span class="s4">(</span><span class="s1">c</span><span class="s4">, </span><span class="s1">c0</span><span class="s4">, </span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">callback</span><span class="s4">, </span><span class="s1">postsolve_args</span><span class="s4">, </span><span class="s1">maxiter</span><span class="s4">=</span><span class="s6">1000</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-8</span><span class="s4">,</span>
+                <span class="s1">disp</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">alpha0</span><span class="s4">=</span><span class="s6">.99995</span><span class="s4">, </span><span class="s1">beta</span><span class="s4">=</span><span class="s6">0.1</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">lstsq</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+                <span class="s1">sym_pos</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">cholesky</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">pc</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">ip</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+                <span class="s1">permc_spec</span><span class="s4">=</span><span class="s5">'MMD_AT_PLUS_A'</span><span class="s4">, **</span><span class="s1">unknown_options</span><span class="s4">):</span>
+    <span class="s0">r&quot;&quot;&quot; 
+    Minimize a linear objective function subject to linear 
+    equality and non-negativity constraints using the interior point method 
+    of [4]_. Linear programming is intended to solve problems 
+    of the following form: 
+ 
+    Minimize:: 
+ 
+        c @ x 
+ 
+    Subject to:: 
+ 
+        A @ x == b 
+            x &gt;= 0 
+ 
+    User-facing documentation is in _linprog_doc.py. 
+ 
+    Parameters 
+    ---------- 
+    c : 1-D array 
+        Coefficients of the linear objective function to be minimized. 
+    c0 : float 
+        Constant term in objective function due to fixed (and eliminated) 
+        variables. (Purely for display.) 
+    A : 2-D array 
+        2-D array such that ``A @ x``, gives the values of the equality 
+        constraints at ``x``. 
+    b : 1-D array 
+        1-D array of values representing the right hand side of each equality 
+        constraint (row) in ``A``. 
+    callback : callable, optional 
+        Callback function to be executed once per iteration. 
+    postsolve_args : tuple 
+        Data needed by _postsolve to convert the solution to the standard-form 
+        problem into the solution to the original problem. 
+ 
+    Options 
+    ------- 
+    maxiter : int (default = 1000) 
+        The maximum number of iterations of the algorithm. 
+    tol : float (default = 1e-8) 
+        Termination tolerance to be used for all termination criteria; 
+        see [4]_ Section 4.5. 
+    disp : bool (default = False) 
+        Set to ``True`` if indicators of optimization status are to be printed 
+        to the console each iteration. 
+    alpha0 : float (default = 0.99995) 
+        The maximal step size for Mehrota's predictor-corrector search 
+        direction; see :math:`\beta_{3}` of [4]_ Table 8.1. 
+    beta : float (default = 0.1) 
+        The desired reduction of the path parameter :math:`\mu` (see [6]_) 
+        when Mehrota's predictor-corrector is not in use (uncommon). 
+    sparse : bool (default = False) 
+        Set to ``True`` if the problem is to be treated as sparse after 
+        presolve. If either ``A_eq`` or ``A_ub`` is a sparse matrix, 
+        this option will automatically be set ``True``, and the problem 
+        will be treated as sparse even during presolve. If your constraint 
+        matrices contain mostly zeros and the problem is not very small (less 
+        than about 100 constraints or variables), consider setting ``True`` 
+        or providing ``A_eq`` and ``A_ub`` as sparse matrices. 
+    lstsq : bool (default = False) 
+        Set to ``True`` if the problem is expected to be very poorly 
+        conditioned. This should always be left ``False`` unless severe 
+        numerical difficulties are encountered. Leave this at the default 
+        unless you receive a warning message suggesting otherwise. 
+    sym_pos : bool (default = True) 
+        Leave ``True`` if the problem is expected to yield a well conditioned 
+        symmetric positive definite normal equation matrix 
+        (almost always). Leave this at the default unless you receive 
+        a warning message suggesting otherwise. 
+    cholesky : bool (default = True) 
+        Set to ``True`` if the normal equations are to be solved by explicit 
+        Cholesky decomposition followed by explicit forward/backward 
+        substitution. This is typically faster for problems 
+        that are numerically well-behaved. 
+    pc : bool (default = True) 
+        Leave ``True`` if the predictor-corrector method of Mehrota is to be 
+        used. This is almost always (if not always) beneficial. 
+    ip : bool (default = False) 
+        Set to ``True`` if the improved initial point suggestion due to [4]_ 
+        Section 4.3 is desired. Whether this is beneficial or not 
+        depends on the problem. 
+    permc_spec : str (default = 'MMD_AT_PLUS_A') 
+        (Has effect only with ``sparse = True``, ``lstsq = False``, ``sym_pos = 
+        True``, and no SuiteSparse.) 
+        A matrix is factorized in each iteration of the algorithm. 
+        This option specifies how to permute the columns of the matrix for 
+        sparsity preservation. Acceptable values are: 
+ 
+        - ``NATURAL``: natural ordering. 
+        - ``MMD_ATA``: minimum degree ordering on the structure of A^T A. 
+        - ``MMD_AT_PLUS_A``: minimum degree ordering on the structure of A^T+A. 
+        - ``COLAMD``: approximate minimum degree column ordering. 
+ 
+        This option can impact the convergence of the 
+        interior point algorithm; test different values to determine which 
+        performs best for your problem. For more information, refer to 
+        ``scipy.sparse.linalg.splu``. 
+    unknown_options : dict 
+        Optional arguments not used by this particular solver. If 
+        `unknown_options` is non-empty a warning is issued listing all 
+        unused options. 
+ 
+    Returns 
+    ------- 
+    x : 1-D array 
+        Solution vector. 
+    status : int 
+        An integer representing the exit status of the optimization:: 
+ 
+         0 : Optimization terminated successfully 
+         1 : Iteration limit reached 
+         2 : Problem appears to be infeasible 
+         3 : Problem appears to be unbounded 
+         4 : Serious numerical difficulties encountered 
+ 
+    message : str 
+        A string descriptor of the exit status of the optimization. 
+    iteration : int 
+        The number of iterations taken to solve the problem. 
+ 
+    Notes 
+    ----- 
+    This method implements the algorithm outlined in [4]_ with ideas from [8]_ 
+    and a structure inspired by the simpler methods of [6]_. 
+ 
+    The primal-dual path following method begins with initial 'guesses' of 
+    the primal and dual variables of the standard form problem and iteratively 
+    attempts to solve the (nonlinear) Karush-Kuhn-Tucker conditions for the 
+    problem with a gradually reduced logarithmic barrier term added to the 
+    objective. This particular implementation uses a homogeneous self-dual 
+    formulation, which provides certificates of infeasibility or unboundedness 
+    where applicable. 
+ 
+    The default initial point for the primal and dual variables is that 
+    defined in [4]_ Section 4.4 Equation 8.22. Optionally (by setting initial 
+    point option ``ip=True``), an alternate (potentially improved) starting 
+    point can be calculated according to the additional recommendations of 
+    [4]_ Section 4.4. 
+ 
+    A search direction is calculated using the predictor-corrector method 
+    (single correction) proposed by Mehrota and detailed in [4]_ Section 4.1. 
+    (A potential improvement would be to implement the method of multiple 
+    corrections described in [4]_ Section 4.2.) In practice, this is 
+    accomplished by solving the normal equations, [4]_ Section 5.1 Equations 
+    8.31 and 8.32, derived from the Newton equations [4]_ Section 5 Equations 
+    8.25 (compare to [4]_ Section 4 Equations 8.6-8.8). The advantage of 
+    solving the normal equations rather than 8.25 directly is that the 
+    matrices involved are symmetric positive definite, so Cholesky 
+    decomposition can be used rather than the more expensive LU factorization. 
+ 
+    With default options, the solver used to perform the factorization depends 
+    on third-party software availability and the conditioning of the problem. 
+ 
+    For dense problems, solvers are tried in the following order: 
+ 
+    1. ``scipy.linalg.cho_factor`` 
+ 
+    2. ``scipy.linalg.solve`` with option ``sym_pos=True`` 
+ 
+    3. ``scipy.linalg.solve`` with option ``sym_pos=False`` 
+ 
+    4. ``scipy.linalg.lstsq`` 
+ 
+    For sparse problems: 
+ 
+    1. ``sksparse.cholmod.cholesky`` (if scikit-sparse and SuiteSparse are installed) 
+ 
+    2. ``scipy.sparse.linalg.factorized`` 
+        (if scikit-umfpack and SuiteSparse are installed) 
+ 
+    3. ``scipy.sparse.linalg.splu`` (which uses SuperLU distributed with SciPy) 
+ 
+    4. ``scipy.sparse.linalg.lsqr`` 
+ 
+    If the solver fails for any reason, successively more robust (but slower) 
+    solvers are attempted in the order indicated. Attempting, failing, and 
+    re-starting factorization can be time consuming, so if the problem is 
+    numerically challenging, options can be set to  bypass solvers that are 
+    failing. Setting ``cholesky=False`` skips to solver 2, 
+    ``sym_pos=False`` skips to solver 3, and ``lstsq=True`` skips 
+    to solver 4 for both sparse and dense problems. 
+ 
+    Potential improvements for combatting issues associated with dense 
+    columns in otherwise sparse problems are outlined in [4]_ Section 5.3 and 
+    [10]_ Section 4.1-4.2; the latter also discusses the alleviation of 
+    accuracy issues associated with the substitution approach to free 
+    variables. 
+ 
+    After calculating the search direction, the maximum possible step size 
+    that does not activate the non-negativity constraints is calculated, and 
+    the smaller of this step size and unity is applied (as in [4]_ Section 
+    4.1.) [4]_ Section 4.3 suggests improvements for choosing the step size. 
+ 
+    The new point is tested according to the termination conditions of [4]_ 
+    Section 4.5. The same tolerance, which can be set using the ``tol`` option, 
+    is used for all checks. (A potential improvement would be to expose 
+    the different tolerances to be set independently.) If optimality, 
+    unboundedness, or infeasibility is detected, the solve procedure 
+    terminates; otherwise it repeats. 
+ 
+    The expected problem formulation differs between the top level ``linprog`` 
+    module and the method specific solvers. The method specific solvers expect a 
+    problem in standard form: 
+ 
+    Minimize:: 
+ 
+        c @ x 
+ 
+    Subject to:: 
+ 
+        A @ x == b 
+            x &gt;= 0 
+ 
+    Whereas the top level ``linprog`` module expects a problem of form: 
+ 
+    Minimize:: 
+ 
+        c @ x 
+ 
+    Subject to:: 
+ 
+        A_ub @ x &lt;= b_ub 
+        A_eq @ x == b_eq 
+         lb &lt;= x &lt;= ub 
+ 
+    where ``lb = 0`` and ``ub = None`` unless set in ``bounds``. 
+ 
+    The original problem contains equality, upper-bound and variable constraints 
+    whereas the method specific solver requires equality constraints and 
+    variable non-negativity. 
+ 
+    ``linprog`` module converts the original problem to standard form by 
+    converting the simple bounds to upper bound constraints, introducing 
+    non-negative slack variables for inequality constraints, and expressing 
+    unbounded variables as the difference between two non-negative variables. 
+ 
+ 
+    References 
+    ---------- 
+    .. [4] Andersen, Erling D., and Knud D. Andersen. &quot;The MOSEK interior point 
+           optimizer for linear programming: an implementation of the 
+           homogeneous algorithm.&quot; High performance optimization. Springer US, 
+           2000. 197-232. 
+    .. [6] Freund, Robert M. &quot;Primal-Dual Interior-Point Methods for Linear 
+           Programming based on Newton's Method.&quot; Unpublished Course Notes, 
+           March 2004. Available 2/25/2017 at 
+           https://ocw.mit.edu/courses/sloan-school-of-management/15-084j-nonlinear-programming-spring-2004/lecture-notes/lec14_int_pt_mthd.pdf 
+    .. [8] Andersen, Erling D., and Knud D. Andersen. &quot;Presolving in linear 
+           programming.&quot; Mathematical Programming 71.2 (1995): 221-245. 
+    .. [9] Bertsimas, Dimitris, and J. Tsitsiklis. &quot;Introduction to linear 
+           programming.&quot; Athena Scientific 1 (1997): 997. 
+    .. [10] Andersen, Erling D., et al. Implementation of interior point methods 
+            for large scale linear programming. HEC/Universite de Geneve, 1996. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_check_unknown_options</span><span class="s4">(</span><span class="s1">unknown_options</span><span class="s4">)</span>
+
+    <span class="s2"># These should be warnings, not errors</span>
+    <span class="s3">if </span><span class="s4">(</span><span class="s1">cholesky </span><span class="s3">or </span><span class="s1">cholesky </span><span class="s3">is None</span><span class="s4">) </span><span class="s3">and </span><span class="s1">sparse </span><span class="s3">and not </span><span class="s1">has_cholmod</span><span class="s4">:</span>
+        <span class="s3">if </span><span class="s1">cholesky</span><span class="s4">:</span>
+            <span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Sparse cholesky is only available with scikit-sparse. &quot;</span>
+                 <span class="s5">&quot;Setting `cholesky = False`&quot;</span><span class="s4">,</span>
+                 <span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">3</span><span class="s4">)</span>
+        <span class="s1">cholesky </span><span class="s4">= </span><span class="s3">False</span>
+
+    <span class="s3">if </span><span class="s1">sparse </span><span class="s3">and </span><span class="s1">lstsq</span><span class="s4">:</span>
+        <span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Option combination 'sparse':True and 'lstsq':True &quot;</span>
+             <span class="s5">&quot;is not recommended.&quot;</span><span class="s4">,</span>
+             <span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">3</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">lstsq </span><span class="s3">and </span><span class="s1">cholesky</span><span class="s4">:</span>
+        <span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Invalid option combination 'lstsq':True &quot;</span>
+             <span class="s5">&quot;and 'cholesky':True; option 'cholesky' has no effect when &quot;</span>
+             <span class="s5">&quot;'lstsq' is set True.&quot;</span><span class="s4">,</span>
+             <span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">3</span><span class="s4">)</span>
+
+    <span class="s1">valid_permc_spec </span><span class="s4">= (</span><span class="s5">'NATURAL'</span><span class="s4">, </span><span class="s5">'MMD_ATA'</span><span class="s4">, </span><span class="s5">'MMD_AT_PLUS_A'</span><span class="s4">, </span><span class="s5">'COLAMD'</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">permc_spec</span><span class="s4">.</span><span class="s1">upper</span><span class="s4">() </span><span class="s3">not in </span><span class="s1">valid_permc_spec</span><span class="s4">:</span>
+        <span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Invalid permc_spec option: '&quot; </span><span class="s4">+ </span><span class="s1">str</span><span class="s4">(</span><span class="s1">permc_spec</span><span class="s4">) + </span><span class="s5">&quot;'. &quot;</span>
+             <span class="s5">&quot;Acceptable values are 'NATURAL', 'MMD_ATA', 'MMD_AT_PLUS_A', &quot;</span>
+             <span class="s5">&quot;and 'COLAMD'. Reverting to default.&quot;</span><span class="s4">,</span>
+             <span class="s1">OptimizeWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">3</span><span class="s4">)</span>
+        <span class="s1">permc_spec </span><span class="s4">= </span><span class="s5">'MMD_AT_PLUS_A'</span>
+
+    <span class="s2"># This can be an error</span>
+    <span class="s3">if not </span><span class="s1">sym_pos </span><span class="s3">and </span><span class="s1">cholesky</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">&quot;Invalid option combination 'sym_pos':False &quot;</span>
+            <span class="s5">&quot;and 'cholesky':True: Cholesky decomposition is only possible &quot;</span>
+            <span class="s5">&quot;for symmetric positive definite matrices.&quot;</span><span class="s4">)</span>
+
+    <span class="s1">cholesky </span><span class="s4">= </span><span class="s1">cholesky </span><span class="s3">or </span><span class="s4">(</span><span class="s1">cholesky </span><span class="s3">is None and </span><span class="s1">sym_pos </span><span class="s3">and not </span><span class="s1">lstsq</span><span class="s4">)</span>
+
+    <span class="s1">x</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">iteration </span><span class="s4">= </span><span class="s1">_ip_hsd</span><span class="s4">(</span><span class="s1">A</span><span class="s4">, </span><span class="s1">b</span><span class="s4">, </span><span class="s1">c</span><span class="s4">, </span><span class="s1">c0</span><span class="s4">, </span><span class="s1">alpha0</span><span class="s4">, </span><span class="s1">beta</span><span class="s4">,</span>
+                                            <span class="s1">maxiter</span><span class="s4">, </span><span class="s1">disp</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">, </span><span class="s1">sparse</span><span class="s4">,</span>
+                                            <span class="s1">lstsq</span><span class="s4">, </span><span class="s1">sym_pos</span><span class="s4">, </span><span class="s1">cholesky</span><span class="s4">,</span>
+                                            <span class="s1">pc</span><span class="s4">, </span><span class="s1">ip</span><span class="s4">, </span><span class="s1">permc_spec</span><span class="s4">, </span><span class="s1">callback</span><span class="s4">,</span>
+                                            <span class="s1">postsolve_args</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">x</span><span class="s4">, </span><span class="s1">status</span><span class="s4">, </span><span class="s1">message</span><span class="s4">, </span><span class="s1">iteration</span>
+</pre>
+</body>
+</html>

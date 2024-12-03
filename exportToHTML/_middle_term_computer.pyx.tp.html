@@ -1,0 +1,650 @@
+<html>
+<head>
+<title>_middle_term_computer.pyx.tp</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_middle_term_computer.pyx.tp</font>
+</center></td></tr></table>
+<pre><span class="s0">{{py:</span>
+
+<span class="s0">implementation_specific_values = [</span>
+    <span class="s0"># Values are the following ones:</span>
+    <span class="s0">#</span>
+    <span class="s0">#       name_suffix, upcast_to_float64, INPUT_DTYPE_t, INPUT_DTYPE</span>
+    <span class="s0">#</span>
+    <span class="s0"># We also use the float64 dtype and C-type names as defined in</span>
+    <span class="s0"># `sklearn.utils._typedefs` to maintain consistency.</span>
+    <span class="s0">#</span>
+    <span class="s0">('64', False, 'float64_t', 'np.float64'),</span>
+    <span class="s0">('32', True, 'float32_t', 'np.float32')</span>
+<span class="s0">]</span>
+
+<span class="s0">}}</span>
+<span class="s0">from libcpp.vector cimport vector</span>
+<span class="s0">from libcpp.algorithm cimport fill</span>
+
+<span class="s0">from ...utils._cython_blas cimport (</span>
+  <span class="s0">BLAS_Order,</span>
+  <span class="s0">BLAS_Trans,</span>
+  <span class="s0">NoTrans,</span>
+  <span class="s0">RowMajor,</span>
+  <span class="s0">Trans,</span>
+  <span class="s0">_gemm,</span>
+<span class="s0">)</span>
+<span class="s0">from ...utils._typedefs cimport float64_t, float32_t, int32_t, intp_t</span>
+
+<span class="s0">import numpy as np</span>
+<span class="s0">from scipy.sparse import issparse, csr_matrix</span>
+
+
+<span class="s0">cdef void _middle_term_sparse_sparse_64(</span>
+    <span class="s0">const float64_t[:] X_data,</span>
+    <span class="s0">const int32_t[:] X_indices,</span>
+    <span class="s0">const int32_t[:] X_indptr,</span>
+    <span class="s0">intp_t X_start,</span>
+    <span class="s0">intp_t X_end,</span>
+    <span class="s0">const float64_t[:] Y_data,</span>
+    <span class="s0">const int32_t[:] Y_indices,</span>
+    <span class="s0">const int32_t[:] Y_indptr,</span>
+    <span class="s0">intp_t Y_start,</span>
+    <span class="s0">intp_t Y_end,</span>
+    <span class="s0">float64_t * D,</span>
+<span class="s0">) noexcept nogil:</span>
+    <span class="s0"># This routine assumes that D points to the first element of a</span>
+    <span class="s0"># zeroed buffer of length at least equal to n_X × n_Y, conceptually</span>
+    <span class="s0"># representing a 2-d C-ordered array.</span>
+    <span class="s0">cdef:</span>
+        <span class="s0">intp_t i, j, k</span>
+        <span class="s0">intp_t n_X = X_end - X_start</span>
+        <span class="s0">intp_t n_Y = Y_end - Y_start</span>
+        <span class="s0">intp_t x_col, x_ptr, y_col, y_ptr</span>
+
+    <span class="s0">for i in range(n_X):</span>
+        <span class="s0">for x_ptr in range(X_indptr[X_start+i], X_indptr[X_start+i+1]):</span>
+            <span class="s0">x_col = X_indices[x_ptr]</span>
+            <span class="s0">for j in range(n_Y):</span>
+                <span class="s0">k = i * n_Y + j</span>
+                <span class="s0">for y_ptr in range(Y_indptr[Y_start+j], Y_indptr[Y_start+j+1]):</span>
+                    <span class="s0">y_col = Y_indices[y_ptr]</span>
+                    <span class="s0">if x_col == y_col:</span>
+                        <span class="s0">D[k] += -2 * X_data[x_ptr] * Y_data[y_ptr]</span>
+
+
+<span class="s0">{{for name_suffix, upcast_to_float64, INPUT_DTYPE_t, INPUT_DTYPE in implementation_specific_values}}</span>
+
+<span class="s0">cdef void _middle_term_sparse_dense_{{name_suffix}}(</span>
+    <span class="s0">const float64_t[:] X_data,</span>
+    <span class="s0">const int32_t[:] X_indices,</span>
+    <span class="s0">const int32_t[:] X_indptr,</span>
+    <span class="s0">intp_t X_start,</span>
+    <span class="s0">intp_t X_end,</span>
+    <span class="s0">const {{INPUT_DTYPE_t}}[:, ::1] Y,</span>
+    <span class="s0">intp_t Y_start,</span>
+    <span class="s0">intp_t Y_end,</span>
+    <span class="s0">bint c_ordered_middle_term,</span>
+    <span class="s0">float64_t * dist_middle_terms,</span>
+<span class="s0">) noexcept nogil:</span>
+    <span class="s0"># This routine assumes that dist_middle_terms is a pointer to the first element</span>
+    <span class="s0"># of a buffer filled with zeros of length at least equal to n_X × n_Y, conceptually</span>
+    <span class="s0"># representing a 2-d C-ordered of F-ordered array.</span>
+    <span class="s0">cdef:</span>
+        <span class="s0">intp_t i, j, k</span>
+        <span class="s0">intp_t n_X = X_end - X_start</span>
+        <span class="s0">intp_t n_Y = Y_end - Y_start</span>
+        <span class="s0">intp_t X_i_col_idx, X_i_ptr, Y_j_col_idx, Y_j_ptr</span>
+
+    <span class="s0">for i in range(n_X):</span>
+        <span class="s0">for j in range(n_Y):</span>
+            <span class="s0">k = i * n_Y + j if c_ordered_middle_term else j * n_X + i</span>
+            <span class="s0">for X_i_ptr in range(X_indptr[X_start+i], X_indptr[X_start+i+1]):</span>
+                <span class="s0">X_i_col_idx = X_indices[X_i_ptr]</span>
+                <span class="s0">dist_middle_terms[k] += -2 * X_data[X_i_ptr] * Y[Y_start + j, X_i_col_idx]</span>
+
+
+<span class="s0">cdef class MiddleTermComputer{{name_suffix}}:</span>
+    <span class="s0">&quot;&quot;&quot;Helper class to compute a Euclidean distance matrix in chunks.</span>
+
+    <span class="s0">This is an abstract base class that is further specialized depending</span>
+    <span class="s0">on the type of data (dense or sparse).</span>
+
+    <span class="s0">`EuclideanDistance` subclasses relies on the squared Euclidean</span>
+    <span class="s0">distances between chunks of vectors X_c and Y_c using the</span>
+    <span class="s0">following decomposition for the (i,j) pair :</span>
+
+
+         <span class="s0">||X_c_i - Y_c_j||² = ||X_c_i||² - 2 X_c_i.Y_c_j^T + ||Y_c_j||²</span>
+
+
+    <span class="s0">This helper class is in charge of wrapping the common logic to compute</span>
+    <span class="s0">the middle term, i.e. `- 2 X_c_i.Y_c_j^T`.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">@classmethod</span>
+    <span class="s0">def get_for(</span>
+        <span class="s0">cls,</span>
+        <span class="s0">X,</span>
+        <span class="s0">Y,</span>
+        <span class="s0">effective_n_threads,</span>
+        <span class="s0">chunks_n_threads,</span>
+        <span class="s0">dist_middle_terms_chunks_size,</span>
+        <span class="s0">n_features,</span>
+        <span class="s0">chunk_size,</span>
+    <span class="s0">) -&gt; MiddleTermComputer{{name_suffix}}:</span>
+        <span class="s0">&quot;&quot;&quot;Return the MiddleTermComputer implementation for the given arguments.</span>
+
+        <span class="s0">Parameters</span>
+        <span class="s0">----------</span>
+        <span class="s0">X : ndarray or CSR sparse matrix of shape (n_samples_X, n_features)</span>
+            <span class="s0">Input data.</span>
+            <span class="s0">If provided as a ndarray, it must be C-contiguous.</span>
+
+        <span class="s0">Y : ndarray or CSR sparse matrix of shape (n_samples_Y, n_features)</span>
+            <span class="s0">Input data.</span>
+            <span class="s0">If provided as a ndarray, it must be C-contiguous.</span>
+
+        <span class="s0">Returns</span>
+        <span class="s0">-------</span>
+        <span class="s0">middle_term_computer: MiddleTermComputer{{name_suffix}}</span>
+            <span class="s0">The suited MiddleTermComputer{{name_suffix}} implementation.</span>
+        <span class="s0">&quot;&quot;&quot;</span>
+        <span class="s0">X_is_sparse = issparse(X)</span>
+        <span class="s0">Y_is_sparse = issparse(Y)</span>
+
+        <span class="s0">if not X_is_sparse and not Y_is_sparse:</span>
+            <span class="s0">return DenseDenseMiddleTermComputer{{name_suffix}}(</span>
+                <span class="s0">X,</span>
+                <span class="s0">Y,</span>
+                <span class="s0">effective_n_threads,</span>
+                <span class="s0">chunks_n_threads,</span>
+                <span class="s0">dist_middle_terms_chunks_size,</span>
+                <span class="s0">n_features,</span>
+                <span class="s0">chunk_size,</span>
+            <span class="s0">)</span>
+        <span class="s0">if X_is_sparse and Y_is_sparse:</span>
+            <span class="s0">return SparseSparseMiddleTermComputer{{name_suffix}}(</span>
+                <span class="s0">X,</span>
+                <span class="s0">Y,</span>
+                <span class="s0">effective_n_threads,</span>
+                <span class="s0">chunks_n_threads,</span>
+                <span class="s0">dist_middle_terms_chunks_size,</span>
+                <span class="s0">n_features,</span>
+                <span class="s0">chunk_size,</span>
+            <span class="s0">)</span>
+        <span class="s0">if X_is_sparse and not Y_is_sparse:</span>
+            <span class="s0">return SparseDenseMiddleTermComputer{{name_suffix}}(</span>
+                <span class="s0">X,</span>
+                <span class="s0">Y,</span>
+                <span class="s0">effective_n_threads,</span>
+                <span class="s0">chunks_n_threads,</span>
+                <span class="s0">dist_middle_terms_chunks_size,</span>
+                <span class="s0">n_features,</span>
+                <span class="s0">chunk_size,</span>
+                <span class="s0">c_ordered_middle_term=True</span>
+            <span class="s0">)</span>
+        <span class="s0">if not X_is_sparse and Y_is_sparse:</span>
+            <span class="s0"># NOTE: The Dense-Sparse case is implement via the Sparse-Dense case.</span>
+            <span class="s0">#</span>
+            <span class="s0"># To do so:</span>
+            <span class="s0">#    - X (dense) and Y (sparse) are swapped</span>
+            <span class="s0">#    - the distance middle term is seen as F-ordered for consistency</span>
+            <span class="s0">#      (c_ordered_middle_term = False)</span>
+            <span class="s0">return SparseDenseMiddleTermComputer{{name_suffix}}(</span>
+                <span class="s0"># Mind that X and Y are swapped here.</span>
+                <span class="s0">Y,</span>
+                <span class="s0">X,</span>
+                <span class="s0">effective_n_threads,</span>
+                <span class="s0">chunks_n_threads,</span>
+                <span class="s0">dist_middle_terms_chunks_size,</span>
+                <span class="s0">n_features,</span>
+                <span class="s0">chunk_size,</span>
+                <span class="s0">c_ordered_middle_term=False,</span>
+            <span class="s0">)</span>
+        <span class="s0">raise NotImplementedError(</span>
+            <span class="s0">&quot;X and Y must be CSR sparse matrices or numpy arrays.&quot;</span>
+        <span class="s0">)</span>
+
+    <span class="s0">@classmethod</span>
+    <span class="s0">def unpack_csr_matrix(cls, X: csr_matrix):</span>
+        <span class="s0">&quot;&quot;&quot;Ensure that the CSR matrix is indexed with np.int32.&quot;&quot;&quot;</span>
+        <span class="s0">X_data = np.asarray(X.data, dtype=np.float64)</span>
+        <span class="s0">X_indices = np.asarray(X.indices, dtype=np.int32)</span>
+        <span class="s0">X_indptr = np.asarray(X.indptr, dtype=np.int32)</span>
+        <span class="s0">return X_data, X_indices, X_indptr</span>
+
+    <span class="s0">def __init__(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t effective_n_threads,</span>
+        <span class="s0">intp_t chunks_n_threads,</span>
+        <span class="s0">intp_t dist_middle_terms_chunks_size,</span>
+        <span class="s0">intp_t n_features,</span>
+        <span class="s0">intp_t chunk_size,</span>
+    <span class="s0">):</span>
+        <span class="s0">self.effective_n_threads = effective_n_threads</span>
+        <span class="s0">self.chunks_n_threads = chunks_n_threads</span>
+        <span class="s0">self.dist_middle_terms_chunks_size = dist_middle_terms_chunks_size</span>
+        <span class="s0">self.n_features = n_features</span>
+        <span class="s0">self.chunk_size = chunk_size</span>
+
+        <span class="s0">self.dist_middle_terms_chunks = vector[vector[float64_t]](self.effective_n_threads)</span>
+
+    <span class="s0">cdef void _parallel_on_X_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">return</span>
+
+    <span class="s0">cdef void _parallel_on_X_parallel_init(self, intp_t thread_num) noexcept nogil:</span>
+        <span class="s0">self.dist_middle_terms_chunks[thread_num].resize(self.dist_middle_terms_chunks_size)</span>
+
+    <span class="s0">cdef void _parallel_on_X_init_chunk(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t thread_num,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">return</span>
+
+    <span class="s0">cdef void _parallel_on_Y_init(self) noexcept nogil:</span>
+        <span class="s0">for thread_num in range(self.chunks_n_threads):</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].resize(</span>
+                <span class="s0">self.dist_middle_terms_chunks_size</span>
+            <span class="s0">)</span>
+
+    <span class="s0">cdef void _parallel_on_Y_parallel_init(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t thread_num,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">return</span>
+
+    <span class="s0">cdef void _parallel_on_Y_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">return</span>
+
+    <span class="s0">cdef float64_t * _compute_dist_middle_terms(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">return NULL</span>
+
+
+<span class="s0">cdef class DenseDenseMiddleTermComputer{{name_suffix}}(MiddleTermComputer{{name_suffix}}):</span>
+    <span class="s0">&quot;&quot;&quot;Computes the middle term of the Euclidean distance between two chunked dense matrices</span>
+    <span class="s0">X_c and Y_c.</span>
+
+                        <span class="s0">dist_middle_terms = - 2 X_c_i.Y_c_j^T</span>
+
+    <span class="s0">This class use the BLAS gemm routine to perform the dot product of each chunks</span>
+    <span class="s0">of the distance matrix with improved arithmetic intensity and vector instruction (SIMD).</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">def __init__(</span>
+        <span class="s0">self,</span>
+        <span class="s0">const {{INPUT_DTYPE_t}}[:, ::1] X,</span>
+        <span class="s0">const {{INPUT_DTYPE_t}}[:, ::1] Y,</span>
+        <span class="s0">intp_t effective_n_threads,</span>
+        <span class="s0">intp_t chunks_n_threads,</span>
+        <span class="s0">intp_t dist_middle_terms_chunks_size,</span>
+        <span class="s0">intp_t n_features,</span>
+        <span class="s0">intp_t chunk_size,</span>
+    <span class="s0">):</span>
+        <span class="s0">super().__init__(</span>
+            <span class="s0">effective_n_threads,</span>
+            <span class="s0">chunks_n_threads,</span>
+            <span class="s0">dist_middle_terms_chunks_size,</span>
+            <span class="s0">n_features,</span>
+            <span class="s0">chunk_size,</span>
+        <span class="s0">)</span>
+        <span class="s0">self.X = X</span>
+        <span class="s0">self.Y = Y</span>
+
+<span class="s0">{{if upcast_to_float64}}</span>
+        <span class="s0"># We populate the buffer for upcasting chunks of X and Y from float32 to float64.</span>
+        <span class="s0">self.X_c_upcast = vector[vector[float64_t]](self.effective_n_threads)</span>
+        <span class="s0">self.Y_c_upcast = vector[vector[float64_t]](self.effective_n_threads)</span>
+
+        <span class="s0">upcast_buffer_n_elements = self.chunk_size * n_features</span>
+
+        <span class="s0">for thread_num in range(self.effective_n_threads):</span>
+            <span class="s0">self.X_c_upcast[thread_num].resize(upcast_buffer_n_elements)</span>
+            <span class="s0">self.Y_c_upcast[thread_num].resize(upcast_buffer_n_elements)</span>
+<span class="s0">{{endif}}</span>
+
+    <span class="s0">cdef void _parallel_on_X_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+<span class="s0">{{if upcast_to_float64}}</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">intp_t i, j</span>
+            <span class="s0">intp_t n_chunk_samples = Y_end - Y_start</span>
+
+        <span class="s0"># Upcasting Y_c=Y[Y_start:Y_end, :] from float32 to float64</span>
+        <span class="s0">for i in range(n_chunk_samples):</span>
+            <span class="s0">for j in range(self.n_features):</span>
+                <span class="s0">self.Y_c_upcast[thread_num][i * self.n_features + j] = &lt;float64_t&gt; self.Y[Y_start + i, j]</span>
+<span class="s0">{{else}}</span>
+        <span class="s0">return</span>
+<span class="s0">{{endif}}</span>
+
+    <span class="s0">cdef void _parallel_on_X_init_chunk(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t thread_num,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+    <span class="s0">) noexcept nogil:</span>
+<span class="s0">{{if upcast_to_float64}}</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">intp_t i, j</span>
+            <span class="s0">intp_t n_chunk_samples = X_end - X_start</span>
+
+        <span class="s0"># Upcasting X_c=X[X_start:X_end, :] from float32 to float64</span>
+        <span class="s0">for i in range(n_chunk_samples):</span>
+            <span class="s0">for j in range(self.n_features):</span>
+                <span class="s0">self.X_c_upcast[thread_num][i * self.n_features + j] = &lt;float64_t&gt; self.X[X_start + i, j]</span>
+<span class="s0">{{else}}</span>
+        <span class="s0">return</span>
+<span class="s0">{{endif}}</span>
+
+    <span class="s0">cdef void _parallel_on_Y_parallel_init(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t thread_num,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+    <span class="s0">) noexcept nogil:</span>
+<span class="s0">{{if upcast_to_float64}}</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">intp_t i, j</span>
+            <span class="s0">intp_t n_chunk_samples = X_end - X_start</span>
+
+        <span class="s0"># Upcasting X_c=X[X_start:X_end, :] from float32 to float64</span>
+        <span class="s0">for i in range(n_chunk_samples):</span>
+            <span class="s0">for j in range(self.n_features):</span>
+                <span class="s0">self.X_c_upcast[thread_num][i * self.n_features + j] = &lt;float64_t&gt; self.X[X_start + i, j]</span>
+<span class="s0">{{else}}</span>
+        <span class="s0">return</span>
+<span class="s0">{{endif}}</span>
+
+    <span class="s0">cdef void _parallel_on_Y_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num</span>
+    <span class="s0">) noexcept nogil:</span>
+<span class="s0">{{if upcast_to_float64}}</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">intp_t i, j</span>
+            <span class="s0">intp_t n_chunk_samples = Y_end - Y_start</span>
+
+        <span class="s0"># Upcasting Y_c=Y[Y_start:Y_end, :] from float32 to float64</span>
+        <span class="s0">for i in range(n_chunk_samples):</span>
+            <span class="s0">for j in range(self.n_features):</span>
+                <span class="s0">self.Y_c_upcast[thread_num][i * self.n_features + j] = &lt;float64_t&gt; self.Y[Y_start + i, j]</span>
+<span class="s0">{{else}}</span>
+        <span class="s0">return</span>
+<span class="s0">{{endif}}</span>
+
+    <span class="s0">cdef float64_t * _compute_dist_middle_terms(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">float64_t *dist_middle_terms = self.dist_middle_terms_chunks[thread_num].data()</span>
+
+            <span class="s0"># Careful: LDA, LDB and LDC are given for F-ordered arrays</span>
+            <span class="s0"># in BLAS documentations, for instance:</span>
+            <span class="s0"># https://www.netlib.org/lapack/explore-html/db/dc9/group__single__blas__level3_gafe51bacb54592ff5de056acabd83c260.html #noqa</span>
+            <span class="s0">#</span>
+            <span class="s0"># Here, we use their counterpart values to work with C-ordered arrays.</span>
+            <span class="s0">BLAS_Order order = RowMajor</span>
+            <span class="s0">BLAS_Trans ta = NoTrans</span>
+            <span class="s0">BLAS_Trans tb = Trans</span>
+            <span class="s0">intp_t m = X_end - X_start</span>
+            <span class="s0">intp_t n = Y_end - Y_start</span>
+            <span class="s0">intp_t K = self.n_features</span>
+            <span class="s0">float64_t alpha = - 2.</span>
+<span class="s0">{{if upcast_to_float64}}</span>
+            <span class="s0">float64_t * A = self.X_c_upcast[thread_num].data()</span>
+            <span class="s0">float64_t * B = self.Y_c_upcast[thread_num].data()</span>
+<span class="s0">{{else}}</span>
+            <span class="s0"># Casting for A and B to remove the const is needed because APIs exposed via</span>
+            <span class="s0"># scipy.linalg.cython_blas aren't reflecting the arguments' const qualifier.</span>
+            <span class="s0"># See: https://github.com/scipy/scipy/issues/14262</span>
+            <span class="s0">float64_t * A = &lt;float64_t *&gt; &amp;self.X[X_start, 0]</span>
+            <span class="s0">float64_t * B = &lt;float64_t *&gt; &amp;self.Y[Y_start, 0]</span>
+<span class="s0">{{endif}}</span>
+            <span class="s0">intp_t lda = self.n_features</span>
+            <span class="s0">intp_t ldb = self.n_features</span>
+            <span class="s0">float64_t beta = 0.</span>
+            <span class="s0">intp_t ldc = Y_end - Y_start</span>
+
+        <span class="s0"># dist_middle_terms = `-2 * X[X_start:X_end] @ Y[Y_start:Y_end].T`</span>
+        <span class="s0">_gemm(order, ta, tb, m, n, K, alpha, A, lda, B, ldb, beta, dist_middle_terms, ldc)</span>
+
+        <span class="s0">return dist_middle_terms</span>
+
+
+<span class="s0">cdef class SparseSparseMiddleTermComputer{{name_suffix}}(MiddleTermComputer{{name_suffix}}):</span>
+    <span class="s0">&quot;&quot;&quot;Middle term of the Euclidean distance between two chunked CSR matrices.</span>
+
+    <span class="s0">The result is return as a contiguous array.</span>
+
+            <span class="s0">dist_middle_terms = - 2 X_c_i.Y_c_j^T</span>
+
+    <span class="s0">The logic of the computation is wrapped in the routine _middle_term_sparse_sparse_64.</span>
+    <span class="s0">This routine iterates over the data, indices and indptr arrays of the sparse matrices without</span>
+    <span class="s0">densifying them.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">def __init__(</span>
+        <span class="s0">self,</span>
+        <span class="s0">X,</span>
+        <span class="s0">Y,</span>
+        <span class="s0">intp_t effective_n_threads,</span>
+        <span class="s0">intp_t chunks_n_threads,</span>
+        <span class="s0">intp_t dist_middle_terms_chunks_size,</span>
+        <span class="s0">intp_t n_features,</span>
+        <span class="s0">intp_t chunk_size,</span>
+    <span class="s0">):</span>
+        <span class="s0">super().__init__(</span>
+            <span class="s0">effective_n_threads,</span>
+            <span class="s0">chunks_n_threads,</span>
+            <span class="s0">dist_middle_terms_chunks_size,</span>
+            <span class="s0">n_features,</span>
+            <span class="s0">chunk_size,</span>
+        <span class="s0">)</span>
+        <span class="s0">self.X_data, self.X_indices, self.X_indptr = self.unpack_csr_matrix(X)</span>
+        <span class="s0">self.Y_data, self.Y_indices, self.Y_indptr = self.unpack_csr_matrix(Y)</span>
+
+    <span class="s0">cdef void _parallel_on_X_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0"># Flush the thread dist_middle_terms_chunks to 0.0</span>
+        <span class="s0">fill(</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].begin(),</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].end(),</span>
+            <span class="s0">0.0,</span>
+        <span class="s0">)</span>
+
+    <span class="s0">cdef void _parallel_on_Y_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0"># Flush the thread dist_middle_terms_chunks to 0.0</span>
+        <span class="s0">fill(</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].begin(),</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].end(),</span>
+            <span class="s0">0.0,</span>
+        <span class="s0">)</span>
+
+    <span class="s0">cdef float64_t * _compute_dist_middle_terms(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">float64_t *dist_middle_terms = (</span>
+                <span class="s0">self.dist_middle_terms_chunks[thread_num].data()</span>
+            <span class="s0">)</span>
+
+        <span class="s0">_middle_term_sparse_sparse_64(</span>
+            <span class="s0">self.X_data,</span>
+            <span class="s0">self.X_indices,</span>
+            <span class="s0">self.X_indptr,</span>
+            <span class="s0">X_start,</span>
+            <span class="s0">X_end,</span>
+            <span class="s0">self.Y_data,</span>
+            <span class="s0">self.Y_indices,</span>
+            <span class="s0">self.Y_indptr,</span>
+            <span class="s0">Y_start,</span>
+            <span class="s0">Y_end,</span>
+            <span class="s0">dist_middle_terms,</span>
+        <span class="s0">)</span>
+
+        <span class="s0">return dist_middle_terms</span>
+
+<span class="s0">cdef class SparseDenseMiddleTermComputer{{name_suffix}}(MiddleTermComputer{{name_suffix}}):</span>
+    <span class="s0">&quot;&quot;&quot;Middle term of the Euclidean distance between chunks of a CSR matrix and a np.ndarray.</span>
+
+    <span class="s0">The logic of the computation is wrapped in the routine _middle_term_sparse_dense_{{name_suffix}}.</span>
+    <span class="s0">This routine iterates over the data, indices and indptr arrays of the sparse matrices</span>
+    <span class="s0">without densifying them.</span>
+    <span class="s0">&quot;&quot;&quot;</span>
+
+    <span class="s0">def __init__(</span>
+        <span class="s0">self,</span>
+        <span class="s0">X,</span>
+        <span class="s0">Y,</span>
+        <span class="s0">intp_t effective_n_threads,</span>
+        <span class="s0">intp_t chunks_n_threads,</span>
+        <span class="s0">intp_t dist_middle_terms_chunks_size,</span>
+        <span class="s0">intp_t n_features,</span>
+        <span class="s0">intp_t chunk_size,</span>
+        <span class="s0">bint c_ordered_middle_term,</span>
+    <span class="s0">):</span>
+        <span class="s0">super().__init__(</span>
+            <span class="s0">effective_n_threads,</span>
+            <span class="s0">chunks_n_threads,</span>
+            <span class="s0">dist_middle_terms_chunks_size,</span>
+            <span class="s0">n_features,</span>
+            <span class="s0">chunk_size,</span>
+        <span class="s0">)</span>
+        <span class="s0">self.X_data, self.X_indices, self.X_indptr = self.unpack_csr_matrix(X)</span>
+        <span class="s0">self.Y = Y</span>
+        <span class="s0">self.c_ordered_middle_term = c_ordered_middle_term</span>
+
+    <span class="s0">cdef void _parallel_on_X_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0"># Fill the thread's dist_middle_terms_chunks with 0.0 before</span>
+        <span class="s0"># computing its elements in _compute_dist_middle_terms.</span>
+        <span class="s0">fill(</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].begin(),</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].end(),</span>
+            <span class="s0">0.0,</span>
+        <span class="s0">)</span>
+
+    <span class="s0">cdef void _parallel_on_Y_pre_compute_and_reduce_distances_on_chunks(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0"># Fill the thread's dist_middle_terms_chunks with 0.0 before</span>
+        <span class="s0"># computing its elements in _compute_dist_middle_terms.</span>
+        <span class="s0">fill(</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].begin(),</span>
+            <span class="s0">self.dist_middle_terms_chunks[thread_num].end(),</span>
+            <span class="s0">0.0,</span>
+        <span class="s0">)</span>
+
+    <span class="s0">cdef float64_t * _compute_dist_middle_terms(</span>
+        <span class="s0">self,</span>
+        <span class="s0">intp_t X_start,</span>
+        <span class="s0">intp_t X_end,</span>
+        <span class="s0">intp_t Y_start,</span>
+        <span class="s0">intp_t Y_end,</span>
+        <span class="s0">intp_t thread_num,</span>
+    <span class="s0">) noexcept nogil:</span>
+        <span class="s0">cdef:</span>
+            <span class="s0">float64_t *dist_middle_terms = (</span>
+                <span class="s0">self.dist_middle_terms_chunks[thread_num].data()</span>
+            <span class="s0">)</span>
+
+        <span class="s0"># For the dense-sparse case, we use the sparse-dense case</span>
+        <span class="s0"># with dist_middle_terms seen as F-ordered.</span>
+        <span class="s0"># Hence we swap indices pointers here.</span>
+        <span class="s0">if not self.c_ordered_middle_term:</span>
+            <span class="s0">X_start, Y_start = Y_start, X_start</span>
+            <span class="s0">X_end, Y_end = Y_end, X_end</span>
+
+        <span class="s0">_middle_term_sparse_dense_{{name_suffix}}(</span>
+            <span class="s0">self.X_data,</span>
+            <span class="s0">self.X_indices,</span>
+            <span class="s0">self.X_indptr,</span>
+            <span class="s0">X_start,</span>
+            <span class="s0">X_end,</span>
+            <span class="s0">self.Y,</span>
+            <span class="s0">Y_start,</span>
+            <span class="s0">Y_end,</span>
+            <span class="s0">self.c_ordered_middle_term,</span>
+            <span class="s0">dist_middle_terms,</span>
+        <span class="s0">)</span>
+
+        <span class="s0">return dist_middle_terms</span>
+
+<span class="s0">{{endfor}}</span>
+</pre>
+</body>
+</html>

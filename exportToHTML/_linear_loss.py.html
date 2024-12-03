@@ -1,0 +1,695 @@
+<html>
+<head>
+<title>_linear_loss.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #6aab73;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_linear_loss.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Loss functions for linear models with raw_prediction = X @ coef 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">sparse</span>
+
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">extmath </span><span class="s2">import </span><span class="s1">squared_norm</span>
+
+
+<span class="s2">class </span><span class="s1">LinearModelLoss</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot;General class for loss functions with raw_prediction = X @ coef + intercept. 
+ 
+    Note that raw_prediction is also known as linear predictor. 
+ 
+    The loss is the average of per sample losses and includes a term for L2 
+    regularization:: 
+ 
+        loss = 1 / s_sum * sum_i s_i loss(y_i, X_i @ coef + intercept) 
+               + 1/2 * l2_reg_strength * ||coef||_2^2 
+ 
+    with sample weights s_i=1 if sample_weight=None and s_sum=sum_i s_i. 
+ 
+    Gradient and hessian, for simplicity without intercept, are:: 
+ 
+        gradient = 1 / s_sum * X.T @ loss.gradient + l2_reg_strength * coef 
+        hessian = 1 / s_sum * X.T @ diag(loss.hessian) @ X 
+                  + l2_reg_strength * identity 
+ 
+    Conventions: 
+        if fit_intercept: 
+            n_dof =  n_features + 1 
+        else: 
+            n_dof = n_features 
+ 
+        if base_loss.is_multiclass: 
+            coef.shape = (n_classes, n_dof) or ravelled (n_classes * n_dof,) 
+        else: 
+            coef.shape = (n_dof,) 
+ 
+        The intercept term is at the end of the coef array: 
+        if base_loss.is_multiclass: 
+            if coef.shape (n_classes, n_dof): 
+                intercept = coef[:, -1] 
+            if coef.shape (n_classes * n_dof,) 
+                intercept = coef[n_features::n_dof] = coef[(n_dof-1)::n_dof] 
+            intercept.shape = (n_classes,) 
+        else: 
+            intercept = coef[-1] 
+ 
+    Note: If coef has shape (n_classes * n_dof,), the 2d-array can be reconstructed as 
+ 
+        coef.reshape((n_classes, -1), order=&quot;F&quot;) 
+ 
+    The option order=&quot;F&quot; makes coef[:, i] contiguous. This, in turn, makes the 
+    coefficients without intercept, coef[:, :-1], contiguous and speeds up 
+    matrix-vector computations. 
+ 
+    Note: If the average loss per sample is wanted instead of the sum of the loss per 
+    sample, one can simply use a rescaled sample_weight such that 
+    sum(sample_weight) = 1. 
+ 
+    Parameters 
+    ---------- 
+    base_loss : instance of class BaseLoss from sklearn._loss. 
+    fit_intercept : bool 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">base_loss</span><span class="s3">, </span><span class="s1">fit_intercept</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss </span><span class="s3">= </span><span class="s1">base_loss</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept </span><span class="s3">= </span><span class="s1">fit_intercept</span>
+
+    <span class="s2">def </span><span class="s1">init_zero_coef</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Allocate coef of correct shape with zeros. 
+ 
+        Parameters: 
+        ----------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+        dtype : data-type, default=None 
+            Overrides the data type of coef. With dtype=None, coef will have the same 
+            dtype as X. 
+ 
+        Returns 
+        ------- 
+        coef : ndarray of shape (n_dof,) or (n_classes, n_dof) 
+            Coefficients of a linear model. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">n_features </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">]</span>
+        <span class="s1">n_classes </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">n_classes</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+            <span class="s1">n_dof </span><span class="s3">= </span><span class="s1">n_features </span><span class="s3">+ </span><span class="s4">1</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">n_dof </span><span class="s3">= </span><span class="s1">n_features</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">is_multiclass</span><span class="s3">:</span>
+            <span class="s1">coef </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">=(</span><span class="s1">n_classes</span><span class="s3">, </span><span class="s1">n_dof</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">coef </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">=</span><span class="s1">n_dof</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">dtype</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">coef</span>
+
+    <span class="s2">def </span><span class="s1">weight_intercept</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">coef</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Helper function to get coefficients and intercept. 
+ 
+        Parameters 
+        ---------- 
+        coef : ndarray of shape (n_dof,), (n_classes, n_dof) or (n_classes * n_dof,) 
+            Coefficients of a linear model. 
+            If shape (n_classes * n_dof,), the classes of one feature are contiguous, 
+            i.e. one reconstructs the 2d-array via 
+            coef.reshape((n_classes, -1), order=&quot;F&quot;). 
+ 
+        Returns 
+        ------- 
+        weights : ndarray of shape (n_features,) or (n_classes, n_features) 
+            Coefficients without intercept term. 
+        intercept : float or ndarray of shape (n_classes,) 
+            Intercept terms. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">is_multiclass</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">intercept </span><span class="s3">= </span><span class="s1">coef</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">]</span>
+                <span class="s1">weights </span><span class="s3">= </span><span class="s1">coef</span><span class="s3">[:-</span><span class="s4">1</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">intercept </span><span class="s3">= </span><span class="s4">0.0</span>
+                <span class="s1">weights </span><span class="s3">= </span><span class="s1">coef</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s6"># reshape to (n_classes, n_dof)</span>
+            <span class="s2">if </span><span class="s1">coef</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s1">weights </span><span class="s3">= </span><span class="s1">coef</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">((</span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">n_classes</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">), </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">weights </span><span class="s3">= </span><span class="s1">coef</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">intercept </span><span class="s3">= </span><span class="s1">weights</span><span class="s3">[:, -</span><span class="s4">1</span><span class="s3">]</span>
+                <span class="s1">weights </span><span class="s3">= </span><span class="s1">weights</span><span class="s3">[:, :-</span><span class="s4">1</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">intercept </span><span class="s3">= </span><span class="s4">0.0</span>
+
+        <span class="s2">return </span><span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept</span>
+
+    <span class="s2">def </span><span class="s1">weight_intercept_raw</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">coef</span><span class="s3">, </span><span class="s1">X</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Helper function to get coefficients, intercept and raw_prediction. 
+ 
+        Parameters 
+        ---------- 
+        coef : ndarray of shape (n_dof,), (n_classes, n_dof) or (n_classes * n_dof,) 
+            Coefficients of a linear model. 
+            If shape (n_classes * n_dof,), the classes of one feature are contiguous, 
+            i.e. one reconstructs the 2d-array via 
+            coef.reshape((n_classes, -1), order=&quot;F&quot;). 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+ 
+        Returns 
+        ------- 
+        weights : ndarray of shape (n_features,) or (n_classes, n_features) 
+            Coefficients without intercept term. 
+        intercept : float or ndarray of shape (n_classes,) 
+            Intercept terms. 
+        raw_prediction : ndarray of shape (n_samples,) or \ 
+            (n_samples, n_classes) 
+        &quot;&quot;&quot;</span>
+        <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">is_multiclass</span><span class="s3">:</span>
+            <span class="s1">raw_prediction </span><span class="s3">= </span><span class="s1">X </span><span class="s3">@ </span><span class="s1">weights </span><span class="s3">+ </span><span class="s1">intercept</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s6"># weights has shape (n_classes, n_dof)</span>
+            <span class="s1">raw_prediction </span><span class="s3">= </span><span class="s1">X </span><span class="s3">@ </span><span class="s1">weights</span><span class="s3">.</span><span class="s1">T </span><span class="s3">+ </span><span class="s1">intercept  </span><span class="s6"># ndarray, likely C-contiguous</span>
+
+        <span class="s2">return </span><span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept</span><span class="s3">, </span><span class="s1">raw_prediction</span>
+
+    <span class="s2">def </span><span class="s1">l2_penalty</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">weights</span><span class="s3">, </span><span class="s1">l2_reg_strength</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute L2 penalty term l2_reg_strength/2 *||w||_2^2.&quot;&quot;&quot;</span>
+        <span class="s1">norm2_w </span><span class="s3">= </span><span class="s1">weights </span><span class="s3">@ </span><span class="s1">weights </span><span class="s2">if </span><span class="s1">weights</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1 </span><span class="s2">else </span><span class="s1">squared_norm</span><span class="s3">(</span><span class="s1">weights</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s4">0.5 </span><span class="s3">* </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">norm2_w</span>
+
+    <span class="s2">def </span><span class="s1">loss</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">coef</span><span class="s3">,</span>
+        <span class="s1">X</span><span class="s3">,</span>
+        <span class="s1">y</span><span class="s3">,</span>
+        <span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">l2_reg_strength</span><span class="s3">=</span><span class="s4">0.0</span><span class="s3">,</span>
+        <span class="s1">n_threads</span><span class="s3">=</span><span class="s4">1</span><span class="s3">,</span>
+        <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute the loss as weighted average over point-wise losses. 
+ 
+        Parameters 
+        ---------- 
+        coef : ndarray of shape (n_dof,), (n_classes, n_dof) or (n_classes * n_dof,) 
+            Coefficients of a linear model. 
+            If shape (n_classes * n_dof,), the classes of one feature are contiguous, 
+            i.e. one reconstructs the 2d-array via 
+            coef.reshape((n_classes, -1), order=&quot;F&quot;). 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+        y : contiguous array of shape (n_samples,) 
+            Observed, true target values. 
+        sample_weight : None or contiguous array of shape (n_samples,), default=None 
+            Sample weights. 
+        l2_reg_strength : float, default=0.0 
+            L2 regularization strength 
+        n_threads : int, default=1 
+            Number of OpenMP threads to use. 
+        raw_prediction : C-contiguous array of shape (n_samples,) or array of \ 
+            shape (n_samples, n_classes) 
+            Raw prediction values (in link space). If provided, these are used. If 
+            None, then raw_prediction = X @ coef + intercept is calculated. 
+ 
+        Returns 
+        ------- 
+        loss : float 
+            Weighted average of losses per sample, plus penalty. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">raw_prediction </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept</span><span class="s3">, </span><span class="s1">raw_prediction </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept_raw</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">X</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">)</span>
+
+        <span class="s1">loss </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">loss</span><span class="s3">(</span>
+            <span class="s1">y_true</span><span class="s3">=</span><span class="s1">y</span><span class="s3">,</span>
+            <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s1">raw_prediction</span><span class="s3">,</span>
+            <span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">n_threads</span><span class="s3">=</span><span class="s1">n_threads</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">loss </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">average</span><span class="s3">(</span><span class="s1">loss</span><span class="s3">, </span><span class="s1">weights</span><span class="s3">=</span><span class="s1">sample_weight</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">loss </span><span class="s3">+ </span><span class="s1">self</span><span class="s3">.</span><span class="s1">l2_penalty</span><span class="s3">(</span><span class="s1">weights</span><span class="s3">, </span><span class="s1">l2_reg_strength</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">loss_gradient</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">coef</span><span class="s3">,</span>
+        <span class="s1">X</span><span class="s3">,</span>
+        <span class="s1">y</span><span class="s3">,</span>
+        <span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">l2_reg_strength</span><span class="s3">=</span><span class="s4">0.0</span><span class="s3">,</span>
+        <span class="s1">n_threads</span><span class="s3">=</span><span class="s4">1</span><span class="s3">,</span>
+        <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Computes the sum of loss and gradient w.r.t. coef. 
+ 
+        Parameters 
+        ---------- 
+        coef : ndarray of shape (n_dof,), (n_classes, n_dof) or (n_classes * n_dof,) 
+            Coefficients of a linear model. 
+            If shape (n_classes * n_dof,), the classes of one feature are contiguous, 
+            i.e. one reconstructs the 2d-array via 
+            coef.reshape((n_classes, -1), order=&quot;F&quot;). 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+        y : contiguous array of shape (n_samples,) 
+            Observed, true target values. 
+        sample_weight : None or contiguous array of shape (n_samples,), default=None 
+            Sample weights. 
+        l2_reg_strength : float, default=0.0 
+            L2 regularization strength 
+        n_threads : int, default=1 
+            Number of OpenMP threads to use. 
+        raw_prediction : C-contiguous array of shape (n_samples,) or array of \ 
+            shape (n_samples, n_classes) 
+            Raw prediction values (in link space). If provided, these are used. If 
+            None, then raw_prediction = X @ coef + intercept is calculated. 
+ 
+        Returns 
+        ------- 
+        loss : float 
+            Weighted average of losses per sample, plus penalty. 
+ 
+        gradient : ndarray of shape coef.shape 
+             The gradient of the loss. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features</span><span class="s3">), </span><span class="s1">n_classes </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">n_classes</span>
+        <span class="s1">n_dof </span><span class="s3">= </span><span class="s1">n_features </span><span class="s3">+ </span><span class="s1">int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">raw_prediction </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept</span><span class="s3">, </span><span class="s1">raw_prediction </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept_raw</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">X</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">)</span>
+
+        <span class="s1">loss</span><span class="s3">, </span><span class="s1">grad_pointwise </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">loss_gradient</span><span class="s3">(</span>
+            <span class="s1">y_true</span><span class="s3">=</span><span class="s1">y</span><span class="s3">,</span>
+            <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s1">raw_prediction</span><span class="s3">,</span>
+            <span class="s1">sample_weight</span><span class="s3">=</span><span class="s1">sample_weight</span><span class="s3">,</span>
+            <span class="s1">n_threads</span><span class="s3">=</span><span class="s1">n_threads</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">sw_sum </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">)</span>
+        <span class="s1">loss </span><span class="s3">= </span><span class="s1">loss</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">() / </span><span class="s1">sw_sum</span>
+        <span class="s1">loss </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">l2_penalty</span><span class="s3">(</span><span class="s1">weights</span><span class="s3">, </span><span class="s1">l2_reg_strength</span><span class="s3">)</span>
+
+        <span class="s1">grad_pointwise </span><span class="s3">/= </span><span class="s1">sw_sum</span>
+
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">is_multiclass</span><span class="s3">:</span>
+            <span class="s1">grad </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+            <span class="s1">grad</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">X</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">grad_pointwise </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">weights</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">grad</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">()</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">grad </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">n_classes</span><span class="s3">, </span><span class="s1">n_dof</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+            <span class="s6"># grad_pointwise.shape = (n_samples, n_classes)</span>
+            <span class="s1">grad</span><span class="s3">[:, :</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">X </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">weights</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">grad</span><span class="s3">[:, -</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">coef</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s1">grad </span><span class="s3">= </span><span class="s1">grad</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">(</span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">loss</span><span class="s3">, </span><span class="s1">grad</span>
+
+    <span class="s2">def </span><span class="s1">gradient</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">coef</span><span class="s3">,</span>
+        <span class="s1">X</span><span class="s3">,</span>
+        <span class="s1">y</span><span class="s3">,</span>
+        <span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">l2_reg_strength</span><span class="s3">=</span><span class="s4">0.0</span><span class="s3">,</span>
+        <span class="s1">n_threads</span><span class="s3">=</span><span class="s4">1</span><span class="s3">,</span>
+        <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Computes the gradient w.r.t. coef. 
+ 
+        Parameters 
+        ---------- 
+        coef : ndarray of shape (n_dof,), (n_classes, n_dof) or (n_classes * n_dof,) 
+            Coefficients of a linear model. 
+            If shape (n_classes * n_dof,), the classes of one feature are contiguous, 
+            i.e. one reconstructs the 2d-array via 
+            coef.reshape((n_classes, -1), order=&quot;F&quot;). 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+        y : contiguous array of shape (n_samples,) 
+            Observed, true target values. 
+        sample_weight : None or contiguous array of shape (n_samples,), default=None 
+            Sample weights. 
+        l2_reg_strength : float, default=0.0 
+            L2 regularization strength 
+        n_threads : int, default=1 
+            Number of OpenMP threads to use. 
+        raw_prediction : C-contiguous array of shape (n_samples,) or array of \ 
+            shape (n_samples, n_classes) 
+            Raw prediction values (in link space). If provided, these are used. If 
+            None, then raw_prediction = X @ coef + intercept is calculated. 
+ 
+        Returns 
+        ------- 
+        gradient : ndarray of shape coef.shape 
+             The gradient of the loss. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features</span><span class="s3">), </span><span class="s1">n_classes </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">n_classes</span>
+        <span class="s1">n_dof </span><span class="s3">= </span><span class="s1">n_features </span><span class="s3">+ </span><span class="s1">int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">raw_prediction </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept</span><span class="s3">, </span><span class="s1">raw_prediction </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept_raw</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">X</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">)</span>
+
+        <span class="s1">grad_pointwise </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">gradient</span><span class="s3">(</span>
+            <span class="s1">y_true</span><span class="s3">=</span><span class="s1">y</span><span class="s3">,</span>
+            <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s1">raw_prediction</span><span class="s3">,</span>
+            <span class="s1">sample_weight</span><span class="s3">=</span><span class="s1">sample_weight</span><span class="s3">,</span>
+            <span class="s1">n_threads</span><span class="s3">=</span><span class="s1">n_threads</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">sw_sum </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">)</span>
+        <span class="s1">grad_pointwise </span><span class="s3">/= </span><span class="s1">sw_sum</span>
+
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">is_multiclass</span><span class="s3">:</span>
+            <span class="s1">grad </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+            <span class="s1">grad</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">X</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">grad_pointwise </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">weights</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">grad</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">()</span>
+            <span class="s2">return </span><span class="s1">grad</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">grad </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">n_classes</span><span class="s3">, </span><span class="s1">n_dof</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+            <span class="s6"># gradient.shape = (n_samples, n_classes)</span>
+            <span class="s1">grad</span><span class="s3">[:, :</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">X </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">weights</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">grad</span><span class="s3">[:, -</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">coef</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">grad</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">(</span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">grad</span>
+
+    <span class="s2">def </span><span class="s1">gradient_hessian</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">coef</span><span class="s3">,</span>
+        <span class="s1">X</span><span class="s3">,</span>
+        <span class="s1">y</span><span class="s3">,</span>
+        <span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">l2_reg_strength</span><span class="s3">=</span><span class="s4">0.0</span><span class="s3">,</span>
+        <span class="s1">n_threads</span><span class="s3">=</span><span class="s4">1</span><span class="s3">,</span>
+        <span class="s1">gradient_out</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">hessian_out</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Computes gradient and hessian w.r.t. coef. 
+ 
+        Parameters 
+        ---------- 
+        coef : ndarray of shape (n_dof,), (n_classes, n_dof) or (n_classes * n_dof,) 
+            Coefficients of a linear model. 
+            If shape (n_classes * n_dof,), the classes of one feature are contiguous, 
+            i.e. one reconstructs the 2d-array via 
+            coef.reshape((n_classes, -1), order=&quot;F&quot;). 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+        y : contiguous array of shape (n_samples,) 
+            Observed, true target values. 
+        sample_weight : None or contiguous array of shape (n_samples,), default=None 
+            Sample weights. 
+        l2_reg_strength : float, default=0.0 
+            L2 regularization strength 
+        n_threads : int, default=1 
+            Number of OpenMP threads to use. 
+        gradient_out : None or ndarray of shape coef.shape 
+            A location into which the gradient is stored. If None, a new array 
+            might be created. 
+        hessian_out : None or ndarray 
+            A location into which the hessian is stored. If None, a new array 
+            might be created. 
+        raw_prediction : C-contiguous array of shape (n_samples,) or array of \ 
+            shape (n_samples, n_classes) 
+            Raw prediction values (in link space). If provided, these are used. If 
+            None, then raw_prediction = X @ coef + intercept is calculated. 
+ 
+        Returns 
+        ------- 
+        gradient : ndarray of shape coef.shape 
+             The gradient of the loss. 
+ 
+        hessian : ndarray 
+            Hessian matrix. 
+ 
+        hessian_warning : bool 
+            True if pointwise hessian has more than half of its elements non-positive. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span>
+        <span class="s1">n_dof </span><span class="s3">= </span><span class="s1">n_features </span><span class="s3">+ </span><span class="s1">int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">raw_prediction </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept</span><span class="s3">, </span><span class="s1">raw_prediction </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept_raw</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">X</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">)</span>
+
+        <span class="s1">grad_pointwise</span><span class="s3">, </span><span class="s1">hess_pointwise </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">gradient_hessian</span><span class="s3">(</span>
+            <span class="s1">y_true</span><span class="s3">=</span><span class="s1">y</span><span class="s3">,</span>
+            <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s1">raw_prediction</span><span class="s3">,</span>
+            <span class="s1">sample_weight</span><span class="s3">=</span><span class="s1">sample_weight</span><span class="s3">,</span>
+            <span class="s1">n_threads</span><span class="s3">=</span><span class="s1">n_threads</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">sw_sum </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">)</span>
+        <span class="s1">grad_pointwise </span><span class="s3">/= </span><span class="s1">sw_sum</span>
+        <span class="s1">hess_pointwise </span><span class="s3">/= </span><span class="s1">sw_sum</span>
+
+        <span class="s6"># For non-canonical link functions and far away from the optimum, the pointwise</span>
+        <span class="s6"># hessian can be negative. We take care that 75% of the hessian entries are</span>
+        <span class="s6"># positive.</span>
+        <span class="s1">hessian_warning </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">mean</span><span class="s3">(</span><span class="s1">hess_pointwise </span><span class="s3">&lt;= </span><span class="s4">0</span><span class="s3">) &gt; </span><span class="s4">0.25</span>
+        <span class="s1">hess_pointwise </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">hess_pointwise</span><span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">is_multiclass</span><span class="s3">:</span>
+            <span class="s6"># gradient</span>
+            <span class="s2">if </span><span class="s1">gradient_out </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">grad </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">grad </span><span class="s3">= </span><span class="s1">gradient_out</span>
+            <span class="s1">grad</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">X</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">grad_pointwise </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">weights</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">grad</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">()</span>
+
+            <span class="s6"># hessian</span>
+            <span class="s2">if </span><span class="s1">hessian_out </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">hess </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">=(</span><span class="s1">n_dof</span><span class="s3">, </span><span class="s1">n_dof</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">hess </span><span class="s3">= </span><span class="s1">hessian_out</span>
+
+            <span class="s2">if </span><span class="s1">hessian_warning</span><span class="s3">:</span>
+                <span class="s6"># Exit early without computing the hessian.</span>
+                <span class="s2">return </span><span class="s1">grad</span><span class="s3">, </span><span class="s1">hess</span><span class="s3">, </span><span class="s1">hessian_warning</span>
+
+            <span class="s6"># TODO: This &quot;sandwich product&quot;, X' diag(W) X, is the main computational</span>
+            <span class="s6"># bottleneck for solvers. A dedicated Cython routine might improve it</span>
+            <span class="s6"># exploiting the symmetry (as opposed to, e.g., BLAS gemm).</span>
+            <span class="s2">if </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">X</span><span class="s3">):</span>
+                <span class="s1">hess</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">, :</span><span class="s1">n_features</span><span class="s3">] = (</span>
+                    <span class="s1">X</span><span class="s3">.</span><span class="s1">T</span>
+                    <span class="s3">@ </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">dia_matrix</span><span class="s3">(</span>
+                        <span class="s3">(</span><span class="s1">hess_pointwise</span><span class="s3">, </span><span class="s4">0</span><span class="s3">), </span><span class="s1">shape</span><span class="s3">=(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">)</span>
+                    <span class="s3">)</span>
+                    <span class="s3">@ </span><span class="s1">X</span>
+                <span class="s3">).</span><span class="s1">toarray</span><span class="s3">()</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s6"># np.einsum may use less memory but the following, using BLAS matrix</span>
+                <span class="s6"># multiplication (gemm), is by far faster.</span>
+                <span class="s1">WX </span><span class="s3">= </span><span class="s1">hess_pointwise</span><span class="s3">[:, </span><span class="s2">None</span><span class="s3">] * </span><span class="s1">X</span>
+                <span class="s1">hess</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">, :</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">X</span><span class="s3">.</span><span class="s1">T</span><span class="s3">, </span><span class="s1">WX</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">l2_reg_strength </span><span class="s3">&gt; </span><span class="s4">0</span><span class="s3">:</span>
+                <span class="s6"># The L2 penalty enters the Hessian on the diagonal only. To add those</span>
+                <span class="s6"># terms, we use a flattened view on the array.</span>
+                <span class="s1">hess</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">(-</span><span class="s4">1</span><span class="s3">)[</span>
+                    <span class="s3">: (</span><span class="s1">n_features </span><span class="s3">* </span><span class="s1">n_dof</span><span class="s3">) : (</span><span class="s1">n_dof </span><span class="s3">+ </span><span class="s4">1</span><span class="s3">)</span>
+                <span class="s3">] += </span><span class="s1">l2_reg_strength</span>
+
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s6"># With intercept included as added column to X, the hessian becomes</span>
+                <span class="s6"># hess = (X, 1)' @ diag(h) @ (X, 1)</span>
+                <span class="s6">#      = (X' @ diag(h) @ X, X' @ h)</span>
+                <span class="s6">#        (           h @ X, sum(h))</span>
+                <span class="s6"># The left upper part has already been filled, it remains to compute</span>
+                <span class="s6"># the last row and the last column.</span>
+                <span class="s1">Xh </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">hess_pointwise</span>
+                <span class="s1">hess</span><span class="s3">[:-</span><span class="s4">1</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">Xh</span>
+                <span class="s1">hess</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">, :-</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">Xh</span>
+                <span class="s1">hess</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">hess_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">()</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s6"># Here we may safely assume HalfMultinomialLoss aka categorical</span>
+            <span class="s6"># cross-entropy.</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError</span>
+
+        <span class="s2">return </span><span class="s1">grad</span><span class="s3">, </span><span class="s1">hess</span><span class="s3">, </span><span class="s1">hessian_warning</span>
+
+    <span class="s2">def </span><span class="s1">gradient_hessian_product</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">coef</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">l2_reg_strength</span><span class="s3">=</span><span class="s4">0.0</span><span class="s3">, </span><span class="s1">n_threads</span><span class="s3">=</span><span class="s4">1</span>
+    <span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Computes gradient and hessp (hessian product function) w.r.t. coef. 
+ 
+        Parameters 
+        ---------- 
+        coef : ndarray of shape (n_dof,), (n_classes, n_dof) or (n_classes * n_dof,) 
+            Coefficients of a linear model. 
+            If shape (n_classes * n_dof,), the classes of one feature are contiguous, 
+            i.e. one reconstructs the 2d-array via 
+            coef.reshape((n_classes, -1), order=&quot;F&quot;). 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+        y : contiguous array of shape (n_samples,) 
+            Observed, true target values. 
+        sample_weight : None or contiguous array of shape (n_samples,), default=None 
+            Sample weights. 
+        l2_reg_strength : float, default=0.0 
+            L2 regularization strength 
+        n_threads : int, default=1 
+            Number of OpenMP threads to use. 
+ 
+        Returns 
+        ------- 
+        gradient : ndarray of shape coef.shape 
+             The gradient of the loss. 
+ 
+        hessp : callable 
+            Function that takes in a vector input of shape of gradient and 
+            and returns matrix-vector product with hessian. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_features</span><span class="s3">), </span><span class="s1">n_classes </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">n_classes</span>
+        <span class="s1">n_dof </span><span class="s3">= </span><span class="s1">n_features </span><span class="s3">+ </span><span class="s1">int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">)</span>
+        <span class="s1">weights</span><span class="s3">, </span><span class="s1">intercept</span><span class="s3">, </span><span class="s1">raw_prediction </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">weight_intercept_raw</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">X</span><span class="s3">)</span>
+        <span class="s1">sw_sum </span><span class="s3">= </span><span class="s1">n_samples </span><span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is None else </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">is_multiclass</span><span class="s3">:</span>
+            <span class="s1">grad_pointwise</span><span class="s3">, </span><span class="s1">hess_pointwise </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">gradient_hessian</span><span class="s3">(</span>
+                <span class="s1">y_true</span><span class="s3">=</span><span class="s1">y</span><span class="s3">,</span>
+                <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s1">raw_prediction</span><span class="s3">,</span>
+                <span class="s1">sample_weight</span><span class="s3">=</span><span class="s1">sample_weight</span><span class="s3">,</span>
+                <span class="s1">n_threads</span><span class="s3">=</span><span class="s1">n_threads</span><span class="s3">,</span>
+            <span class="s3">)</span>
+            <span class="s1">grad_pointwise </span><span class="s3">/= </span><span class="s1">sw_sum</span>
+            <span class="s1">hess_pointwise </span><span class="s3">/= </span><span class="s1">sw_sum</span>
+            <span class="s1">grad </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">coef</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+            <span class="s1">grad</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">X</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">grad_pointwise </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">weights</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">grad</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">()</span>
+
+            <span class="s6"># Precompute as much as possible: hX, hX_sum and hessian_sum</span>
+            <span class="s1">hessian_sum </span><span class="s3">= </span><span class="s1">hess_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">X</span><span class="s3">):</span>
+                <span class="s1">hX </span><span class="s3">= (</span>
+                    <span class="s1">sparse</span><span class="s3">.</span><span class="s1">dia_matrix</span><span class="s3">((</span><span class="s1">hess_pointwise</span><span class="s3">, </span><span class="s4">0</span><span class="s3">), </span><span class="s1">shape</span><span class="s3">=(</span><span class="s1">n_samples</span><span class="s3">, </span><span class="s1">n_samples</span><span class="s3">))</span>
+                    <span class="s3">@ </span><span class="s1">X</span>
+                <span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">hX </span><span class="s3">= </span><span class="s1">hess_pointwise</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">] * </span><span class="s1">X</span>
+
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s6"># Calculate the double derivative with respect to intercept.</span>
+                <span class="s6"># Note: In case hX is sparse, hX.sum is a matrix object.</span>
+                <span class="s1">hX_sum </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">squeeze</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">hX</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)))</span>
+                <span class="s6"># prevent squeezing to zero-dim array if n_features == 1</span>
+                <span class="s1">hX_sum </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_1d</span><span class="s3">(</span><span class="s1">hX_sum</span><span class="s3">)</span>
+
+            <span class="s6"># With intercept included and l2_reg_strength = 0, hessp returns</span>
+            <span class="s6"># res = (X, 1)' @ diag(h) @ (X, 1) @ s</span>
+            <span class="s6">#     = (X, 1)' @ (hX @ s[:n_features], sum(h) * s[-1])</span>
+            <span class="s6"># res[:n_features] = X' @ hX @ s[:n_features] + sum(h) * s[-1]</span>
+            <span class="s6"># res[-1] = 1' @ hX @ s[:n_features] + sum(h) * s[-1]</span>
+            <span class="s2">def </span><span class="s1">hessp</span><span class="s3">(</span><span class="s1">s</span><span class="s3">):</span>
+                <span class="s1">ret </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty_like</span><span class="s3">(</span><span class="s1">s</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">X</span><span class="s3">):</span>
+                    <span class="s1">ret</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">X</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ (</span><span class="s1">hX </span><span class="s3">@ </span><span class="s1">s</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">])</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">ret</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">linalg</span><span class="s3">.</span><span class="s1">multi_dot</span><span class="s3">([</span><span class="s1">X</span><span class="s3">.</span><span class="s1">T</span><span class="s3">, </span><span class="s1">hX</span><span class="s3">, </span><span class="s1">s</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">]])</span>
+                <span class="s1">ret</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] += </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">s</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">]</span>
+
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                    <span class="s1">ret</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] += </span><span class="s1">s</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] * </span><span class="s1">hX_sum</span>
+                    <span class="s1">ret</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">hX_sum </span><span class="s3">@ </span><span class="s1">s</span><span class="s3">[:</span><span class="s1">n_features</span><span class="s3">] + </span><span class="s1">hessian_sum </span><span class="s3">* </span><span class="s1">s</span><span class="s3">[-</span><span class="s4">1</span><span class="s3">]</span>
+                <span class="s2">return </span><span class="s1">ret</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s6"># Here we may safely assume HalfMultinomialLoss aka categorical</span>
+            <span class="s6"># cross-entropy.</span>
+            <span class="s6"># HalfMultinomialLoss computes only the diagonal part of the hessian, i.e.</span>
+            <span class="s6"># diagonal in the classes. Here, we want the matrix-vector product of the</span>
+            <span class="s6"># full hessian. Therefore, we call gradient_proba.</span>
+            <span class="s1">grad_pointwise</span><span class="s3">, </span><span class="s1">proba </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">base_loss</span><span class="s3">.</span><span class="s1">gradient_proba</span><span class="s3">(</span>
+                <span class="s1">y_true</span><span class="s3">=</span><span class="s1">y</span><span class="s3">,</span>
+                <span class="s1">raw_prediction</span><span class="s3">=</span><span class="s1">raw_prediction</span><span class="s3">,</span>
+                <span class="s1">sample_weight</span><span class="s3">=</span><span class="s1">sample_weight</span><span class="s3">,</span>
+                <span class="s1">n_threads</span><span class="s3">=</span><span class="s1">n_threads</span><span class="s3">,</span>
+            <span class="s3">)</span>
+            <span class="s1">grad_pointwise </span><span class="s3">/= </span><span class="s1">sw_sum</span>
+            <span class="s1">grad </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">n_classes</span><span class="s3">, </span><span class="s1">n_dof</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+            <span class="s1">grad</span><span class="s3">[:, :</span><span class="s1">n_features</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">X </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">weights</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">grad</span><span class="s3">[:, -</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">grad_pointwise</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">)</span>
+
+            <span class="s6"># Full hessian-vector product, i.e. not only the diagonal part of the</span>
+            <span class="s6"># hessian. Derivation with some index battle for input vector s:</span>
+            <span class="s6">#   - sample index i</span>
+            <span class="s6">#   - feature indices j, m</span>
+            <span class="s6">#   - class indices k, l</span>
+            <span class="s6">#   - 1_{k=l} is one if k=l else 0</span>
+            <span class="s6">#   - p_i_k is the (predicted) probability that sample i belongs to class k</span>
+            <span class="s6">#     for all i: sum_k p_i_k = 1</span>
+            <span class="s6">#   - s_l_m is input vector for class l and feature m</span>
+            <span class="s6">#   - X' = X transposed</span>
+            <span class="s6">#</span>
+            <span class="s6"># Note: Hessian with dropping most indices is just:</span>
+            <span class="s6">#       X' @ p_k (1(k=l) - p_l) @ X</span>
+            <span class="s6">#</span>
+            <span class="s6"># result_{k j} = sum_{i, l, m} Hessian_{i, k j, m l} * s_l_m</span>
+            <span class="s6">#   = sum_{i, l, m} (X')_{ji} * p_i_k * (1_{k=l} - p_i_l)</span>
+            <span class="s6">#                   * X_{im} s_l_m</span>
+            <span class="s6">#   = sum_{i, m} (X')_{ji} * p_i_k</span>
+            <span class="s6">#                * (X_{im} * s_k_m - sum_l p_i_l * X_{im} * s_l_m)</span>
+            <span class="s6">#</span>
+            <span class="s6"># See also https://github.com/scikit-learn/scikit-learn/pull/3646#discussion_r17461411  # noqa</span>
+            <span class="s2">def </span><span class="s1">hessp</span><span class="s3">(</span><span class="s1">s</span><span class="s3">):</span>
+                <span class="s1">s </span><span class="s3">= </span><span class="s1">s</span><span class="s3">.</span><span class="s1">reshape</span><span class="s3">((</span><span class="s1">n_classes</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">), </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)  </span><span class="s6"># shape = (n_classes, n_dof)</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                    <span class="s1">s_intercept </span><span class="s3">= </span><span class="s1">s</span><span class="s3">[:, -</span><span class="s4">1</span><span class="s3">]</span>
+                    <span class="s1">s </span><span class="s3">= </span><span class="s1">s</span><span class="s3">[:, :-</span><span class="s4">1</span><span class="s3">]  </span><span class="s6"># shape = (n_classes, n_features)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">s_intercept </span><span class="s3">= </span><span class="s4">0</span>
+                <span class="s1">tmp </span><span class="s3">= </span><span class="s1">X </span><span class="s3">@ </span><span class="s1">s</span><span class="s3">.</span><span class="s1">T </span><span class="s3">+ </span><span class="s1">s_intercept  </span><span class="s6"># X_{im} * s_k_m</span>
+                <span class="s1">tmp </span><span class="s3">+= (-</span><span class="s1">proba </span><span class="s3">* </span><span class="s1">tmp</span><span class="s3">).</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s4">1</span><span class="s3">)[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">]  </span><span class="s6"># - sum_l ..</span>
+                <span class="s1">tmp </span><span class="s3">*= </span><span class="s1">proba  </span><span class="s6"># * p_i_k</span>
+                <span class="s2">if </span><span class="s1">sample_weight </span><span class="s2">is not None</span><span class="s3">:</span>
+                    <span class="s1">tmp </span><span class="s3">*= </span><span class="s1">sample_weight</span><span class="s3">[:, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">newaxis</span><span class="s3">]</span>
+                <span class="s6"># hess_prod = empty_like(grad), but we ravel grad below and this</span>
+                <span class="s6"># function is run after that.</span>
+                <span class="s1">hess_prod </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">n_classes</span><span class="s3">, </span><span class="s1">n_dof</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">weights</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+                <span class="s1">hess_prod</span><span class="s3">[:, :</span><span class="s1">n_features</span><span class="s3">] = (</span><span class="s1">tmp</span><span class="s3">.</span><span class="s1">T </span><span class="s3">@ </span><span class="s1">X</span><span class="s3">) / </span><span class="s1">sw_sum </span><span class="s3">+ </span><span class="s1">l2_reg_strength </span><span class="s3">* </span><span class="s1">s</span>
+                <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                    <span class="s1">hess_prod</span><span class="s3">[:, -</span><span class="s4">1</span><span class="s3">] = </span><span class="s1">tmp</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">axis</span><span class="s3">=</span><span class="s4">0</span><span class="s3">) / </span><span class="s1">sw_sum</span>
+                <span class="s2">if </span><span class="s1">coef</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s1">hess_prod</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">(</span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s1">hess_prod</span>
+
+            <span class="s2">if </span><span class="s1">coef</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s4">1</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">grad</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">(</span><span class="s1">order</span><span class="s3">=</span><span class="s5">&quot;F&quot;</span><span class="s3">), </span><span class="s1">hessp</span>
+
+        <span class="s2">return </span><span class="s1">grad</span><span class="s3">, </span><span class="s1">hessp</span>
+</pre>
+</body>
+</html>

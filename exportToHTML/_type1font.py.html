@@ -1,0 +1,903 @@
+<html>
+<head>
+<title>_type1font.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_type1font.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A class representing a Type 1 font. 
+ 
+This version reads pfa and pfb files and splits them for embedding in 
+pdf files. It also supports SlantFont and ExtendFont transformations, 
+similarly to pdfTeX and friends. There is no support yet for subsetting. 
+ 
+Usage:: 
+ 
+    font = Type1Font(filename) 
+    clear_part, encrypted_part, finale = font.parts 
+    slanted_font = font.transform({'slant': 0.167}) 
+    extended_font = font.transform({'extend': 1.2}) 
+ 
+Sources: 
+ 
+* Adobe Technical Note #5040, Supporting Downloadable PostScript 
+  Language Fonts. 
+ 
+* Adobe Type 1 Font Format, Adobe Systems Incorporated, third printing, 
+  v1.1, 1993. ISBN 0-201-57044-0. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">annotations</span>
+
+<span class="s2">import </span><span class="s1">binascii</span>
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">string</span>
+<span class="s2">import </span><span class="s1">struct</span>
+<span class="s2">import </span><span class="s1">typing </span><span class="s2">as </span><span class="s1">T</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib</span><span class="s3">.</span><span class="s1">cbook </span><span class="s2">import </span><span class="s1">_format_approx</span>
+<span class="s2">from </span><span class="s3">. </span><span class="s2">import </span><span class="s1">_api</span>
+
+<span class="s1">_log </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">_Token</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A token in a PostScript stream. 
+ 
+    Attributes 
+    ---------- 
+    pos : int 
+        Position, i.e. offset from the beginning of the data. 
+    raw : str 
+        Raw text of the token. 
+    kind : str 
+        Description of the token (for debugging or testing). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= (</span><span class="s4">'pos'</span><span class="s3">, </span><span class="s4">'raw'</span><span class="s3">)</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'?'</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">pos</span><span class="s3">, </span><span class="s1">raw</span><span class="s3">):</span>
+        <span class="s1">_log</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span><span class="s4">'type1font._Token %s at %d: %r'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">pos</span><span class="s3">, </span><span class="s1">raw</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">pos </span><span class="s3">= </span><span class="s1">pos</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">raw </span><span class="s3">= </span><span class="s1">raw</span>
+
+    <span class="s2">def </span><span class="s1">__str__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s4">f&quot;&lt;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">kind</span><span class="s2">} {</span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s2">} </span><span class="s4">@</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">pos</span><span class="s2">}</span><span class="s4">&gt;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">endpos</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Position one past the end of the token&quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">pos </span><span class="s3">+ </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">names</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a name token with one of the names?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">is_slash_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a name token that starts with a slash?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">is_delim</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a delimiter token?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">is_number</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Is this a number token?&quot;&quot;&quot;</span>
+        <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span>
+
+
+<span class="s2">class </span><span class="s1">_NameToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'name'</span>
+
+    <span class="s2">def </span><span class="s1">is_slash_name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'/'</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]</span>
+
+
+<span class="s2">class </span><span class="s1">_BooleanToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'boolean'</span>
+
+    <span class="s2">def </span><span class="s1">value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw </span><span class="s3">== </span><span class="s4">'true'</span>
+
+
+<span class="s2">class </span><span class="s1">_KeywordToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'keyword'</span>
+
+    <span class="s2">def </span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">names</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw </span><span class="s2">in </span><span class="s1">names</span>
+
+
+<span class="s2">class </span><span class="s1">_DelimiterToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'delimiter'</span>
+
+    <span class="s2">def </span><span class="s1">is_delim</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">opposite</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">{</span><span class="s4">'['</span><span class="s3">: </span><span class="s4">']'</span><span class="s3">, </span><span class="s4">']'</span><span class="s3">: </span><span class="s4">'['</span><span class="s3">,</span>
+                <span class="s4">'{'</span><span class="s3">: </span><span class="s4">'}'</span><span class="s3">, </span><span class="s4">'}'</span><span class="s3">: </span><span class="s4">'{'</span><span class="s3">,</span>
+                <span class="s4">'&lt;&lt;'</span><span class="s3">: </span><span class="s4">'&gt;&gt;'</span><span class="s3">, </span><span class="s4">'&gt;&gt;'</span><span class="s3">: </span><span class="s4">'&lt;&lt;'</span>
+                <span class="s3">}[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">]</span>
+
+
+<span class="s2">class </span><span class="s1">_WhitespaceToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'whitespace'</span>
+
+
+<span class="s2">class </span><span class="s1">_StringToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'string'</span>
+    <span class="s1">_escapes_re </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'\\([\\()nrtbf]|[0-7]{1,3})'</span><span class="s3">)</span>
+    <span class="s1">_replacements </span><span class="s3">= {</span><span class="s4">'</span><span class="s2">\\</span><span class="s4">'</span><span class="s3">: </span><span class="s4">'</span><span class="s2">\\</span><span class="s4">'</span><span class="s3">, </span><span class="s4">'('</span><span class="s3">: </span><span class="s4">'('</span><span class="s3">, </span><span class="s4">')'</span><span class="s3">: </span><span class="s4">')'</span><span class="s3">, </span><span class="s4">'n'</span><span class="s3">: </span><span class="s4">'</span><span class="s2">\n</span><span class="s4">'</span><span class="s3">,</span>
+                     <span class="s4">'r'</span><span class="s3">: </span><span class="s4">'</span><span class="s2">\r</span><span class="s4">'</span><span class="s3">, </span><span class="s4">'t'</span><span class="s3">: </span><span class="s4">'</span><span class="s2">\t</span><span class="s4">'</span><span class="s3">, </span><span class="s4">'b'</span><span class="s3">: </span><span class="s4">'</span><span class="s2">\b</span><span class="s4">'</span><span class="s3">, </span><span class="s4">'f'</span><span class="s3">: </span><span class="s4">'</span><span class="s2">\f</span><span class="s4">'</span><span class="s3">}</span>
+    <span class="s1">_ws_re </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">'[</span><span class="s2">\0\t\r\f\n </span><span class="s4">]'</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">_escape</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">match</span><span class="s3">):</span>
+        <span class="s1">group </span><span class="s3">= </span><span class="s1">match</span><span class="s3">.</span><span class="s1">group</span><span class="s3">(</span><span class="s5">1</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">_replacements</span><span class="s3">[</span><span class="s1">group</span><span class="s3">]</span>
+        <span class="s2">except </span><span class="s1">KeyError</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">chr</span><span class="s3">(</span><span class="s1">int</span><span class="s3">(</span><span class="s1">group</span><span class="s3">, </span><span class="s5">8</span><span class="s3">))</span>
+
+    <span class="s3">@</span><span class="s1">functools</span><span class="s3">.</span><span class="s1">lru_cache</span>
+    <span class="s2">def </span><span class="s1">value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] == </span><span class="s4">'('</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_escapes_re</span><span class="s3">.</span><span class="s1">sub</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_escape</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:-</span><span class="s5">1</span><span class="s3">])</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_ws_re</span><span class="s3">.</span><span class="s1">sub</span><span class="s3">(</span><span class="s4">''</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:-</span><span class="s5">1</span><span class="s3">])</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">data</span><span class="s3">) % </span><span class="s5">2 </span><span class="s3">== </span><span class="s5">1</span><span class="s3">:</span>
+                <span class="s1">data </span><span class="s3">+= </span><span class="s4">'0'</span>
+            <span class="s2">return </span><span class="s1">binascii</span><span class="s3">.</span><span class="s1">unhexlify</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">_BinaryToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'binary'</span>
+
+    <span class="s2">def </span><span class="s1">value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]</span>
+
+
+<span class="s2">class </span><span class="s1">_NumberToken</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s1">kind </span><span class="s3">= </span><span class="s4">'number'</span>
+
+    <span class="s2">def </span><span class="s1">is_number</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return True</span>
+
+    <span class="s2">def </span><span class="s1">value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s4">'.' </span><span class="s2">not in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">float</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">raw</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_tokenize</span><span class="s3">(</span><span class="s1">data</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">, </span><span class="s1">skip_ws</span><span class="s3">: </span><span class="s1">bool</span><span class="s3">) </span><span class="s1">-&gt; T</span><span class="s3">.</span><span class="s1">Generator</span><span class="s3">[</span><span class="s1">_Token</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s2">None</span><span class="s3">]:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A generator that produces _Token instances from Type-1 font code. 
+ 
+    The consumer of the generator may send an integer to the tokenizer to 
+    indicate that the next token should be _BinaryToken of the given length. 
+ 
+    Parameters 
+    ---------- 
+    data : bytes 
+        The data of the font to tokenize. 
+ 
+    skip_ws : bool 
+        If true, the generator will drop any _WhitespaceTokens from the output. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">text </span><span class="s3">= </span><span class="s1">data</span><span class="s3">.</span><span class="s1">decode</span><span class="s3">(</span><span class="s4">'ascii'</span><span class="s3">, </span><span class="s4">'replace'</span><span class="s3">)</span>
+    <span class="s1">whitespace_or_comment_re </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'[\0\t\r\f\n ]+|%[^\r\n]*'</span><span class="s3">)</span>
+    <span class="s1">token_re </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'/{0,2}[^]\0\t\r\f\n ()&lt;&gt;{}/%[]+'</span><span class="s3">)</span>
+    <span class="s1">instring_re </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'[()\\]'</span><span class="s3">)</span>
+    <span class="s1">hex_re </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'^&lt;[0-9a-fA-F\0\t\r\f\n ]*&gt;$'</span><span class="s3">)</span>
+    <span class="s1">oct_re </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">compile</span><span class="s3">(</span><span class="s4">r'[0-7]{1,3}'</span><span class="s3">)</span>
+    <span class="s1">pos </span><span class="s3">= </span><span class="s5">0</span>
+    <span class="s1">next_binary</span><span class="s3">: </span><span class="s1">int </span><span class="s3">| </span><span class="s2">None </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">while </span><span class="s1">pos </span><span class="s3">&lt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">text</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">next_binary </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">n </span><span class="s3">= </span><span class="s1">next_binary</span>
+            <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_BinaryToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">data</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">:</span><span class="s1">pos</span><span class="s3">+</span><span class="s1">n</span><span class="s3">]))</span>
+            <span class="s1">pos </span><span class="s3">+= </span><span class="s1">n</span>
+            <span class="s2">continue</span>
+        <span class="s1">match </span><span class="s3">= </span><span class="s1">whitespace_or_comment_re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">text</span><span class="s3">, </span><span class="s1">pos</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">match</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">skip_ws</span><span class="s3">:</span>
+                <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_WhitespaceToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">match</span><span class="s3">.</span><span class="s1">group</span><span class="s3">()))</span>
+            <span class="s1">pos </span><span class="s3">= </span><span class="s1">match</span><span class="s3">.</span><span class="s1">end</span><span class="s3">()</span>
+        <span class="s2">elif </span><span class="s1">text</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">] == </span><span class="s4">'('</span><span class="s3">:</span>
+            <span class="s6"># PostScript string rules:</span>
+            <span class="s6"># - parentheses must be balanced</span>
+            <span class="s6"># - backslashes escape backslashes and parens</span>
+            <span class="s6"># - also codes \n\r\t\b\f and octal escapes are recognized</span>
+            <span class="s6"># - other backslashes do not escape anything</span>
+            <span class="s1">start </span><span class="s3">= </span><span class="s1">pos</span>
+            <span class="s1">pos </span><span class="s3">+= </span><span class="s5">1</span>
+            <span class="s1">depth </span><span class="s3">= </span><span class="s5">1</span>
+            <span class="s2">while </span><span class="s1">depth</span><span class="s3">:</span>
+                <span class="s1">match </span><span class="s3">= </span><span class="s1">instring_re</span><span class="s3">.</span><span class="s1">search</span><span class="s3">(</span><span class="s1">text</span><span class="s3">, </span><span class="s1">pos</span><span class="s3">)</span>
+                <span class="s2">if </span><span class="s1">match </span><span class="s2">is None</span><span class="s3">:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                        <span class="s4">f'Unterminated string starting at </span><span class="s2">{</span><span class="s1">start</span><span class="s2">}</span><span class="s4">'</span><span class="s3">)</span>
+                <span class="s1">pos </span><span class="s3">= </span><span class="s1">match</span><span class="s3">.</span><span class="s1">end</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">match</span><span class="s3">.</span><span class="s1">group</span><span class="s3">() == </span><span class="s4">'('</span><span class="s3">:</span>
+                    <span class="s1">depth </span><span class="s3">+= </span><span class="s5">1</span>
+                <span class="s2">elif </span><span class="s1">match</span><span class="s3">.</span><span class="s1">group</span><span class="s3">() == </span><span class="s4">')'</span><span class="s3">:</span>
+                    <span class="s1">depth </span><span class="s3">-= </span><span class="s5">1</span>
+                <span class="s2">else</span><span class="s3">:  </span><span class="s6"># a backslash</span>
+                    <span class="s1">char </span><span class="s3">= </span><span class="s1">text</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">char </span><span class="s2">in </span><span class="s4">r'\()nrtbf'</span><span class="s3">:</span>
+                        <span class="s1">pos </span><span class="s3">+= </span><span class="s5">1</span>
+                    <span class="s2">else</span><span class="s3">:</span>
+                        <span class="s1">octal </span><span class="s3">= </span><span class="s1">oct_re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">text</span><span class="s3">, </span><span class="s1">pos</span><span class="s3">)</span>
+                        <span class="s2">if </span><span class="s1">octal</span><span class="s3">:</span>
+                            <span class="s1">pos </span><span class="s3">= </span><span class="s1">octal</span><span class="s3">.</span><span class="s1">end</span><span class="s3">()</span>
+                        <span class="s2">else</span><span class="s3">:</span>
+                            <span class="s2">pass  </span><span class="s6"># non-escaping backslash</span>
+            <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_StringToken</span><span class="s3">(</span><span class="s1">start</span><span class="s3">, </span><span class="s1">text</span><span class="s3">[</span><span class="s1">start</span><span class="s3">:</span><span class="s1">pos</span><span class="s3">]))</span>
+        <span class="s2">elif </span><span class="s1">text</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">:</span><span class="s1">pos </span><span class="s3">+ </span><span class="s5">2</span><span class="s3">] </span><span class="s2">in </span><span class="s3">(</span><span class="s4">'&lt;&lt;'</span><span class="s3">, </span><span class="s4">'&gt;&gt;'</span><span class="s3">):</span>
+            <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_DelimiterToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">text</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">:</span><span class="s1">pos </span><span class="s3">+ </span><span class="s5">2</span><span class="s3">]))</span>
+            <span class="s1">pos </span><span class="s3">+= </span><span class="s5">2</span>
+        <span class="s2">elif </span><span class="s1">text</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">] == </span><span class="s4">'&lt;'</span><span class="s3">:</span>
+            <span class="s1">start </span><span class="s3">= </span><span class="s1">pos</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">pos </span><span class="s3">= </span><span class="s1">text</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s4">'&gt;'</span><span class="s3">, </span><span class="s1">pos</span><span class="s3">) + </span><span class="s5">1</span>
+            <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">f'Unterminated hex string starting at </span><span class="s2">{</span><span class="s1">start</span><span class="s2">}</span><span class="s4">'</span>
+                                 <span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+            <span class="s2">if not </span><span class="s1">hex_re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">text</span><span class="s3">[</span><span class="s1">start</span><span class="s3">:</span><span class="s1">pos</span><span class="s3">]):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">f'Malformed hex string starting at </span><span class="s2">{</span><span class="s1">start</span><span class="s2">}</span><span class="s4">'</span><span class="s3">)</span>
+            <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_StringToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">text</span><span class="s3">[</span><span class="s1">start</span><span class="s3">:</span><span class="s1">pos</span><span class="s3">]))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">match </span><span class="s3">= </span><span class="s1">token_re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">text</span><span class="s3">, </span><span class="s1">pos</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">match</span><span class="s3">:</span>
+                <span class="s1">raw </span><span class="s3">= </span><span class="s1">match</span><span class="s3">.</span><span class="s1">group</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">raw</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s4">'/'</span><span class="s3">):</span>
+                    <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_NameToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">raw</span><span class="s3">))</span>
+                <span class="s2">elif </span><span class="s1">match</span><span class="s3">.</span><span class="s1">group</span><span class="s3">() </span><span class="s2">in </span><span class="s3">(</span><span class="s4">'true'</span><span class="s3">, </span><span class="s4">'false'</span><span class="s3">):</span>
+                    <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_BooleanToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">raw</span><span class="s3">))</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">try</span><span class="s3">:</span>
+                        <span class="s1">float</span><span class="s3">(</span><span class="s1">raw</span><span class="s3">)</span>
+                        <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_NumberToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">raw</span><span class="s3">))</span>
+                    <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:</span>
+                        <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_KeywordToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">raw</span><span class="s3">))</span>
+                <span class="s1">pos </span><span class="s3">= </span><span class="s1">match</span><span class="s3">.</span><span class="s1">end</span><span class="s3">()</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">next_binary </span><span class="s3">= (</span><span class="s2">yield </span><span class="s1">_DelimiterToken</span><span class="s3">(</span><span class="s1">pos</span><span class="s3">, </span><span class="s1">text</span><span class="s3">[</span><span class="s1">pos</span><span class="s3">]))</span>
+                <span class="s1">pos </span><span class="s3">+= </span><span class="s5">1</span>
+
+
+<span class="s2">class </span><span class="s1">_BalancedExpression</span><span class="s3">(</span><span class="s1">_Token</span><span class="s3">):</span>
+    <span class="s2">pass</span>
+
+
+<span class="s2">def </span><span class="s1">_expression</span><span class="s3">(</span><span class="s1">initial</span><span class="s3">, </span><span class="s1">tokens</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Consume some number of tokens and return a balanced PostScript expression. 
+ 
+    Parameters 
+    ---------- 
+    initial : _Token 
+        The token that triggered parsing a balanced expression. 
+    tokens : iterator of _Token 
+        Following tokens. 
+    data : bytes 
+        Underlying data that the token positions point to. 
+ 
+    Returns 
+    ------- 
+    _BalancedExpression 
+    &quot;&quot;&quot;</span>
+    <span class="s1">delim_stack </span><span class="s3">= []</span>
+    <span class="s1">token </span><span class="s3">= </span><span class="s1">initial</span>
+    <span class="s2">while True</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_delim</span><span class="s3">():</span>
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">raw </span><span class="s2">in </span><span class="s3">(</span><span class="s4">'['</span><span class="s3">, </span><span class="s4">'{'</span><span class="s3">):</span>
+                <span class="s1">delim_stack</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">token</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">token</span><span class="s3">.</span><span class="s1">raw </span><span class="s2">in </span><span class="s3">(</span><span class="s4">']'</span><span class="s3">, </span><span class="s4">'}'</span><span class="s3">):</span>
+                <span class="s2">if not </span><span class="s1">delim_stack</span><span class="s3">:</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">f&quot;unmatched closing token </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s4">&quot;</span><span class="s3">)</span>
+                <span class="s1">match </span><span class="s3">= </span><span class="s1">delim_stack</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">match</span><span class="s3">.</span><span class="s1">raw </span><span class="s3">!= </span><span class="s1">token</span><span class="s3">.</span><span class="s1">opposite</span><span class="s3">():</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                        <span class="s4">f&quot;opening token </span><span class="s2">{</span><span class="s1">match</span><span class="s2">} </span><span class="s4">closed by </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s4">&quot;</span>
+                    <span class="s3">)</span>
+                <span class="s2">if not </span><span class="s1">delim_stack</span><span class="s3">:</span>
+                    <span class="s2">break</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">f'unknown delimiter </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s4">'</span><span class="s3">)</span>
+        <span class="s2">elif not </span><span class="s1">delim_stack</span><span class="s3">:</span>
+            <span class="s2">break</span>
+        <span class="s1">token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">_BalancedExpression</span><span class="s3">(</span>
+        <span class="s1">initial</span><span class="s3">.</span><span class="s1">pos</span><span class="s3">,</span>
+        <span class="s1">data</span><span class="s3">[</span><span class="s1">initial</span><span class="s3">.</span><span class="s1">pos</span><span class="s3">:</span><span class="s1">token</span><span class="s3">.</span><span class="s1">endpos</span><span class="s3">()].</span><span class="s1">decode</span><span class="s3">(</span><span class="s4">'ascii'</span><span class="s3">, </span><span class="s4">'replace'</span><span class="s3">)</span>
+    <span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">Type1Font</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A class representing a Type-1 font, for use by backends. 
+ 
+    Attributes 
+    ---------- 
+    parts : tuple 
+        A 3-tuple of the cleartext part, the encrypted part, and the finale of 
+        zeros. 
+ 
+    decrypted : bytes 
+        The decrypted form of ``parts[1]``. 
+ 
+    prop : dict[str, Any] 
+        A dictionary of font properties. Noteworthy keys include: 
+ 
+        - FontName: PostScript name of the font 
+        - Encoding: dict from numeric codes to glyph names 
+        - FontMatrix: bytes object encoding a matrix 
+        - UniqueID: optional font identifier, dropped when modifying the font 
+        - CharStrings: dict from glyph names to byte code 
+        - Subrs: array of byte code subroutines 
+        - OtherSubrs: bytes object encoding some PostScript code 
+    &quot;&quot;&quot;</span>
+    <span class="s1">__slots__ </span><span class="s3">= (</span><span class="s4">'parts'</span><span class="s3">, </span><span class="s4">'decrypted'</span><span class="s3">, </span><span class="s4">'prop'</span><span class="s3">, </span><span class="s4">'_pos'</span><span class="s3">, </span><span class="s4">'_abbr'</span><span class="s3">)</span>
+    <span class="s6"># the _pos dict contains (begin, end) indices to parts[0] + decrypted</span>
+    <span class="s6"># so that they can be replaced when transforming the font;</span>
+    <span class="s6"># but since sometimes a definition appears in both parts[0] and decrypted,</span>
+    <span class="s6"># _pos[name] is an array of such pairs</span>
+    <span class="s6">#</span>
+    <span class="s6"># _abbr maps three standard abbreviations to their particular names in</span>
+    <span class="s6"># this font (e.g. 'RD' is named '-|' in some fonts)</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">input</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Initialize a Type-1 font. 
+ 
+        Parameters 
+        ---------- 
+        input : str or 3-tuple 
+            Either a pfb file name, or a 3-tuple of already-decoded Type-1 
+            font `~.Type1Font.parts`. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">input</span><span class="s3">, </span><span class="s1">tuple</span><span class="s3">) </span><span class="s2">and </span><span class="s1">len</span><span class="s3">(</span><span class="s1">input</span><span class="s3">) == </span><span class="s5">3</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">parts </span><span class="s3">= </span><span class="s1">input</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">input</span><span class="s3">, </span><span class="s4">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">file</span><span class="s3">:</span>
+                <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_read</span><span class="s3">(</span><span class="s1">file</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">parts </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_split</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">decrypted </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_decrypt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">parts</span><span class="s3">[</span><span class="s5">1</span><span class="s3">], </span><span class="s4">'eexec'</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr </span><span class="s3">= {</span><span class="s4">'RD'</span><span class="s3">: </span><span class="s4">'RD'</span><span class="s3">, </span><span class="s4">'ND'</span><span class="s3">: </span><span class="s4">'ND'</span><span class="s3">, </span><span class="s4">'NP'</span><span class="s3">: </span><span class="s4">'NP'</span><span class="s3">}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_parse</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">_read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">file</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Read the font from a file, decoding into usable parts.&quot;&quot;&quot;</span>
+        <span class="s1">rawdata </span><span class="s3">= </span><span class="s1">file</span><span class="s3">.</span><span class="s1">read</span><span class="s3">()</span>
+        <span class="s2">if not </span><span class="s1">rawdata</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s7">b'</span><span class="s2">\x80</span><span class="s7">'</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">rawdata</span>
+
+        <span class="s1">data </span><span class="s3">= </span><span class="s7">b''</span>
+        <span class="s2">while </span><span class="s1">rawdata</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">rawdata</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s7">b'</span><span class="s2">\x80</span><span class="s7">'</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">'Broken pfb file (expected byte 128, '</span>
+                                   <span class="s4">'got %d)' </span><span class="s3">% </span><span class="s1">rawdata</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+            <span class="s1">type </span><span class="s3">= </span><span class="s1">rawdata</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">type </span><span class="s2">in </span><span class="s3">(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">):</span>
+                <span class="s1">length</span><span class="s3">, = </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s4">'&lt;i'</span><span class="s3">, </span><span class="s1">rawdata</span><span class="s3">[</span><span class="s5">2</span><span class="s3">:</span><span class="s5">6</span><span class="s3">])</span>
+                <span class="s1">segment </span><span class="s3">= </span><span class="s1">rawdata</span><span class="s3">[</span><span class="s5">6</span><span class="s3">:</span><span class="s5">6 </span><span class="s3">+ </span><span class="s1">length</span><span class="s3">]</span>
+                <span class="s1">rawdata </span><span class="s3">= </span><span class="s1">rawdata</span><span class="s3">[</span><span class="s5">6 </span><span class="s3">+ </span><span class="s1">length</span><span class="s3">:]</span>
+
+            <span class="s2">if </span><span class="s1">type </span><span class="s3">== </span><span class="s5">1</span><span class="s3">:       </span><span class="s6"># ASCII text: include verbatim</span>
+                <span class="s1">data </span><span class="s3">+= </span><span class="s1">segment</span>
+            <span class="s2">elif </span><span class="s1">type </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:     </span><span class="s6"># binary data: encode in hexadecimal</span>
+                <span class="s1">data </span><span class="s3">+= </span><span class="s1">binascii</span><span class="s3">.</span><span class="s1">hexlify</span><span class="s3">(</span><span class="s1">segment</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">type </span><span class="s3">== </span><span class="s5">3</span><span class="s3">:     </span><span class="s6"># end of file</span>
+                <span class="s2">break</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">'Unknown segment type %d in pfb file' </span><span class="s3">% </span><span class="s1">type</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">data</span>
+
+    <span class="s2">def </span><span class="s1">_split</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Split the Type 1 font into its three main parts. 
+ 
+        The three parts are: (1) the cleartext part, which ends in a 
+        eexec operator; (2) the encrypted part; (3) the fixed part, 
+        which contains 512 ASCII zeros possibly divided on various 
+        lines, a cleartomark operator, and possibly something else. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s6"># Cleartext part: just find the eexec and skip whitespace</span>
+        <span class="s1">idx </span><span class="s3">= </span><span class="s1">data</span><span class="s3">.</span><span class="s1">index</span><span class="s3">(</span><span class="s7">b'eexec'</span><span class="s3">)</span>
+        <span class="s1">idx </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s7">b'eexec'</span><span class="s3">)</span>
+        <span class="s2">while </span><span class="s1">data</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">] </span><span class="s2">in </span><span class="s7">b' </span><span class="s2">\t\r\n</span><span class="s7">'</span><span class="s3">:</span>
+            <span class="s1">idx </span><span class="s3">+= </span><span class="s5">1</span>
+        <span class="s1">len1 </span><span class="s3">= </span><span class="s1">idx</span>
+
+        <span class="s6"># Encrypted part: find the cleartomark operator and count</span>
+        <span class="s6"># zeros backward</span>
+        <span class="s1">idx </span><span class="s3">= </span><span class="s1">data</span><span class="s3">.</span><span class="s1">rindex</span><span class="s3">(</span><span class="s7">b'cleartomark'</span><span class="s3">) - </span><span class="s5">1</span>
+        <span class="s1">zeros </span><span class="s3">= </span><span class="s5">512</span>
+        <span class="s2">while </span><span class="s1">zeros </span><span class="s2">and </span><span class="s1">data</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">] </span><span class="s2">in </span><span class="s7">b'0' </span><span class="s2">or </span><span class="s1">data</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">] </span><span class="s2">in </span><span class="s7">b'</span><span class="s2">\r\n</span><span class="s7">'</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">data</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">] </span><span class="s2">in </span><span class="s7">b'0'</span><span class="s3">:</span>
+                <span class="s1">zeros </span><span class="s3">-= </span><span class="s5">1</span>
+            <span class="s1">idx </span><span class="s3">-= </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s1">zeros</span><span class="s3">:</span>
+            <span class="s6"># this may have been a problem on old implementations that</span>
+            <span class="s6"># used the zeros as necessary padding</span>
+            <span class="s1">_log</span><span class="s3">.</span><span class="s1">info</span><span class="s3">(</span><span class="s4">'Insufficiently many zeros in Type 1 font'</span><span class="s3">)</span>
+
+        <span class="s6"># Convert encrypted part to binary (if we read a pfb file, we may end</span>
+        <span class="s6"># up converting binary to hexadecimal to binary again; but if we read</span>
+        <span class="s6"># a pfa file, this part is already in hex, and I am not quite sure if</span>
+        <span class="s6"># even the pfb format guarantees that it will be in binary).</span>
+        <span class="s1">idx1 </span><span class="s3">= </span><span class="s1">len1 </span><span class="s3">+ ((</span><span class="s1">idx </span><span class="s3">- </span><span class="s1">len1 </span><span class="s3">+ </span><span class="s5">2</span><span class="s3">) &amp; ~</span><span class="s5">1</span><span class="s3">)  </span><span class="s6"># ensure an even number of bytes</span>
+        <span class="s1">binary </span><span class="s3">= </span><span class="s1">binascii</span><span class="s3">.</span><span class="s1">unhexlify</span><span class="s3">(</span><span class="s1">data</span><span class="s3">[</span><span class="s1">len1</span><span class="s3">:</span><span class="s1">idx1</span><span class="s3">])</span>
+
+        <span class="s2">return </span><span class="s1">data</span><span class="s3">[:</span><span class="s1">len1</span><span class="s3">], </span><span class="s1">binary</span><span class="s3">, </span><span class="s1">data</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">+</span><span class="s5">1</span><span class="s3">:]</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_decrypt</span><span class="s3">(</span><span class="s1">ciphertext</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">ndiscard</span><span class="s3">=</span><span class="s5">4</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Decrypt ciphertext using the Type-1 font algorithm. 
+ 
+        The algorithm is described in Adobe's &quot;Adobe Type 1 Font Format&quot;. 
+        The key argument can be an integer, or one of the strings 
+        'eexec' and 'charstring', which map to the key specified for the 
+        corresponding part of Type-1 fonts. 
+ 
+        The ndiscard argument should be an integer, usually 4. 
+        That number of bytes is discarded from the beginning of plaintext. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">key </span><span class="s3">= </span><span class="s1">_api</span><span class="s3">.</span><span class="s1">check_getitem</span><span class="s3">({</span><span class="s4">'eexec'</span><span class="s3">: </span><span class="s5">55665</span><span class="s3">, </span><span class="s4">'charstring'</span><span class="s3">: </span><span class="s5">4330</span><span class="s3">}, </span><span class="s1">key</span><span class="s3">=</span><span class="s1">key</span><span class="s3">)</span>
+        <span class="s1">plaintext </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">byte </span><span class="s2">in </span><span class="s1">ciphertext</span><span class="s3">:</span>
+            <span class="s1">plaintext</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">byte </span><span class="s3">^ (</span><span class="s1">key </span><span class="s3">&gt;&gt; </span><span class="s5">8</span><span class="s3">))</span>
+            <span class="s1">key </span><span class="s3">= ((</span><span class="s1">key</span><span class="s3">+</span><span class="s1">byte</span><span class="s3">) * </span><span class="s5">52845 </span><span class="s3">+ </span><span class="s5">22719</span><span class="s3">) &amp; </span><span class="s5">0xffff</span>
+
+        <span class="s2">return </span><span class="s1">bytes</span><span class="s3">(</span><span class="s1">plaintext</span><span class="s3">[</span><span class="s1">ndiscard</span><span class="s3">:])</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_encrypt</span><span class="s3">(</span><span class="s1">plaintext</span><span class="s3">, </span><span class="s1">key</span><span class="s3">, </span><span class="s1">ndiscard</span><span class="s3">=</span><span class="s5">4</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Encrypt plaintext using the Type-1 font algorithm. 
+ 
+        The algorithm is described in Adobe's &quot;Adobe Type 1 Font Format&quot;. 
+        The key argument can be an integer, or one of the strings 
+        'eexec' and 'charstring', which map to the key specified for the 
+        corresponding part of Type-1 fonts. 
+ 
+        The ndiscard argument should be an integer, usually 4. That 
+        number of bytes is prepended to the plaintext before encryption. 
+        This function prepends NUL bytes for reproducibility, even though 
+        the original algorithm uses random bytes, presumably to avoid 
+        cryptanalysis. 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">key </span><span class="s3">= </span><span class="s1">_api</span><span class="s3">.</span><span class="s1">check_getitem</span><span class="s3">({</span><span class="s4">'eexec'</span><span class="s3">: </span><span class="s5">55665</span><span class="s3">, </span><span class="s4">'charstring'</span><span class="s3">: </span><span class="s5">4330</span><span class="s3">}, </span><span class="s1">key</span><span class="s3">=</span><span class="s1">key</span><span class="s3">)</span>
+        <span class="s1">ciphertext </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">byte </span><span class="s2">in </span><span class="s7">b'</span><span class="s2">\0</span><span class="s7">' </span><span class="s3">* </span><span class="s1">ndiscard </span><span class="s3">+ </span><span class="s1">plaintext</span><span class="s3">:</span>
+            <span class="s1">c </span><span class="s3">= </span><span class="s1">byte </span><span class="s3">^ (</span><span class="s1">key </span><span class="s3">&gt;&gt; </span><span class="s5">8</span><span class="s3">)</span>
+            <span class="s1">ciphertext</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">c</span><span class="s3">)</span>
+            <span class="s1">key </span><span class="s3">= ((</span><span class="s1">key </span><span class="s3">+ </span><span class="s1">c</span><span class="s3">) * </span><span class="s5">52845 </span><span class="s3">+ </span><span class="s5">22719</span><span class="s3">) &amp; </span><span class="s5">0xffff</span>
+
+        <span class="s2">return </span><span class="s1">bytes</span><span class="s3">(</span><span class="s1">ciphertext</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_parse</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Find the values of various font properties. This limited kind 
+        of parsing is described in Chapter 10 &quot;Adobe Type Manager 
+        Compatibility&quot; of the Type-1 spec. 
+        &quot;&quot;&quot;</span>
+        <span class="s6"># Start with reasonable defaults</span>
+        <span class="s1">prop </span><span class="s3">= {</span><span class="s4">'Weight'</span><span class="s3">: </span><span class="s4">'Regular'</span><span class="s3">, </span><span class="s4">'ItalicAngle'</span><span class="s3">: </span><span class="s5">0.0</span><span class="s3">, </span><span class="s4">'isFixedPitch'</span><span class="s3">: </span><span class="s2">False</span><span class="s3">,</span>
+                <span class="s4">'UnderlinePosition'</span><span class="s3">: -</span><span class="s5">100</span><span class="s3">, </span><span class="s4">'UnderlineThickness'</span><span class="s3">: </span><span class="s5">50</span><span class="s3">}</span>
+        <span class="s1">pos </span><span class="s3">= {}</span>
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">parts</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] + </span><span class="s1">self</span><span class="s3">.</span><span class="s1">decrypted</span>
+
+        <span class="s1">source </span><span class="s3">= </span><span class="s1">_tokenize</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">while True</span><span class="s3">:</span>
+            <span class="s6"># See if there is a key to be assigned a value</span>
+            <span class="s6"># e.g. /FontName in /FontName /Helvetica def</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">source</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">StopIteration</span><span class="s3">:</span>
+                <span class="s2">break</span>
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_delim</span><span class="s3">():</span>
+                <span class="s6"># skip over this - we want top-level keys only</span>
+                <span class="s1">_expression</span><span class="s3">(</span><span class="s1">token</span><span class="s3">, </span><span class="s1">source</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_slash_name</span><span class="s3">():</span>
+                <span class="s1">key </span><span class="s3">= </span><span class="s1">token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+                <span class="s1">keypos </span><span class="s3">= </span><span class="s1">token</span><span class="s3">.</span><span class="s1">pos</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">continue</span>
+
+            <span class="s6"># Some values need special parsing</span>
+            <span class="s2">if </span><span class="s1">key </span><span class="s2">in </span><span class="s3">(</span><span class="s4">'Subrs'</span><span class="s3">, </span><span class="s4">'CharStrings'</span><span class="s3">, </span><span class="s4">'Encoding'</span><span class="s3">, </span><span class="s4">'OtherSubrs'</span><span class="s3">):</span>
+                <span class="s1">prop</span><span class="s3">[</span><span class="s1">key</span><span class="s3">], </span><span class="s1">endpos </span><span class="s3">= {</span>
+                    <span class="s4">'Subrs'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_parse_subrs</span><span class="s3">,</span>
+                    <span class="s4">'CharStrings'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_parse_charstrings</span><span class="s3">,</span>
+                    <span class="s4">'Encoding'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_parse_encoding</span><span class="s3">,</span>
+                    <span class="s4">'OtherSubrs'</span><span class="s3">: </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_parse_othersubrs</span>
+                <span class="s3">}[</span><span class="s1">key</span><span class="s3">](</span><span class="s1">source</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+                <span class="s1">pos</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, []).</span><span class="s1">append</span><span class="s3">((</span><span class="s1">keypos</span><span class="s3">, </span><span class="s1">endpos</span><span class="s3">))</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">source</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">StopIteration</span><span class="s3">:</span>
+                <span class="s2">break</span>
+
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">token</span><span class="s3">, </span><span class="s1">_KeywordToken</span><span class="s3">):</span>
+                <span class="s6"># constructs like</span>
+                <span class="s6"># FontDirectory /Helvetica known {...} {...} ifelse</span>
+                <span class="s6"># mean the key was not really a key</span>
+                <span class="s2">continue</span>
+
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_delim</span><span class="s3">():</span>
+                <span class="s1">value </span><span class="s3">= </span><span class="s1">_expression</span><span class="s3">(</span><span class="s1">token</span><span class="s3">, </span><span class="s1">source</span><span class="s3">, </span><span class="s1">data</span><span class="s3">).</span><span class="s1">raw</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">value </span><span class="s3">= </span><span class="s1">token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+
+            <span class="s6"># look for a 'def' possibly preceded by access modifiers</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">kw </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span>
+                    <span class="s1">kw </span><span class="s2">for </span><span class="s1">kw </span><span class="s2">in </span><span class="s1">source</span>
+                    <span class="s2">if not </span><span class="s1">kw</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'readonly'</span><span class="s3">, </span><span class="s4">'noaccess'</span><span class="s3">, </span><span class="s4">'executeonly'</span><span class="s3">)</span>
+                <span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">StopIteration</span><span class="s3">:</span>
+                <span class="s2">break</span>
+
+            <span class="s6"># sometimes noaccess def and readonly def are abbreviated</span>
+            <span class="s2">if </span><span class="s1">kw</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'def'</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr</span><span class="s3">[</span><span class="s4">'ND'</span><span class="s3">], </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr</span><span class="s3">[</span><span class="s4">'NP'</span><span class="s3">]):</span>
+                <span class="s1">prop</span><span class="s3">[</span><span class="s1">key</span><span class="s3">] = </span><span class="s1">value</span>
+                <span class="s1">pos</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s1">key</span><span class="s3">, []).</span><span class="s1">append</span><span class="s3">((</span><span class="s1">keypos</span><span class="s3">, </span><span class="s1">kw</span><span class="s3">.</span><span class="s1">endpos</span><span class="s3">()))</span>
+
+            <span class="s6"># detect the standard abbreviations</span>
+            <span class="s2">if </span><span class="s1">value </span><span class="s3">== </span><span class="s4">'{noaccess def}'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr</span><span class="s3">[</span><span class="s4">'ND'</span><span class="s3">] = </span><span class="s1">key</span>
+            <span class="s2">elif </span><span class="s1">value </span><span class="s3">== </span><span class="s4">'{noaccess put}'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr</span><span class="s3">[</span><span class="s4">'NP'</span><span class="s3">] = </span><span class="s1">key</span>
+            <span class="s2">elif </span><span class="s1">value </span><span class="s3">== </span><span class="s4">'{string currentfile exch readstring pop}'</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr</span><span class="s3">[</span><span class="s4">'RD'</span><span class="s3">] = </span><span class="s1">key</span>
+
+        <span class="s6"># Fill in the various *Name properties</span>
+        <span class="s2">if </span><span class="s4">'FontName' </span><span class="s2">not in </span><span class="s1">prop</span><span class="s3">:</span>
+            <span class="s1">prop</span><span class="s3">[</span><span class="s4">'FontName'</span><span class="s3">] = (</span><span class="s1">prop</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'FullName'</span><span class="s3">) </span><span class="s2">or</span>
+                                <span class="s1">prop</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'FamilyName'</span><span class="s3">) </span><span class="s2">or</span>
+                                <span class="s4">'Unknown'</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s4">'FullName' </span><span class="s2">not in </span><span class="s1">prop</span><span class="s3">:</span>
+            <span class="s1">prop</span><span class="s3">[</span><span class="s4">'FullName'</span><span class="s3">] = </span><span class="s1">prop</span><span class="s3">[</span><span class="s4">'FontName'</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s4">'FamilyName' </span><span class="s2">not in </span><span class="s1">prop</span><span class="s3">:</span>
+            <span class="s1">extras </span><span class="s3">= (</span><span class="s4">'(?i)([ -](regular|plain|italic|oblique|(semi)?bold|'</span>
+                      <span class="s4">'(ultra)?light|extra|condensed))+$'</span><span class="s3">)</span>
+            <span class="s1">prop</span><span class="s3">[</span><span class="s4">'FamilyName'</span><span class="s3">] = </span><span class="s1">re</span><span class="s3">.</span><span class="s1">sub</span><span class="s3">(</span><span class="s1">extras</span><span class="s3">, </span><span class="s4">''</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">[</span><span class="s4">'FullName'</span><span class="s3">])</span>
+        <span class="s6"># Decrypt the encrypted parts</span>
+        <span class="s1">ndiscard </span><span class="s3">= </span><span class="s1">prop</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'lenIV'</span><span class="s3">, </span><span class="s5">4</span><span class="s3">)</span>
+        <span class="s1">cs </span><span class="s3">= </span><span class="s1">prop</span><span class="s3">[</span><span class="s4">'CharStrings'</span><span class="s3">]</span>
+        <span class="s2">for </span><span class="s1">key</span><span class="s3">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">cs</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+            <span class="s1">cs</span><span class="s3">[</span><span class="s1">key</span><span class="s3">] = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_decrypt</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s4">'charstring'</span><span class="s3">, </span><span class="s1">ndiscard</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s4">'Subrs' </span><span class="s2">in </span><span class="s1">prop</span><span class="s3">:</span>
+            <span class="s1">prop</span><span class="s3">[</span><span class="s4">'Subrs'</span><span class="s3">] = [</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_decrypt</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s4">'charstring'</span><span class="s3">, </span><span class="s1">ndiscard</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">value </span><span class="s2">in </span><span class="s1">prop</span><span class="s3">[</span><span class="s4">'Subrs'</span><span class="s3">]</span>
+            <span class="s3">]</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">prop </span><span class="s3">= </span><span class="s1">prop</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pos </span><span class="s3">= </span><span class="s1">pos</span>
+
+    <span class="s2">def </span><span class="s1">_parse_subrs</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">tokens</span><span class="s3">, </span><span class="s1">_data</span><span class="s3">):</span>
+        <span class="s1">count_token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">count_token</span><span class="s3">.</span><span class="s1">is_number</span><span class="s3">():</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                <span class="s4">f&quot;Token following /Subrs must be a number, was </span><span class="s2">{</span><span class="s1">count_token</span><span class="s2">}</span><span class="s4">&quot;</span>
+            <span class="s3">)</span>
+        <span class="s1">count </span><span class="s3">= </span><span class="s1">count_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+        <span class="s1">array </span><span class="s3">= [</span><span class="s2">None</span><span class="s3">] * </span><span class="s1">count</span>
+        <span class="s1">next</span><span class="s3">(</span><span class="s1">t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens </span><span class="s2">if </span><span class="s1">t</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'array'</span><span class="s3">))</span>
+        <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">count</span><span class="s3">):</span>
+            <span class="s1">next</span><span class="s3">(</span><span class="s1">t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens </span><span class="s2">if </span><span class="s1">t</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'dup'</span><span class="s3">))</span>
+            <span class="s1">index_token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">index_token</span><span class="s3">.</span><span class="s1">is_number</span><span class="s3">():</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                    <span class="s4">&quot;Token following dup in Subrs definition must be a &quot;</span>
+                    <span class="s4">f&quot;number, was </span><span class="s2">{</span><span class="s1">index_token</span><span class="s2">}</span><span class="s4">&quot;</span>
+                <span class="s3">)</span>
+            <span class="s1">nbytes_token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">nbytes_token</span><span class="s3">.</span><span class="s1">is_number</span><span class="s3">():</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                    <span class="s4">&quot;Second token following dup in Subrs definition must &quot;</span>
+                    <span class="s4">f&quot;be a number, was </span><span class="s2">{</span><span class="s1">nbytes_token</span><span class="s2">}</span><span class="s4">&quot;</span>
+                <span class="s3">)</span>
+            <span class="s1">token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr</span><span class="s3">[</span><span class="s4">'RD'</span><span class="s3">]):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                    <span class="s4">f&quot;Token preceding subr must be </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_abbr</span><span class="s3">[</span><span class="s4">'RD'</span><span class="s3">]</span><span class="s2">}</span><span class="s4">, &quot;</span>
+                    <span class="s4">f&quot;was </span><span class="s2">{</span><span class="s1">token</span><span class="s2">}</span><span class="s4">&quot;</span>
+                <span class="s3">)</span>
+            <span class="s1">binary_token </span><span class="s3">= </span><span class="s1">tokens</span><span class="s3">.</span><span class="s1">send</span><span class="s3">(</span><span class="s5">1</span><span class="s3">+</span><span class="s1">nbytes_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">())</span>
+            <span class="s1">array</span><span class="s3">[</span><span class="s1">index_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()] = </span><span class="s1">binary_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+
+        <span class="s2">return </span><span class="s1">array</span><span class="s3">, </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">).</span><span class="s1">endpos</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_charstrings</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">, </span><span class="s1">_data</span><span class="s3">):</span>
+        <span class="s1">count_token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">count_token</span><span class="s3">.</span><span class="s1">is_number</span><span class="s3">():</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                <span class="s4">&quot;Token following /CharStrings must be a number, &quot;</span>
+                <span class="s4">f&quot;was </span><span class="s2">{</span><span class="s1">count_token</span><span class="s2">}</span><span class="s4">&quot;</span>
+            <span class="s3">)</span>
+        <span class="s1">count </span><span class="s3">= </span><span class="s1">count_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+        <span class="s1">charstrings </span><span class="s3">= {}</span>
+        <span class="s1">next</span><span class="s3">(</span><span class="s1">t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens </span><span class="s2">if </span><span class="s1">t</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'begin'</span><span class="s3">))</span>
+        <span class="s2">while True</span><span class="s3">:</span>
+            <span class="s1">token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens</span>
+                         <span class="s2">if </span><span class="s1">t</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'end'</span><span class="s3">) </span><span class="s2">or </span><span class="s1">t</span><span class="s3">.</span><span class="s1">is_slash_name</span><span class="s3">())</span>
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">raw </span><span class="s3">== </span><span class="s4">'end'</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">charstrings</span><span class="s3">, </span><span class="s1">token</span><span class="s3">.</span><span class="s1">endpos</span><span class="s3">()</span>
+            <span class="s1">glyphname </span><span class="s3">= </span><span class="s1">token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+            <span class="s1">nbytes_token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">nbytes_token</span><span class="s3">.</span><span class="s1">is_number</span><span class="s3">():</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                    <span class="s4">f&quot;Token following /</span><span class="s2">{</span><span class="s1">glyphname</span><span class="s2">} </span><span class="s4">in CharStrings definition &quot;</span>
+                    <span class="s4">f&quot;must be a number, was </span><span class="s2">{</span><span class="s1">nbytes_token</span><span class="s2">}</span><span class="s4">&quot;</span>
+                <span class="s3">)</span>
+            <span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)  </span><span class="s6"># usually RD or |-</span>
+            <span class="s1">binary_token </span><span class="s3">= </span><span class="s1">tokens</span><span class="s3">.</span><span class="s1">send</span><span class="s3">(</span><span class="s5">1</span><span class="s3">+</span><span class="s1">nbytes_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">())</span>
+            <span class="s1">charstrings</span><span class="s3">[</span><span class="s1">glyphname</span><span class="s3">] = </span><span class="s1">binary_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_encoding</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">, </span><span class="s1">_data</span><span class="s3">):</span>
+        <span class="s6"># this only works for encodings that follow the Adobe manual</span>
+        <span class="s6"># but some old fonts include non-compliant data - we log a warning</span>
+        <span class="s6"># and return a possibly incomplete encoding</span>
+        <span class="s1">encoding </span><span class="s3">= {}</span>
+        <span class="s2">while True</span><span class="s3">:</span>
+            <span class="s1">token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">t </span><span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">tokens</span>
+                         <span class="s2">if </span><span class="s1">t</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'StandardEncoding'</span><span class="s3">, </span><span class="s4">'dup'</span><span class="s3">, </span><span class="s4">'def'</span><span class="s3">))</span>
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'StandardEncoding'</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">_StandardEncoding</span><span class="s3">, </span><span class="s1">token</span><span class="s3">.</span><span class="s1">endpos</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'def'</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">encoding</span><span class="s3">, </span><span class="s1">token</span><span class="s3">.</span><span class="s1">endpos</span><span class="s3">()</span>
+            <span class="s1">index_token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">index_token</span><span class="s3">.</span><span class="s1">is_number</span><span class="s3">():</span>
+                <span class="s1">_log</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span>
+                    <span class="s4">f&quot;Parsing encoding: expected number, got </span><span class="s2">{</span><span class="s1">index_token</span><span class="s2">}</span><span class="s4">&quot;</span>
+                <span class="s3">)</span>
+                <span class="s2">continue</span>
+            <span class="s1">name_token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">name_token</span><span class="s3">.</span><span class="s1">is_slash_name</span><span class="s3">():</span>
+                <span class="s1">_log</span><span class="s3">.</span><span class="s1">warning</span><span class="s3">(</span>
+                    <span class="s4">f&quot;Parsing encoding: expected slash-name, got </span><span class="s2">{</span><span class="s1">name_token</span><span class="s2">}</span><span class="s4">&quot;</span>
+                <span class="s3">)</span>
+                <span class="s2">continue</span>
+            <span class="s1">encoding</span><span class="s3">[</span><span class="s1">index_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()] = </span><span class="s1">name_token</span><span class="s3">.</span><span class="s1">value</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_parse_othersubrs</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s1">init_pos </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">while True</span><span class="s3">:</span>
+            <span class="s1">token </span><span class="s3">= </span><span class="s1">next</span><span class="s3">(</span><span class="s1">tokens</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">init_pos </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">init_pos </span><span class="s3">= </span><span class="s1">token</span><span class="s3">.</span><span class="s1">pos</span>
+            <span class="s2">if </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_delim</span><span class="s3">():</span>
+                <span class="s1">_expression</span><span class="s3">(</span><span class="s1">token</span><span class="s3">, </span><span class="s1">tokens</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">token</span><span class="s3">.</span><span class="s1">is_keyword</span><span class="s3">(</span><span class="s4">'def'</span><span class="s3">, </span><span class="s4">'ND'</span><span class="s3">, </span><span class="s4">'|-'</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">data</span><span class="s3">[</span><span class="s1">init_pos</span><span class="s3">:</span><span class="s1">token</span><span class="s3">.</span><span class="s1">endpos</span><span class="s3">()], </span><span class="s1">token</span><span class="s3">.</span><span class="s1">endpos</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">transform</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">effects</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Return a new font that is slanted and/or extended. 
+ 
+        Parameters 
+        ---------- 
+        effects : dict 
+            A dict with optional entries: 
+ 
+            - 'slant' : float, default: 0 
+                Tangent of the angle that the font is to be slanted to the 
+                right. Negative values slant to the left. 
+            - 'extend' : float, default: 1 
+                Scaling factor for the font width. Values less than 1 condense 
+                the glyphs. 
+ 
+        Returns 
+        ------- 
+        `Type1Font` 
+        &quot;&quot;&quot;</span>
+        <span class="s1">fontname </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">prop</span><span class="s3">[</span><span class="s4">'FontName'</span><span class="s3">]</span>
+        <span class="s1">italicangle </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">prop</span><span class="s3">[</span><span class="s4">'ItalicAngle'</span><span class="s3">]</span>
+
+        <span class="s1">array </span><span class="s3">= [</span>
+            <span class="s1">float</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">prop</span><span class="s3">[</span><span class="s4">'FontMatrix'</span><span class="s3">]</span>
+                               <span class="s3">.</span><span class="s1">lstrip</span><span class="s3">(</span><span class="s4">'['</span><span class="s3">).</span><span class="s1">rstrip</span><span class="s3">(</span><span class="s4">']'</span><span class="s3">).</span><span class="s1">split</span><span class="s3">())</span>
+        <span class="s3">]</span>
+        <span class="s1">oldmatrix </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">eye</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s5">3</span><span class="s3">)</span>
+        <span class="s1">oldmatrix</span><span class="s3">[</span><span class="s5">0</span><span class="s3">:</span><span class="s5">3</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">array</span><span class="s3">[::</span><span class="s5">2</span><span class="s3">]</span>
+        <span class="s1">oldmatrix</span><span class="s3">[</span><span class="s5">0</span><span class="s3">:</span><span class="s5">3</span><span class="s3">, </span><span class="s5">1</span><span class="s3">] = </span><span class="s1">array</span><span class="s3">[</span><span class="s5">1</span><span class="s3">::</span><span class="s5">2</span><span class="s3">]</span>
+        <span class="s1">modifier </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">eye</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s5">3</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s4">'slant' </span><span class="s2">in </span><span class="s1">effects</span><span class="s3">:</span>
+            <span class="s1">slant </span><span class="s3">= </span><span class="s1">effects</span><span class="s3">[</span><span class="s4">'slant'</span><span class="s3">]</span>
+            <span class="s1">fontname </span><span class="s3">+= </span><span class="s4">f'_Slant_</span><span class="s2">{</span><span class="s1">int</span><span class="s3">(</span><span class="s5">1000 </span><span class="s3">* </span><span class="s1">slant</span><span class="s3">)</span><span class="s2">}</span><span class="s4">'</span>
+            <span class="s1">italicangle </span><span class="s3">= </span><span class="s1">round</span><span class="s3">(</span>
+                <span class="s1">float</span><span class="s3">(</span><span class="s1">italicangle</span><span class="s3">) - </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arctan</span><span class="s3">(</span><span class="s1">slant</span><span class="s3">) / </span><span class="s1">np</span><span class="s3">.</span><span class="s1">pi </span><span class="s3">* </span><span class="s5">180</span><span class="s3">,</span>
+                <span class="s5">5</span>
+            <span class="s3">)</span>
+            <span class="s1">modifier</span><span class="s3">[</span><span class="s5">1</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">slant</span>
+
+        <span class="s2">if </span><span class="s4">'extend' </span><span class="s2">in </span><span class="s1">effects</span><span class="s3">:</span>
+            <span class="s1">extend </span><span class="s3">= </span><span class="s1">effects</span><span class="s3">[</span><span class="s4">'extend'</span><span class="s3">]</span>
+            <span class="s1">fontname </span><span class="s3">+= </span><span class="s4">f'_Extend_</span><span class="s2">{</span><span class="s1">int</span><span class="s3">(</span><span class="s5">1000 </span><span class="s3">* </span><span class="s1">extend</span><span class="s3">)</span><span class="s2">}</span><span class="s4">'</span>
+            <span class="s1">modifier</span><span class="s3">[</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s3">] = </span><span class="s1">extend</span>
+
+        <span class="s1">newmatrix </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">modifier</span><span class="s3">, </span><span class="s1">oldmatrix</span><span class="s3">)</span>
+        <span class="s1">array</span><span class="s3">[::</span><span class="s5">2</span><span class="s3">] = </span><span class="s1">newmatrix</span><span class="s3">[</span><span class="s5">0</span><span class="s3">:</span><span class="s5">3</span><span class="s3">, </span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s1">array</span><span class="s3">[</span><span class="s5">1</span><span class="s3">::</span><span class="s5">2</span><span class="s3">] = </span><span class="s1">newmatrix</span><span class="s3">[</span><span class="s5">0</span><span class="s3">:</span><span class="s5">3</span><span class="s3">, </span><span class="s5">1</span><span class="s3">]</span>
+        <span class="s1">fontmatrix </span><span class="s3">= (</span>
+            <span class="s4">f&quot;[</span><span class="s2">{</span><span class="s4">' '</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">_format_approx</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s5">6</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">array</span><span class="s3">)</span><span class="s2">}</span><span class="s4">]&quot;</span>
+        <span class="s3">)</span>
+        <span class="s1">replacements </span><span class="s3">= (</span>
+            <span class="s3">[(</span><span class="s1">x</span><span class="s3">, </span><span class="s4">f'/FontName/</span><span class="s2">{</span><span class="s1">fontname</span><span class="s2">} </span><span class="s4">def'</span><span class="s3">)</span>
+             <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span><span class="s3">[</span><span class="s4">'FontName'</span><span class="s3">]]</span>
+            <span class="s3">+ [(</span><span class="s1">x</span><span class="s3">, </span><span class="s4">f'/ItalicAngle </span><span class="s2">{</span><span class="s1">italicangle</span><span class="s2">} </span><span class="s4">def'</span><span class="s3">)</span>
+               <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span><span class="s3">[</span><span class="s4">'ItalicAngle'</span><span class="s3">]]</span>
+            <span class="s3">+ [(</span><span class="s1">x</span><span class="s3">, </span><span class="s4">f'/FontMatrix </span><span class="s2">{</span><span class="s1">fontmatrix</span><span class="s2">} </span><span class="s4">readonly def'</span><span class="s3">)</span>
+               <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span><span class="s3">[</span><span class="s4">'FontMatrix'</span><span class="s3">]]</span>
+            <span class="s3">+ [(</span><span class="s1">x</span><span class="s3">, </span><span class="s4">''</span><span class="s3">) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pos</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s4">'UniqueID'</span><span class="s3">, [])]</span>
+        <span class="s3">)</span>
+
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">bytearray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">parts</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+        <span class="s1">data</span><span class="s3">.</span><span class="s1">extend</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">decrypted</span><span class="s3">)</span>
+        <span class="s1">len0 </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">parts</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+        <span class="s2">for </span><span class="s3">(</span><span class="s1">pos0</span><span class="s3">, </span><span class="s1">pos1</span><span class="s3">), </span><span class="s1">value </span><span class="s2">in </span><span class="s1">sorted</span><span class="s3">(</span><span class="s1">replacements</span><span class="s3">, </span><span class="s1">reverse</span><span class="s3">=</span><span class="s2">True</span><span class="s3">):</span>
+            <span class="s1">data</span><span class="s3">[</span><span class="s1">pos0</span><span class="s3">:</span><span class="s1">pos1</span><span class="s3">] = </span><span class="s1">value</span><span class="s3">.</span><span class="s1">encode</span><span class="s3">(</span><span class="s4">'ascii'</span><span class="s3">, </span><span class="s4">'replace'</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">pos0 </span><span class="s3">&lt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">parts</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]):</span>
+                <span class="s2">if </span><span class="s1">pos1 </span><span class="s3">&gt;= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">parts</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]):</span>
+                    <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                        <span class="s4">f&quot;text to be replaced with </span><span class="s2">{</span><span class="s1">value</span><span class="s2">} </span><span class="s4">spans &quot;</span>
+                        <span class="s4">&quot;the eexec boundary&quot;</span>
+                    <span class="s3">)</span>
+                <span class="s1">len0 </span><span class="s3">+= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">value</span><span class="s3">) - </span><span class="s1">pos1 </span><span class="s3">+ </span><span class="s1">pos0</span>
+
+        <span class="s1">data </span><span class="s3">= </span><span class="s1">bytes</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">Type1Font</span><span class="s3">((</span>
+            <span class="s1">data</span><span class="s3">[:</span><span class="s1">len0</span><span class="s3">],</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_encrypt</span><span class="s3">(</span><span class="s1">data</span><span class="s3">[</span><span class="s1">len0</span><span class="s3">:], </span><span class="s4">'eexec'</span><span class="s3">),</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">parts</span><span class="s3">[</span><span class="s5">2</span><span class="s3">]</span>
+        <span class="s3">))</span>
+
+
+<span class="s1">_StandardEncoding </span><span class="s3">= {</span>
+    <span class="s3">**{</span><span class="s1">ord</span><span class="s3">(</span><span class="s1">letter</span><span class="s3">): </span><span class="s1">letter </span><span class="s2">for </span><span class="s1">letter </span><span class="s2">in </span><span class="s1">string</span><span class="s3">.</span><span class="s1">ascii_letters</span><span class="s3">},</span>
+    <span class="s5">0</span><span class="s3">: </span><span class="s4">'.notdef'</span><span class="s3">,</span>
+    <span class="s5">32</span><span class="s3">: </span><span class="s4">'space'</span><span class="s3">,</span>
+    <span class="s5">33</span><span class="s3">: </span><span class="s4">'exclam'</span><span class="s3">,</span>
+    <span class="s5">34</span><span class="s3">: </span><span class="s4">'quotedbl'</span><span class="s3">,</span>
+    <span class="s5">35</span><span class="s3">: </span><span class="s4">'numbersign'</span><span class="s3">,</span>
+    <span class="s5">36</span><span class="s3">: </span><span class="s4">'dollar'</span><span class="s3">,</span>
+    <span class="s5">37</span><span class="s3">: </span><span class="s4">'percent'</span><span class="s3">,</span>
+    <span class="s5">38</span><span class="s3">: </span><span class="s4">'ampersand'</span><span class="s3">,</span>
+    <span class="s5">39</span><span class="s3">: </span><span class="s4">'quoteright'</span><span class="s3">,</span>
+    <span class="s5">40</span><span class="s3">: </span><span class="s4">'parenleft'</span><span class="s3">,</span>
+    <span class="s5">41</span><span class="s3">: </span><span class="s4">'parenright'</span><span class="s3">,</span>
+    <span class="s5">42</span><span class="s3">: </span><span class="s4">'asterisk'</span><span class="s3">,</span>
+    <span class="s5">43</span><span class="s3">: </span><span class="s4">'plus'</span><span class="s3">,</span>
+    <span class="s5">44</span><span class="s3">: </span><span class="s4">'comma'</span><span class="s3">,</span>
+    <span class="s5">45</span><span class="s3">: </span><span class="s4">'hyphen'</span><span class="s3">,</span>
+    <span class="s5">46</span><span class="s3">: </span><span class="s4">'period'</span><span class="s3">,</span>
+    <span class="s5">47</span><span class="s3">: </span><span class="s4">'slash'</span><span class="s3">,</span>
+    <span class="s5">48</span><span class="s3">: </span><span class="s4">'zero'</span><span class="s3">,</span>
+    <span class="s5">49</span><span class="s3">: </span><span class="s4">'one'</span><span class="s3">,</span>
+    <span class="s5">50</span><span class="s3">: </span><span class="s4">'two'</span><span class="s3">,</span>
+    <span class="s5">51</span><span class="s3">: </span><span class="s4">'three'</span><span class="s3">,</span>
+    <span class="s5">52</span><span class="s3">: </span><span class="s4">'four'</span><span class="s3">,</span>
+    <span class="s5">53</span><span class="s3">: </span><span class="s4">'five'</span><span class="s3">,</span>
+    <span class="s5">54</span><span class="s3">: </span><span class="s4">'six'</span><span class="s3">,</span>
+    <span class="s5">55</span><span class="s3">: </span><span class="s4">'seven'</span><span class="s3">,</span>
+    <span class="s5">56</span><span class="s3">: </span><span class="s4">'eight'</span><span class="s3">,</span>
+    <span class="s5">57</span><span class="s3">: </span><span class="s4">'nine'</span><span class="s3">,</span>
+    <span class="s5">58</span><span class="s3">: </span><span class="s4">'colon'</span><span class="s3">,</span>
+    <span class="s5">59</span><span class="s3">: </span><span class="s4">'semicolon'</span><span class="s3">,</span>
+    <span class="s5">60</span><span class="s3">: </span><span class="s4">'less'</span><span class="s3">,</span>
+    <span class="s5">61</span><span class="s3">: </span><span class="s4">'equal'</span><span class="s3">,</span>
+    <span class="s5">62</span><span class="s3">: </span><span class="s4">'greater'</span><span class="s3">,</span>
+    <span class="s5">63</span><span class="s3">: </span><span class="s4">'question'</span><span class="s3">,</span>
+    <span class="s5">64</span><span class="s3">: </span><span class="s4">'at'</span><span class="s3">,</span>
+    <span class="s5">91</span><span class="s3">: </span><span class="s4">'bracketleft'</span><span class="s3">,</span>
+    <span class="s5">92</span><span class="s3">: </span><span class="s4">'backslash'</span><span class="s3">,</span>
+    <span class="s5">93</span><span class="s3">: </span><span class="s4">'bracketright'</span><span class="s3">,</span>
+    <span class="s5">94</span><span class="s3">: </span><span class="s4">'asciicircum'</span><span class="s3">,</span>
+    <span class="s5">95</span><span class="s3">: </span><span class="s4">'underscore'</span><span class="s3">,</span>
+    <span class="s5">96</span><span class="s3">: </span><span class="s4">'quoteleft'</span><span class="s3">,</span>
+    <span class="s5">123</span><span class="s3">: </span><span class="s4">'braceleft'</span><span class="s3">,</span>
+    <span class="s5">124</span><span class="s3">: </span><span class="s4">'bar'</span><span class="s3">,</span>
+    <span class="s5">125</span><span class="s3">: </span><span class="s4">'braceright'</span><span class="s3">,</span>
+    <span class="s5">126</span><span class="s3">: </span><span class="s4">'asciitilde'</span><span class="s3">,</span>
+    <span class="s5">161</span><span class="s3">: </span><span class="s4">'exclamdown'</span><span class="s3">,</span>
+    <span class="s5">162</span><span class="s3">: </span><span class="s4">'cent'</span><span class="s3">,</span>
+    <span class="s5">163</span><span class="s3">: </span><span class="s4">'sterling'</span><span class="s3">,</span>
+    <span class="s5">164</span><span class="s3">: </span><span class="s4">'fraction'</span><span class="s3">,</span>
+    <span class="s5">165</span><span class="s3">: </span><span class="s4">'yen'</span><span class="s3">,</span>
+    <span class="s5">166</span><span class="s3">: </span><span class="s4">'florin'</span><span class="s3">,</span>
+    <span class="s5">167</span><span class="s3">: </span><span class="s4">'section'</span><span class="s3">,</span>
+    <span class="s5">168</span><span class="s3">: </span><span class="s4">'currency'</span><span class="s3">,</span>
+    <span class="s5">169</span><span class="s3">: </span><span class="s4">'quotesingle'</span><span class="s3">,</span>
+    <span class="s5">170</span><span class="s3">: </span><span class="s4">'quotedblleft'</span><span class="s3">,</span>
+    <span class="s5">171</span><span class="s3">: </span><span class="s4">'guillemotleft'</span><span class="s3">,</span>
+    <span class="s5">172</span><span class="s3">: </span><span class="s4">'guilsinglleft'</span><span class="s3">,</span>
+    <span class="s5">173</span><span class="s3">: </span><span class="s4">'guilsinglright'</span><span class="s3">,</span>
+    <span class="s5">174</span><span class="s3">: </span><span class="s4">'fi'</span><span class="s3">,</span>
+    <span class="s5">175</span><span class="s3">: </span><span class="s4">'fl'</span><span class="s3">,</span>
+    <span class="s5">177</span><span class="s3">: </span><span class="s4">'endash'</span><span class="s3">,</span>
+    <span class="s5">178</span><span class="s3">: </span><span class="s4">'dagger'</span><span class="s3">,</span>
+    <span class="s5">179</span><span class="s3">: </span><span class="s4">'daggerdbl'</span><span class="s3">,</span>
+    <span class="s5">180</span><span class="s3">: </span><span class="s4">'periodcentered'</span><span class="s3">,</span>
+    <span class="s5">182</span><span class="s3">: </span><span class="s4">'paragraph'</span><span class="s3">,</span>
+    <span class="s5">183</span><span class="s3">: </span><span class="s4">'bullet'</span><span class="s3">,</span>
+    <span class="s5">184</span><span class="s3">: </span><span class="s4">'quotesinglbase'</span><span class="s3">,</span>
+    <span class="s5">185</span><span class="s3">: </span><span class="s4">'quotedblbase'</span><span class="s3">,</span>
+    <span class="s5">186</span><span class="s3">: </span><span class="s4">'quotedblright'</span><span class="s3">,</span>
+    <span class="s5">187</span><span class="s3">: </span><span class="s4">'guillemotright'</span><span class="s3">,</span>
+    <span class="s5">188</span><span class="s3">: </span><span class="s4">'ellipsis'</span><span class="s3">,</span>
+    <span class="s5">189</span><span class="s3">: </span><span class="s4">'perthousand'</span><span class="s3">,</span>
+    <span class="s5">191</span><span class="s3">: </span><span class="s4">'questiondown'</span><span class="s3">,</span>
+    <span class="s5">193</span><span class="s3">: </span><span class="s4">'grave'</span><span class="s3">,</span>
+    <span class="s5">194</span><span class="s3">: </span><span class="s4">'acute'</span><span class="s3">,</span>
+    <span class="s5">195</span><span class="s3">: </span><span class="s4">'circumflex'</span><span class="s3">,</span>
+    <span class="s5">196</span><span class="s3">: </span><span class="s4">'tilde'</span><span class="s3">,</span>
+    <span class="s5">197</span><span class="s3">: </span><span class="s4">'macron'</span><span class="s3">,</span>
+    <span class="s5">198</span><span class="s3">: </span><span class="s4">'breve'</span><span class="s3">,</span>
+    <span class="s5">199</span><span class="s3">: </span><span class="s4">'dotaccent'</span><span class="s3">,</span>
+    <span class="s5">200</span><span class="s3">: </span><span class="s4">'dieresis'</span><span class="s3">,</span>
+    <span class="s5">202</span><span class="s3">: </span><span class="s4">'ring'</span><span class="s3">,</span>
+    <span class="s5">203</span><span class="s3">: </span><span class="s4">'cedilla'</span><span class="s3">,</span>
+    <span class="s5">205</span><span class="s3">: </span><span class="s4">'hungarumlaut'</span><span class="s3">,</span>
+    <span class="s5">206</span><span class="s3">: </span><span class="s4">'ogonek'</span><span class="s3">,</span>
+    <span class="s5">207</span><span class="s3">: </span><span class="s4">'caron'</span><span class="s3">,</span>
+    <span class="s5">208</span><span class="s3">: </span><span class="s4">'emdash'</span><span class="s3">,</span>
+    <span class="s5">225</span><span class="s3">: </span><span class="s4">'AE'</span><span class="s3">,</span>
+    <span class="s5">227</span><span class="s3">: </span><span class="s4">'ordfeminine'</span><span class="s3">,</span>
+    <span class="s5">232</span><span class="s3">: </span><span class="s4">'Lslash'</span><span class="s3">,</span>
+    <span class="s5">233</span><span class="s3">: </span><span class="s4">'Oslash'</span><span class="s3">,</span>
+    <span class="s5">234</span><span class="s3">: </span><span class="s4">'OE'</span><span class="s3">,</span>
+    <span class="s5">235</span><span class="s3">: </span><span class="s4">'ordmasculine'</span><span class="s3">,</span>
+    <span class="s5">241</span><span class="s3">: </span><span class="s4">'ae'</span><span class="s3">,</span>
+    <span class="s5">245</span><span class="s3">: </span><span class="s4">'dotlessi'</span><span class="s3">,</span>
+    <span class="s5">248</span><span class="s3">: </span><span class="s4">'lslash'</span><span class="s3">,</span>
+    <span class="s5">249</span><span class="s3">: </span><span class="s4">'oslash'</span><span class="s3">,</span>
+    <span class="s5">250</span><span class="s3">: </span><span class="s4">'oe'</span><span class="s3">,</span>
+    <span class="s5">251</span><span class="s3">: </span><span class="s4">'germandbls'</span><span class="s3">,</span>
+<span class="s3">}</span>
+</pre>
+</body>
+</html>

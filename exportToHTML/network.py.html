@@ -1,0 +1,694 @@
+<html>
+<head>
+<title>network.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #5f826b; font-style: italic;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #cf8e6d;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+network.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Copyright (c) 2023, 2024, Oracle and/or its affiliates.</span>
+<span class="s0">#</span>
+<span class="s0"># This program is free software; you can redistribute it and/or modify</span>
+<span class="s0"># it under the terms of the GNU General Public License, version 2.0, as</span>
+<span class="s0"># published by the Free Software Foundation.</span>
+<span class="s0">#</span>
+<span class="s0"># This program is designed to work with certain software (including</span>
+<span class="s0"># but not limited to OpenSSL) that is licensed under separate terms,</span>
+<span class="s0"># as designated in a particular file or component or in included license</span>
+<span class="s0"># documentation. The authors of MySQL hereby grant you an</span>
+<span class="s0"># additional permission to link the program and your derivative works</span>
+<span class="s0"># with the separately licensed software that they have either included with</span>
+<span class="s0"># the program or referenced in the documentation.</span>
+<span class="s0">#</span>
+<span class="s0"># Without limiting anything contained in the foregoing, this file,</span>
+<span class="s0"># which is part of MySQL Connector/Python, is also subject to the</span>
+<span class="s0"># Universal FOSS Exception, version 1.0, a copy of which can be found at</span>
+<span class="s0"># http://oss.oracle.com/licenses/universal-foss-exception.</span>
+<span class="s0">#</span>
+<span class="s0"># This program is distributed in the hope that it will be useful, but</span>
+<span class="s0"># WITHOUT ANY WARRANTY; without even the implied warranty of</span>
+<span class="s0"># MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.</span>
+<span class="s0"># See the GNU General Public License, version 2.0, for more details.</span>
+<span class="s0">#</span>
+<span class="s0"># You should have received a copy of the GNU General Public License</span>
+<span class="s0"># along with this program; if not, write to the Free Software Foundation, Inc.,</span>
+<span class="s0"># 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA</span>
+
+<span class="s0"># pylint: disable=dangerous-default-value</span>
+
+<span class="s2">&quot;&quot;&quot;Module implementing low-level socket communication with MySQL servers.&quot;&quot;&quot;</span>
+
+
+<span class="s1">__all__ </span><span class="s3">= [</span><span class="s4">&quot;MySQLTcpSocket&quot;</span><span class="s3">, </span><span class="s4">&quot;MySQLUnixSocket&quot;</span><span class="s3">]</span>
+
+<span class="s5">import </span><span class="s1">asyncio</span>
+<span class="s5">import </span><span class="s1">struct</span>
+<span class="s5">import </span><span class="s1">zlib</span>
+
+<span class="s5">try</span><span class="s3">:</span>
+    <span class="s5">import </span><span class="s1">ssl</span>
+
+    <span class="s1">TLS_VERSIONS </span><span class="s3">= {</span>
+        <span class="s4">&quot;TLSv1&quot;</span><span class="s3">: </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">PROTOCOL_TLSv1</span><span class="s3">,</span>
+        <span class="s4">&quot;TLSv1.1&quot;</span><span class="s3">: </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">PROTOCOL_TLSv1_1</span><span class="s3">,</span>
+        <span class="s4">&quot;TLSv1.2&quot;</span><span class="s3">: </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">PROTOCOL_TLSv1_2</span><span class="s3">,</span>
+        <span class="s4">&quot;TLSv1.3&quot;</span><span class="s3">: </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">PROTOCOL_TLS</span><span class="s3">,</span>
+    <span class="s3">}</span>
+<span class="s5">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s1">ssl </span><span class="s3">= </span><span class="s5">None</span>
+
+<span class="s5">from </span><span class="s1">abc </span><span class="s5">import </span><span class="s1">ABC</span><span class="s3">, </span><span class="s1">abstractmethod</span>
+<span class="s5">from </span><span class="s1">collections </span><span class="s5">import </span><span class="s1">deque</span>
+<span class="s5">from </span><span class="s1">typing </span><span class="s5">import </span><span class="s1">Any</span><span class="s3">, </span><span class="s1">Deque</span><span class="s3">, </span><span class="s1">List</span><span class="s3">, </span><span class="s1">Optional</span><span class="s3">, </span><span class="s1">Tuple</span>
+
+<span class="s5">from </span><span class="s3">..</span><span class="s1">errors </span><span class="s5">import </span><span class="s3">(</span>
+    <span class="s1">InterfaceError</span><span class="s3">,</span>
+    <span class="s1">NotSupportedError</span><span class="s3">,</span>
+    <span class="s1">OperationalError</span><span class="s3">,</span>
+    <span class="s1">ProgrammingError</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s5">from </span><span class="s3">..</span><span class="s1">network </span><span class="s5">import </span><span class="s3">(</span>
+    <span class="s1">COMPRESSED_PACKET_HEADER_LENGTH</span><span class="s3">,</span>
+    <span class="s1">MAX_PAYLOAD_LENGTH</span><span class="s3">,</span>
+    <span class="s1">MIN_COMPRESS_LENGTH</span><span class="s3">,</span>
+    <span class="s1">PACKET_HEADER_LENGTH</span><span class="s3">,</span>
+<span class="s3">)</span>
+<span class="s5">from </span><span class="s3">.</span><span class="s1">utils </span><span class="s5">import </span><span class="s1">StreamWriter</span><span class="s3">, </span><span class="s1">open_connection</span>
+
+
+<span class="s5">def </span><span class="s1">_strioerror</span><span class="s3">(</span><span class="s1">err</span><span class="s3">: </span><span class="s1">IOError</span><span class="s3">) </span><span class="s1">-&gt; str</span><span class="s3">:</span>
+    <span class="s2">&quot;&quot;&quot;Reformat the IOError error message. 
+ 
+    This function reformats the IOError error message. 
+    &quot;&quot;&quot;</span>
+    <span class="s5">return </span><span class="s1">str</span><span class="s3">(</span><span class="s1">err</span><span class="s3">) </span><span class="s5">if not </span><span class="s1">err</span><span class="s3">.</span><span class="s1">errno </span><span class="s5">else </span><span class="s4">f&quot;</span><span class="s5">{</span><span class="s1">err</span><span class="s3">.</span><span class="s1">errno</span><span class="s5">} {</span><span class="s1">err</span><span class="s3">.</span><span class="s1">strerror</span><span class="s5">}</span><span class="s4">&quot;</span>
+
+
+<span class="s5">class </span><span class="s1">NetworkBroker</span><span class="s3">(</span><span class="s1">ABC</span><span class="s3">):</span>
+    <span class="s2">&quot;&quot;&quot;Broker class interface. 
+ 
+    The network object is a broker used as a delegate by a socket object. Whenever the 
+    socket wants to deliver or get packets to or from the MySQL server it needs to rely 
+    on its network broker (netbroker). 
+ 
+    The netbroker sends `payloads` and receives `packets`. 
+ 
+    A packet is a bytes sequence, it has a header and body (referred to as payload). 
+    The first `PACKET_HEADER_LENGTH` or `COMPRESSED_PACKET_HEADER_LENGTH` 
+    (as appropriate) bytes correspond to the `header`, the remaining ones represent the 
+    `payload`. 
+ 
+    The maximum payload length allowed to be sent per packet to the server is 
+    `MAX_PAYLOAD_LENGTH`. When  `send` is called with a payload whose length is greater 
+    than `MAX_PAYLOAD_LENGTH` the netbroker breaks it down into packets, so the caller 
+    of `send` can provide payloads of arbitrary length. 
+ 
+    Finally, data received by the netbroker comes directly from the server, expect to 
+    get a packet for each call to `recv`. The received packet contains a header and 
+    payload, the latter respecting `MAX_PAYLOAD_LENGTH`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s5">async def </span><span class="s1">write</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">writer</span><span class="s3">: </span><span class="s1">StreamWriter</span><span class="s3">,</span>
+        <span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">,</span>
+        <span class="s1">payload</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">,</span>
+        <span class="s1">packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+        <span class="s1">compressed_packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+    <span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Send `payload` to the MySQL server. 
+ 
+        If provided a payload whose length is greater than `MAX_PAYLOAD_LENGTH`, it is 
+        broken down into packets. 
+ 
+        Args: 
+            sock: Object holding the socket connection. 
+            address: Socket's location. 
+            payload: Packet's body to send. 
+            packet_number: Sequence id (packet ID) to attach to the header when sending 
+                           plain packets. 
+            compressed_packet_number: Same as `packet_number` but used when sending 
+                                      compressed packets. 
+ 
+        Raises: 
+            :class:`OperationalError`: If something goes wrong while sending packets to 
+                                       the MySQL server. 
+        &quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s5">async def </span><span class="s1">read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">: </span><span class="s1">asyncio</span><span class="s3">.</span><span class="s1">StreamReader</span><span class="s3">, </span><span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">) </span><span class="s1">-&gt; bytearray</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Get the next available packet from the MySQL server. 
+ 
+        Args: 
+            sock: Object holding the socket connection. 
+            address: Socket's location. 
+ 
+        Returns: 
+            packet: A packet from the MySQL server. 
+ 
+        Raises: 
+            :class:`OperationalError`: If something goes wrong while receiving packets 
+                                       from the MySQL server. 
+            :class:`InterfaceError`: If something goes wrong while receiving packets 
+                                     from the MySQL server. 
+        &quot;&quot;&quot;</span>
+
+
+<span class="s5">class </span><span class="s1">NetworkBrokerPlain</span><span class="s3">(</span><span class="s1">NetworkBroker</span><span class="s3">):</span>
+    <span class="s2">&quot;&quot;&quot;Broker class for MySQL socket communication.&quot;&quot;&quot;</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr</span><span class="s3">: </span><span class="s1">int </span><span class="s3">= -</span><span class="s6">1  </span><span class="s0"># packet number</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s5">def </span><span class="s1">get_header</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">) </span><span class="s1">-&gt; Tuple</span><span class="s3">[</span><span class="s1">int</span><span class="s3">, </span><span class="s1">int</span><span class="s3">]:</span>
+        <span class="s2">&quot;&quot;&quot;Recover the header information from a packet.&quot;&quot;&quot;</span>
+        <span class="s5">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">) &lt; </span><span class="s1">PACKET_HEADER_LENGTH</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Can't recover header info from an incomplete packet&quot;</span><span class="s3">)</span>
+
+        <span class="s1">pll</span><span class="s3">, </span><span class="s1">seqid </span><span class="s3">= (</span>
+            <span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">pkt</span><span class="s3">[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">] + </span><span class="s7">b&quot;</span><span class="s5">\x00</span><span class="s7">&quot;</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">],</span>
+            <span class="s1">pkt</span><span class="s3">[</span><span class="s6">3</span><span class="s3">],</span>
+        <span class="s3">)</span>
+        <span class="s0"># payload length, sequence id</span>
+        <span class="s5">return </span><span class="s1">pll</span><span class="s3">, </span><span class="s1">seqid</span>
+
+    <span class="s5">def </span><span class="s1">_set_next_pktnr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">next_id</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Set the given packet id, if any, else increment packet id.&quot;&quot;&quot;</span>
+        <span class="s5">if </span><span class="s1">next_id </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr </span><span class="s3">+= </span><span class="s6">1</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr </span><span class="s3">= </span><span class="s1">next_id</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr </span><span class="s3">%= </span><span class="s6">256</span>
+
+    <span class="s5">async def </span><span class="s1">_write_pkt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">: </span><span class="s1">StreamWriter</span><span class="s3">, </span><span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">, </span><span class="s1">pkt</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Write packet to the comm channel.&quot;&quot;&quot;</span>
+        <span class="s5">try</span><span class="s3">:</span>
+            <span class="s1">writer</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">)</span>
+            <span class="s5">await </span><span class="s1">writer</span><span class="s3">.</span><span class="s1">drain</span><span class="s3">()</span>
+        <span class="s5">except </span><span class="s1">IOError </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">OperationalError</span><span class="s3">(</span>
+                <span class="s1">errno</span><span class="s3">=</span><span class="s6">2055</span><span class="s3">, </span><span class="s1">values</span><span class="s3">=(</span><span class="s1">address</span><span class="s3">, </span><span class="s1">_strioerror</span><span class="s3">(</span><span class="s1">err</span><span class="s3">))</span>
+            <span class="s3">) </span><span class="s5">from </span><span class="s1">err</span>
+        <span class="s5">except </span><span class="s1">AttributeError </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">OperationalError</span><span class="s3">(</span><span class="s1">errno</span><span class="s3">=</span><span class="s6">2006</span><span class="s3">) </span><span class="s5">from </span><span class="s1">err</span>
+
+    <span class="s5">async def </span><span class="s1">_read_chunk</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">: </span><span class="s1">asyncio</span><span class="s3">.</span><span class="s1">StreamReader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">: </span><span class="s1">int </span><span class="s3">= </span><span class="s6">0</span>
+    <span class="s3">) </span><span class="s1">-&gt; bytearray</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Read `size` bytes from the comm channel.&quot;&quot;&quot;</span>
+        <span class="s1">pkt </span><span class="s3">= </span><span class="s1">bytearray</span><span class="s3">(</span><span class="s7">b&quot;&quot;</span><span class="s3">)</span>
+        <span class="s5">while </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">) &lt; </span><span class="s1">size</span><span class="s3">:</span>
+            <span class="s1">chunk </span><span class="s3">= </span><span class="s5">await </span><span class="s1">reader</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">size </span><span class="s3">- </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">))</span>
+            <span class="s5">if not </span><span class="s1">chunk</span><span class="s3">:</span>
+                <span class="s5">raise </span><span class="s1">InterfaceError</span><span class="s3">(</span><span class="s1">errno</span><span class="s3">=</span><span class="s6">2013</span><span class="s3">)</span>
+            <span class="s1">pkt </span><span class="s3">+= </span><span class="s1">chunk</span>
+        <span class="s5">return </span><span class="s1">pkt</span>
+
+    <span class="s5">async def </span><span class="s1">write</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">writer</span><span class="s3">: </span><span class="s1">StreamWriter</span><span class="s3">,</span>
+        <span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">,</span>
+        <span class="s1">payload</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">,</span>
+        <span class="s1">packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+        <span class="s1">compressed_packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+    <span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Send payload to the MySQL server. 
+ 
+        If provided a payload whose length is greater than `MAX_PAYLOAD_LENGTH`, it is 
+        broken down into packets. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_next_pktnr</span><span class="s3">(</span><span class="s1">packet_number</span><span class="s3">)</span>
+
+        <span class="s0"># If the payload is larger than or equal to MAX_PAYLOAD_LENGTH the length is</span>
+        <span class="s0"># set to 2^24 - 1 (ff ff ff) and additional packets are sent with the rest of</span>
+        <span class="s0"># the payload until the payload of a packet is less than MAX_PAYLOAD_LENGTH.</span>
+        <span class="s1">offset </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s5">for </span><span class="s1">_ </span><span class="s5">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">) // </span><span class="s1">MAX_PAYLOAD_LENGTH</span><span class="s3">):</span>
+            <span class="s0"># payload_len, sequence_id, payload</span>
+            <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_write_pkt</span><span class="s3">(</span>
+                <span class="s1">writer</span><span class="s3">,</span>
+                <span class="s1">address</span><span class="s3">,</span>
+                <span class="s7">b&quot;</span><span class="s5">\xff</span><span class="s7">&quot; </span><span class="s3">* </span><span class="s6">3</span>
+                <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;B&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr</span><span class="s3">)</span>
+                <span class="s3">+ </span><span class="s1">payload</span><span class="s3">[</span><span class="s1">offset </span><span class="s3">: </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">MAX_PAYLOAD_LENGTH</span><span class="s3">],</span>
+            <span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_next_pktnr</span><span class="s3">()</span>
+            <span class="s1">offset </span><span class="s3">+= </span><span class="s1">MAX_PAYLOAD_LENGTH</span>
+        <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_write_pkt</span><span class="s3">(</span>
+            <span class="s1">writer</span><span class="s3">,</span>
+            <span class="s1">address</span><span class="s3">,</span>
+            <span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">) - </span><span class="s1">offset</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">]</span>
+            <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;B&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr</span><span class="s3">)</span>
+            <span class="s3">+ </span><span class="s1">payload</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">:],</span>
+        <span class="s3">)</span>
+
+    <span class="s5">async def </span><span class="s1">read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">: </span><span class="s1">asyncio</span><span class="s3">.</span><span class="s1">StreamReader</span><span class="s3">, </span><span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">) </span><span class="s1">-&gt; bytearray</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Receive `one` packet from the MySQL server.&quot;&quot;&quot;</span>
+        <span class="s5">try</span><span class="s3">:</span>
+            <span class="s0"># Read the header of the MySQL packet.</span>
+            <span class="s1">header </span><span class="s3">= </span><span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_read_chunk</span><span class="s3">(</span><span class="s1">reader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=</span><span class="s1">PACKET_HEADER_LENGTH</span><span class="s3">)</span>
+
+            <span class="s0"># Pull the payload length and sequence id.</span>
+            <span class="s1">payload_len</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_header</span><span class="s3">(</span><span class="s1">header</span><span class="s3">)</span>
+
+            <span class="s0"># Read the payload, and return packet.</span>
+            <span class="s5">return </span><span class="s1">header </span><span class="s3">+ </span><span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_read_chunk</span><span class="s3">(</span><span class="s1">reader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=</span><span class="s1">payload_len</span><span class="s3">)</span>
+        <span class="s5">except </span><span class="s1">IOError </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">OperationalError</span><span class="s3">(</span>
+                <span class="s1">errno</span><span class="s3">=</span><span class="s6">2055</span><span class="s3">, </span><span class="s1">values</span><span class="s3">=(</span><span class="s1">address</span><span class="s3">, </span><span class="s1">_strioerror</span><span class="s3">(</span><span class="s1">err</span><span class="s3">))</span>
+            <span class="s3">) </span><span class="s5">from </span><span class="s1">err</span>
+
+
+<span class="s5">class </span><span class="s1">NetworkBrokerCompressed</span><span class="s3">(</span><span class="s1">NetworkBrokerPlain</span><span class="s3">):</span>
+    <span class="s2">&quot;&quot;&quot;Broker class for MySQL socket communication.&quot;&quot;&quot;</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr </span><span class="s3">= -</span><span class="s6">1</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_queue_read</span><span class="s3">: </span><span class="s1">Deque</span><span class="s3">[</span><span class="s1">bytearray</span><span class="s3">] = </span><span class="s1">deque</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s5">def </span><span class="s1">_prepare_packets</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">, </span><span class="s1">pktnr</span><span class="s3">: </span><span class="s1">int</span><span class="s3">) </span><span class="s1">-&gt; List</span><span class="s3">[</span><span class="s1">bytes</span><span class="s3">]:</span>
+        <span class="s2">&quot;&quot;&quot;Prepare a payload for sending to the MySQL server.&quot;&quot;&quot;</span>
+        <span class="s1">offset </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s1">pkts </span><span class="s3">= []</span>
+
+        <span class="s0"># If the payload is larger than or equal to MAX_PAYLOAD_LENGTH the length is</span>
+        <span class="s0"># set to 2^24 - 1 (ff ff ff) and additional packets are sent with the rest of</span>
+        <span class="s0"># the payload until the payload of a packet is less than MAX_PAYLOAD_LENGTH.</span>
+        <span class="s5">for </span><span class="s1">_ </span><span class="s5">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">) // </span><span class="s1">MAX_PAYLOAD_LENGTH</span><span class="s3">):</span>
+            <span class="s0"># payload length + sequence id + payload</span>
+            <span class="s1">pkts</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                <span class="s7">b&quot;</span><span class="s5">\xff</span><span class="s7">&quot; </span><span class="s3">* </span><span class="s6">3</span>
+                <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;B&quot;</span><span class="s3">, </span><span class="s1">pktnr</span><span class="s3">)</span>
+                <span class="s3">+ </span><span class="s1">payload</span><span class="s3">[</span><span class="s1">offset </span><span class="s3">: </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">MAX_PAYLOAD_LENGTH</span><span class="s3">]</span>
+            <span class="s3">)</span>
+            <span class="s1">pktnr </span><span class="s3">= (</span><span class="s1">pktnr </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">) % </span><span class="s6">256</span>
+            <span class="s1">offset </span><span class="s3">+= </span><span class="s1">MAX_PAYLOAD_LENGTH</span>
+        <span class="s1">pkts</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+            <span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">) - </span><span class="s1">offset</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">]</span>
+            <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;B&quot;</span><span class="s3">, </span><span class="s1">pktnr</span><span class="s3">)</span>
+            <span class="s3">+ </span><span class="s1">payload</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">:]</span>
+        <span class="s3">)</span>
+        <span class="s5">return </span><span class="s1">pkts</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s5">def </span><span class="s1">get_header</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">) </span><span class="s1">-&gt; Tuple</span><span class="s3">[</span><span class="s1">int</span><span class="s3">, </span><span class="s1">int</span><span class="s3">, </span><span class="s1">int</span><span class="s3">]:  </span><span class="s0"># type: ignore[override]</span>
+        <span class="s2">&quot;&quot;&quot;Recover the header information from a packet.&quot;&quot;&quot;</span>
+        <span class="s5">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">) &lt; </span><span class="s1">COMPRESSED_PACKET_HEADER_LENGTH</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Can't recover header info from an incomplete packet&quot;</span><span class="s3">)</span>
+
+        <span class="s1">compressed_pll</span><span class="s3">, </span><span class="s1">seqid</span><span class="s3">, </span><span class="s1">uncompressed_pll </span><span class="s3">= (</span>
+            <span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">pkt</span><span class="s3">[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">] + </span><span class="s7">b&quot;</span><span class="s5">\x00</span><span class="s7">&quot;</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">],</span>
+            <span class="s1">pkt</span><span class="s3">[</span><span class="s6">3</span><span class="s3">],</span>
+            <span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">pkt</span><span class="s3">[</span><span class="s6">4</span><span class="s3">:</span><span class="s6">7</span><span class="s3">] + </span><span class="s7">b&quot;</span><span class="s5">\x00</span><span class="s7">&quot;</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">],</span>
+        <span class="s3">)</span>
+        <span class="s0"># compressed payload length, sequence id, uncompressed payload length</span>
+        <span class="s5">return </span><span class="s1">compressed_pll</span><span class="s3">, </span><span class="s1">seqid</span><span class="s3">, </span><span class="s1">uncompressed_pll</span>
+
+    <span class="s5">def </span><span class="s1">_set_next_compressed_pktnr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">next_id</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Set the given packet id, if any, else increment packet id.&quot;&quot;&quot;</span>
+        <span class="s5">if </span><span class="s1">next_id </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr </span><span class="s3">+= </span><span class="s6">1</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr </span><span class="s3">= </span><span class="s1">next_id</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr </span><span class="s3">%= </span><span class="s6">256</span>
+
+    <span class="s5">async def </span><span class="s1">_write_pkt</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">writer</span><span class="s3">: </span><span class="s1">StreamWriter</span><span class="s3">, </span><span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">, </span><span class="s1">pkt</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Compress packet and write it to the comm channel.&quot;&quot;&quot;</span>
+        <span class="s1">compressed_pkt </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">compress</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">)</span>
+        <span class="s1">pkt </span><span class="s3">= (</span>
+            <span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">compressed_pkt</span><span class="s3">))[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">]</span>
+            <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;B&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr</span><span class="s3">)</span>
+            <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">))[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">]</span>
+            <span class="s3">+ </span><span class="s1">compressed_pkt</span>
+        <span class="s3">)</span>
+        <span class="s5">return await </span><span class="s1">super</span><span class="s3">().</span><span class="s1">_write_pkt</span><span class="s3">(</span><span class="s1">writer</span><span class="s3">, </span><span class="s1">address</span><span class="s3">, </span><span class="s1">pkt</span><span class="s3">)</span>
+
+    <span class="s5">async def </span><span class="s1">write</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">writer</span><span class="s3">: </span><span class="s1">StreamWriter</span><span class="s3">,</span>
+        <span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">,</span>
+        <span class="s1">payload</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">,</span>
+        <span class="s1">packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+        <span class="s1">compressed_packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+    <span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Send `payload` as compressed packets to the MySQL server. 
+ 
+        If provided a payload whose length is greater than `MAX_PAYLOAD_LENGTH`, it is 
+        broken down into packets. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Get next packet numbers.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_next_pktnr</span><span class="s3">(</span><span class="s1">packet_number</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_next_compressed_pktnr</span><span class="s3">(</span><span class="s1">compressed_packet_number</span><span class="s3">)</span>
+
+        <span class="s1">payload_prep </span><span class="s3">= </span><span class="s1">bytearray</span><span class="s3">(</span><span class="s7">b&quot;&quot;</span><span class="s3">).</span><span class="s1">join</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_prepare_packets</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr</span><span class="s3">))</span>
+        <span class="s5">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">) &gt;= </span><span class="s1">MAX_PAYLOAD_LENGTH </span><span class="s3">- </span><span class="s1">PACKET_HEADER_LENGTH</span><span class="s3">:</span>
+            <span class="s0"># Sending a MySQL payload of the size greater or equal to 2^24 - 5 via</span>
+            <span class="s0"># compression leads to at least one extra compressed packet WHY? let's say</span>
+            <span class="s0"># len(payload) is MAX_PAYLOAD_LENGTH - 3; when preparing the payload, a</span>
+            <span class="s0"># header of size PACKET_HEADER_LENGTH is pre-appended to the payload.</span>
+            <span class="s0"># This means that len(payload_prep) is</span>
+            <span class="s0"># MAX_PAYLOAD_LENGTH - 3 + PACKET_HEADER_LENGTH = MAX_PAYLOAD_LENGTH + 1</span>
+            <span class="s0"># surpassing the maximum allowed payload size per packet.</span>
+            <span class="s1">offset </span><span class="s3">= </span><span class="s6">0</span>
+
+            <span class="s0"># Send several MySQL packets.</span>
+            <span class="s5">for </span><span class="s1">_ </span><span class="s5">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload_prep</span><span class="s3">) // </span><span class="s1">MAX_PAYLOAD_LENGTH</span><span class="s3">):</span>
+                <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_write_pkt</span><span class="s3">(</span>
+                    <span class="s1">writer</span><span class="s3">, </span><span class="s1">address</span><span class="s3">, </span><span class="s1">payload_prep</span><span class="s3">[</span><span class="s1">offset </span><span class="s3">: </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">MAX_PAYLOAD_LENGTH</span><span class="s3">]</span>
+                <span class="s3">)</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_set_next_compressed_pktnr</span><span class="s3">()</span>
+                <span class="s1">offset </span><span class="s3">+= </span><span class="s1">MAX_PAYLOAD_LENGTH</span>
+            <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_write_pkt</span><span class="s3">(</span><span class="s1">writer</span><span class="s3">, </span><span class="s1">address</span><span class="s3">, </span><span class="s1">payload_prep</span><span class="s3">[</span><span class="s1">offset</span><span class="s3">:])</span>
+        <span class="s5">else</span><span class="s3">:</span>
+            <span class="s0"># Send one MySQL packet.</span>
+            <span class="s0"># For small packets it may be too costly to compress the packet.</span>
+            <span class="s0"># Usually payloads less than 50 bytes (MIN_COMPRESS_LENGTH) aren't</span>
+            <span class="s0"># compressed (see MySQL source code Documentation).</span>
+            <span class="s5">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload</span><span class="s3">) &gt; </span><span class="s1">MIN_COMPRESS_LENGTH</span><span class="s3">:</span>
+                <span class="s0"># Perform compression.</span>
+                <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_write_pkt</span><span class="s3">(</span><span class="s1">writer</span><span class="s3">, </span><span class="s1">address</span><span class="s3">, </span><span class="s1">payload_prep</span><span class="s3">)</span>
+            <span class="s5">else</span><span class="s3">:</span>
+                <span class="s0"># Skip compression.</span>
+                <span class="s5">await </span><span class="s1">super</span><span class="s3">().</span><span class="s1">_write_pkt</span><span class="s3">(</span>
+                    <span class="s1">writer</span><span class="s3">,</span>
+                    <span class="s1">address</span><span class="s3">,</span>
+                    <span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">len</span><span class="s3">(</span><span class="s1">payload_prep</span><span class="s3">))[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">]</span>
+                    <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;B&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr</span><span class="s3">)</span>
+                    <span class="s3">+ </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">(</span><span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s6">0</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">:</span><span class="s6">3</span><span class="s3">]</span>
+                    <span class="s3">+ </span><span class="s1">payload_prep</span><span class="s3">,</span>
+                <span class="s3">)</span>
+
+    <span class="s5">async def </span><span class="s1">_read_compressed_pkt</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">: </span><span class="s1">asyncio</span><span class="s3">.</span><span class="s1">StreamReader</span><span class="s3">, </span><span class="s1">compressed_pll</span><span class="s3">: </span><span class="s1">int</span>
+    <span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Handle reading of a compressed packet.&quot;&quot;&quot;</span>
+        <span class="s0"># compressed_pll stands for compressed payload length.</span>
+        <span class="s1">pkt </span><span class="s3">= </span><span class="s1">bytearray</span><span class="s3">(</span>
+            <span class="s1">zlib</span><span class="s3">.</span><span class="s1">decompress</span><span class="s3">(</span><span class="s5">await </span><span class="s1">super</span><span class="s3">().</span><span class="s1">_read_chunk</span><span class="s3">(</span><span class="s1">reader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=</span><span class="s1">compressed_pll</span><span class="s3">))</span>
+        <span class="s3">)</span>
+        <span class="s1">offset </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s5">while </span><span class="s1">offset </span><span class="s3">&lt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">):</span>
+            <span class="s0"># pll stands for payload length</span>
+            <span class="s1">pll </span><span class="s3">= </span><span class="s1">struct</span><span class="s3">.</span><span class="s1">unpack</span><span class="s3">(</span>
+                <span class="s4">&quot;&lt;I&quot;</span><span class="s3">, </span><span class="s1">pkt</span><span class="s3">[</span><span class="s1">offset </span><span class="s3">: </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">PACKET_HEADER_LENGTH </span><span class="s3">- </span><span class="s6">1</span><span class="s3">] + </span><span class="s7">b&quot;</span><span class="s5">\x00</span><span class="s7">&quot;</span>
+            <span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+            <span class="s5">if </span><span class="s1">PACKET_HEADER_LENGTH </span><span class="s3">+ </span><span class="s1">pll </span><span class="s3">&gt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">) - </span><span class="s1">offset</span><span class="s3">:</span>
+                <span class="s0"># More bytes need to be consumed.</span>
+                <span class="s0"># Read the header of the next MySQL packet.</span>
+                <span class="s1">header </span><span class="s3">= </span><span class="s5">await </span><span class="s1">super</span><span class="s3">().</span><span class="s1">_read_chunk</span><span class="s3">(</span>
+                    <span class="s1">reader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=</span><span class="s1">COMPRESSED_PACKET_HEADER_LENGTH</span>
+                <span class="s3">)</span>
+
+                <span class="s0"># compressed payload length, sequence id, uncompressed payload length.</span>
+                <span class="s3">(</span>
+                    <span class="s1">compressed_pll</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr</span><span class="s3">,</span>
+                    <span class="s1">uncompressed_pll</span><span class="s3">,</span>
+                <span class="s3">) = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_header</span><span class="s3">(</span><span class="s1">header</span><span class="s3">)</span>
+                <span class="s1">compressed_pkt </span><span class="s3">= </span><span class="s5">await </span><span class="s1">super</span><span class="s3">().</span><span class="s1">_read_chunk</span><span class="s3">(</span><span class="s1">reader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=</span><span class="s1">compressed_pll</span><span class="s3">)</span>
+
+                <span class="s0"># Recalling that if uncompressed payload length == 0, the packet comes</span>
+                <span class="s0"># in uncompressed, so no decompression is needed.</span>
+                <span class="s1">pkt </span><span class="s3">+= (</span>
+                    <span class="s1">compressed_pkt</span>
+                    <span class="s5">if </span><span class="s1">uncompressed_pll </span><span class="s3">== </span><span class="s6">0</span>
+                    <span class="s5">else </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">decompress</span><span class="s3">(</span><span class="s1">compressed_pkt</span><span class="s3">)</span>
+                <span class="s3">)</span>
+
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_queue_read</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">pkt</span><span class="s3">[</span><span class="s1">offset </span><span class="s3">: </span><span class="s1">offset </span><span class="s3">+ </span><span class="s1">PACKET_HEADER_LENGTH </span><span class="s3">+ </span><span class="s1">pll</span><span class="s3">])</span>
+            <span class="s1">offset </span><span class="s3">+= </span><span class="s1">PACKET_HEADER_LENGTH </span><span class="s3">+ </span><span class="s1">pll</span>
+
+    <span class="s5">async def </span><span class="s1">read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">reader</span><span class="s3">: </span><span class="s1">asyncio</span><span class="s3">.</span><span class="s1">StreamReader</span><span class="s3">, </span><span class="s1">address</span><span class="s3">: </span><span class="s1">str</span><span class="s3">) </span><span class="s1">-&gt; bytearray</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Receive `one` or `several` packets from the MySQL server, enqueue them, and 
+        return the packet at the head. 
+        &quot;&quot;&quot;</span>
+        <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_queue_read</span><span class="s3">:</span>
+            <span class="s5">try</span><span class="s3">:</span>
+                <span class="s0"># Read the header of the next MySQL packet.</span>
+                <span class="s1">header </span><span class="s3">= </span><span class="s5">await </span><span class="s1">super</span><span class="s3">().</span><span class="s1">_read_chunk</span><span class="s3">(</span>
+                    <span class="s1">reader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=</span><span class="s1">COMPRESSED_PACKET_HEADER_LENGTH</span>
+                <span class="s3">)</span>
+
+                <span class="s0"># compressed payload length, sequence id, uncompressed payload length</span>
+                <span class="s3">(</span>
+                    <span class="s1">compressed_pll</span><span class="s3">,</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_compressed_pktnr</span><span class="s3">,</span>
+                    <span class="s1">uncompressed_pll</span><span class="s3">,</span>
+                <span class="s3">) = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_header</span><span class="s3">(</span><span class="s1">header</span><span class="s3">)</span>
+
+                <span class="s5">if </span><span class="s1">uncompressed_pll </span><span class="s3">== </span><span class="s6">0</span><span class="s3">:</span>
+                    <span class="s0"># Packet is not compressed, so just store it.</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_queue_read</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span>
+                        <span class="s5">await </span><span class="s1">super</span><span class="s3">().</span><span class="s1">_read_chunk</span><span class="s3">(</span><span class="s1">reader</span><span class="s3">, </span><span class="s1">size</span><span class="s3">=</span><span class="s1">compressed_pll</span><span class="s3">)</span>
+                    <span class="s3">)</span>
+                <span class="s5">else</span><span class="s3">:</span>
+                    <span class="s0"># Packet comes in compressed, further action is needed.</span>
+                    <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_read_compressed_pkt</span><span class="s3">(</span><span class="s1">reader</span><span class="s3">, </span><span class="s1">compressed_pll</span><span class="s3">)</span>
+            <span class="s5">except </span><span class="s1">IOError </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+                <span class="s5">raise </span><span class="s1">OperationalError</span><span class="s3">(</span>
+                    <span class="s1">errno</span><span class="s3">=</span><span class="s6">2055</span><span class="s3">, </span><span class="s1">values</span><span class="s3">=(</span><span class="s1">address</span><span class="s3">, </span><span class="s1">_strioerror</span><span class="s3">(</span><span class="s1">err</span><span class="s3">))</span>
+                <span class="s3">) </span><span class="s5">from </span><span class="s1">err</span>
+
+        <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_queue_read</span><span class="s3">:</span>
+            <span class="s5">return None</span>
+
+        <span class="s1">pkt </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_queue_read</span><span class="s3">.</span><span class="s1">popleft</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_pktnr </span><span class="s3">= </span><span class="s1">pkt</span><span class="s3">[</span><span class="s6">3</span><span class="s3">]</span>
+
+        <span class="s5">return </span><span class="s1">pkt</span>
+
+
+<span class="s5">class </span><span class="s1">MySQLSocket</span><span class="s3">(</span><span class="s1">ABC</span><span class="s3">):</span>
+    <span class="s2">&quot;&quot;&quot;MySQL socket communication interface. 
+ 
+    Examples: 
+        Subclasses: network.MySQLTCPSocket and network.MySQLUnixSocket. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Network layer where transactions are made with plain (uncompressed) packets 
+        is enabled by default. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_reader</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">asyncio</span><span class="s3">.</span><span class="s1">StreamReader</span><span class="s3">] = </span><span class="s5">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">StreamWriter</span><span class="s3">] = </span><span class="s5">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_connection_timeout</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_address</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">str</span><span class="s3">] = </span><span class="s5">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_netbroker</span><span class="s3">: </span><span class="s1">NetworkBroker </span><span class="s3">= </span><span class="s1">NetworkBrokerPlain</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_is_connected</span><span class="s3">: </span><span class="s1">bool </span><span class="s3">= </span><span class="s5">False</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s5">def </span><span class="s1">address</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; str</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Socket location.&quot;&quot;&quot;</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_address</span>
+
+    <span class="s3">@</span><span class="s1">abstractmethod</span>
+    <span class="s5">async def </span><span class="s1">open_connection</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">: </span><span class="s1">Any</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Open the socket.&quot;&quot;&quot;</span>
+
+    <span class="s5">async def </span><span class="s1">close_connection</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Close the connection.&quot;&quot;&quot;</span>
+        <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+            <span class="s0"># Without transport.abort(), an error is raised when using SSL</span>
+            <span class="s5">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">.</span><span class="s1">transport </span><span class="s5">is not None</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">.</span><span class="s1">transport</span><span class="s3">.</span><span class="s1">abort</span><span class="s3">()</span>
+            <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">.</span><span class="s1">wait_closed</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_is_connected </span><span class="s3">= </span><span class="s5">False</span>
+
+    <span class="s5">def </span><span class="s1">is_connected</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; bool</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Check if the socket is connected. 
+ 
+        Return: 
+            bool: Returns `True` if the socket is connected to MySQL server. 
+        &quot;&quot;&quot;</span>
+        <span class="s5">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_is_connected</span>
+
+    <span class="s5">def </span><span class="s1">set_connection_timeout</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">: </span><span class="s1">int</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Set the connection timeout.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_connection_timeout </span><span class="s3">= </span><span class="s1">timeout</span>
+
+    <span class="s5">def </span><span class="s1">switch_to_compressed_mode</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Enable network layer where transactions are made with compressed packets.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_netbroker </span><span class="s3">= </span><span class="s1">NetworkBrokerCompressed</span><span class="s3">()</span>
+
+    <span class="s5">async def </span><span class="s1">switch_to_ssl</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">ssl_context</span><span class="s3">: </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">SSLContext</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Upgrade an existing stream-based connection to TLS. 
+ 
+        The `start_tls()` method from `asyncio.streams.StreamWriter` is only available 
+        in Python 3.11. This method is used as a workaround. 
+ 
+        The MySQL TLS negotiation happens in the middle of the TCP connection. 
+        Therefore, passing a socket to open connection will cause it to negotiate 
+        TLS on an existing connection. 
+ 
+        Args: 
+            ssl_context: The SSL Context to be used. 
+ 
+        Raises: 
+            RuntimeError: If the transport does not expose the socket instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Ensure that self._writer is already created</span>
+        <span class="s5">assert </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_writer </span><span class="s5">is not None</span>
+
+        <span class="s1">socket </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">.</span><span class="s1">transport</span><span class="s3">.</span><span class="s1">get_extra_info</span><span class="s3">(</span><span class="s4">&quot;socket&quot;</span><span class="s3">)</span>
+        <span class="s5">if </span><span class="s1">socket</span><span class="s3">.</span><span class="s1">family </span><span class="s3">== </span><span class="s6">1</span><span class="s3">:  </span><span class="s0"># socket.AF_UNIX</span>
+            <span class="s5">raise </span><span class="s1">ProgrammingError</span><span class="s3">(</span><span class="s4">&quot;SSL is not supported when using Unix sockets&quot;</span><span class="s3">)</span>
+
+        <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">.</span><span class="s1">start_tls</span><span class="s3">(</span><span class="s1">ssl_context</span><span class="s3">)</span>
+
+    <span class="s5">async def </span><span class="s1">write</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">payload</span><span class="s3">: </span><span class="s1">bytes</span><span class="s3">,</span>
+        <span class="s1">packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+        <span class="s1">compressed_packet_number</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">int</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+    <span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Send packets to the MySQL server.&quot;&quot;&quot;</span>
+        <span class="s5">await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_netbroker</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">address</span><span class="s3">,</span>
+            <span class="s1">payload</span><span class="s3">,</span>
+            <span class="s1">packet_number</span><span class="s3">=</span><span class="s1">packet_number</span><span class="s3">,</span>
+            <span class="s1">compressed_packet_number</span><span class="s3">=</span><span class="s1">compressed_packet_number</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+    <span class="s5">async def </span><span class="s1">read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">) </span><span class="s1">-&gt; bytearray</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Read packets from the MySQL server.&quot;&quot;&quot;</span>
+        <span class="s5">return await </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_netbroker</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_reader</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">address</span><span class="s3">)</span>
+
+    <span class="s5">def </span><span class="s1">build_ssl_context</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s1">ssl_ca</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">str</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+        <span class="s1">ssl_cert</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">str</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+        <span class="s1">ssl_key</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">str</span><span class="s3">] = </span><span class="s5">None</span><span class="s3">,</span>
+        <span class="s1">ssl_verify_cert</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">bool</span><span class="s3">] = </span><span class="s5">False</span><span class="s3">,</span>
+        <span class="s1">ssl_verify_identity</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">bool</span><span class="s3">] = </span><span class="s5">False</span><span class="s3">,</span>
+        <span class="s1">tls_versions</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">List</span><span class="s3">[</span><span class="s1">str</span><span class="s3">]] = [],</span>
+        <span class="s1">tls_cipher_suites</span><span class="s3">: </span><span class="s1">Optional</span><span class="s3">[</span><span class="s1">List</span><span class="s3">[</span><span class="s1">str</span><span class="s3">]] = [],</span>
+    <span class="s3">) </span><span class="s1">-&gt; ssl</span><span class="s3">.</span><span class="s1">SSLContext</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Build a SSLContext.&quot;&quot;&quot;</span>
+        <span class="s5">if not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_reader</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">InterfaceError</span><span class="s3">(</span><span class="s1">errno</span><span class="s3">=</span><span class="s6">2048</span><span class="s3">)</span>
+
+        <span class="s5">if </span><span class="s1">ssl </span><span class="s5">is None</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;Python installation has no SSL support&quot;</span><span class="s3">)</span>
+
+        <span class="s5">try</span><span class="s3">:</span>
+            <span class="s5">if </span><span class="s1">tls_versions</span><span class="s3">:</span>
+                <span class="s1">tls_versions</span><span class="s3">.</span><span class="s1">sort</span><span class="s3">(</span><span class="s1">reverse</span><span class="s3">=</span><span class="s5">True</span><span class="s3">)</span>
+                <span class="s1">tls_version </span><span class="s3">= </span><span class="s1">tls_versions</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+                <span class="s1">ssl_protocol </span><span class="s3">= </span><span class="s1">TLS_VERSIONS</span><span class="s3">[</span><span class="s1">tls_version</span><span class="s3">]</span>
+                <span class="s1">context </span><span class="s3">= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">SSLContext</span><span class="s3">(</span><span class="s1">ssl_protocol</span><span class="s3">)</span>
+
+                <span class="s5">if </span><span class="s1">tls_version </span><span class="s3">== </span><span class="s4">&quot;TLSv1.3&quot;</span><span class="s3">:</span>
+                    <span class="s5">if </span><span class="s4">&quot;TLSv1.2&quot; </span><span class="s5">not in </span><span class="s1">tls_versions</span><span class="s3">:</span>
+                        <span class="s1">context</span><span class="s3">.</span><span class="s1">options </span><span class="s3">|= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">OP_NO_TLSv1_2</span>
+                    <span class="s5">if </span><span class="s4">&quot;TLSv1.1&quot; </span><span class="s5">not in </span><span class="s1">tls_versions</span><span class="s3">:</span>
+                        <span class="s1">context</span><span class="s3">.</span><span class="s1">options </span><span class="s3">|= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">OP_NO_TLSv1_1</span>
+                    <span class="s5">if </span><span class="s4">&quot;TLSv1&quot; </span><span class="s5">not in </span><span class="s1">tls_versions</span><span class="s3">:</span>
+                        <span class="s1">context</span><span class="s3">.</span><span class="s1">options </span><span class="s3">|= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">OP_NO_TLSv1</span>
+            <span class="s5">else</span><span class="s3">:</span>
+                <span class="s1">context </span><span class="s3">= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">create_default_context</span><span class="s3">()</span>
+
+            <span class="s1">context</span><span class="s3">.</span><span class="s1">check_hostname </span><span class="s3">= </span><span class="s1">ssl_verify_identity</span>
+
+            <span class="s5">if </span><span class="s1">ssl_verify_cert</span><span class="s3">:</span>
+                <span class="s1">context</span><span class="s3">.</span><span class="s1">verify_mode </span><span class="s3">= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">CERT_REQUIRED</span>
+            <span class="s5">elif </span><span class="s1">ssl_verify_identity</span><span class="s3">:</span>
+                <span class="s1">context</span><span class="s3">.</span><span class="s1">verify_mode </span><span class="s3">= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">CERT_OPTIONAL</span>
+            <span class="s5">else</span><span class="s3">:</span>
+                <span class="s1">context</span><span class="s3">.</span><span class="s1">verify_mode </span><span class="s3">= </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">CERT_NONE</span>
+
+            <span class="s1">context</span><span class="s3">.</span><span class="s1">load_default_certs</span><span class="s3">()</span>
+
+            <span class="s5">if </span><span class="s1">ssl_ca</span><span class="s3">:</span>
+                <span class="s5">try</span><span class="s3">:</span>
+                    <span class="s1">context</span><span class="s3">.</span><span class="s1">load_verify_locations</span><span class="s3">(</span><span class="s1">ssl_ca</span><span class="s3">)</span>
+                <span class="s5">except </span><span class="s3">(</span><span class="s1">IOError</span><span class="s3">, </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">SSLError</span><span class="s3">) </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+                    <span class="s5">raise </span><span class="s1">InterfaceError</span><span class="s3">(</span><span class="s4">f&quot;Invalid CA Certificate: </span><span class="s5">{</span><span class="s1">err</span><span class="s5">}</span><span class="s4">&quot;</span><span class="s3">) </span><span class="s5">from </span><span class="s1">err</span>
+            <span class="s5">if </span><span class="s1">ssl_cert</span><span class="s3">:</span>
+                <span class="s5">try</span><span class="s3">:</span>
+                    <span class="s1">context</span><span class="s3">.</span><span class="s1">load_cert_chain</span><span class="s3">(</span><span class="s1">ssl_cert</span><span class="s3">, </span><span class="s1">ssl_key</span><span class="s3">)</span>
+                <span class="s5">except </span><span class="s3">(</span><span class="s1">IOError</span><span class="s3">, </span><span class="s1">ssl</span><span class="s3">.</span><span class="s1">SSLError</span><span class="s3">) </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+                    <span class="s5">raise </span><span class="s1">InterfaceError</span><span class="s3">(</span><span class="s4">f&quot;Invalid Certificate/Key: </span><span class="s5">{</span><span class="s1">err</span><span class="s5">}</span><span class="s4">&quot;</span><span class="s3">) </span><span class="s5">from </span><span class="s1">err</span>
+
+            <span class="s5">if </span><span class="s1">tls_cipher_suites</span><span class="s3">:</span>
+                <span class="s1">context</span><span class="s3">.</span><span class="s1">set_ciphers</span><span class="s3">(</span><span class="s4">&quot;:&quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">tls_cipher_suites</span><span class="s3">))</span>
+
+            <span class="s5">return </span><span class="s1">context</span>
+        <span class="s5">except </span><span class="s1">NameError </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">NotSupportedError</span><span class="s3">(</span><span class="s4">&quot;Python installation has no SSL support&quot;</span><span class="s3">) </span><span class="s5">from </span><span class="s1">err</span>
+        <span class="s5">except </span><span class="s3">(</span>
+            <span class="s1">IOError</span><span class="s3">,</span>
+            <span class="s1">NotImplementedError</span><span class="s3">,</span>
+            <span class="s1">ssl</span><span class="s3">.</span><span class="s1">CertificateError</span><span class="s3">,</span>
+            <span class="s1">ssl</span><span class="s3">.</span><span class="s1">SSLError</span><span class="s3">,</span>
+        <span class="s3">) </span><span class="s5">as </span><span class="s1">err</span><span class="s3">:</span>
+            <span class="s5">raise </span><span class="s1">InterfaceError</span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">err</span><span class="s3">)) </span><span class="s5">from </span><span class="s1">err</span>
+
+
+<span class="s5">class </span><span class="s1">MySQLTcpSocket</span><span class="s3">(</span><span class="s1">MySQLSocket</span><span class="s3">):</span>
+    <span class="s2">&quot;&quot;&quot;MySQL socket class using TCP/IP. 
+ 
+    Args: 
+        host: MySQL host name. 
+        port: MySQL port. 
+        force_ipv6: Force IPv6 usage. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">, </span><span class="s1">host</span><span class="s3">: </span><span class="s1">str </span><span class="s3">= </span><span class="s4">&quot;127.0.0.1&quot;</span><span class="s3">, </span><span class="s1">port</span><span class="s3">: </span><span class="s1">int </span><span class="s3">= </span><span class="s6">3306</span><span class="s3">, </span><span class="s1">force_ipv6</span><span class="s3">: </span><span class="s1">bool </span><span class="s3">= </span><span class="s5">False</span>
+    <span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_host</span><span class="s3">: </span><span class="s1">str </span><span class="s3">= </span><span class="s1">host</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_port</span><span class="s3">: </span><span class="s1">int </span><span class="s3">= </span><span class="s1">port</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_force_ipv6</span><span class="s3">: </span><span class="s1">bool </span><span class="s3">= </span><span class="s1">force_ipv6</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_address</span><span class="s3">: </span><span class="s1">str </span><span class="s3">= </span><span class="s4">f&quot;</span><span class="s5">{</span><span class="s1">host</span><span class="s5">}</span><span class="s4">:</span><span class="s5">{</span><span class="s1">port</span><span class="s5">}</span><span class="s4">&quot;</span>
+
+    <span class="s5">async def </span><span class="s1">open_connection</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">: </span><span class="s1">Any</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Open TCP/IP connection.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_reader</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_writer </span><span class="s3">= </span><span class="s5">await </span><span class="s1">open_connection</span><span class="s3">(</span>
+            <span class="s1">host</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_host</span><span class="s3">, </span><span class="s1">port</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_port</span><span class="s3">, **</span><span class="s1">kwargs</span>
+        <span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_is_connected </span><span class="s3">= </span><span class="s5">True</span>
+
+
+<span class="s5">class </span><span class="s1">MySQLUnixSocket</span><span class="s3">(</span><span class="s1">MySQLSocket</span><span class="s3">):</span>
+    <span class="s2">&quot;&quot;&quot;MySQL socket class using UNIX sockets. 
+ 
+    Args: 
+        unix_socket: UNIX socket file path. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s5">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">unix_socket</span><span class="s3">: </span><span class="s1">str </span><span class="s3">= </span><span class="s4">&quot;/tmp/mysql.sock&quot;</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_address</span><span class="s3">: </span><span class="s1">str </span><span class="s3">= </span><span class="s1">unix_socket</span>
+
+    <span class="s5">async def </span><span class="s1">open_connection</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">: </span><span class="s1">Any</span><span class="s3">) </span><span class="s1">-&gt; </span><span class="s5">None</span><span class="s3">:</span>
+        <span class="s2">&quot;&quot;&quot;Open UNIX socket connection.&quot;&quot;&quot;</span>
+        <span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_reader</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_writer</span><span class="s3">,</span>
+        <span class="s3">) = </span><span class="s5">await </span><span class="s1">asyncio</span><span class="s3">.</span><span class="s1">open_unix_connection</span><span class="s3">(  </span><span class="s0"># type: ignore[assignment]</span>
+            <span class="s1">path</span><span class="s3">=</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_address</span><span class="s3">, **</span><span class="s1">kwargs</span>
+        <span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_is_connected </span><span class="s3">= </span><span class="s5">True</span>
+</pre>
+</body>
+</html>

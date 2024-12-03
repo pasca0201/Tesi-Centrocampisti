@@ -1,0 +1,431 @@
+<html>
+<head>
+<title>synchronize.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+synchronize.py</font>
+</center></td></tr></table>
+<pre><span class="s0">###############################################################################</span>
+<span class="s0"># Synchronization primitives based on our SemLock implementation</span>
+<span class="s0">#</span>
+<span class="s0"># author: Thomas Moreau and Olivier Grisel</span>
+<span class="s0">#</span>
+<span class="s0"># adapted from multiprocessing/synchronize.py (17/02/2017)</span>
+<span class="s0">#  * Remove ctx argument for compatibility reason</span>
+<span class="s0">#  * Registers a cleanup function with the loky resource_tracker to remove the</span>
+<span class="s0">#    semaphore when the process dies instead.</span>
+<span class="s0">#</span>
+<span class="s0"># TODO: investigate which Python version is required to be able to use</span>
+<span class="s0"># multiprocessing.resource_tracker and therefore multiprocessing.synchronize</span>
+<span class="s0"># instead of a loky-specific fork.</span>
+
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">tempfile</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">import </span><span class="s1">_multiprocessing</span>
+<span class="s2">from </span><span class="s1">time </span><span class="s2">import </span><span class="s1">time </span><span class="s2">as </span><span class="s1">_time</span>
+<span class="s2">from </span><span class="s1">multiprocessing </span><span class="s2">import </span><span class="s1">process</span><span class="s3">, </span><span class="s1">util</span>
+<span class="s2">from </span><span class="s1">multiprocessing</span><span class="s3">.</span><span class="s1">context </span><span class="s2">import </span><span class="s1">assert_spawning</span>
+
+<span class="s2">from </span><span class="s3">. </span><span class="s2">import </span><span class="s1">resource_tracker</span>
+
+<span class="s1">__all__ </span><span class="s3">= [</span>
+    <span class="s4">&quot;Lock&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;RLock&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;Semaphore&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;BoundedSemaphore&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;Condition&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;Event&quot;</span><span class="s3">,</span>
+<span class="s3">]</span>
+<span class="s0"># Try to import the mp.synchronize module cleanly, if it fails</span>
+<span class="s0"># raise ImportError for platforms lacking a working sem_open implementation.</span>
+<span class="s0"># See issue 3770</span>
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">from </span><span class="s1">_multiprocessing </span><span class="s2">import </span><span class="s1">SemLock </span><span class="s2">as </span><span class="s1">_SemLock</span>
+    <span class="s2">from </span><span class="s1">_multiprocessing </span><span class="s2">import </span><span class="s1">sem_unlink</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s2">raise </span><span class="s1">ImportError</span><span class="s3">(</span>
+        <span class="s4">&quot;This platform lacks a functioning sem_open&quot;</span>
+        <span class="s4">&quot; implementation, therefore, the required&quot;</span>
+        <span class="s4">&quot; synchronization primitives needed will not&quot;</span>
+        <span class="s4">&quot; function, see issue 3770.&quot;</span>
+    <span class="s3">)</span>
+
+<span class="s0">#</span>
+<span class="s0"># Constants</span>
+<span class="s0">#</span>
+
+<span class="s1">RECURSIVE_MUTEX</span><span class="s3">, </span><span class="s1">SEMAPHORE </span><span class="s3">= </span><span class="s1">range</span><span class="s3">(</span><span class="s5">2</span><span class="s3">)</span>
+<span class="s1">SEM_VALUE_MAX </span><span class="s3">= </span><span class="s1">_multiprocessing</span><span class="s3">.</span><span class="s1">SemLock</span><span class="s3">.</span><span class="s1">SEM_VALUE_MAX</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Base class for semaphores and mutexes; wraps `_multiprocessing.SemLock`</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">SemLock</span><span class="s3">:</span>
+
+    <span class="s1">_rand </span><span class="s3">= </span><span class="s1">tempfile</span><span class="s3">.</span><span class="s1">_RandomNameSequence</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">kind</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">maxvalue</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s0"># unlink_now is only used on win32 or when we are using fork.</span>
+        <span class="s1">unlink_now </span><span class="s3">= </span><span class="s2">False</span>
+        <span class="s2">if </span><span class="s1">name </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s0"># Try to find an unused name for the SemLock instance.</span>
+            <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s5">100</span><span class="s3">):</span>
+                <span class="s2">try</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock </span><span class="s3">= </span><span class="s1">_SemLock</span><span class="s3">(</span>
+                        <span class="s1">kind</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">maxvalue</span><span class="s3">, </span><span class="s1">SemLock</span><span class="s3">.</span><span class="s1">_make_name</span><span class="s3">(), </span><span class="s1">unlink_now</span>
+                    <span class="s3">)</span>
+                <span class="s2">except </span><span class="s1">FileExistsError</span><span class="s3">:  </span><span class="s0"># pragma: no cover</span>
+                    <span class="s2">pass</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">break</span>
+            <span class="s2">else</span><span class="s3">:  </span><span class="s0"># pragma: no cover</span>
+                <span class="s2">raise </span><span class="s1">FileExistsError</span><span class="s3">(</span><span class="s4">&quot;cannot find name for semaphore&quot;</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock </span><span class="s3">= </span><span class="s1">_SemLock</span><span class="s3">(</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">maxvalue</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">unlink_now</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">name </span><span class="s3">= </span><span class="s1">name</span>
+        <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+            <span class="s4">f&quot;created semlock with handle </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">handle</span><span class="s2">} </span><span class="s4">and name &quot;</span>
+            <span class="s4">f'&quot;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">name</span><span class="s2">}</span><span class="s4">&quot;'</span>
+        <span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_make_methods</span><span class="s3">()</span>
+
+        <span class="s2">def </span><span class="s1">_after_fork</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_after_fork</span><span class="s3">()</span>
+
+        <span class="s1">util</span><span class="s3">.</span><span class="s1">register_after_fork</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">_after_fork</span><span class="s3">)</span>
+
+        <span class="s0"># When the object is garbage collected or the</span>
+        <span class="s0"># process shuts down we unlink the semaphore name</span>
+        <span class="s1">resource_tracker</span><span class="s3">.</span><span class="s1">register</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">name</span><span class="s3">, </span><span class="s4">&quot;semlock&quot;</span><span class="s3">)</span>
+        <span class="s1">util</span><span class="s3">.</span><span class="s1">Finalize</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">, </span><span class="s1">SemLock</span><span class="s3">.</span><span class="s1">_cleanup</span><span class="s3">, (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">name</span><span class="s3">,), </span><span class="s1">exitpriority</span><span class="s3">=</span><span class="s5">0</span>
+        <span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_cleanup</span><span class="s3">(</span><span class="s1">name</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">sem_unlink</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">FileNotFoundError</span><span class="s3">:</span>
+            <span class="s0"># Already unlinked, possibly by user code: ignore and make sure to</span>
+            <span class="s0"># unregister the semaphore from the resource tracker.</span>
+            <span class="s2">pass</span>
+        <span class="s2">finally</span><span class="s3">:</span>
+            <span class="s1">resource_tracker</span><span class="s3">.</span><span class="s1">unregister</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s4">&quot;semlock&quot;</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_make_methods</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">acquire </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">acquire</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">release </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">release</span>
+
+    <span class="s2">def </span><span class="s1">__enter__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__exit__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__getstate__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">assert_spawning</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+        <span class="s1">sl </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span>
+        <span class="s1">h </span><span class="s3">= </span><span class="s1">sl</span><span class="s3">.</span><span class="s1">handle</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">h</span><span class="s3">, </span><span class="s1">sl</span><span class="s3">.</span><span class="s1">kind</span><span class="s3">, </span><span class="s1">sl</span><span class="s3">.</span><span class="s1">maxvalue</span><span class="s3">, </span><span class="s1">sl</span><span class="s3">.</span><span class="s1">name</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__setstate__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock </span><span class="s3">= </span><span class="s1">_SemLock</span><span class="s3">.</span><span class="s1">_rebuild</span><span class="s3">(*</span><span class="s1">state</span><span class="s3">)</span>
+        <span class="s1">util</span><span class="s3">.</span><span class="s1">debug</span><span class="s3">(</span>
+            <span class="s4">f'recreated blocker with handle </span><span class="s2">{</span><span class="s1">state</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span><span class="s2">!r} </span><span class="s4">and name &quot;</span><span class="s2">{</span><span class="s1">state</span><span class="s3">[</span><span class="s5">3</span><span class="s3">]</span><span class="s2">}</span><span class="s4">&quot;'</span>
+        <span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_make_methods</span><span class="s3">()</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_make_name</span><span class="s3">():</span>
+        <span class="s0"># OSX does not support long names for semaphores</span>
+        <span class="s2">return </span><span class="s4">f&quot;/loky-</span><span class="s2">{</span><span class="s1">os</span><span class="s3">.</span><span class="s1">getpid</span><span class="s3">()</span><span class="s2">}</span><span class="s4">-</span><span class="s2">{</span><span class="s1">next</span><span class="s3">(</span><span class="s1">SemLock</span><span class="s3">.</span><span class="s1">_rand</span><span class="s3">)</span><span class="s2">}</span><span class="s4">&quot;</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Semaphore</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">Semaphore</span><span class="s3">(</span><span class="s1">SemLock</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">=</span><span class="s5">1</span><span class="s3">):</span>
+        <span class="s1">SemLock</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">SEMAPHORE</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">SEM_VALUE_MAX</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_value</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">platform </span><span class="s3">== </span><span class="s4">&quot;darwin&quot;</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">NotImplementedError</span><span class="s3">(</span><span class="s4">&quot;OSX does not implement sem_getvalue&quot;</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_get_value</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_get_value</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s4">&quot;unknown&quot;</span>
+        <span class="s2">return </span><span class="s4">f&quot;&lt;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s2">}</span><span class="s4">(value=</span><span class="s2">{</span><span class="s1">value</span><span class="s2">}</span><span class="s4">)&gt;&quot;</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Bounded semaphore</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">BoundedSemaphore</span><span class="s3">(</span><span class="s1">Semaphore</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">value</span><span class="s3">=</span><span class="s5">1</span><span class="s3">):</span>
+        <span class="s1">SemLock</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">SEMAPHORE</span><span class="s3">, </span><span class="s1">value</span><span class="s3">, </span><span class="s1">value</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_get_value</span><span class="s3">()</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s1">value </span><span class="s3">= </span><span class="s4">&quot;unknown&quot;</span>
+        <span class="s2">return </span><span class="s3">(</span>
+            <span class="s4">f&quot;&lt;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s2">}</span><span class="s4">(value=</span><span class="s2">{</span><span class="s1">value</span><span class="s2">}</span><span class="s4">, &quot;</span>
+            <span class="s4">f&quot;maxvalue=</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">maxvalue</span><span class="s2">}</span><span class="s4">)&gt;&quot;</span>
+        <span class="s3">)</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Non-recursive lock</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">Lock</span><span class="s3">(</span><span class="s1">SemLock</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">SEMAPHORE</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_is_mine</span><span class="s3">():</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s1">process</span><span class="s3">.</span><span class="s1">current_process</span><span class="s3">().</span><span class="s1">name</span>
+                <span class="s2">if </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">name </span><span class="s3">!= </span><span class="s4">&quot;MainThread&quot;</span><span class="s3">:</span>
+                    <span class="s1">name </span><span class="s3">= </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">|</span><span class="s2">{</span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">name</span><span class="s2">}</span><span class="s4">&quot;</span>
+            <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_get_value</span><span class="s3">() == </span><span class="s5">1</span><span class="s3">:</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s4">&quot;None&quot;</span>
+            <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_count</span><span class="s3">() &gt; </span><span class="s5">0</span><span class="s3">:</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s4">&quot;SomeOtherThread&quot;</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s4">&quot;SomeOtherProcess&quot;</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s1">name </span><span class="s3">= </span><span class="s4">&quot;unknown&quot;</span>
+        <span class="s2">return </span><span class="s4">f&quot;&lt;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s2">}</span><span class="s4">(owner=</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">)&gt;&quot;</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Recursive lock</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">RLock</span><span class="s3">(</span><span class="s1">SemLock</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">RECURSIVE_MUTEX</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_is_mine</span><span class="s3">():</span>
+                <span class="s1">name </span><span class="s3">= </span><span class="s1">process</span><span class="s3">.</span><span class="s1">current_process</span><span class="s3">().</span><span class="s1">name</span>
+                <span class="s2">if </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">name </span><span class="s3">!= </span><span class="s4">&quot;MainThread&quot;</span><span class="s3">:</span>
+                    <span class="s1">name </span><span class="s3">= </span><span class="s4">f&quot;</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">|</span><span class="s2">{</span><span class="s1">threading</span><span class="s3">.</span><span class="s1">current_thread</span><span class="s3">().</span><span class="s1">name</span><span class="s2">}</span><span class="s4">&quot;</span>
+                <span class="s1">count </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_count</span><span class="s3">()</span>
+            <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_get_value</span><span class="s3">() == </span><span class="s5">1</span><span class="s3">:</span>
+                <span class="s1">name</span><span class="s3">, </span><span class="s1">count </span><span class="s3">= </span><span class="s4">&quot;None&quot;</span><span class="s3">, </span><span class="s5">0</span>
+            <span class="s2">elif </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_count</span><span class="s3">() &gt; </span><span class="s5">0</span><span class="s3">:</span>
+                <span class="s1">name</span><span class="s3">, </span><span class="s1">count </span><span class="s3">= </span><span class="s4">&quot;SomeOtherThread&quot;</span><span class="s3">, </span><span class="s4">&quot;nonzero&quot;</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">name</span><span class="s3">, </span><span class="s1">count </span><span class="s3">= </span><span class="s4">&quot;SomeOtherProcess&quot;</span><span class="s3">, </span><span class="s4">&quot;nonzero&quot;</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s1">name</span><span class="s3">, </span><span class="s1">count </span><span class="s3">= </span><span class="s4">&quot;unknown&quot;</span><span class="s3">, </span><span class="s4">&quot;unknown&quot;</span>
+        <span class="s2">return </span><span class="s4">f&quot;&lt;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s2">}</span><span class="s4">(</span><span class="s2">{</span><span class="s1">name</span><span class="s2">}</span><span class="s4">, </span><span class="s2">{</span><span class="s1">count</span><span class="s2">}</span><span class="s4">)&gt;&quot;</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Condition variable</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">Condition</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">lock</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock </span><span class="s3">= </span><span class="s1">lock </span><span class="s2">or </span><span class="s1">RLock</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count </span><span class="s3">= </span><span class="s1">Semaphore</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count </span><span class="s3">= </span><span class="s1">Semaphore</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore </span><span class="s3">= </span><span class="s1">Semaphore</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_make_methods</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__getstate__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">assert_spawning</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">__setstate__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+        <span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">,</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">,</span>
+        <span class="s3">) = </span><span class="s1">state</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_make_methods</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__enter__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">__enter__</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">__exit__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">__exit__</span><span class="s3">(*</span><span class="s1">args</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_make_methods</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">acquire </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">acquire</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">release </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">release</span>
+
+    <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">num_waiters </span><span class="s3">= (</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_get_value</span><span class="s3">()</span>
+                <span class="s3">- </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_get_value</span><span class="s3">()</span>
+            <span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s1">num_waiters </span><span class="s3">= </span><span class="s4">&quot;unknown&quot;</span>
+        <span class="s2">return </span><span class="s4">f&quot;&lt;</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">__class__</span><span class="s3">.</span><span class="s1">__name__</span><span class="s2">}</span><span class="s4">(</span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s2">}</span><span class="s4">, </span><span class="s2">{</span><span class="s1">num_waiters</span><span class="s2">}</span><span class="s4">)&gt;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">wait</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_is_mine</span><span class="s3">()</span>
+        <span class="s3">), </span><span class="s4">&quot;must acquire() condition before using wait()&quot;</span>
+
+        <span class="s0"># indicate that this thread is going to sleep</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+
+        <span class="s0"># release lock</span>
+        <span class="s1">count </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_count</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">count</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s0"># wait for notification or timeout</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">True</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">)</span>
+        <span class="s2">finally</span><span class="s3">:</span>
+            <span class="s0"># indicate that this thread has woken</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+
+            <span class="s0"># reacquire lock</span>
+            <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">count</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">notify</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_is_mine</span><span class="s3">(), </span><span class="s4">&quot;lock is not owned&quot;</span>
+        <span class="s2">assert not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+
+        <span class="s0"># to take account of timeouts since last notify() we subtract</span>
+        <span class="s0"># woken_count from sleeping_count and rezero woken_count</span>
+        <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s1">res</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):  </span><span class="s0"># try grabbing a sleeper</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()  </span><span class="s0"># wake up one sleeper</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">()  </span><span class="s0"># wait for the sleeper to wake</span>
+
+            <span class="s0"># rezero _wait_semaphore in case a timeout just happened</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">notify_all</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_lock</span><span class="s3">.</span><span class="s1">_semlock</span><span class="s3">.</span><span class="s1">_is_mine</span><span class="s3">(), </span><span class="s4">&quot;lock is not owned&quot;</span>
+        <span class="s2">assert not </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+
+        <span class="s0"># to take account of timeouts since last notify*() we subtract</span>
+        <span class="s0"># woken_count from sleeping_count and rezero woken_count</span>
+        <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s1">res </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s1">res</span>
+
+        <span class="s1">sleepers </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_sleeping_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()  </span><span class="s0"># wake up one sleeper</span>
+            <span class="s1">sleepers </span><span class="s3">+= </span><span class="s5">1</span>
+
+        <span class="s2">if </span><span class="s1">sleepers</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">sleepers</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_woken_count</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">()  </span><span class="s0"># wait for a sleeper to wake</span>
+
+            <span class="s0"># rezero wait_semaphore in case some timeouts just happened</span>
+            <span class="s2">while </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_wait_semaphore</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):</span>
+                <span class="s2">pass</span>
+
+    <span class="s2">def </span><span class="s1">wait_for</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">predicate</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">result </span><span class="s3">= </span><span class="s1">predicate</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">result</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">result</span>
+        <span class="s2">if </span><span class="s1">timeout </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">endtime </span><span class="s3">= </span><span class="s1">_time</span><span class="s3">() + </span><span class="s1">timeout</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">endtime </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s1">waittime </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">while not </span><span class="s1">result</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">endtime </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">waittime </span><span class="s3">= </span><span class="s1">endtime </span><span class="s3">- </span><span class="s1">_time</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">waittime </span><span class="s3">&lt;= </span><span class="s5">0</span><span class="s3">:</span>
+                    <span class="s2">break</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">wait</span><span class="s3">(</span><span class="s1">waittime</span><span class="s3">)</span>
+            <span class="s1">result </span><span class="s3">= </span><span class="s1">predicate</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">result</span>
+
+
+<span class="s0">#</span>
+<span class="s0"># Event</span>
+<span class="s0">#</span>
+
+
+<span class="s2">class </span><span class="s1">Event</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_cond </span><span class="s3">= </span><span class="s1">Condition</span><span class="s3">(</span><span class="s1">Lock</span><span class="s3">())</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_flag </span><span class="s3">= </span><span class="s1">Semaphore</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">is_set</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cond</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+                <span class="s2">return True</span>
+            <span class="s2">return False</span>
+
+    <span class="s2">def </span><span class="s1">set</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cond</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_cond</span><span class="s3">.</span><span class="s1">notify_all</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">clear</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cond</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">wait</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">timeout</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cond</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_cond</span><span class="s3">.</span><span class="s1">wait</span><span class="s3">(</span><span class="s1">timeout</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">acquire</span><span class="s3">(</span><span class="s2">False</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_flag</span><span class="s3">.</span><span class="s1">release</span><span class="s3">()</span>
+                <span class="s2">return True</span>
+            <span class="s2">return False</span>
+</pre>
+</body>
+</html>

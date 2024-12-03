@@ -1,0 +1,1510 @@
+<html>
+<head>
+<title>cloudpickle.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+cloudpickle.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Pickler class to extend the standard pickle.Pickler functionality 
+ 
+The main objective is to make it natural to perform distributed computing on 
+clusters (such as PySpark, Dask, Ray...) with interactively defined code 
+(functions, classes, ...) written in notebooks or console. 
+ 
+In particular this pickler adds the following features: 
+- serialize interactively-defined or locally-defined functions, classes, 
+  enums, typevars, lambdas and nested functions to compiled byte code; 
+- deal with some other non-serializable objects in an ad-hoc manner where 
+  applicable. 
+ 
+This pickler is therefore meant to be used for the communication between short 
+lived Python processes running the same version of Python and libraries. In 
+particular, it is not meant to be used for long term storage of Python objects. 
+ 
+It does not include an unpickler, as standard Python unpickling suffices. 
+ 
+This module was extracted from the `cloud` package, developed by `PiCloud, Inc. 
+&lt;https://web.archive.org/web/20140626004012/http://www.picloud.com/&gt;`_. 
+ 
+Copyright (c) 2012-now, CloudPickle developers and contributors. 
+Copyright (c) 2012, Regents of the University of California. 
+Copyright (c) 2009 `PiCloud, Inc. &lt;https://web.archive.org/web/20140626004012/http://www.picloud.com/&gt;`_. 
+All rights reserved. 
+ 
+Redistribution and use in source and binary forms, with or without 
+modification, are permitted provided that the following conditions 
+are met: 
+    * Redistributions of source code must retain the above copyright 
+      notice, this list of conditions and the following disclaimer. 
+    * Redistributions in binary form must reproduce the above copyright 
+      notice, this list of conditions and the following disclaimer in the 
+      documentation and/or other materials provided with the distribution. 
+    * Neither the name of the University of California, Berkeley nor the 
+      names of its contributors may be used to endorse or promote 
+      products derived from this software without specific prior written 
+      permission. 
+ 
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
+&quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED 
+TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR 
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF 
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING 
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS 
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">_collections_abc</span>
+<span class="s2">from </span><span class="s1">collections </span><span class="s2">import </span><span class="s1">ChainMap</span><span class="s3">, </span><span class="s1">OrderedDict</span>
+<span class="s2">import </span><span class="s1">abc</span>
+<span class="s2">import </span><span class="s1">builtins</span>
+<span class="s2">import </span><span class="s1">copyreg</span>
+<span class="s2">import </span><span class="s1">dataclasses</span>
+<span class="s2">import </span><span class="s1">dis</span>
+<span class="s2">from </span><span class="s1">enum </span><span class="s2">import </span><span class="s1">Enum</span>
+<span class="s2">import </span><span class="s1">io</span>
+<span class="s2">import </span><span class="s1">itertools</span>
+<span class="s2">import </span><span class="s1">logging</span>
+<span class="s2">import </span><span class="s1">opcode</span>
+<span class="s2">import </span><span class="s1">pickle</span>
+<span class="s2">from </span><span class="s1">pickle </span><span class="s2">import </span><span class="s1">_getattribute</span>
+<span class="s2">import </span><span class="s1">platform</span>
+<span class="s2">import </span><span class="s1">struct</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">threading</span>
+<span class="s2">import </span><span class="s1">types</span>
+<span class="s2">import </span><span class="s1">typing</span>
+<span class="s2">import </span><span class="s1">uuid</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">weakref</span>
+
+<span class="s4"># The following import is required to be imported in the cloudpickle</span>
+<span class="s4"># namespace to be able to load pickle files generated with older versions of</span>
+<span class="s4"># cloudpickle. See: tests/test_backward_compat.py</span>
+<span class="s2">from </span><span class="s1">types </span><span class="s2">import </span><span class="s1">CellType  </span><span class="s4"># noqa: F401</span>
+
+
+<span class="s4"># cloudpickle is meant for inter process communication: we expect all</span>
+<span class="s4"># communicating processes to run the same Python version hence we favor</span>
+<span class="s4"># communication speed over compatibility:</span>
+<span class="s1">DEFAULT_PROTOCOL </span><span class="s3">= </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">HIGHEST_PROTOCOL</span>
+
+<span class="s4"># Names of modules whose resources should be treated as dynamic.</span>
+<span class="s1">_PICKLE_BY_VALUE_MODULES </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+
+<span class="s4"># Track the provenance of reconstructed dynamic classes to make it possible to</span>
+<span class="s4"># reconstruct instances from the matching singleton class definition when</span>
+<span class="s4"># appropriate and preserve the usual &quot;isinstance&quot; semantics of Python objects.</span>
+<span class="s1">_DYNAMIC_CLASS_TRACKER_BY_CLASS </span><span class="s3">= </span><span class="s1">weakref</span><span class="s3">.</span><span class="s1">WeakKeyDictionary</span><span class="s3">()</span>
+<span class="s1">_DYNAMIC_CLASS_TRACKER_BY_ID </span><span class="s3">= </span><span class="s1">weakref</span><span class="s3">.</span><span class="s1">WeakValueDictionary</span><span class="s3">()</span>
+<span class="s1">_DYNAMIC_CLASS_TRACKER_LOCK </span><span class="s3">= </span><span class="s1">threading</span><span class="s3">.</span><span class="s1">Lock</span><span class="s3">()</span>
+
+<span class="s1">PYPY </span><span class="s3">= </span><span class="s1">platform</span><span class="s3">.</span><span class="s1">python_implementation</span><span class="s3">() == </span><span class="s5">&quot;PyPy&quot;</span>
+
+<span class="s1">builtin_code_type </span><span class="s3">= </span><span class="s2">None</span>
+<span class="s2">if </span><span class="s1">PYPY</span><span class="s3">:</span>
+    <span class="s4"># builtin-code objects only exist in pypy</span>
+    <span class="s1">builtin_code_type </span><span class="s3">= </span><span class="s1">type</span><span class="s3">(</span><span class="s1">float</span><span class="s3">.</span><span class="s1">__new__</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">)</span>
+
+<span class="s1">_extract_code_globals_cache </span><span class="s3">= </span><span class="s1">weakref</span><span class="s3">.</span><span class="s1">WeakKeyDictionary</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">_get_or_create_tracker_id</span><span class="s3">(</span><span class="s1">class_def</span><span class="s3">):</span>
+    <span class="s2">with </span><span class="s1">_DYNAMIC_CLASS_TRACKER_LOCK</span><span class="s3">:</span>
+        <span class="s1">class_tracker_id </span><span class="s3">= </span><span class="s1">_DYNAMIC_CLASS_TRACKER_BY_CLASS</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">class_def</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">class_tracker_id </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">class_tracker_id </span><span class="s3">= </span><span class="s1">uuid</span><span class="s3">.</span><span class="s1">uuid4</span><span class="s3">().</span><span class="s1">hex</span>
+            <span class="s1">_DYNAMIC_CLASS_TRACKER_BY_CLASS</span><span class="s3">[</span><span class="s1">class_def</span><span class="s3">] = </span><span class="s1">class_tracker_id</span>
+            <span class="s1">_DYNAMIC_CLASS_TRACKER_BY_ID</span><span class="s3">[</span><span class="s1">class_tracker_id</span><span class="s3">] = </span><span class="s1">class_def</span>
+    <span class="s2">return </span><span class="s1">class_tracker_id</span>
+
+
+<span class="s2">def </span><span class="s1">_lookup_class_or_track</span><span class="s3">(</span><span class="s1">class_tracker_id</span><span class="s3">, </span><span class="s1">class_def</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">class_tracker_id </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s2">with </span><span class="s1">_DYNAMIC_CLASS_TRACKER_LOCK</span><span class="s3">:</span>
+            <span class="s1">class_def </span><span class="s3">= </span><span class="s1">_DYNAMIC_CLASS_TRACKER_BY_ID</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span>
+                <span class="s1">class_tracker_id</span><span class="s3">, </span><span class="s1">class_def</span>
+            <span class="s3">)</span>
+            <span class="s1">_DYNAMIC_CLASS_TRACKER_BY_CLASS</span><span class="s3">[</span><span class="s1">class_def</span><span class="s3">] = </span><span class="s1">class_tracker_id</span>
+    <span class="s2">return </span><span class="s1">class_def</span>
+
+
+<span class="s2">def </span><span class="s1">register_pickle_by_value</span><span class="s3">(</span><span class="s1">module</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Register a module to make it functions and classes picklable by value. 
+ 
+    By default, functions and classes that are attributes of an importable 
+    module are to be pickled by reference, that is relying on re-importing 
+    the attribute from the module at load time. 
+ 
+    If `register_pickle_by_value(module)` is called, all its functions and 
+    classes are subsequently to be pickled by value, meaning that they can 
+    be loaded in Python processes where the module is not importable. 
+ 
+    This is especially useful when developing a module in a distributed 
+    execution environment: restarting the client Python process with the new 
+    source code is enough: there is no need to re-install the new version 
+    of the module on all the worker nodes nor to restart the workers. 
+ 
+    Note: this feature is considered experimental. See the cloudpickle 
+    README.md file for more details and limitations. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;Input should be a module object, got </span><span class="s2">{</span><span class="s1">str</span><span class="s3">(</span><span class="s1">module</span><span class="s3">)</span><span class="s2">} </span><span class="s5">instead&quot;</span><span class="s3">)</span>
+    <span class="s4"># In the future, cloudpickle may need a way to access any module registered</span>
+    <span class="s4"># for pickling by value in order to introspect relative imports inside</span>
+    <span class="s4"># functions pickled by value. (see</span>
+    <span class="s4"># https://github.com/cloudpipe/cloudpickle/pull/417#issuecomment-873684633).</span>
+    <span class="s4"># This access can be ensured by checking that module is present in</span>
+    <span class="s4"># sys.modules at registering time and assuming that it will still be in</span>
+    <span class="s4"># there when accessed during pickling. Another alternative would be to</span>
+    <span class="s4"># store a weakref to the module. Even though cloudpickle does not implement</span>
+    <span class="s4"># this introspection yet, in order to avoid a possible breaking change</span>
+    <span class="s4"># later, we still enforce the presence of module inside sys.modules.</span>
+    <span class="s2">if </span><span class="s1">module</span><span class="s3">.</span><span class="s1">__name__ </span><span class="s2">not in </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+            <span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">module</span><span class="s2">} </span><span class="s5">was not imported correctly, have you used an &quot;</span>
+            <span class="s5">&quot;`import` statement to access it?&quot;</span>
+        <span class="s3">)</span>
+    <span class="s1">_PICKLE_BY_VALUE_MODULES</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">module</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">unregister_pickle_by_value</span><span class="s3">(</span><span class="s1">module</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Unregister that the input module should be pickled by value.&quot;&quot;&quot;</span>
+    <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;Input should be a module object, got </span><span class="s2">{</span><span class="s1">str</span><span class="s3">(</span><span class="s1">module</span><span class="s3">)</span><span class="s2">} </span><span class="s5">instead&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">module</span><span class="s3">.</span><span class="s1">__name__ </span><span class="s2">not in </span><span class="s1">_PICKLE_BY_VALUE_MODULES</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s5">f&quot;</span><span class="s2">{</span><span class="s1">module</span><span class="s2">} </span><span class="s5">is not registered for pickle by value&quot;</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">_PICKLE_BY_VALUE_MODULES</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">module</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">list_registry_pickle_by_value</span><span class="s3">():</span>
+    <span class="s2">return </span><span class="s1">_PICKLE_BY_VALUE_MODULES</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">_is_registered_pickle_by_value</span><span class="s3">(</span><span class="s1">module</span><span class="s3">):</span>
+    <span class="s1">module_name </span><span class="s3">= </span><span class="s1">module</span><span class="s3">.</span><span class="s1">__name__</span>
+    <span class="s2">if </span><span class="s1">module_name </span><span class="s2">in </span><span class="s1">_PICKLE_BY_VALUE_MODULES</span><span class="s3">:</span>
+        <span class="s2">return True</span>
+    <span class="s2">while True</span><span class="s3">:</span>
+        <span class="s1">parent_name </span><span class="s3">= </span><span class="s1">module_name</span><span class="s3">.</span><span class="s1">rsplit</span><span class="s3">(</span><span class="s5">&quot;.&quot;</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">parent_name </span><span class="s3">== </span><span class="s1">module_name</span><span class="s3">:</span>
+            <span class="s2">break</span>
+        <span class="s2">if </span><span class="s1">parent_name </span><span class="s2">in </span><span class="s1">_PICKLE_BY_VALUE_MODULES</span><span class="s3">:</span>
+            <span class="s2">return True</span>
+        <span class="s1">module_name </span><span class="s3">= </span><span class="s1">parent_name</span>
+    <span class="s2">return False</span>
+
+
+<span class="s2">def </span><span class="s1">_whichmodule</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Find the module an object belongs to. 
+ 
+    This function differs from ``pickle.whichmodule`` in two ways: 
+    - it does not mangle the cases where obj's module is __main__ and obj was 
+      not found in any module. 
+    - Errors arising during module introspection are ignored, as those errors 
+      are considered unwanted side effects. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">module_name </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;__module__&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">module_name </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">module_name</span>
+    <span class="s4"># Protect the iteration by using a copy of sys.modules against dynamic</span>
+    <span class="s4"># modules that trigger imports of other modules upon calls to getattr or</span>
+    <span class="s4"># other threads importing at the same time.</span>
+    <span class="s2">for </span><span class="s1">module_name</span><span class="s3">, </span><span class="s1">module </span><span class="s2">in </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">().</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s4"># Some modules such as coverage can inject non-module objects inside</span>
+        <span class="s4"># sys.modules</span>
+        <span class="s2">if </span><span class="s3">(</span>
+            <span class="s1">module_name </span><span class="s3">== </span><span class="s5">&quot;__main__&quot;</span>
+            <span class="s2">or </span><span class="s1">module </span><span class="s2">is None</span>
+            <span class="s2">or not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">)</span>
+        <span class="s3">):</span>
+            <span class="s2">continue</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">_getattribute</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">] </span><span class="s2">is </span><span class="s1">obj</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">module_name</span>
+        <span class="s2">except </span><span class="s1">Exception</span><span class="s3">:</span>
+            <span class="s2">pass</span>
+    <span class="s2">return None</span>
+
+
+<span class="s2">def </span><span class="s1">_should_pickle_by_reference</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Test whether an function or a class should be pickled by reference 
+ 
+    Pickling by reference means by that the object (typically a function or a 
+    class) is an attribute of a module that is assumed to be importable in the 
+    target Python environment. Loading will therefore rely on importing the 
+    module and then calling `getattr` on it to access the function or class. 
+ 
+    Pickling by reference is the only option to pickle functions and classes 
+    in the standard library. In cloudpickle the alternative option is to 
+    pickle by value (for instance for interactively or locally defined 
+    functions and classes or for attributes of modules that have been 
+    explicitly registered to be pickled by value. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">) </span><span class="s2">or </span><span class="s1">issubclass</span><span class="s3">(</span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s1">type</span><span class="s3">):</span>
+        <span class="s1">module_and_name </span><span class="s3">= </span><span class="s1">_lookup_module_and_qualname</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">module_and_name </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return False</span>
+        <span class="s1">module</span><span class="s3">, </span><span class="s1">name </span><span class="s3">= </span><span class="s1">module_and_name</span>
+        <span class="s2">return not </span><span class="s1">_is_registered_pickle_by_value</span><span class="s3">(</span><span class="s1">module</span><span class="s3">)</span>
+
+    <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">):</span>
+        <span class="s4"># We assume that sys.modules is primarily used as a cache mechanism for</span>
+        <span class="s4"># the Python import machinery. Checking if a module has been added in</span>
+        <span class="s4"># is sys.modules therefore a cheap and simple heuristic to tell us</span>
+        <span class="s4"># whether we can assume that a given module could be imported by name</span>
+        <span class="s4"># in another Python process.</span>
+        <span class="s2">if </span><span class="s1">_is_registered_pickle_by_value</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+            <span class="s2">return False</span>
+        <span class="s2">return </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__ </span><span class="s2">in </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span>
+            <span class="s5">&quot;cannot check importability of {} instances&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">).</span><span class="s1">__name__</span><span class="s3">)</span>
+        <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_lookup_module_and_qualname</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">name </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">name </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;__qualname__&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">name </span><span class="s2">is None</span><span class="s3">:  </span><span class="s4"># pragma: no cover</span>
+        <span class="s4"># This used to be needed for Python 2.7 support but is probably not</span>
+        <span class="s4"># needed anymore. However we keep the __name__ introspection in case</span>
+        <span class="s4"># users of cloudpickle rely on this old behavior for unknown reasons.</span>
+        <span class="s1">name </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;__name__&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s1">module_name </span><span class="s3">= </span><span class="s1">_whichmodule</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">module_name </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s4"># In this case, obj.__module__ is None AND obj was not found in any</span>
+        <span class="s4"># imported module. obj is thus treated as dynamic.</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">if </span><span class="s1">module_name </span><span class="s3">== </span><span class="s5">&quot;__main__&quot;</span><span class="s3">:</span>
+        <span class="s2">return None</span>
+
+    <span class="s4"># Note: if module_name is in sys.modules, the corresponding module is</span>
+    <span class="s4"># assumed importable at unpickling time. See #357</span>
+    <span class="s1">module </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">module_name</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">module </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s4"># The main reason why obj's module would not be imported is that this</span>
+        <span class="s4"># module has been dynamically created, using for example</span>
+        <span class="s4"># types.ModuleType. The other possibility is that module was removed</span>
+        <span class="s4"># from sys.modules after obj was created/imported. But this case is not</span>
+        <span class="s4"># supported, as the standard pickle does not support it either.</span>
+        <span class="s2">return None</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">obj2</span><span class="s3">, </span><span class="s1">parent </span><span class="s3">= </span><span class="s1">_getattribute</span><span class="s3">(</span><span class="s1">module</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+        <span class="s4"># obj was not found inside the module it points to</span>
+        <span class="s2">return None</span>
+    <span class="s2">if </span><span class="s1">obj2 </span><span class="s2">is not </span><span class="s1">obj</span><span class="s3">:</span>
+        <span class="s2">return None</span>
+    <span class="s2">return </span><span class="s1">module</span><span class="s3">, </span><span class="s1">name</span>
+
+
+<span class="s2">def </span><span class="s1">_extract_code_globals</span><span class="s3">(</span><span class="s1">co</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Find all globals names read or written to by codeblock co.&quot;&quot;&quot;</span>
+    <span class="s1">out_names </span><span class="s3">= </span><span class="s1">_extract_code_globals_cache</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">co</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">out_names </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s4"># We use a dict with None values instead of a set to get a</span>
+        <span class="s4"># deterministic order and avoid introducing non-deterministic pickle</span>
+        <span class="s4"># bytes as a results.</span>
+        <span class="s1">out_names </span><span class="s3">= {</span><span class="s1">name</span><span class="s3">: </span><span class="s2">None for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">_walk_global_ops</span><span class="s3">(</span><span class="s1">co</span><span class="s3">)}</span>
+
+        <span class="s4"># Declaring a function inside another one using the &quot;def ...&quot; syntax</span>
+        <span class="s4"># generates a constant code object corresponding to the one of the</span>
+        <span class="s4"># nested function's As the nested function may itself need global</span>
+        <span class="s4"># variables, we need to introspect its code, extract its globals, (look</span>
+        <span class="s4"># for code object in it's co_consts attribute..) and add the result to</span>
+        <span class="s4"># code_globals</span>
+        <span class="s2">if </span><span class="s1">co</span><span class="s3">.</span><span class="s1">co_consts</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">const </span><span class="s2">in </span><span class="s1">co</span><span class="s3">.</span><span class="s1">co_consts</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">const</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">CodeType</span><span class="s3">):</span>
+                    <span class="s1">out_names</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">_extract_code_globals</span><span class="s3">(</span><span class="s1">const</span><span class="s3">))</span>
+
+        <span class="s1">_extract_code_globals_cache</span><span class="s3">[</span><span class="s1">co</span><span class="s3">] = </span><span class="s1">out_names</span>
+
+    <span class="s2">return </span><span class="s1">out_names</span>
+
+
+<span class="s2">def </span><span class="s1">_find_imported_submodules</span><span class="s3">(</span><span class="s1">code</span><span class="s3">, </span><span class="s1">top_level_dependencies</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Find currently imported submodules used by a function. 
+ 
+    Submodules used by a function need to be detected and referenced for the 
+    function to work correctly at depickling time. Because submodules can be 
+    referenced as attribute of their parent package (``package.submodule``), we 
+    need a special introspection technique that does not rely on GLOBAL-related 
+    opcodes to find references of them in a code object. 
+ 
+    Example: 
+    ``` 
+    import concurrent.futures 
+    import cloudpickle 
+    def func(): 
+        x = concurrent.futures.ThreadPoolExecutor 
+    if __name__ == '__main__': 
+        cloudpickle.dumps(func) 
+    ``` 
+    The globals extracted by cloudpickle in the function's state include the 
+    concurrent package, but not its submodule (here, concurrent.futures), which 
+    is the module used by func. Find_imported_submodules will detect the usage 
+    of concurrent.futures. Saving this module alongside with func will ensure 
+    that calling func once depickled does not fail due to concurrent.futures 
+    not being imported 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">subimports </span><span class="s3">= []</span>
+    <span class="s4"># check if any known dependency is an imported package</span>
+    <span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">top_level_dependencies</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s3">(</span>
+            <span class="s1">isinstance</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">)</span>
+            <span class="s2">and </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s5">&quot;__package__&quot;</span><span class="s3">)</span>
+            <span class="s2">and </span><span class="s1">x</span><span class="s3">.</span><span class="s1">__package__</span>
+        <span class="s3">):</span>
+            <span class="s4"># check if the package has any currently loaded sub-imports</span>
+            <span class="s1">prefix </span><span class="s3">= </span><span class="s1">x</span><span class="s3">.</span><span class="s1">__name__ </span><span class="s3">+ </span><span class="s5">&quot;.&quot;</span>
+            <span class="s4"># A concurrent thread could mutate sys.modules,</span>
+            <span class="s4"># make sure we iterate over a copy to avoid exceptions</span>
+            <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">list</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">):</span>
+                <span class="s4"># Older versions of pytest will add a &quot;None&quot; module to</span>
+                <span class="s4"># sys.modules.</span>
+                <span class="s2">if </span><span class="s1">name </span><span class="s2">is not None and </span><span class="s1">name</span><span class="s3">.</span><span class="s1">startswith</span><span class="s3">(</span><span class="s1">prefix</span><span class="s3">):</span>
+                    <span class="s4"># check whether the function can address the sub-module</span>
+                    <span class="s1">tokens </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">name</span><span class="s3">[</span><span class="s1">len</span><span class="s3">(</span><span class="s1">prefix</span><span class="s3">) :].</span><span class="s1">split</span><span class="s3">(</span><span class="s5">&quot;.&quot;</span><span class="s3">))</span>
+                    <span class="s2">if not </span><span class="s1">tokens </span><span class="s3">- </span><span class="s1">set</span><span class="s3">(</span><span class="s1">code</span><span class="s3">.</span><span class="s1">co_names</span><span class="s3">):</span>
+                        <span class="s1">subimports</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">[</span><span class="s1">name</span><span class="s3">])</span>
+    <span class="s2">return </span><span class="s1">subimports</span>
+
+
+<span class="s4"># relevant opcodes</span>
+<span class="s1">STORE_GLOBAL </span><span class="s3">= </span><span class="s1">opcode</span><span class="s3">.</span><span class="s1">opmap</span><span class="s3">[</span><span class="s5">&quot;STORE_GLOBAL&quot;</span><span class="s3">]</span>
+<span class="s1">DELETE_GLOBAL </span><span class="s3">= </span><span class="s1">opcode</span><span class="s3">.</span><span class="s1">opmap</span><span class="s3">[</span><span class="s5">&quot;DELETE_GLOBAL&quot;</span><span class="s3">]</span>
+<span class="s1">LOAD_GLOBAL </span><span class="s3">= </span><span class="s1">opcode</span><span class="s3">.</span><span class="s1">opmap</span><span class="s3">[</span><span class="s5">&quot;LOAD_GLOBAL&quot;</span><span class="s3">]</span>
+<span class="s1">GLOBAL_OPS </span><span class="s3">= (</span><span class="s1">STORE_GLOBAL</span><span class="s3">, </span><span class="s1">DELETE_GLOBAL</span><span class="s3">, </span><span class="s1">LOAD_GLOBAL</span><span class="s3">)</span>
+<span class="s1">HAVE_ARGUMENT </span><span class="s3">= </span><span class="s1">dis</span><span class="s3">.</span><span class="s1">HAVE_ARGUMENT</span>
+<span class="s1">EXTENDED_ARG </span><span class="s3">= </span><span class="s1">dis</span><span class="s3">.</span><span class="s1">EXTENDED_ARG</span>
+
+
+<span class="s1">_BUILTIN_TYPE_NAMES </span><span class="s3">= {}</span>
+<span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">types</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+    <span class="s2">if </span><span class="s1">type</span><span class="s3">(</span><span class="s1">v</span><span class="s3">) </span><span class="s2">is </span><span class="s1">type</span><span class="s3">:</span>
+        <span class="s1">_BUILTIN_TYPE_NAMES</span><span class="s3">[</span><span class="s1">v</span><span class="s3">] = </span><span class="s1">k</span>
+
+
+<span class="s2">def </span><span class="s1">_builtin_type</span><span class="s3">(</span><span class="s1">name</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">name </span><span class="s3">== </span><span class="s5">&quot;ClassType&quot;</span><span class="s3">:  </span><span class="s4"># pragma: no cover</span>
+        <span class="s4"># Backward compat to load pickle files generated with cloudpickle</span>
+        <span class="s4"># &lt; 1.3 even if loading pickle files from older versions is not</span>
+        <span class="s4"># officially supported.</span>
+        <span class="s2">return </span><span class="s1">type</span>
+    <span class="s2">return </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">types</span><span class="s3">, </span><span class="s1">name</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_walk_global_ops</span><span class="s3">(</span><span class="s1">code</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Yield referenced name for global-referencing instructions in code.&quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">instr </span><span class="s2">in </span><span class="s1">dis</span><span class="s3">.</span><span class="s1">get_instructions</span><span class="s3">(</span><span class="s1">code</span><span class="s3">):</span>
+        <span class="s1">op </span><span class="s3">= </span><span class="s1">instr</span><span class="s3">.</span><span class="s1">opcode</span>
+        <span class="s2">if </span><span class="s1">op </span><span class="s2">in </span><span class="s1">GLOBAL_OPS</span><span class="s3">:</span>
+            <span class="s2">yield </span><span class="s1">instr</span><span class="s3">.</span><span class="s1">argval</span>
+
+
+<span class="s2">def </span><span class="s1">_extract_class_dict</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Retrieve a copy of the dict of a class without the inherited method.&quot;&quot;&quot;</span>
+    <span class="s1">clsdict </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">)  </span><span class="s4"># copy dict proxy to a dict</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">__bases__</span><span class="s3">) == </span><span class="s6">1</span><span class="s3">:</span>
+        <span class="s1">inherited_dict </span><span class="s3">= </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">__bases__</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">__dict__</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">inherited_dict </span><span class="s3">= {}</span>
+        <span class="s2">for </span><span class="s1">base </span><span class="s2">in </span><span class="s1">reversed</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">.</span><span class="s1">__bases__</span><span class="s3">):</span>
+            <span class="s1">inherited_dict</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">base</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">)</span>
+    <span class="s1">to_remove </span><span class="s3">= []</span>
+    <span class="s2">for </span><span class="s1">name</span><span class="s3">, </span><span class="s1">value </span><span class="s2">in </span><span class="s1">clsdict</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">base_value </span><span class="s3">= </span><span class="s1">inherited_dict</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+            <span class="s2">if </span><span class="s1">value </span><span class="s2">is </span><span class="s1">base_value</span><span class="s3">:</span>
+                <span class="s1">to_remove</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">KeyError</span><span class="s3">:</span>
+            <span class="s2">pass</span>
+    <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">to_remove</span><span class="s3">:</span>
+        <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">clsdict</span>
+
+
+<span class="s2">def </span><span class="s1">is_tornado_coroutine</span><span class="s3">(</span><span class="s1">func</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Return whether `func` is a Tornado coroutine function. 
+ 
+    Running coroutines are not supported. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+        <span class="s5">&quot;is_tornado_coroutine is deprecated in cloudpickle 3.0 and will be &quot;</span>
+        <span class="s5">&quot;removed in cloudpickle 4.0. Use tornado.gen.is_coroutine_function &quot;</span>
+        <span class="s5">&quot;directly instead.&quot;</span><span class="s3">,</span>
+        <span class="s1">category</span><span class="s3">=</span><span class="s1">DeprecationWarning</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s2">if </span><span class="s5">&quot;tornado.gen&quot; </span><span class="s2">not in </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">:</span>
+        <span class="s2">return False</span>
+    <span class="s1">gen </span><span class="s3">= </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">[</span><span class="s5">&quot;tornado.gen&quot;</span><span class="s3">]</span>
+    <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">gen</span><span class="s3">, </span><span class="s5">&quot;is_coroutine_function&quot;</span><span class="s3">):</span>
+        <span class="s4"># Tornado version is too old</span>
+        <span class="s2">return False</span>
+    <span class="s2">return </span><span class="s1">gen</span><span class="s3">.</span><span class="s1">is_coroutine_function</span><span class="s3">(</span><span class="s1">func</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">subimport</span><span class="s3">(</span><span class="s1">name</span><span class="s3">):</span>
+    <span class="s4"># We cannot do simply: `return __import__(name)`: Indeed, if ``name`` is</span>
+    <span class="s4"># the name of a submodule, __import__ will return the top-level root module</span>
+    <span class="s4"># of this submodule. For instance, __import__('os.path') returns the `os`</span>
+    <span class="s4"># module.</span>
+    <span class="s1">__import__</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">modules</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+
+
+<span class="s2">def </span><span class="s1">dynamic_subimport</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">vars</span><span class="s3">):</span>
+    <span class="s1">mod </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+    <span class="s1">mod</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">vars</span><span class="s3">)</span>
+    <span class="s1">mod</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">[</span><span class="s5">&quot;__builtins__&quot;</span><span class="s3">] = </span><span class="s1">builtins</span><span class="s3">.</span><span class="s1">__dict__</span>
+    <span class="s2">return </span><span class="s1">mod</span>
+
+
+<span class="s2">def </span><span class="s1">_get_cell_contents</span><span class="s3">(</span><span class="s1">cell</span><span class="s3">):</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">cell</span><span class="s3">.</span><span class="s1">cell_contents</span>
+    <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:</span>
+        <span class="s4"># Handle empty cells explicitly with a sentinel value.</span>
+        <span class="s2">return </span><span class="s1">_empty_cell_value</span>
+
+
+<span class="s2">def </span><span class="s1">instance</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Create a new instance of a class. 
+ 
+    Parameters 
+    ---------- 
+    cls : type 
+        The class to create an instance of. 
+ 
+    Returns 
+    ------- 
+    instance : cls 
+        A new instance of ``cls``. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">return </span><span class="s1">cls</span><span class="s3">()</span>
+
+
+<span class="s3">@</span><span class="s1">instance</span>
+<span class="s2">class </span><span class="s1">_empty_cell_value</span><span class="s3">:</span>
+    <span class="s0">&quot;&quot;&quot;Sentinel for empty closures.&quot;&quot;&quot;</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">__reduce__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">cls</span><span class="s3">.</span><span class="s1">__name__</span>
+
+
+<span class="s2">def </span><span class="s1">_make_function</span><span class="s3">(</span><span class="s1">code</span><span class="s3">, </span><span class="s1">globals</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">argdefs</span><span class="s3">, </span><span class="s1">closure</span><span class="s3">):</span>
+    <span class="s4"># Setting __builtins__ in globals is needed for nogil CPython.</span>
+    <span class="s1">globals</span><span class="s3">[</span><span class="s5">&quot;__builtins__&quot;</span><span class="s3">] = </span><span class="s1">__builtins__</span>
+    <span class="s2">return </span><span class="s1">types</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">(</span><span class="s1">code</span><span class="s3">, </span><span class="s1">globals</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">argdefs</span><span class="s3">, </span><span class="s1">closure</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_make_empty_cell</span><span class="s3">():</span>
+    <span class="s2">if False</span><span class="s3">:</span>
+        <span class="s4"># trick the compiler into creating an empty cell in our lambda</span>
+        <span class="s1">cell </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">raise </span><span class="s1">AssertionError</span><span class="s3">(</span><span class="s5">&quot;this route should not be executed&quot;</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s3">(</span><span class="s2">lambda</span><span class="s3">: </span><span class="s1">cell</span><span class="s3">).</span><span class="s1">__closure__</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+
+
+<span class="s2">def </span><span class="s1">_make_cell</span><span class="s3">(</span><span class="s1">value</span><span class="s3">=</span><span class="s1">_empty_cell_value</span><span class="s3">):</span>
+    <span class="s1">cell </span><span class="s3">= </span><span class="s1">_make_empty_cell</span><span class="s3">()</span>
+    <span class="s2">if </span><span class="s1">value </span><span class="s2">is not </span><span class="s1">_empty_cell_value</span><span class="s3">:</span>
+        <span class="s1">cell</span><span class="s3">.</span><span class="s1">cell_contents </span><span class="s3">= </span><span class="s1">value</span>
+    <span class="s2">return </span><span class="s1">cell</span>
+
+
+<span class="s2">def </span><span class="s1">_make_skeleton_class</span><span class="s3">(</span>
+    <span class="s1">type_constructor</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">bases</span><span class="s3">, </span><span class="s1">type_kwargs</span><span class="s3">, </span><span class="s1">class_tracker_id</span><span class="s3">, </span><span class="s1">extra</span>
+<span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Build dynamic class with an empty __dict__ to be filled once memoized 
+ 
+    If class_tracker_id is not None, try to lookup an existing class definition 
+    matching that id. If none is found, track a newly reconstructed class 
+    definition under that id so that other instances stemming from the same 
+    class id will also reuse this class definition. 
+ 
+    The &quot;extra&quot; variable is meant to be a dict (or None) that can be used for 
+    forward compatibility shall the need arise. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">skeleton_class </span><span class="s3">= </span><span class="s1">types</span><span class="s3">.</span><span class="s1">new_class</span><span class="s3">(</span>
+        <span class="s1">name</span><span class="s3">, </span><span class="s1">bases</span><span class="s3">, {</span><span class="s5">&quot;metaclass&quot;</span><span class="s3">: </span><span class="s1">type_constructor</span><span class="s3">}, </span><span class="s2">lambda </span><span class="s1">ns</span><span class="s3">: </span><span class="s1">ns</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">type_kwargs</span><span class="s3">)</span>
+    <span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">_lookup_class_or_track</span><span class="s3">(</span><span class="s1">class_tracker_id</span><span class="s3">, </span><span class="s1">skeleton_class</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_make_skeleton_enum</span><span class="s3">(</span>
+    <span class="s1">bases</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">qualname</span><span class="s3">, </span><span class="s1">members</span><span class="s3">, </span><span class="s1">module</span><span class="s3">, </span><span class="s1">class_tracker_id</span><span class="s3">, </span><span class="s1">extra</span>
+<span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Build dynamic enum with an empty __dict__ to be filled once memoized 
+ 
+    The creation of the enum class is inspired by the code of 
+    EnumMeta._create_. 
+ 
+    If class_tracker_id is not None, try to lookup an existing enum definition 
+    matching that id. If none is found, track a newly reconstructed enum 
+    definition under that id so that other instances stemming from the same 
+    class id will also reuse this enum definition. 
+ 
+    The &quot;extra&quot; variable is meant to be a dict (or None) that can be used for 
+    forward compatibility shall the need arise. 
+    &quot;&quot;&quot;</span>
+    <span class="s4"># enums always inherit from their base Enum class at the last position in</span>
+    <span class="s4"># the list of base classes:</span>
+    <span class="s1">enum_base </span><span class="s3">= </span><span class="s1">bases</span><span class="s3">[-</span><span class="s6">1</span><span class="s3">]</span>
+    <span class="s1">metacls </span><span class="s3">= </span><span class="s1">enum_base</span><span class="s3">.</span><span class="s1">__class__</span>
+    <span class="s1">classdict </span><span class="s3">= </span><span class="s1">metacls</span><span class="s3">.</span><span class="s1">__prepare__</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">bases</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">member_name</span><span class="s3">, </span><span class="s1">member_value </span><span class="s2">in </span><span class="s1">members</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s1">classdict</span><span class="s3">[</span><span class="s1">member_name</span><span class="s3">] = </span><span class="s1">member_value</span>
+    <span class="s1">enum_class </span><span class="s3">= </span><span class="s1">metacls</span><span class="s3">.</span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">metacls</span><span class="s3">, </span><span class="s1">name</span><span class="s3">, </span><span class="s1">bases</span><span class="s3">, </span><span class="s1">classdict</span><span class="s3">)</span>
+    <span class="s1">enum_class</span><span class="s3">.</span><span class="s1">__module__ </span><span class="s3">= </span><span class="s1">module</span>
+    <span class="s1">enum_class</span><span class="s3">.</span><span class="s1">__qualname__ </span><span class="s3">= </span><span class="s1">qualname</span>
+
+    <span class="s2">return </span><span class="s1">_lookup_class_or_track</span><span class="s3">(</span><span class="s1">class_tracker_id</span><span class="s3">, </span><span class="s1">enum_class</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_make_typevar</span><span class="s3">(</span><span class="s1">name</span><span class="s3">, </span><span class="s1">bound</span><span class="s3">, </span><span class="s1">constraints</span><span class="s3">, </span><span class="s1">covariant</span><span class="s3">, </span><span class="s1">contravariant</span><span class="s3">, </span><span class="s1">class_tracker_id</span><span class="s3">):</span>
+    <span class="s1">tv </span><span class="s3">= </span><span class="s1">typing</span><span class="s3">.</span><span class="s1">TypeVar</span><span class="s3">(</span>
+        <span class="s1">name</span><span class="s3">,</span>
+        <span class="s3">*</span><span class="s1">constraints</span><span class="s3">,</span>
+        <span class="s1">bound</span><span class="s3">=</span><span class="s1">bound</span><span class="s3">,</span>
+        <span class="s1">covariant</span><span class="s3">=</span><span class="s1">covariant</span><span class="s3">,</span>
+        <span class="s1">contravariant</span><span class="s3">=</span><span class="s1">contravariant</span><span class="s3">,</span>
+    <span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">_lookup_class_or_track</span><span class="s3">(</span><span class="s1">class_tracker_id</span><span class="s3">, </span><span class="s1">tv</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_decompose_typevar</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s3">(</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__bound__</span><span class="s3">,</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__constraints__</span><span class="s3">,</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__covariant__</span><span class="s3">,</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__contravariant__</span><span class="s3">,</span>
+        <span class="s1">_get_or_create_tracker_id</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+    <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_typevar_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s4"># TypeVar instances require the module information hence why we</span>
+    <span class="s4"># are not using the _should_pickle_by_reference directly</span>
+    <span class="s1">module_and_name </span><span class="s3">= </span><span class="s1">_lookup_module_and_qualname</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">module_and_name </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">_make_typevar</span><span class="s3">, </span><span class="s1">_decompose_typevar</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">))</span>
+    <span class="s2">elif </span><span class="s1">_is_registered_pickle_by_value</span><span class="s3">(</span><span class="s1">module_and_name</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]):</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">_make_typevar</span><span class="s3">, </span><span class="s1">_decompose_typevar</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">))</span>
+
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">getattr</span><span class="s3">, </span><span class="s1">module_and_name</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_get_bases</span><span class="s3">(</span><span class="s1">typ</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s5">&quot;__orig_bases__&quot; </span><span class="s2">in </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">typ</span><span class="s3">, </span><span class="s5">&quot;__dict__&quot;</span><span class="s3">, {}):</span>
+        <span class="s4"># For generic types (see PEP 560)</span>
+        <span class="s4"># Note that simply checking `hasattr(typ, '__orig_bases__')` is not</span>
+        <span class="s4"># correct.  Subclasses of a fully-parameterized generic class does not</span>
+        <span class="s4"># have `__orig_bases__` defined, but `hasattr(typ, '__orig_bases__')`</span>
+        <span class="s4"># will return True because it's defined in the base class.</span>
+        <span class="s1">bases_attr </span><span class="s3">= </span><span class="s5">&quot;__orig_bases__&quot;</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s4"># For regular class objects</span>
+        <span class="s1">bases_attr </span><span class="s3">= </span><span class="s5">&quot;__bases__&quot;</span>
+    <span class="s2">return </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">typ</span><span class="s3">, </span><span class="s1">bases_attr</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_make_dict_keys</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">is_ordered</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">is_ordered</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">OrderedDict</span><span class="s3">.</span><span class="s1">fromkeys</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">).</span><span class="s1">keys</span><span class="s3">()</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">dict</span><span class="s3">.</span><span class="s1">fromkeys</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">).</span><span class="s1">keys</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">_make_dict_values</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">is_ordered</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">is_ordered</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">OrderedDict</span><span class="s3">((</span><span class="s1">i</span><span class="s3">, </span><span class="s1">_</span><span class="s3">) </span><span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)).</span><span class="s1">values</span><span class="s3">()</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">{</span><span class="s1">i</span><span class="s3">: </span><span class="s1">_ </span><span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)}.</span><span class="s1">values</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">_make_dict_items</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">is_ordered</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">is_ordered</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">).</span><span class="s1">items</span><span class="s3">()</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">items</span><span class="s3">()</span>
+
+
+<span class="s4"># COLLECTION OF OBJECTS __getnewargs__-LIKE METHODS</span>
+<span class="s4"># -------------------------------------------------</span>
+
+
+<span class="s2">def </span><span class="s1">_class_getnewargs</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s1">type_kwargs </span><span class="s3">= {}</span>
+    <span class="s2">if </span><span class="s5">&quot;__module__&quot; </span><span class="s2">in </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">:</span>
+        <span class="s1">type_kwargs</span><span class="s3">[</span><span class="s5">&quot;__module__&quot;</span><span class="s3">] = </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__module__</span>
+
+    <span class="s1">__dict__ </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s5">&quot;__dict__&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">__dict__</span><span class="s3">, </span><span class="s1">property</span><span class="s3">):</span>
+        <span class="s1">type_kwargs</span><span class="s3">[</span><span class="s5">&quot;__dict__&quot;</span><span class="s3">] = </span><span class="s1">__dict__</span>
+
+    <span class="s2">return </span><span class="s3">(</span>
+        <span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,</span>
+        <span class="s1">_get_bases</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+        <span class="s1">type_kwargs</span><span class="s3">,</span>
+        <span class="s1">_get_or_create_tracker_id</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+        <span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_enum_getnewargs</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s1">members </span><span class="s3">= {</span><span class="s1">e</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: </span><span class="s1">e</span><span class="s3">.</span><span class="s1">value </span><span class="s2">for </span><span class="s1">e </span><span class="s2">in </span><span class="s1">obj</span><span class="s3">}</span>
+    <span class="s2">return </span><span class="s3">(</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__bases__</span><span class="s3">,</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__qualname__</span><span class="s3">,</span>
+        <span class="s1">members</span><span class="s3">,</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">__module__</span><span class="s3">,</span>
+        <span class="s1">_get_or_create_tracker_id</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+        <span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">)</span>
+
+
+<span class="s4"># COLLECTION OF OBJECTS RECONSTRUCTORS</span>
+<span class="s4"># ------------------------------------</span>
+<span class="s2">def </span><span class="s1">_file_reconstructor</span><span class="s3">(</span><span class="s1">retval</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">retval</span>
+
+
+<span class="s4"># COLLECTION OF OBJECTS STATE GETTERS</span>
+<span class="s4"># -----------------------------------</span>
+
+
+<span class="s2">def </span><span class="s1">_function_getstate</span><span class="s3">(</span><span class="s1">func</span><span class="s3">):</span>
+    <span class="s4"># - Put func's dynamic attributes (stored in func.__dict__) in state. These</span>
+    <span class="s4">#   attributes will be restored at unpickling time using</span>
+    <span class="s4">#   f.__dict__.update(state)</span>
+    <span class="s4"># - Put func's members into slotstate. Such attributes will be restored at</span>
+    <span class="s4">#   unpickling time by iterating over slotstate and calling setattr(func,</span>
+    <span class="s4">#   slotname, slotvalue)</span>
+    <span class="s1">slotstate </span><span class="s3">= {</span>
+        <span class="s5">&quot;__name__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,</span>
+        <span class="s5">&quot;__qualname__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__qualname__</span><span class="s3">,</span>
+        <span class="s5">&quot;__annotations__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__annotations__</span><span class="s3">,</span>
+        <span class="s5">&quot;__kwdefaults__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__kwdefaults__</span><span class="s3">,</span>
+        <span class="s5">&quot;__defaults__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__defaults__</span><span class="s3">,</span>
+        <span class="s5">&quot;__module__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__module__</span><span class="s3">,</span>
+        <span class="s5">&quot;__doc__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__doc__</span><span class="s3">,</span>
+        <span class="s5">&quot;__closure__&quot;</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__closure__</span><span class="s3">,</span>
+    <span class="s3">}</span>
+
+    <span class="s1">f_globals_ref </span><span class="s3">= </span><span class="s1">_extract_code_globals</span><span class="s3">(</span><span class="s1">func</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">)</span>
+    <span class="s1">f_globals </span><span class="s3">= {</span><span class="s1">k</span><span class="s3">: </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__globals__</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] </span><span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">f_globals_ref </span><span class="s2">if </span><span class="s1">k </span><span class="s2">in </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__globals__</span><span class="s3">}</span>
+
+    <span class="s2">if </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__closure__ </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">closure_values </span><span class="s3">= </span><span class="s1">list</span><span class="s3">(</span><span class="s1">map</span><span class="s3">(</span><span class="s1">_get_cell_contents</span><span class="s3">, </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__closure__</span><span class="s3">))</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">closure_values </span><span class="s3">= ()</span>
+
+    <span class="s4"># Extract currently-imported submodules used by func. Storing these modules</span>
+    <span class="s4"># in a smoke _cloudpickle_subimports attribute of the object's state will</span>
+    <span class="s4"># trigger the side effect of importing these modules at unpickling time</span>
+    <span class="s4"># (which is necessary for func to work correctly once depickled)</span>
+    <span class="s1">slotstate</span><span class="s3">[</span><span class="s5">&quot;_cloudpickle_submodules&quot;</span><span class="s3">] = </span><span class="s1">_find_imported_submodules</span><span class="s3">(</span>
+        <span class="s1">func</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">, </span><span class="s1">itertools</span><span class="s3">.</span><span class="s1">chain</span><span class="s3">(</span><span class="s1">f_globals</span><span class="s3">.</span><span class="s1">values</span><span class="s3">(), </span><span class="s1">closure_values</span><span class="s3">)</span>
+    <span class="s3">)</span>
+    <span class="s1">slotstate</span><span class="s3">[</span><span class="s5">&quot;__globals__&quot;</span><span class="s3">] = </span><span class="s1">f_globals</span>
+
+    <span class="s1">state </span><span class="s3">= </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__dict__</span>
+    <span class="s2">return </span><span class="s1">state</span><span class="s3">, </span><span class="s1">slotstate</span>
+
+
+<span class="s2">def </span><span class="s1">_class_getstate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s1">clsdict </span><span class="s3">= </span><span class="s1">_extract_class_dict</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+    <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;__weakref__&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">issubclass</span><span class="s3">(</span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s1">abc</span><span class="s3">.</span><span class="s1">ABCMeta</span><span class="s3">):</span>
+        <span class="s4"># If obj is an instance of an ABCMeta subclass, don't pickle the</span>
+        <span class="s4"># cache/negative caches populated during isinstance/issubclass</span>
+        <span class="s4"># checks, but pickle the list of registered subclasses of obj.</span>
+        <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;_abc_cache&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;_abc_negative_cache&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;_abc_negative_cache_version&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s1">registry </span><span class="s3">= </span><span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;_abc_registry&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">registry </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s4"># The abc caches and registered subclasses of a</span>
+            <span class="s4"># class are bundled into the single _abc_impl attribute</span>
+            <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;_abc_impl&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+            <span class="s3">(</span><span class="s1">registry</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">) = </span><span class="s1">abc</span><span class="s3">.</span><span class="s1">_get_dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+
+            <span class="s1">clsdict</span><span class="s3">[</span><span class="s5">&quot;_abc_impl&quot;</span><span class="s3">] = [</span><span class="s1">subclass_weakref</span><span class="s3">() </span><span class="s2">for </span><span class="s1">subclass_weakref </span><span class="s2">in </span><span class="s1">registry</span><span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s4"># In the above if clause, registry is a set of weakrefs -- in</span>
+            <span class="s4"># this case, registry is a WeakSet</span>
+            <span class="s1">clsdict</span><span class="s3">[</span><span class="s5">&quot;_abc_impl&quot;</span><span class="s3">] = [</span><span class="s1">type_ </span><span class="s2">for </span><span class="s1">type_ </span><span class="s2">in </span><span class="s1">registry</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s5">&quot;__slots__&quot; </span><span class="s2">in </span><span class="s1">clsdict</span><span class="s3">:</span>
+        <span class="s4"># pickle string length optimization: member descriptors of obj are</span>
+        <span class="s4"># created automatically from obj's __slots__ attribute, no need to</span>
+        <span class="s4"># save them in obj's state</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__slots__</span><span class="s3">, </span><span class="s1">str</span><span class="s3">):</span>
+            <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__slots__</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__slots__</span><span class="s3">:</span>
+                <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">k</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+
+    <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;__dict__&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)  </span><span class="s4"># unpicklable property object</span>
+
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">clsdict</span><span class="s3">, {})</span>
+
+
+<span class="s2">def </span><span class="s1">_enum_getstate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s1">clsdict</span><span class="s3">, </span><span class="s1">slotstate </span><span class="s3">= </span><span class="s1">_class_getstate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+
+    <span class="s1">members </span><span class="s3">= {</span><span class="s1">e</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: </span><span class="s1">e</span><span class="s3">.</span><span class="s1">value </span><span class="s2">for </span><span class="s1">e </span><span class="s2">in </span><span class="s1">obj</span><span class="s3">}</span>
+    <span class="s4"># Cleanup the clsdict that will be passed to _make_skeleton_enum:</span>
+    <span class="s4"># Those attributes are already handled by the metaclass.</span>
+    <span class="s2">for </span><span class="s1">attrname </span><span class="s2">in </span><span class="s3">[</span>
+        <span class="s5">&quot;_generate_next_value_&quot;</span><span class="s3">,</span>
+        <span class="s5">&quot;_member_names_&quot;</span><span class="s3">,</span>
+        <span class="s5">&quot;_member_map_&quot;</span><span class="s3">,</span>
+        <span class="s5">&quot;_member_type_&quot;</span><span class="s3">,</span>
+        <span class="s5">&quot;_value2member_map_&quot;</span><span class="s3">,</span>
+    <span class="s3">]:</span>
+        <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">attrname</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">member </span><span class="s2">in </span><span class="s1">members</span><span class="s3">:</span>
+        <span class="s1">clsdict</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">member</span><span class="s3">)</span>
+        <span class="s4"># Special handling of Enum subclasses</span>
+    <span class="s2">return </span><span class="s1">clsdict</span><span class="s3">, </span><span class="s1">slotstate</span>
+
+
+<span class="s4"># COLLECTIONS OF OBJECTS REDUCERS</span>
+<span class="s4"># -------------------------------</span>
+<span class="s4"># A reducer is a function taking a single argument (obj), and that returns a</span>
+<span class="s4"># tuple with all the necessary data to re-construct obj. Apart from a few</span>
+<span class="s4"># exceptions (list, dict, bytes, int, etc.), a reducer is necessary to</span>
+<span class="s4"># correctly pickle an object.</span>
+<span class="s4"># While many built-in objects (Exceptions objects, instances of the &quot;object&quot;</span>
+<span class="s4"># class, etc), are shipped with their own built-in reducer (invoked using</span>
+<span class="s4"># obj.__reduce__), some do not. The following methods were created to &quot;fill</span>
+<span class="s4"># these holes&quot;.</span>
+
+
+<span class="s2">def </span><span class="s1">_code_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;code object reducer.&quot;&quot;&quot;</span>
+    <span class="s4"># If you are not sure about the order of arguments, take a look at help</span>
+    <span class="s4"># of the specific type from types, for example:</span>
+    <span class="s4"># &gt;&gt;&gt; from types import CodeType</span>
+    <span class="s4"># &gt;&gt;&gt; help(CodeType)</span>
+    <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;co_exceptiontable&quot;</span><span class="s3">):</span>
+        <span class="s4"># Python 3.11 and later: there are some new attributes</span>
+        <span class="s4"># related to the enhanced exceptions.</span>
+        <span class="s1">args </span><span class="s3">= (</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_argcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_posonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_kwonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_nlocals</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_stacksize</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_flags</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_code</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_consts</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_names</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_varnames</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_filename</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_name</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_qualname</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_firstlineno</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_linetable</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_exceptiontable</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_freevars</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_cellvars</span><span class="s3">,</span>
+        <span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;co_linetable&quot;</span><span class="s3">):</span>
+        <span class="s4"># Python 3.10 and later: obj.co_lnotab is deprecated and constructor</span>
+        <span class="s4"># expects obj.co_linetable instead.</span>
+        <span class="s1">args </span><span class="s3">= (</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_argcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_posonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_kwonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_nlocals</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_stacksize</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_flags</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_code</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_consts</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_names</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_varnames</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_filename</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_name</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_firstlineno</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_linetable</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_freevars</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_cellvars</span><span class="s3">,</span>
+        <span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;co_nmeta&quot;</span><span class="s3">):  </span><span class="s4"># pragma: no cover</span>
+        <span class="s4"># &quot;nogil&quot; Python: modified attributes from 3.9</span>
+        <span class="s1">args </span><span class="s3">= (</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_argcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_posonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_kwonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_nlocals</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_framesize</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_ndefaultargs</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_nmeta</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_flags</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_code</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_consts</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_varnames</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_filename</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_name</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_firstlineno</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_lnotab</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_exc_handlers</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_jump_table</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_freevars</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_cellvars</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_free2reg</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_cell2reg</span><span class="s3">,</span>
+        <span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s4"># Backward compat for 3.8 and 3.9</span>
+        <span class="s1">args </span><span class="s3">= (</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_argcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_posonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_kwonlyargcount</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_nlocals</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_stacksize</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_flags</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_code</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_consts</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_names</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_varnames</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_filename</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_name</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_firstlineno</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_lnotab</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_freevars</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">co_cellvars</span><span class="s3">,</span>
+        <span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">types</span><span class="s3">.</span><span class="s1">CodeType</span><span class="s3">, </span><span class="s1">args</span>
+
+
+<span class="s2">def </span><span class="s1">_cell_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Cell (containing values of a function's free variables) reducer.&quot;&quot;&quot;</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">cell_contents</span>
+    <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:  </span><span class="s4"># cell is empty</span>
+        <span class="s2">return </span><span class="s1">_make_empty_cell</span><span class="s3">, ()</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">_make_cell</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">cell_contents</span><span class="s3">,)</span>
+
+
+<span class="s2">def </span><span class="s1">_classmethod_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s1">orig_func </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__func__</span>
+    <span class="s2">return </span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), (</span><span class="s1">orig_func</span><span class="s3">,)</span>
+
+
+<span class="s2">def </span><span class="s1">_file_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Save a file.&quot;&quot;&quot;</span>
+    <span class="s2">import </span><span class="s1">io</span>
+
+    <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;name&quot;</span><span class="s3">) </span><span class="s2">or not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;mode&quot;</span><span class="s3">):</span>
+        <span class="s2">raise </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">PicklingError</span><span class="s3">(</span>
+            <span class="s5">&quot;Cannot pickle files that do not map to an actual file&quot;</span>
+        <span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stdout</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">getattr</span><span class="s3">, (</span><span class="s1">sys</span><span class="s3">, </span><span class="s5">&quot;stdout&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stderr</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">getattr</span><span class="s3">, (</span><span class="s1">sys</span><span class="s3">, </span><span class="s5">&quot;stderr&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">stdin</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">PicklingError</span><span class="s3">(</span><span class="s5">&quot;Cannot pickle standard input&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">closed</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">PicklingError</span><span class="s3">(</span><span class="s5">&quot;Cannot pickle closed files&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s5">&quot;isatty&quot;</span><span class="s3">) </span><span class="s2">and </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">isatty</span><span class="s3">():</span>
+        <span class="s2">raise </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">PicklingError</span><span class="s3">(</span><span class="s5">&quot;Cannot pickle files that map to tty objects&quot;</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s5">&quot;r&quot; </span><span class="s2">not in </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">mode </span><span class="s2">and </span><span class="s5">&quot;+&quot; </span><span class="s2">not in </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">mode</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">PicklingError</span><span class="s3">(</span>
+            <span class="s5">&quot;Cannot pickle files that are not opened for reading: %s&quot; </span><span class="s3">% </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">mode</span>
+        <span class="s3">)</span>
+
+    <span class="s1">name </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">name</span>
+
+    <span class="s1">retval </span><span class="s3">= </span><span class="s1">io</span><span class="s3">.</span><span class="s1">StringIO</span><span class="s3">()</span>
+
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s4"># Read the whole file</span>
+        <span class="s1">curloc </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">tell</span><span class="s3">()</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">seek</span><span class="s3">(</span><span class="s6">0</span><span class="s3">)</span>
+        <span class="s1">contents </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">read</span><span class="s3">()</span>
+        <span class="s1">obj</span><span class="s3">.</span><span class="s1">seek</span><span class="s3">(</span><span class="s1">curloc</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s1">OSError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">PicklingError</span><span class="s3">(</span>
+            <span class="s5">&quot;Cannot pickle file %s as it cannot be read&quot; </span><span class="s3">% </span><span class="s1">name</span>
+        <span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+    <span class="s1">retval</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">contents</span><span class="s3">)</span>
+    <span class="s1">retval</span><span class="s3">.</span><span class="s1">seek</span><span class="s3">(</span><span class="s1">curloc</span><span class="s3">)</span>
+
+    <span class="s1">retval</span><span class="s3">.</span><span class="s1">name </span><span class="s3">= </span><span class="s1">name</span>
+    <span class="s2">return </span><span class="s1">_file_reconstructor</span><span class="s3">, (</span><span class="s1">retval</span><span class="s3">,)</span>
+
+
+<span class="s2">def </span><span class="s1">_getset_descriptor_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">getattr</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__objclass__</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_mappingproxy_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">types</span><span class="s3">.</span><span class="s1">MappingProxyType</span><span class="s3">, (</span><span class="s1">dict</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),)</span>
+
+
+<span class="s2">def </span><span class="s1">_memoryview_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">bytes</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">tobytes</span><span class="s3">(),)</span>
+
+
+<span class="s2">def </span><span class="s1">_module_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">_should_pickle_by_reference</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">subimport</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">,)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s4"># Some external libraries can populate the &quot;__builtins__&quot; entry of a</span>
+        <span class="s4"># module's `__dict__` with unpicklable objects (see #316). For that</span>
+        <span class="s4"># reason, we do not attempt to pickle the &quot;__builtins__&quot; entry, and</span>
+        <span class="s4"># restore a default value for it at unpickling time.</span>
+        <span class="s1">state </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+        <span class="s1">state</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;__builtins__&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">dynamic_subimport</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">state</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_method_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s3">(</span><span class="s1">types</span><span class="s3">.</span><span class="s1">MethodType</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__func__</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__self__</span><span class="s3">))</span>
+
+
+<span class="s2">def </span><span class="s1">_logger_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">name</span><span class="s3">,)</span>
+
+
+<span class="s2">def </span><span class="s1">_root_logger_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">, ()</span>
+
+
+<span class="s2">def </span><span class="s1">_property_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">property</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">fget</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">fset</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">fdel</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__doc__</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_weakset_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">weakref</span><span class="s3">.</span><span class="s1">WeakSet</span><span class="s3">, (</span><span class="s1">list</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),)</span>
+
+
+<span class="s2">def </span><span class="s1">_dynamic_class_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Save a class that can't be referenced as a module attribute. 
+ 
+    This method is used to serialize classes that are defined inside 
+    functions, or that otherwise can't be serialized as attribute lookups 
+    from importable modules. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">Enum </span><span class="s2">is not None and </span><span class="s1">issubclass</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">Enum</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s3">(</span>
+            <span class="s1">_make_skeleton_enum</span><span class="s3">,</span>
+            <span class="s1">_enum_getnewargs</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+            <span class="s1">_enum_getstate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+            <span class="s2">None</span><span class="s3">,</span>
+            <span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">_class_setstate</span><span class="s3">,</span>
+        <span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s3">(</span>
+            <span class="s1">_make_skeleton_class</span><span class="s3">,</span>
+            <span class="s1">_class_getnewargs</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+            <span class="s1">_class_getstate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),</span>
+            <span class="s2">None</span><span class="s3">,</span>
+            <span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">_class_setstate</span><span class="s3">,</span>
+        <span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_class_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Select the reducer depending on the dynamic nature of the class obj.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">type</span><span class="s3">(</span><span class="s2">None</span><span class="s3">):  </span><span class="s4"># noqa</span>
+        <span class="s2">return </span><span class="s1">type</span><span class="s3">, (</span><span class="s2">None</span><span class="s3">,)</span>
+    <span class="s2">elif </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">type</span><span class="s3">(</span><span class="s1">Ellipsis</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">type</span><span class="s3">, (</span><span class="s1">Ellipsis</span><span class="s3">,)</span>
+    <span class="s2">elif </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">type</span><span class="s3">(</span><span class="s1">NotImplemented</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">type</span><span class="s3">, (</span><span class="s1">NotImplemented</span><span class="s3">,)</span>
+    <span class="s2">elif </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">_BUILTIN_TYPE_NAMES</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">_builtin_type</span><span class="s3">, (</span><span class="s1">_BUILTIN_TYPE_NAMES</span><span class="s3">[</span><span class="s1">obj</span><span class="s3">],)</span>
+    <span class="s2">elif not </span><span class="s1">_should_pickle_by_reference</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">_dynamic_class_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">NotImplemented</span>
+
+
+<span class="s2">def </span><span class="s1">_dict_keys_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s4"># Safer not to ship the full dict as sending the rest might</span>
+    <span class="s4"># be unintended and could potentially cause leaking of</span>
+    <span class="s4"># sensitive information</span>
+    <span class="s2">return </span><span class="s1">_make_dict_keys</span><span class="s3">, (</span><span class="s1">list</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),)</span>
+
+
+<span class="s2">def </span><span class="s1">_dict_values_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s4"># Safer not to ship the full dict as sending the rest might</span>
+    <span class="s4"># be unintended and could potentially cause leaking of</span>
+    <span class="s4"># sensitive information</span>
+    <span class="s2">return </span><span class="s1">_make_dict_values</span><span class="s3">, (</span><span class="s1">list</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),)</span>
+
+
+<span class="s2">def </span><span class="s1">_dict_items_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">_make_dict_items</span><span class="s3">, (</span><span class="s1">dict</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">),)</span>
+
+
+<span class="s2">def </span><span class="s1">_odict_keys_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s4"># Safer not to ship the full dict as sending the rest might</span>
+    <span class="s4"># be unintended and could potentially cause leaking of</span>
+    <span class="s4"># sensitive information</span>
+    <span class="s2">return </span><span class="s1">_make_dict_keys</span><span class="s3">, (</span><span class="s1">list</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s2">True</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_odict_values_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s4"># Safer not to ship the full dict as sending the rest might</span>
+    <span class="s4"># be unintended and could potentially cause leaking of</span>
+    <span class="s4"># sensitive information</span>
+    <span class="s2">return </span><span class="s1">_make_dict_values</span><span class="s3">, (</span><span class="s1">list</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s2">True</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_odict_items_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">_make_dict_items</span><span class="s3">, (</span><span class="s1">dict</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s2">True</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_dataclass_field_base_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">_get_dataclass_field_type_sentinel</span><span class="s3">, (</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">name</span><span class="s3">,)</span>
+
+
+<span class="s4"># COLLECTIONS OF OBJECTS STATE SETTERS</span>
+<span class="s4"># ------------------------------------</span>
+<span class="s4"># state setters are called at unpickling time, once the object is created and</span>
+<span class="s4"># it has to be updated to how it was at unpickling time.</span>
+
+
+<span class="s2">def </span><span class="s1">_function_setstate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Update the state of a dynamic function. 
+ 
+    As __closure__ and __globals__ are readonly attributes of a function, we 
+    cannot rely on the native setstate routine of pickle.load_build, that calls 
+    setattr on items of the slotstate. Instead, we have to modify them inplace. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">state</span><span class="s3">, </span><span class="s1">slotstate </span><span class="s3">= </span><span class="s1">state</span>
+    <span class="s1">obj</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+
+    <span class="s1">obj_globals </span><span class="s3">= </span><span class="s1">slotstate</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;__globals__&quot;</span><span class="s3">)</span>
+    <span class="s1">obj_closure </span><span class="s3">= </span><span class="s1">slotstate</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;__closure__&quot;</span><span class="s3">)</span>
+    <span class="s4"># _cloudpickle_subimports is a set of submodules that must be loaded for</span>
+    <span class="s4"># the pickled function to work correctly at unpickling time. Now that these</span>
+    <span class="s4"># submodules are depickled (hence imported), they can be removed from the</span>
+    <span class="s4"># object's state (the object state only served as a reference holder to</span>
+    <span class="s4"># these submodules)</span>
+    <span class="s1">slotstate</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s5">&quot;_cloudpickle_submodules&quot;</span><span class="s3">)</span>
+
+    <span class="s1">obj</span><span class="s3">.</span><span class="s1">__globals__</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">obj_globals</span><span class="s3">)</span>
+    <span class="s1">obj</span><span class="s3">.</span><span class="s1">__globals__</span><span class="s3">[</span><span class="s5">&quot;__builtins__&quot;</span><span class="s3">] = </span><span class="s1">__builtins__</span>
+
+    <span class="s2">if </span><span class="s1">obj_closure </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s3">, </span><span class="s1">cell </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">obj_closure</span><span class="s3">):</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">value </span><span class="s3">= </span><span class="s1">cell</span><span class="s3">.</span><span class="s1">cell_contents</span>
+            <span class="s2">except </span><span class="s1">ValueError</span><span class="s3">:  </span><span class="s4"># cell is empty</span>
+                <span class="s2">continue</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">__closure__</span><span class="s3">[</span><span class="s1">i</span><span class="s3">].</span><span class="s1">cell_contents </span><span class="s3">= </span><span class="s1">value</span>
+
+    <span class="s2">for </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v </span><span class="s2">in </span><span class="s1">slotstate</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s1">setattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">k</span><span class="s3">, </span><span class="s1">v</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_class_setstate</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">state</span><span class="s3">):</span>
+    <span class="s1">state</span><span class="s3">, </span><span class="s1">slotstate </span><span class="s3">= </span><span class="s1">state</span>
+    <span class="s1">registry </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s2">for </span><span class="s1">attrname</span><span class="s3">, </span><span class="s1">attr </span><span class="s2">in </span><span class="s1">state</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s2">if </span><span class="s1">attrname </span><span class="s3">== </span><span class="s5">&quot;_abc_impl&quot;</span><span class="s3">:</span>
+            <span class="s1">registry </span><span class="s3">= </span><span class="s1">attr</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">setattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">attrname</span><span class="s3">, </span><span class="s1">attr</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">registry </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">subclass </span><span class="s2">in </span><span class="s1">registry</span><span class="s3">:</span>
+            <span class="s1">obj</span><span class="s3">.</span><span class="s1">register</span><span class="s3">(</span><span class="s1">subclass</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">obj</span>
+
+
+<span class="s4"># COLLECTION OF DATACLASS UTILITIES</span>
+<span class="s4"># ---------------------------------</span>
+<span class="s4"># There are some internal sentinel values whose identity must be preserved when</span>
+<span class="s4"># unpickling dataclass fields. Each sentinel value has a unique name that we can</span>
+<span class="s4"># use to retrieve its identity at unpickling time.</span>
+
+
+<span class="s1">_DATACLASSE_FIELD_TYPE_SENTINELS </span><span class="s3">= {</span>
+    <span class="s1">dataclasses</span><span class="s3">.</span><span class="s1">_FIELD</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: </span><span class="s1">dataclasses</span><span class="s3">.</span><span class="s1">_FIELD</span><span class="s3">,</span>
+    <span class="s1">dataclasses</span><span class="s3">.</span><span class="s1">_FIELD_CLASSVAR</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: </span><span class="s1">dataclasses</span><span class="s3">.</span><span class="s1">_FIELD_CLASSVAR</span><span class="s3">,</span>
+    <span class="s1">dataclasses</span><span class="s3">.</span><span class="s1">_FIELD_INITVAR</span><span class="s3">.</span><span class="s1">name</span><span class="s3">: </span><span class="s1">dataclasses</span><span class="s3">.</span><span class="s1">_FIELD_INITVAR</span><span class="s3">,</span>
+<span class="s3">}</span>
+
+
+<span class="s2">def </span><span class="s1">_get_dataclass_field_type_sentinel</span><span class="s3">(</span><span class="s1">name</span><span class="s3">):</span>
+    <span class="s2">return </span><span class="s1">_DATACLASSE_FIELD_TYPE_SENTINELS</span><span class="s3">[</span><span class="s1">name</span><span class="s3">]</span>
+
+
+<span class="s2">class </span><span class="s1">Pickler</span><span class="s3">(</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">Pickler</span><span class="s3">):</span>
+    <span class="s4"># set of reducers defined and used by cloudpickle (private)</span>
+    <span class="s1">_dispatch_table </span><span class="s3">= {}</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">classmethod</span><span class="s3">] = </span><span class="s1">_classmethod_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">io</span><span class="s3">.</span><span class="s1">TextIOWrapper</span><span class="s3">] = </span><span class="s1">_file_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">logging</span><span class="s3">.</span><span class="s1">Logger</span><span class="s3">] = </span><span class="s1">_logger_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">logging</span><span class="s3">.</span><span class="s1">RootLogger</span><span class="s3">] = </span><span class="s1">_root_logger_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">memoryview</span><span class="s3">] = </span><span class="s1">_memoryview_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">property</span><span class="s3">] = </span><span class="s1">_property_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">staticmethod</span><span class="s3">] = </span><span class="s1">_classmethod_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">CellType</span><span class="s3">] = </span><span class="s1">_cell_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">types</span><span class="s3">.</span><span class="s1">CodeType</span><span class="s3">] = </span><span class="s1">_code_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">types</span><span class="s3">.</span><span class="s1">GetSetDescriptorType</span><span class="s3">] = </span><span class="s1">_getset_descriptor_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">types</span><span class="s3">.</span><span class="s1">ModuleType</span><span class="s3">] = </span><span class="s1">_module_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">types</span><span class="s3">.</span><span class="s1">MethodType</span><span class="s3">] = </span><span class="s1">_method_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">types</span><span class="s3">.</span><span class="s1">MappingProxyType</span><span class="s3">] = </span><span class="s1">_mappingproxy_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">weakref</span><span class="s3">.</span><span class="s1">WeakSet</span><span class="s3">] = </span><span class="s1">_weakset_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">typing</span><span class="s3">.</span><span class="s1">TypeVar</span><span class="s3">] = </span><span class="s1">_typevar_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">_collections_abc</span><span class="s3">.</span><span class="s1">dict_keys</span><span class="s3">] = </span><span class="s1">_dict_keys_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">_collections_abc</span><span class="s3">.</span><span class="s1">dict_values</span><span class="s3">] = </span><span class="s1">_dict_values_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">_collections_abc</span><span class="s3">.</span><span class="s1">dict_items</span><span class="s3">] = </span><span class="s1">_dict_items_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">type</span><span class="s3">(</span><span class="s1">OrderedDict</span><span class="s3">().</span><span class="s1">keys</span><span class="s3">())] = </span><span class="s1">_odict_keys_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">type</span><span class="s3">(</span><span class="s1">OrderedDict</span><span class="s3">().</span><span class="s1">values</span><span class="s3">())] = </span><span class="s1">_odict_values_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">type</span><span class="s3">(</span><span class="s1">OrderedDict</span><span class="s3">().</span><span class="s1">items</span><span class="s3">())] = </span><span class="s1">_odict_items_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractmethod</span><span class="s3">] = </span><span class="s1">_classmethod_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractclassmethod</span><span class="s3">] = </span><span class="s1">_classmethod_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractstaticmethod</span><span class="s3">] = </span><span class="s1">_classmethod_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">abc</span><span class="s3">.</span><span class="s1">abstractproperty</span><span class="s3">] = </span><span class="s1">_property_reduce</span>
+    <span class="s1">_dispatch_table</span><span class="s3">[</span><span class="s1">dataclasses</span><span class="s3">.</span><span class="s1">_FIELD_BASE</span><span class="s3">] = </span><span class="s1">_dataclass_field_base_reduce</span>
+
+    <span class="s1">dispatch_table </span><span class="s3">= </span><span class="s1">ChainMap</span><span class="s3">(</span><span class="s1">_dispatch_table</span><span class="s3">, </span><span class="s1">copyreg</span><span class="s3">.</span><span class="s1">dispatch_table</span><span class="s3">)</span>
+
+    <span class="s4"># function reducers are defined as instance methods of cloudpickle.Pickler</span>
+    <span class="s4"># objects, as they rely on a cloudpickle.Pickler attribute (globals_ref)</span>
+    <span class="s2">def </span><span class="s1">_dynamic_function_reduce</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">func</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Reduce a function that is not pickleable via attribute lookup.&quot;&quot;&quot;</span>
+        <span class="s1">newargs </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_function_getnewargs</span><span class="s3">(</span><span class="s1">func</span><span class="s3">)</span>
+        <span class="s1">state </span><span class="s3">= </span><span class="s1">_function_getstate</span><span class="s3">(</span><span class="s1">func</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s3">(</span><span class="s1">_make_function</span><span class="s3">, </span><span class="s1">newargs</span><span class="s3">, </span><span class="s1">state</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">_function_setstate</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_function_reduce</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">):</span>
+        <span class="s0">&quot;&quot;&quot;Reducer for function objects. 
+ 
+        If obj is a top-level attribute of a file-backed module, this reducer 
+        returns NotImplemented, making the cloudpickle.Pickler fall back to 
+        traditional pickle.Pickler routines to save obj. Otherwise, it reduces 
+        obj using a custom cloudpickle reducer designed specifically to handle 
+        dynamic functions. 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">_should_pickle_by_reference</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">NotImplemented</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_dynamic_function_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">_function_getnewargs</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">func</span><span class="s3">):</span>
+        <span class="s1">code </span><span class="s3">= </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__code__</span>
+
+        <span class="s4"># base_globals represents the future global namespace of func at</span>
+        <span class="s4"># unpickling time. Looking it up and storing it in</span>
+        <span class="s4"># cloudpickle.Pickler.globals_ref allow functions sharing the same</span>
+        <span class="s4"># globals at pickling time to also share them once unpickled, at one</span>
+        <span class="s4"># condition: since globals_ref is an attribute of a cloudpickle.Pickler</span>
+        <span class="s4"># instance, and that a new cloudpickle.Pickler is created each time</span>
+        <span class="s4"># cloudpickle.dump or cloudpickle.dumps is called, functions also need</span>
+        <span class="s4"># to be saved within the same invocation of</span>
+        <span class="s4"># cloudpickle.dump/cloudpickle.dumps (for example:</span>
+        <span class="s4"># cloudpickle.dumps([f1, f2])). There is no such limitation when using</span>
+        <span class="s4"># cloudpickle.Pickler.dump, as long as the multiple invocations are</span>
+        <span class="s4"># bound to the same cloudpickle.Pickler instance.</span>
+        <span class="s1">base_globals </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">globals_ref</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s1">id</span><span class="s3">(</span><span class="s1">func</span><span class="s3">.</span><span class="s1">__globals__</span><span class="s3">), {})</span>
+
+        <span class="s2">if </span><span class="s1">base_globals </span><span class="s3">== {}:</span>
+            <span class="s4"># Add module attributes used to resolve relative imports</span>
+            <span class="s4"># instructions inside func.</span>
+            <span class="s2">for </span><span class="s1">k </span><span class="s2">in </span><span class="s3">[</span><span class="s5">&quot;__package__&quot;</span><span class="s3">, </span><span class="s5">&quot;__name__&quot;</span><span class="s3">, </span><span class="s5">&quot;__path__&quot;</span><span class="s3">, </span><span class="s5">&quot;__file__&quot;</span><span class="s3">]:</span>
+                <span class="s2">if </span><span class="s1">k </span><span class="s2">in </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__globals__</span><span class="s3">:</span>
+                    <span class="s1">base_globals</span><span class="s3">[</span><span class="s1">k</span><span class="s3">] = </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__globals__</span><span class="s3">[</span><span class="s1">k</span><span class="s3">]</span>
+
+        <span class="s4"># Do not bind the free variables before the function is created to</span>
+        <span class="s4"># avoid infinite recursion.</span>
+        <span class="s2">if </span><span class="s1">func</span><span class="s3">.</span><span class="s1">__closure__ </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">closure </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">closure </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">_make_empty_cell</span><span class="s3">() </span><span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">code</span><span class="s3">.</span><span class="s1">co_freevars</span><span class="s3">)))</span>
+
+        <span class="s2">return </span><span class="s1">code</span><span class="s3">, </span><span class="s1">base_globals</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closure</span>
+
+    <span class="s2">def </span><span class="s1">dump</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">super</span><span class="s3">().</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">RuntimeError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">args</span><span class="s3">) &gt; </span><span class="s6">0 </span><span class="s2">and </span><span class="s5">&quot;recursion&quot; </span><span class="s2">in </span><span class="s1">e</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]:</span>
+                <span class="s1">msg </span><span class="s3">= </span><span class="s5">&quot;Could not pickle object as excessively deep recursion required.&quot;</span>
+                <span class="s2">raise </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">PicklingError</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">) </span><span class="s2">from </span><span class="s1">e</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">file</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">buffer_callback</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">protocol </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">protocol </span><span class="s3">= </span><span class="s1">DEFAULT_PROTOCOL</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">file</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s1">protocol</span><span class="s3">, </span><span class="s1">buffer_callback</span><span class="s3">=</span><span class="s1">buffer_callback</span><span class="s3">)</span>
+        <span class="s4"># map functions __globals__ attribute ids, to ensure that functions</span>
+        <span class="s4"># sharing the same global namespace at pickling time also share</span>
+        <span class="s4"># their global namespace at unpickling time.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">globals_ref </span><span class="s3">= {}</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">proto </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">protocol</span><span class="s3">)</span>
+
+    <span class="s2">if not </span><span class="s1">PYPY</span><span class="s3">:</span>
+        <span class="s4"># pickle.Pickler is the C implementation of the CPython pickler and</span>
+        <span class="s4"># therefore we rely on reduce_override method to customize the pickler</span>
+        <span class="s4"># behavior.</span>
+
+        <span class="s4"># `cloudpickle.Pickler.dispatch` is only left for backward</span>
+        <span class="s4"># compatibility - note that when using protocol 5,</span>
+        <span class="s4"># `cloudpickle.Pickler.dispatch` is not an extension of</span>
+        <span class="s4"># `pickle._Pickler.dispatch` dictionary, because `cloudpickle.Pickler`</span>
+        <span class="s4"># subclasses the C-implemented `pickle.Pickler`, which does not expose</span>
+        <span class="s4"># a `dispatch` attribute.  Earlier versions of `cloudpickle.Pickler`</span>
+        <span class="s4"># used `cloudpickle.Pickler.dispatch` as a class-level attribute</span>
+        <span class="s4"># storing all reducers implemented by cloudpickle, but the attribute</span>
+        <span class="s4"># name was not a great choice given because it would collide with a</span>
+        <span class="s4"># similarly named attribute in the pure-Python `pickle._Pickler`</span>
+        <span class="s4"># implementation in the standard library.</span>
+        <span class="s1">dispatch </span><span class="s3">= </span><span class="s1">dispatch_table</span>
+
+        <span class="s4"># Implementation of the reducer_override callback, in order to</span>
+        <span class="s4"># efficiently serialize dynamic functions and classes by subclassing</span>
+        <span class="s4"># the C-implemented `pickle.Pickler`.</span>
+        <span class="s4"># TODO: decorrelate reducer_override (which is tied to CPython's</span>
+        <span class="s4"># implementation - would it make sense to backport it to pypy? - and</span>
+        <span class="s4"># pickle's protocol 5 which is implementation agnostic. Currently, the</span>
+        <span class="s4"># availability of both notions coincide on CPython's pickle, but it may</span>
+        <span class="s4"># not be the case anymore when pypy implements protocol 5.</span>
+
+        <span class="s2">def </span><span class="s1">reducer_override</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">):</span>
+            <span class="s0">&quot;&quot;&quot;Type-agnostic reducing callback for function and classes. 
+ 
+            For performance reasons, subclasses of the C `pickle.Pickler` class 
+            cannot register custom reducers for functions and classes in the 
+            dispatch_table attribute. Reducers for such types must instead 
+            implemented via the special `reducer_override` method. 
+ 
+            Note that this method will be called for any object except a few 
+            builtin-types (int, lists, dicts etc.), which differs from reducers 
+            in the Pickler's dispatch_table, each of them being invoked for 
+            objects of a specific type only. 
+ 
+            This property comes in handy for classes: although most classes are 
+            instances of the ``type`` metaclass, some of them can be instances 
+            of other custom metaclasses (such as enum.EnumMeta for example). In 
+            particular, the metaclass will likely not be known in advance, and 
+            thus cannot be special-cased using an entry in the dispatch_table. 
+            reducer_override, among other things, allows us to register a 
+            reducer that will be called for any class, independently of its 
+            type. 
+ 
+            Notes: 
+ 
+            * reducer_override has the priority over dispatch_table-registered 
+            reducers. 
+            * reducer_override can be used to fix other limitations of 
+              cloudpickle for other types that suffered from type-specific 
+              reducers, such as Exceptions. See 
+              https://github.com/cloudpipe/cloudpickle/issues/248 
+            &quot;&quot;&quot;</span>
+            <span class="s1">t </span><span class="s3">= </span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">try</span><span class="s3">:</span>
+                <span class="s1">is_anyclass </span><span class="s3">= </span><span class="s1">issubclass</span><span class="s3">(</span><span class="s1">t</span><span class="s3">, </span><span class="s1">type</span><span class="s3">)</span>
+            <span class="s2">except </span><span class="s1">TypeError</span><span class="s3">:  </span><span class="s4"># t is not a class (old Boost; see SF #502085)</span>
+                <span class="s1">is_anyclass </span><span class="s3">= </span><span class="s2">False</span>
+
+            <span class="s2">if </span><span class="s1">is_anyclass</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">_class_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">types</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_function_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s4"># fallback to save_global, including the Pickler's</span>
+                <span class="s4"># dispatch_table</span>
+                <span class="s2">return </span><span class="s1">NotImplemented</span>
+
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s4"># When reducer_override is not available, hack the pure-Python</span>
+        <span class="s4"># Pickler's types.FunctionType and type savers. Note: the type saver</span>
+        <span class="s4"># must override Pickler.save_global, because pickle.py contains a</span>
+        <span class="s4"># hard-coded call to save_global when pickling meta-classes.</span>
+        <span class="s1">dispatch </span><span class="s3">= </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">Pickler</span><span class="s3">.</span><span class="s1">dispatch</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+        <span class="s2">def </span><span class="s1">_save_reduce_pickle5</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">,</span>
+            <span class="s1">func</span><span class="s3">,</span>
+            <span class="s1">args</span><span class="s3">,</span>
+            <span class="s1">state</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">listitems</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">dictitems</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">state_setter</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+            <span class="s1">obj</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+        <span class="s3">):</span>
+            <span class="s1">save </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">save</span>
+            <span class="s1">write </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">write</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">save_reduce</span><span class="s3">(</span>
+                <span class="s1">func</span><span class="s3">,</span>
+                <span class="s1">args</span><span class="s3">,</span>
+                <span class="s1">state</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                <span class="s1">listitems</span><span class="s3">=</span><span class="s1">listitems</span><span class="s3">,</span>
+                <span class="s1">dictitems</span><span class="s3">=</span><span class="s1">dictitems</span><span class="s3">,</span>
+                <span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">,</span>
+            <span class="s3">)</span>
+            <span class="s4"># backport of the Python 3.8 state_setter pickle operations</span>
+            <span class="s1">save</span><span class="s3">(</span><span class="s1">state_setter</span><span class="s3">)</span>
+            <span class="s1">save</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)  </span><span class="s4"># simple BINGET opcode as obj is already memoized.</span>
+            <span class="s1">save</span><span class="s3">(</span><span class="s1">state</span><span class="s3">)</span>
+            <span class="s1">write</span><span class="s3">(</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">TUPLE2</span><span class="s3">)</span>
+            <span class="s4"># Trigger a state_setter(obj, state) function call.</span>
+            <span class="s1">write</span><span class="s3">(</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">REDUCE</span><span class="s3">)</span>
+            <span class="s4"># The purpose of state_setter is to carry-out an</span>
+            <span class="s4"># inplace modification of obj. We do not care about what the</span>
+            <span class="s4"># method might return, so its output is eventually removed from</span>
+            <span class="s4"># the stack.</span>
+            <span class="s1">write</span><span class="s3">(</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">POP</span><span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">save_global</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">pack</span><span class="s3">=</span><span class="s1">struct</span><span class="s3">.</span><span class="s1">pack</span><span class="s3">):</span>
+            <span class="s0">&quot;&quot;&quot;Main dispatch method. 
+ 
+            The name of this method is somewhat misleading: all types get 
+            dispatched here. 
+            &quot;&quot;&quot;</span>
+            <span class="s2">if </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">type</span><span class="s3">(</span><span class="s2">None</span><span class="s3">):  </span><span class="s4"># noqa</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">save_reduce</span><span class="s3">(</span><span class="s1">type</span><span class="s3">, (</span><span class="s2">None</span><span class="s3">,), </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">type</span><span class="s3">(</span><span class="s1">Ellipsis</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">save_reduce</span><span class="s3">(</span><span class="s1">type</span><span class="s3">, (</span><span class="s1">Ellipsis</span><span class="s3">,), </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">obj </span><span class="s2">is </span><span class="s1">type</span><span class="s3">(</span><span class="s1">NotImplemented</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">save_reduce</span><span class="s3">(</span><span class="s1">type</span><span class="s3">, (</span><span class="s1">NotImplemented</span><span class="s3">,), </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">_BUILTIN_TYPE_NAMES</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">save_reduce</span><span class="s3">(</span>
+                    <span class="s1">_builtin_type</span><span class="s3">, (</span><span class="s1">_BUILTIN_TYPE_NAMES</span><span class="s3">[</span><span class="s1">obj</span><span class="s3">],), </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span>
+                <span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">name </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">super</span><span class="s3">().</span><span class="s1">save_global</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s2">elif not </span><span class="s1">_should_pickle_by_reference</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">):</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_save_reduce_pickle5</span><span class="s3">(*</span><span class="s1">_dynamic_class_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">super</span><span class="s3">().</span><span class="s1">save_global</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">)</span>
+
+        <span class="s1">dispatch</span><span class="s3">[</span><span class="s1">type</span><span class="s3">] = </span><span class="s1">save_global</span>
+
+        <span class="s2">def </span><span class="s1">save_function</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+            <span class="s0">&quot;&quot;&quot;Registered with the dispatch to handle all function types. 
+ 
+            Determines what kind of function obj is (e.g. lambda, defined at 
+            interactive prompt, etc) and handles the pickling appropriately. 
+            &quot;&quot;&quot;</span>
+            <span class="s2">if </span><span class="s1">_should_pickle_by_reference</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">super</span><span class="s3">().</span><span class="s1">save_global</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s1">name</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">PYPY </span><span class="s2">and </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">, </span><span class="s1">builtin_code_type</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">save_pypy_builtin_func</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_save_reduce_pickle5</span><span class="s3">(</span>
+                    <span class="s3">*</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_dynamic_function_reduce</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span>
+                <span class="s3">)</span>
+
+        <span class="s2">def </span><span class="s1">save_pypy_builtin_func</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">):</span>
+            <span class="s0">&quot;&quot;&quot;Save pypy equivalent of builtin functions. 
+ 
+            PyPy does not have the concept of builtin-functions. Instead, 
+            builtin-functions are simple function instances, but with a 
+            builtin-code attribute. 
+            Most of the time, builtin functions should be pickled by attribute. 
+            But PyPy has flaky support for __qualname__, so some builtin 
+            functions such as float.__new__ will be classified as dynamic. For 
+            this reason only, we created this special routine. Because 
+            builtin-functions are not expected to have closure or globals, 
+            there is no additional hack (compared the one already implemented 
+            in pickle) to protect ourselves from reference cycles. A simple 
+            (reconstructor, newargs, obj.__dict__) tuple is save_reduced.  Note 
+            also that PyPy improved their support for __qualname__ in v3.6, so 
+            this routing should be removed when cloudpickle supports only PyPy 
+            3.6 and later. 
+            &quot;&quot;&quot;</span>
+            <span class="s1">rv </span><span class="s3">= (</span>
+                <span class="s1">types</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">,</span>
+                <span class="s3">(</span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__code__</span><span class="s3">, {}, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__name__</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__defaults__</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">__closure__</span><span class="s3">),</span>
+                <span class="s1">obj</span><span class="s3">.</span><span class="s1">__dict__</span><span class="s3">,</span>
+            <span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">save_reduce</span><span class="s3">(*</span><span class="s1">rv</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">obj</span><span class="s3">)</span>
+
+        <span class="s1">dispatch</span><span class="s3">[</span><span class="s1">types</span><span class="s3">.</span><span class="s1">FunctionType</span><span class="s3">] = </span><span class="s1">save_function</span>
+
+
+<span class="s4"># Shorthands similar to pickle.dump/pickle.dumps</span>
+
+
+<span class="s2">def </span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">file</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">buffer_callback</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Serialize obj as bytes streamed into file 
+ 
+    protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to 
+    pickle.HIGHEST_PROTOCOL. This setting favors maximum communication 
+    speed between processes running the same Python version. 
+ 
+    Set protocol=pickle.DEFAULT_PROTOCOL instead if you need to ensure 
+    compatibility with older versions of Python (although this is not always 
+    guaranteed to work because cloudpickle relies on some internal 
+    implementation details that can change from one Python version to the 
+    next). 
+    &quot;&quot;&quot;</span>
+    <span class="s1">Pickler</span><span class="s3">(</span><span class="s1">file</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s1">protocol</span><span class="s3">, </span><span class="s1">buffer_callback</span><span class="s3">=</span><span class="s1">buffer_callback</span><span class="s3">).</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">dumps</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">buffer_callback</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Serialize obj as a string of bytes allocated in memory 
+ 
+    protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to 
+    pickle.HIGHEST_PROTOCOL. This setting favors maximum communication 
+    speed between processes running the same Python version. 
+ 
+    Set protocol=pickle.DEFAULT_PROTOCOL instead if you need to ensure 
+    compatibility with older versions of Python (although this is not always 
+    guaranteed to work because cloudpickle relies on some internal 
+    implementation details that can change from one Python version to the 
+    next). 
+    &quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">io</span><span class="s3">.</span><span class="s1">BytesIO</span><span class="s3">() </span><span class="s2">as </span><span class="s1">file</span><span class="s3">:</span>
+        <span class="s1">cp </span><span class="s3">= </span><span class="s1">Pickler</span><span class="s3">(</span><span class="s1">file</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s1">protocol</span><span class="s3">, </span><span class="s1">buffer_callback</span><span class="s3">=</span><span class="s1">buffer_callback</span><span class="s3">)</span>
+        <span class="s1">cp</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">file</span><span class="s3">.</span><span class="s1">getvalue</span><span class="s3">()</span>
+
+
+<span class="s4"># Include pickles unloading functions in this namespace for convenience.</span>
+<span class="s1">load</span><span class="s3">, </span><span class="s1">loads </span><span class="s3">= </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">, </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">loads</span>
+
+<span class="s4"># Backward compat alias.</span>
+<span class="s1">CloudPickler </span><span class="s3">= </span><span class="s1">Pickler</span>
+</pre>
+</body>
+</html>

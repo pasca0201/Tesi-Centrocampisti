@@ -1,0 +1,1194 @@
+<html>
+<head>
+<title>_pls.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_pls.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+The :mod:`sklearn.pls` module implements Partial Least Squares (PLS). 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Edouard Duchesnay &lt;edouard.duchesnay@cea.fr&gt;</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">abc </span><span class="s3">import </span><span class="s1">ABCMeta</span><span class="s4">, </span><span class="s1">abstractmethod</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg </span><span class="s3">import </span><span class="s1">svd</span>
+
+<span class="s3">from </span><span class="s4">..</span><span class="s1">base </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">BaseEstimator</span><span class="s4">,</span>
+    <span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s4">,</span>
+    <span class="s1">MultiOutputMixin</span><span class="s4">,</span>
+    <span class="s1">RegressorMixin</span><span class="s4">,</span>
+    <span class="s1">TransformerMixin</span><span class="s4">,</span>
+    <span class="s1">_fit_context</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">ConvergenceWarning</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils </span><span class="s3">import </span><span class="s1">check_array</span><span class="s4">, </span><span class="s1">check_consistent_length</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s1">Interval</span><span class="s4">, </span><span class="s1">StrOptions</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">extmath </span><span class="s3">import </span><span class="s1">svd_flip</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">fixes </span><span class="s3">import </span><span class="s1">parse_version</span><span class="s4">, </span><span class="s1">sp_version</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">validation </span><span class="s3">import </span><span class="s1">FLOAT_DTYPES</span><span class="s4">, </span><span class="s1">check_is_fitted</span>
+
+<span class="s1">__all__ </span><span class="s4">= [</span><span class="s5">&quot;PLSCanonical&quot;</span><span class="s4">, </span><span class="s5">&quot;PLSRegression&quot;</span><span class="s4">, </span><span class="s5">&quot;PLSSVD&quot;</span><span class="s4">]</span>
+
+
+<span class="s3">if </span><span class="s1">sp_version </span><span class="s4">&gt;= </span><span class="s1">parse_version</span><span class="s4">(</span><span class="s5">&quot;1.7&quot;</span><span class="s4">):</span>
+    <span class="s2"># Starting in scipy 1.7 pinv2 was deprecated in favor of pinv.</span>
+    <span class="s2"># pinv now uses the svd to compute the pseudo-inverse.</span>
+    <span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg </span><span class="s3">import </span><span class="s1">pinv </span><span class="s3">as </span><span class="s1">pinv2</span>
+<span class="s3">else</span><span class="s4">:</span>
+    <span class="s3">from </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">linalg </span><span class="s3">import </span><span class="s1">pinv2</span>
+
+
+<span class="s3">def </span><span class="s1">_pinv2_old</span><span class="s4">(</span><span class="s1">a</span><span class="s4">):</span>
+    <span class="s2"># Used previous scipy pinv2 that was updated in:</span>
+    <span class="s2"># https://github.com/scipy/scipy/pull/10067</span>
+    <span class="s2"># We can not set `cond` or `rcond` for pinv2 in scipy &gt;= 1.3 to keep the</span>
+    <span class="s2"># same behavior of pinv2 for scipy &lt; 1.3, because the condition used to</span>
+    <span class="s2"># determine the rank is dependent on the output of svd.</span>
+    <span class="s1">u</span><span class="s4">, </span><span class="s1">s</span><span class="s4">, </span><span class="s1">vh </span><span class="s4">= </span><span class="s1">svd</span><span class="s4">(</span><span class="s1">a</span><span class="s4">, </span><span class="s1">full_matrices</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">check_finite</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+
+    <span class="s1">t </span><span class="s4">= </span><span class="s1">u</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">char</span><span class="s4">.</span><span class="s1">lower</span><span class="s4">()</span>
+    <span class="s1">factor </span><span class="s4">= {</span><span class="s5">&quot;f&quot;</span><span class="s4">: </span><span class="s6">1e3</span><span class="s4">, </span><span class="s5">&quot;d&quot;</span><span class="s4">: </span><span class="s6">1e6</span><span class="s4">}</span>
+    <span class="s1">cond </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">max</span><span class="s4">(</span><span class="s1">s</span><span class="s4">) * </span><span class="s1">factor</span><span class="s4">[</span><span class="s1">t</span><span class="s4">] * </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">t</span><span class="s4">).</span><span class="s1">eps</span>
+    <span class="s1">rank </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sum</span><span class="s4">(</span><span class="s1">s </span><span class="s4">&gt; </span><span class="s1">cond</span><span class="s4">)</span>
+
+    <span class="s1">u </span><span class="s4">= </span><span class="s1">u</span><span class="s4">[:, :</span><span class="s1">rank</span><span class="s4">]</span>
+    <span class="s1">u </span><span class="s4">/= </span><span class="s1">s</span><span class="s4">[:</span><span class="s1">rank</span><span class="s4">]</span>
+    <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">transpose</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">conjugate</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">u</span><span class="s4">, </span><span class="s1">vh</span><span class="s4">[:</span><span class="s1">rank</span><span class="s4">])))</span>
+
+
+<span class="s3">def </span><span class="s1">_get_first_singular_vectors_power_method</span><span class="s4">(</span>
+    <span class="s1">X</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">, </span><span class="s1">mode</span><span class="s4">=</span><span class="s5">&quot;A&quot;</span><span class="s4">, </span><span class="s1">max_iter</span><span class="s4">=</span><span class="s6">500</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-06</span><span class="s4">, </span><span class="s1">norm_y_weights</span><span class="s4">=</span><span class="s3">False</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Return the first left and right singular vectors of X'Y. 
+ 
+    Provides an alternative to the svd(X'Y) and uses the power method instead. 
+    With norm_y_weights to True and in mode A, this corresponds to the 
+    algorithm section 11.3 of the Wegelin's review, except this starts at the 
+    &quot;update saliences&quot; part. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">eps </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">).</span><span class="s1">eps</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">y_score </span><span class="s4">= </span><span class="s1">next</span><span class="s4">(</span><span class="s1">col </span><span class="s3">for </span><span class="s1">col </span><span class="s3">in </span><span class="s1">Y</span><span class="s4">.</span><span class="s1">T </span><span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">col</span><span class="s4">) &gt; </span><span class="s1">eps</span><span class="s4">))</span>
+    <span class="s3">except </span><span class="s1">StopIteration </span><span class="s3">as </span><span class="s1">e</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">StopIteration</span><span class="s4">(</span><span class="s5">&quot;y residual is constant&quot;</span><span class="s4">) </span><span class="s3">from </span><span class="s1">e</span>
+
+    <span class="s1">x_weights_old </span><span class="s4">= </span><span class="s6">100  </span><span class="s2"># init to big value for first convergence check</span>
+
+    <span class="s3">if </span><span class="s1">mode </span><span class="s4">== </span><span class="s5">&quot;B&quot;</span><span class="s4">:</span>
+        <span class="s2"># Precompute pseudo inverse matrices</span>
+        <span class="s2"># Basically: X_pinv = (X.T X)^-1 X.T</span>
+        <span class="s2"># Which requires inverting a (n_features, n_features) matrix.</span>
+        <span class="s2"># As a result, and as detailed in the Wegelin's review, CCA (i.e. mode</span>
+        <span class="s2"># B) will be unstable if n_features &gt; n_samples or n_targets &gt;</span>
+        <span class="s2"># n_samples</span>
+        <span class="s1">X_pinv</span><span class="s4">, </span><span class="s1">Y_pinv </span><span class="s4">= </span><span class="s1">_pinv2_old</span><span class="s4">(</span><span class="s1">X</span><span class="s4">), </span><span class="s1">_pinv2_old</span><span class="s4">(</span><span class="s1">Y</span><span class="s4">)</span>
+
+    <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">max_iter</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">mode </span><span class="s4">== </span><span class="s5">&quot;B&quot;</span><span class="s4">:</span>
+            <span class="s1">x_weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X_pinv</span><span class="s4">, </span><span class="s1">y_score</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">x_weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">y_score</span><span class="s4">) / </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y_score</span><span class="s4">, </span><span class="s1">y_score</span><span class="s4">)</span>
+
+        <span class="s1">x_weights </span><span class="s4">/= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x_weights</span><span class="s4">, </span><span class="s1">x_weights</span><span class="s4">)) + </span><span class="s1">eps</span>
+        <span class="s1">x_score </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">x_weights</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">mode </span><span class="s4">== </span><span class="s5">&quot;B&quot;</span><span class="s4">:</span>
+            <span class="s1">y_weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">Y_pinv</span><span class="s4">, </span><span class="s1">x_score</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">y_weights </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">Y</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">x_score</span><span class="s4">) / </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x_score</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">x_score</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">norm_y_weights</span><span class="s4">:</span>
+            <span class="s1">y_weights </span><span class="s4">/= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y_weights</span><span class="s4">, </span><span class="s1">y_weights</span><span class="s4">)) + </span><span class="s1">eps</span>
+
+        <span class="s1">y_score </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">Y</span><span class="s4">, </span><span class="s1">y_weights</span><span class="s4">) / (</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y_weights</span><span class="s4">, </span><span class="s1">y_weights</span><span class="s4">) + </span><span class="s1">eps</span><span class="s4">)</span>
+
+        <span class="s1">x_weights_diff </span><span class="s4">= </span><span class="s1">x_weights </span><span class="s4">- </span><span class="s1">x_weights_old</span>
+        <span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x_weights_diff</span><span class="s4">, </span><span class="s1">x_weights_diff</span><span class="s4">) &lt; </span><span class="s1">tol </span><span class="s3">or </span><span class="s1">Y</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">] == </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s3">break</span>
+        <span class="s1">x_weights_old </span><span class="s4">= </span><span class="s1">x_weights</span>
+
+    <span class="s1">n_iter </span><span class="s4">= </span><span class="s1">i </span><span class="s4">+ </span><span class="s6">1</span>
+    <span class="s3">if </span><span class="s1">n_iter </span><span class="s4">== </span><span class="s1">max_iter</span><span class="s4">:</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Maximum number of iterations reached&quot;</span><span class="s4">, </span><span class="s1">ConvergenceWarning</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">x_weights</span><span class="s4">, </span><span class="s1">y_weights</span><span class="s4">, </span><span class="s1">n_iter</span>
+
+
+<span class="s3">def </span><span class="s1">_get_first_singular_vectors_svd</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Return the first left and right singular vectors of X'Y. 
+ 
+    Here the whole SVD is computed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">C </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+    <span class="s1">U</span><span class="s4">, </span><span class="s1">_</span><span class="s4">, </span><span class="s1">Vt </span><span class="s4">= </span><span class="s1">svd</span><span class="s4">(</span><span class="s1">C</span><span class="s4">, </span><span class="s1">full_matrices</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">U</span><span class="s4">[:, </span><span class="s6">0</span><span class="s4">], </span><span class="s1">Vt</span><span class="s4">[</span><span class="s6">0</span><span class="s4">, :]</span>
+
+
+<span class="s3">def </span><span class="s1">_center_scale_xy</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">, </span><span class="s1">scale</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Center X, Y and scale if the scale parameter==True 
+ 
+    Returns 
+    ------- 
+        X, Y, x_mean, y_mean, x_std, y_std 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># center</span>
+    <span class="s1">x_mean </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">)</span>
+    <span class="s1">X </span><span class="s4">-= </span><span class="s1">x_mean</span>
+    <span class="s1">y_mean </span><span class="s4">= </span><span class="s1">Y</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">)</span>
+    <span class="s1">Y </span><span class="s4">-= </span><span class="s1">y_mean</span>
+    <span class="s2"># scale</span>
+    <span class="s3">if </span><span class="s1">scale</span><span class="s4">:</span>
+        <span class="s1">x_std </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">std</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">ddof</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s1">x_std</span><span class="s4">[</span><span class="s1">x_std </span><span class="s4">== </span><span class="s6">0.0</span><span class="s4">] = </span><span class="s6">1.0</span>
+        <span class="s1">X </span><span class="s4">/= </span><span class="s1">x_std</span>
+        <span class="s1">y_std </span><span class="s4">= </span><span class="s1">Y</span><span class="s4">.</span><span class="s1">std</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">ddof</span><span class="s4">=</span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s1">y_std</span><span class="s4">[</span><span class="s1">y_std </span><span class="s4">== </span><span class="s6">0.0</span><span class="s4">] = </span><span class="s6">1.0</span>
+        <span class="s1">Y </span><span class="s4">/= </span><span class="s1">y_std</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">x_std </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">])</span>
+        <span class="s1">y_std </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones</span><span class="s4">(</span><span class="s1">Y</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">])</span>
+    <span class="s3">return </span><span class="s1">X</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">, </span><span class="s1">x_mean</span><span class="s4">, </span><span class="s1">y_mean</span><span class="s4">, </span><span class="s1">x_std</span><span class="s4">, </span><span class="s1">y_std</span>
+
+
+<span class="s3">def </span><span class="s1">_svd_flip_1d</span><span class="s4">(</span><span class="s1">u</span><span class="s4">, </span><span class="s1">v</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Same as svd_flip but works on 1d arrays, and is inplace&quot;&quot;&quot;</span>
+    <span class="s2"># svd_flip would force us to convert to 2d array and would also return 2d</span>
+    <span class="s2"># arrays. We don't want that.</span>
+    <span class="s1">biggest_abs_val_idx </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">argmax</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">u</span><span class="s4">))</span>
+    <span class="s1">sign </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sign</span><span class="s4">(</span><span class="s1">u</span><span class="s4">[</span><span class="s1">biggest_abs_val_idx</span><span class="s4">])</span>
+    <span class="s1">u </span><span class="s4">*= </span><span class="s1">sign</span>
+    <span class="s1">v </span><span class="s4">*= </span><span class="s1">sign</span>
+
+
+<span class="s2"># TODO(1.7): Remove</span>
+<span class="s3">def </span><span class="s1">_deprecate_Y_when_optional</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">):</span>
+    <span class="s3">if </span><span class="s1">Y </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+            <span class="s5">&quot;`Y` is deprecated in 1.5 and will be removed in 1.7. Use `y` instead.&quot;</span><span class="s4">,</span>
+            <span class="s1">FutureWarning</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">y </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;Cannot use both `y` and `Y`. Use only `y` as `Y` is deprecated.&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">Y</span>
+    <span class="s3">return </span><span class="s1">y</span>
+
+
+<span class="s2"># TODO(1.7): Remove</span>
+<span class="s3">def </span><span class="s1">_deprecate_Y_when_required</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">):</span>
+    <span class="s3">if </span><span class="s1">y </span><span class="s3">is None and </span><span class="s1">Y </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;y is required.&quot;</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">_deprecate_Y_when_optional</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">_PLS</span><span class="s4">(</span>
+    <span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s4">,</span>
+    <span class="s1">TransformerMixin</span><span class="s4">,</span>
+    <span class="s1">RegressorMixin</span><span class="s4">,</span>
+    <span class="s1">MultiOutputMixin</span><span class="s4">,</span>
+    <span class="s1">BaseEstimator</span><span class="s4">,</span>
+    <span class="s1">metaclass</span><span class="s4">=</span><span class="s1">ABCMeta</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Partial Least Squares (PLS) 
+ 
+    This class implements the generic PLS algorithm. 
+ 
+    Main ref: Wegelin, a survey of Partial Least Squares (PLS) methods, 
+    with emphasis on the two-block case 
+    https://stat.uw.edu/sites/default/files/files/reports/2000/tr371.pdf 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s5">&quot;n_components&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;scale&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;deflation_mode&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;regression&quot;</span><span class="s4">, </span><span class="s5">&quot;canonical&quot;</span><span class="s4">})],</span>
+        <span class="s5">&quot;mode&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;A&quot;</span><span class="s4">, </span><span class="s5">&quot;B&quot;</span><span class="s4">})],</span>
+        <span class="s5">&quot;algorithm&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;svd&quot;</span><span class="s4">, </span><span class="s5">&quot;nipals&quot;</span><span class="s4">})],</span>
+        <span class="s5">&quot;max_iter&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;tol&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s6">0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;copy&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+    <span class="s4">}</span>
+
+    <span class="s4">@</span><span class="s1">abstractmethod</span>
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">n_components</span><span class="s4">=</span><span class="s6">2</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">scale</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">deflation_mode</span><span class="s4">=</span><span class="s5">&quot;regression&quot;</span><span class="s4">,</span>
+        <span class="s1">mode</span><span class="s4">=</span><span class="s5">&quot;A&quot;</span><span class="s4">,</span>
+        <span class="s1">algorithm</span><span class="s4">=</span><span class="s5">&quot;nipals&quot;</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">500</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-06</span><span class="s4">,</span>
+        <span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_components </span><span class="s4">= </span><span class="s1">n_components</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">deflation_mode </span><span class="s4">= </span><span class="s1">deflation_mode</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">mode </span><span class="s4">= </span><span class="s1">mode</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">scale </span><span class="s4">= </span><span class="s1">scale</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">= </span><span class="s1">algorithm</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter </span><span class="s4">= </span><span class="s1">max_iter</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">tol </span><span class="s4">= </span><span class="s1">tol</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">copy </span><span class="s4">= </span><span class="s1">copy</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit model to data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training vectors, where `n_samples` is the number of samples and 
+            `n_features` is the number of predictors. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+            .. deprecated:: 1.5 
+               `Y` is deprecated in 1.5 and will be removed in 1.7. Use `y` instead. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted model. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">_deprecate_Y_when_required</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+
+        <span class="s1">check_consistent_length</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">,</span>
+            <span class="s1">force_writeable</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">,</span>
+            <span class="s1">ensure_min_samples</span><span class="s4">=</span><span class="s6">2</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span>
+            <span class="s1">y</span><span class="s4">,</span>
+            <span class="s1">input_name</span><span class="s4">=</span><span class="s5">&quot;y&quot;</span><span class="s4">,</span>
+            <span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">,</span>
+            <span class="s1">force_writeable</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">,</span>
+            <span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">y</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_predict_1d </span><span class="s4">= </span><span class="s3">True</span>
+            <span class="s1">y </span><span class="s4">= </span><span class="s1">y</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_predict_1d </span><span class="s4">= </span><span class="s3">False</span>
+
+        <span class="s1">n </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+        <span class="s1">p </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+        <span class="s1">q </span><span class="s4">= </span><span class="s1">y</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+
+        <span class="s1">n_components </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_components</span>
+        <span class="s2"># With PLSRegression n_components is bounded by the rank of (X.T X) see</span>
+        <span class="s2"># Wegelin page 25. With CCA and PLSCanonical, n_components is bounded</span>
+        <span class="s2"># by the rank of X and the rank of Y: see Wegelin page 12</span>
+        <span class="s1">rank_upper_bound </span><span class="s4">= </span><span class="s1">p </span><span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">deflation_mode </span><span class="s4">== </span><span class="s5">&quot;regression&quot; </span><span class="s3">else </span><span class="s1">min</span><span class="s4">(</span><span class="s1">n</span><span class="s4">, </span><span class="s1">p</span><span class="s4">, </span><span class="s1">q</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">n_components </span><span class="s4">&gt; </span><span class="s1">rank_upper_bound</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">f&quot;`n_components` upper bound is </span><span class="s3">{</span><span class="s1">rank_upper_bound</span><span class="s3">}</span><span class="s5">. &quot;</span>
+                <span class="s5">f&quot;Got </span><span class="s3">{</span><span class="s1">n_components</span><span class="s3">} </span><span class="s5">instead. Reduce `n_components`.&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_norm_y_weights </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">deflation_mode </span><span class="s4">== </span><span class="s5">&quot;canonical&quot;  </span><span class="s2"># 1.1</span>
+        <span class="s1">norm_y_weights </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_norm_y_weights</span>
+
+        <span class="s2"># Scale (in place)</span>
+        <span class="s1">Xk</span><span class="s4">, </span><span class="s1">yk</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_mean</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_mean</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_std</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_std </span><span class="s4">= </span><span class="s1">_center_scale_xy</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">scale</span>
+        <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">x_weights_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">p</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">))  </span><span class="s2"># U</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">y_weights_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">q</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">))  </span><span class="s2"># V</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_x_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">n</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">))  </span><span class="s2"># Xi</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_y_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">n</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">))  </span><span class="s2"># Omega</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">x_loadings_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">p</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">))  </span><span class="s2"># Gamma</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">y_loadings_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">q</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">))  </span><span class="s2"># Delta</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_iter_ </span><span class="s4">= []</span>
+
+        <span class="s2"># This whole thing corresponds to the algorithm in section 4.1 of the</span>
+        <span class="s2"># review from Wegelin. See above for a notation mapping from code to</span>
+        <span class="s2"># paper.</span>
+        <span class="s1">y_eps </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">yk</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">).</span><span class="s1">eps</span>
+        <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_components</span><span class="s4">):</span>
+            <span class="s2"># Find first left and right singular vectors of the X.T.dot(Y)</span>
+            <span class="s2"># cross-covariance matrix.</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s5">&quot;nipals&quot;</span><span class="s4">:</span>
+                <span class="s2"># Replace columns that are all close to zero with zeros</span>
+                <span class="s1">yk_mask </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">all</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">yk</span><span class="s4">) &lt; </span><span class="s6">10 </span><span class="s4">* </span><span class="s1">y_eps</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">)</span>
+                <span class="s1">yk</span><span class="s4">[:, </span><span class="s1">yk_mask</span><span class="s4">] = </span><span class="s6">0.0</span>
+
+                <span class="s3">try</span><span class="s4">:</span>
+                    <span class="s4">(</span>
+                        <span class="s1">x_weights</span><span class="s4">,</span>
+                        <span class="s1">y_weights</span><span class="s4">,</span>
+                        <span class="s1">n_iter_</span><span class="s4">,</span>
+                    <span class="s4">) = </span><span class="s1">_get_first_singular_vectors_power_method</span><span class="s4">(</span>
+                        <span class="s1">Xk</span><span class="s4">,</span>
+                        <span class="s1">yk</span><span class="s4">,</span>
+                        <span class="s1">mode</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">mode</span><span class="s4">,</span>
+                        <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter</span><span class="s4">,</span>
+                        <span class="s1">tol</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">tol</span><span class="s4">,</span>
+                        <span class="s1">norm_y_weights</span><span class="s4">=</span><span class="s1">norm_y_weights</span><span class="s4">,</span>
+                    <span class="s4">)</span>
+                <span class="s3">except </span><span class="s1">StopIteration </span><span class="s3">as </span><span class="s1">e</span><span class="s4">:</span>
+                    <span class="s3">if </span><span class="s1">str</span><span class="s4">(</span><span class="s1">e</span><span class="s4">) != </span><span class="s5">&quot;y residual is constant&quot;</span><span class="s4">:</span>
+                        <span class="s3">raise</span>
+                    <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">f&quot;y residual is constant at iteration </span><span class="s3">{</span><span class="s1">k</span><span class="s3">}</span><span class="s5">&quot;</span><span class="s4">)</span>
+                    <span class="s3">break</span>
+
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">n_iter_</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">n_iter_</span><span class="s4">)</span>
+
+            <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s5">&quot;svd&quot;</span><span class="s4">:</span>
+                <span class="s1">x_weights</span><span class="s4">, </span><span class="s1">y_weights </span><span class="s4">= </span><span class="s1">_get_first_singular_vectors_svd</span><span class="s4">(</span><span class="s1">Xk</span><span class="s4">, </span><span class="s1">yk</span><span class="s4">)</span>
+
+            <span class="s2"># inplace sign flip for consistency across solvers and archs</span>
+            <span class="s1">_svd_flip_1d</span><span class="s4">(</span><span class="s1">x_weights</span><span class="s4">, </span><span class="s1">y_weights</span><span class="s4">)</span>
+
+            <span class="s2"># compute scores, i.e. the projections of X and Y</span>
+            <span class="s1">x_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">Xk</span><span class="s4">, </span><span class="s1">x_weights</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">norm_y_weights</span><span class="s4">:</span>
+                <span class="s1">y_ss </span><span class="s4">= </span><span class="s6">1</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">y_ss </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y_weights</span><span class="s4">, </span><span class="s1">y_weights</span><span class="s4">)</span>
+            <span class="s1">y_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">yk</span><span class="s4">, </span><span class="s1">y_weights</span><span class="s4">) / </span><span class="s1">y_ss</span>
+
+            <span class="s2"># Deflation: subtract rank-one approx to obtain Xk+1 and Yk+1</span>
+            <span class="s1">x_loadings </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">Xk</span><span class="s4">) / </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">x_scores</span><span class="s4">)</span>
+            <span class="s1">Xk </span><span class="s4">-= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">outer</span><span class="s4">(</span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">x_loadings</span><span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">deflation_mode </span><span class="s4">== </span><span class="s5">&quot;canonical&quot;</span><span class="s4">:</span>
+                <span class="s2"># regress Yk on y_score</span>
+                <span class="s1">y_loadings </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y_scores</span><span class="s4">, </span><span class="s1">yk</span><span class="s4">) / </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y_scores</span><span class="s4">, </span><span class="s1">y_scores</span><span class="s4">)</span>
+                <span class="s1">yk </span><span class="s4">-= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">outer</span><span class="s4">(</span><span class="s1">y_scores</span><span class="s4">, </span><span class="s1">y_loadings</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">deflation_mode </span><span class="s4">== </span><span class="s5">&quot;regression&quot;</span><span class="s4">:</span>
+                <span class="s2"># regress Yk on x_score</span>
+                <span class="s1">y_loadings </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">yk</span><span class="s4">) / </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">x_scores</span><span class="s4">)</span>
+                <span class="s1">yk </span><span class="s4">-= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">outer</span><span class="s4">(</span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">y_loadings</span><span class="s4">)</span>
+
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">x_weights_</span><span class="s4">[:, </span><span class="s1">k</span><span class="s4">] = </span><span class="s1">x_weights</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">y_weights_</span><span class="s4">[:, </span><span class="s1">k</span><span class="s4">] = </span><span class="s1">y_weights</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_x_scores</span><span class="s4">[:, </span><span class="s1">k</span><span class="s4">] = </span><span class="s1">x_scores</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_y_scores</span><span class="s4">[:, </span><span class="s1">k</span><span class="s4">] = </span><span class="s1">y_scores</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">x_loadings_</span><span class="s4">[:, </span><span class="s1">k</span><span class="s4">] = </span><span class="s1">x_loadings</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">y_loadings_</span><span class="s4">[:, </span><span class="s1">k</span><span class="s4">] = </span><span class="s1">y_loadings</span>
+
+        <span class="s2"># X was approximated as Xi . Gamma.T + X_(R+1)</span>
+        <span class="s2"># Xi . Gamma.T is a sum of n_components rank-1 matrices. X_(R+1) is</span>
+        <span class="s2"># whatever is left to fully reconstruct X, and can be 0 if X is of rank</span>
+        <span class="s2"># n_components.</span>
+        <span class="s2"># Similarly, y was approximated as Omega . Delta.T + y_(R+1)</span>
+
+        <span class="s2"># Compute transformation matrices (rotations_). See User Guide.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">x_rotations_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">x_weights_</span><span class="s4">,</span>
+            <span class="s1">pinv2</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_loadings_</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_weights_</span><span class="s4">), </span><span class="s1">check_finite</span><span class="s4">=</span><span class="s3">False</span><span class="s4">),</span>
+        <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">y_rotations_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">y_weights_</span><span class="s4">,</span>
+            <span class="s1">pinv2</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">y_loadings_</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">y_weights_</span><span class="s4">), </span><span class="s1">check_finite</span><span class="s4">=</span><span class="s3">False</span><span class="s4">),</span>
+        <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">coef_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_rotations_</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">y_loadings_</span><span class="s4">.</span><span class="s1">T</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">coef_ </span><span class="s4">= (</span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef_ </span><span class="s4">* </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_std</span><span class="s4">).</span><span class="s1">T </span><span class="s4">/ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_std</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">intercept_ </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_mean</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_n_features_out </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_rotations_</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Apply the dimension reduction. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Samples to transform. 
+ 
+        y : array-like of shape (n_samples, n_targets), default=None 
+            Target vectors. 
+ 
+        Y : array-like of shape (n_samples, n_targets), default=None 
+            Target vectors. 
+ 
+            .. deprecated:: 1.5 
+               `Y` is deprecated in 1.5 and will be removed in 1.7. Use `y` instead. 
+ 
+        copy : bool, default=True 
+            Whether to copy `X` and `Y`, or perform in-place normalization. 
+ 
+        Returns 
+        ------- 
+        x_scores, y_scores : array-like or tuple of array-like 
+            Return `x_scores` if `Y` is not given, `(x_scores, y_scores)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">_deprecate_Y_when_optional</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s1">copy</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">FLOAT_DTYPES</span><span class="s4">, </span><span class="s1">reset</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s2"># Normalize</span>
+        <span class="s1">X </span><span class="s4">-= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_mean</span>
+        <span class="s1">X </span><span class="s4">/= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_std</span>
+        <span class="s2"># Apply rotation</span>
+        <span class="s1">x_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_rotations_</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">y </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">y </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span>
+                <span class="s1">y</span><span class="s4">, </span><span class="s1">input_name</span><span class="s4">=</span><span class="s5">&quot;y&quot;</span><span class="s4">, </span><span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s1">copy</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">FLOAT_DTYPES</span>
+            <span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">y</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+                <span class="s1">y </span><span class="s4">= </span><span class="s1">y</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s1">y </span><span class="s4">-= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_mean</span>
+            <span class="s1">y </span><span class="s4">/= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_std</span>
+            <span class="s1">y_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">y_rotations_</span><span class="s4">)</span>
+            <span class="s3">return </span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">y_scores</span>
+
+        <span class="s3">return </span><span class="s1">x_scores</span>
+
+    <span class="s3">def </span><span class="s1">inverse_transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Transform data back to its original space. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_components) 
+            New data, where `n_samples` is the number of samples 
+            and `n_components` is the number of pls components. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_components) 
+            New target, where `n_samples` is the number of samples 
+            and `n_components` is the number of pls components. 
+ 
+        Y : array-like of shape (n_samples, n_components) 
+            New target, where `n_samples` is the number of samples 
+            and `n_components` is the number of pls components. 
+ 
+            .. deprecated:: 1.5 
+               `Y` is deprecated in 1.5 and will be removed in 1.7. Use `y` instead. 
+ 
+        Returns 
+        ------- 
+        X_reconstructed : ndarray of shape (n_samples, n_features) 
+            Return the reconstructed `X` data. 
+ 
+        y_reconstructed : ndarray of shape (n_samples, n_targets) 
+            Return the reconstructed `X` target. Only returned when `y` is given. 
+ 
+        Notes 
+        ----- 
+        This transformation will only be exact if `n_components=n_features`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">_deprecate_Y_when_optional</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">input_name</span><span class="s4">=</span><span class="s5">&quot;X&quot;</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">FLOAT_DTYPES</span><span class="s4">)</span>
+        <span class="s2"># From pls space to original space</span>
+        <span class="s1">X_reconstructed </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">matmul</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_loadings_</span><span class="s4">.</span><span class="s1">T</span><span class="s4">)</span>
+        <span class="s2"># Denormalize</span>
+        <span class="s1">X_reconstructed </span><span class="s4">*= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_std</span>
+        <span class="s1">X_reconstructed </span><span class="s4">+= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_mean</span>
+
+        <span class="s3">if </span><span class="s1">y </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">y </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">input_name</span><span class="s4">=</span><span class="s5">&quot;y&quot;</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">FLOAT_DTYPES</span><span class="s4">)</span>
+            <span class="s2"># From pls space to original space</span>
+            <span class="s1">y_reconstructed </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">matmul</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">y_loadings_</span><span class="s4">.</span><span class="s1">T</span><span class="s4">)</span>
+            <span class="s2"># Denormalize</span>
+            <span class="s1">y_reconstructed </span><span class="s4">*= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_std</span>
+            <span class="s1">y_reconstructed </span><span class="s4">+= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_mean</span>
+            <span class="s3">return </span><span class="s1">X_reconstructed</span><span class="s4">, </span><span class="s1">y_reconstructed</span>
+
+        <span class="s3">return </span><span class="s1">X_reconstructed</span>
+
+    <span class="s3">def </span><span class="s1">predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict targets of given samples. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Samples. 
+ 
+        copy : bool, default=True 
+            Whether to copy `X` and `Y`, or perform in-place normalization. 
+ 
+        Returns 
+        ------- 
+        y_pred : ndarray of shape (n_samples,) or (n_samples, n_targets) 
+            Returns predicted values. 
+ 
+        Notes 
+        ----- 
+        This call requires the estimation of a matrix of shape 
+        `(n_features, n_targets)`, which may be an issue in high dimensional 
+        space. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s1">copy</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">FLOAT_DTYPES</span><span class="s4">, </span><span class="s1">reset</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s2"># Only center X but do not scale it since the coefficients are already scaled</span>
+        <span class="s1">X </span><span class="s4">-= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_mean</span>
+        <span class="s1">Ypred </span><span class="s4">= </span><span class="s1">X </span><span class="s4">@ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">coef_</span><span class="s4">.</span><span class="s1">T </span><span class="s4">+ </span><span class="s1">self</span><span class="s4">.</span><span class="s1">intercept_</span>
+        <span class="s3">return </span><span class="s1">Ypred</span><span class="s4">.</span><span class="s1">ravel</span><span class="s4">() </span><span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_predict_1d </span><span class="s3">else </span><span class="s1">Ypred</span>
+
+    <span class="s3">def </span><span class="s1">fit_transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Learn and apply the dimension reduction on the train data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training vectors, where `n_samples` is the number of samples and 
+            `n_features` is the number of predictors. 
+ 
+        y : array-like of shape (n_samples, n_targets), default=None 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+        Returns 
+        ------- 
+        self : ndarray of shape (n_samples, n_components) 
+            Return `x_scores` if `Y` is not given, `(x_scores, y_scores)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">).</span><span class="s1">transform</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s4">{</span><span class="s5">&quot;poor_score&quot;</span><span class="s4">: </span><span class="s3">True</span><span class="s4">, </span><span class="s5">&quot;requires_y&quot;</span><span class="s4">: </span><span class="s3">False</span><span class="s4">}</span>
+
+
+<span class="s3">class </span><span class="s1">PLSRegression</span><span class="s4">(</span><span class="s1">_PLS</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;PLS regression. 
+ 
+    PLSRegression is also known as PLS2 or PLS1, depending on the number of 
+    targets. 
+ 
+    For a comparison between other cross decomposition algorithms, see 
+    :ref:`sphx_glr_auto_examples_cross_decomposition_plot_compare_cross_decomposition.py`. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    .. versionadded:: 0.8 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        Number of components to keep. Should be in `[1, n_features]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    max_iter : int, default=500 
+        The maximum number of iterations of the power method when 
+        `algorithm='nipals'`. Ignored otherwise. 
+ 
+    tol : float, default=1e-06 
+        The tolerance used as convergence criteria in the power method: the 
+        algorithm stops whenever the squared norm of `u_i - u_{i-1}` is less 
+        than `tol`, where `u` corresponds to the left singular vector. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in :term:`fit` before applying centering, 
+        and potentially scaling. If `False`, these operations will be done 
+        inplace, modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    y_weights_ : ndarray of shape (n_targets, n_components) 
+        The right singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    x_loadings_ : ndarray of shape (n_features, n_components) 
+        The loadings of `X`. 
+ 
+    y_loadings_ : ndarray of shape (n_targets, n_components) 
+        The loadings of `Y`. 
+ 
+    x_scores_ : ndarray of shape (n_samples, n_components) 
+        The transformed training samples. 
+ 
+    y_scores_ : ndarray of shape (n_samples, n_components) 
+        The transformed training targets. 
+ 
+    x_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `X`. 
+ 
+    y_rotations_ : ndarray of shape (n_targets, n_components) 
+        The projection matrix used to transform `Y`. 
+ 
+    coef_ : ndarray of shape (n_target, n_features) 
+        The coefficients of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+    intercept_ : ndarray of shape (n_targets,) 
+        The intercepts of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    n_iter_ : list of shape (n_components,) 
+        Number of iterations of the power method, for each 
+        component. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PLSCanonical : Partial Least Squares transformer and regressor. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import PLSRegression 
+    &gt;&gt;&gt; X = [[0., 0., 1.], [1.,0.,0.], [2.,2.,2.], [2.,5.,4.]] 
+    &gt;&gt;&gt; y = [[0.1, -0.2], [0.9, 1.1], [6.2, 5.9], [11.9, 12.3]] 
+    &gt;&gt;&gt; pls2 = PLSRegression(n_components=2) 
+    &gt;&gt;&gt; pls2.fit(X, y) 
+    PLSRegression() 
+    &gt;&gt;&gt; Y_pred = pls2.predict(X) 
+ 
+    For a comparison between PLS Regression and :class:`~sklearn.decomposition.PCA`, see 
+    :ref:`sphx_glr_auto_examples_cross_decomposition_plot_pcr_vs_pls.py`. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {**</span><span class="s1">_PLS</span><span class="s4">.</span><span class="s1">_parameter_constraints</span><span class="s4">}</span>
+    <span class="s3">for </span><span class="s1">param </span><span class="s3">in </span><span class="s4">(</span><span class="s5">&quot;deflation_mode&quot;</span><span class="s4">, </span><span class="s5">&quot;mode&quot;</span><span class="s4">, </span><span class="s5">&quot;algorithm&quot;</span><span class="s4">):</span>
+        <span class="s1">_parameter_constraints</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s1">param</span><span class="s4">)</span>
+
+    <span class="s2"># This implementation provides the same results that 3 PLS packages</span>
+    <span class="s2"># provided in the R language (R-project):</span>
+    <span class="s2">#     - &quot;mixOmics&quot; with function pls(X, Y, mode = &quot;regression&quot;)</span>
+    <span class="s2">#     - &quot;plspm &quot; with function plsreg2(X, Y)</span>
+    <span class="s2">#     - &quot;pls&quot; with function oscorespls.fit(X, Y)</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">=</span><span class="s6">2</span><span class="s4">, *, </span><span class="s1">scale</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">max_iter</span><span class="s4">=</span><span class="s6">500</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-06</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">n_components</span><span class="s4">=</span><span class="s1">n_components</span><span class="s4">,</span>
+            <span class="s1">scale</span><span class="s4">=</span><span class="s1">scale</span><span class="s4">,</span>
+            <span class="s1">deflation_mode</span><span class="s4">=</span><span class="s5">&quot;regression&quot;</span><span class="s4">,</span>
+            <span class="s1">mode</span><span class="s4">=</span><span class="s5">&quot;A&quot;</span><span class="s4">,</span>
+            <span class="s1">algorithm</span><span class="s4">=</span><span class="s5">&quot;nipals&quot;</span><span class="s4">,</span>
+            <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">copy</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit model to data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training vectors, where `n_samples` is the number of samples and 
+            `n_features` is the number of predictors. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Target vectors, where `n_samples` is the number of samples and 
+            `n_targets` is the number of response variables. 
+ 
+            .. deprecated:: 1.5 
+               `Y` is deprecated in 1.5 and will be removed in 1.7. Use `y` instead. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted model. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">_deprecate_Y_when_required</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">)</span>
+        <span class="s2"># expose the fitted attributes `x_scores_` and `y_scores_`</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">x_scores_ </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_scores</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">y_scores_ </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_scores</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+
+<span class="s3">class </span><span class="s1">PLSCanonical</span><span class="s4">(</span><span class="s1">_PLS</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Partial Least Squares transformer and regressor. 
+ 
+    For a comparison between other cross decomposition algorithms, see 
+    :ref:`sphx_glr_auto_examples_cross_decomposition_plot_compare_cross_decomposition.py`. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    .. versionadded:: 0.8 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        Number of components to keep. Should be in `[1, min(n_samples, 
+        n_features, n_targets)]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    algorithm : {'nipals', 'svd'}, default='nipals' 
+        The algorithm used to estimate the first singular vectors of the 
+        cross-covariance matrix. 'nipals' uses the power method while 'svd' 
+        will compute the whole SVD. 
+ 
+    max_iter : int, default=500 
+        The maximum number of iterations of the power method when 
+        `algorithm='nipals'`. Ignored otherwise. 
+ 
+    tol : float, default=1e-06 
+        The tolerance used as convergence criteria in the power method: the 
+        algorithm stops whenever the squared norm of `u_i - u_{i-1}` is less 
+        than `tol`, where `u` corresponds to the left singular vector. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in fit before applying centering, and 
+        potentially scaling. If False, these operations will be done inplace, 
+        modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    y_weights_ : ndarray of shape (n_targets, n_components) 
+        The right singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    x_loadings_ : ndarray of shape (n_features, n_components) 
+        The loadings of `X`. 
+ 
+    y_loadings_ : ndarray of shape (n_targets, n_components) 
+        The loadings of `Y`. 
+ 
+    x_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `X`. 
+ 
+    y_rotations_ : ndarray of shape (n_targets, n_components) 
+        The projection matrix used to transform `Y`. 
+ 
+    coef_ : ndarray of shape (n_targets, n_features) 
+        The coefficients of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+    intercept_ : ndarray of shape (n_targets,) 
+        The intercepts of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    n_iter_ : list of shape (n_components,) 
+        Number of iterations of the power method, for each 
+        component. Empty if `algorithm='svd'`. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    CCA : Canonical Correlation Analysis. 
+    PLSSVD : Partial Least Square SVD. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import PLSCanonical 
+    &gt;&gt;&gt; X = [[0., 0., 1.], [1.,0.,0.], [2.,2.,2.], [2.,5.,4.]] 
+    &gt;&gt;&gt; y = [[0.1, -0.2], [0.9, 1.1], [6.2, 5.9], [11.9, 12.3]] 
+    &gt;&gt;&gt; plsca = PLSCanonical(n_components=2) 
+    &gt;&gt;&gt; plsca.fit(X, y) 
+    PLSCanonical() 
+    &gt;&gt;&gt; X_c, y_c = plsca.transform(X, y) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {**</span><span class="s1">_PLS</span><span class="s4">.</span><span class="s1">_parameter_constraints</span><span class="s4">}</span>
+    <span class="s3">for </span><span class="s1">param </span><span class="s3">in </span><span class="s4">(</span><span class="s5">&quot;deflation_mode&quot;</span><span class="s4">, </span><span class="s5">&quot;mode&quot;</span><span class="s4">):</span>
+        <span class="s1">_parameter_constraints</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s1">param</span><span class="s4">)</span>
+
+    <span class="s2"># This implementation provides the same results that the &quot;plspm&quot; package</span>
+    <span class="s2"># provided in the R language (R-project), using the function plsca(X, Y).</span>
+    <span class="s2"># Results are equal or collinear with the function</span>
+    <span class="s2"># ``pls(..., mode = &quot;canonical&quot;)`` of the &quot;mixOmics&quot; package. The</span>
+    <span class="s2"># difference relies in the fact that mixOmics implementation does not</span>
+    <span class="s2"># exactly implement the Wold algorithm since it does not normalize</span>
+    <span class="s2"># y_weights to one.</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">n_components</span><span class="s4">=</span><span class="s6">2</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">scale</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">algorithm</span><span class="s4">=</span><span class="s5">&quot;nipals&quot;</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">500</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-06</span><span class="s4">,</span>
+        <span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">n_components</span><span class="s4">=</span><span class="s1">n_components</span><span class="s4">,</span>
+            <span class="s1">scale</span><span class="s4">=</span><span class="s1">scale</span><span class="s4">,</span>
+            <span class="s1">deflation_mode</span><span class="s4">=</span><span class="s5">&quot;canonical&quot;</span><span class="s4">,</span>
+            <span class="s1">mode</span><span class="s4">=</span><span class="s5">&quot;A&quot;</span><span class="s4">,</span>
+            <span class="s1">algorithm</span><span class="s4">=</span><span class="s1">algorithm</span><span class="s4">,</span>
+            <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">copy</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">CCA</span><span class="s4">(</span><span class="s1">_PLS</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Canonical Correlation Analysis, also known as &quot;Mode B&quot; PLS. 
+ 
+    For a comparison between other cross decomposition algorithms, see 
+    :ref:`sphx_glr_auto_examples_cross_decomposition_plot_compare_cross_decomposition.py`. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        Number of components to keep. Should be in `[1, min(n_samples, 
+        n_features, n_targets)]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    max_iter : int, default=500 
+        The maximum number of iterations of the power method. 
+ 
+    tol : float, default=1e-06 
+        The tolerance used as convergence criteria in the power method: the 
+        algorithm stops whenever the squared norm of `u_i - u_{i-1}` is less 
+        than `tol`, where `u` corresponds to the left singular vector. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in fit before applying centering, and 
+        potentially scaling. If False, these operations will be done inplace, 
+        modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    y_weights_ : ndarray of shape (n_targets, n_components) 
+        The right singular vectors of the cross-covariance matrices of each 
+        iteration. 
+ 
+    x_loadings_ : ndarray of shape (n_features, n_components) 
+        The loadings of `X`. 
+ 
+    y_loadings_ : ndarray of shape (n_targets, n_components) 
+        The loadings of `Y`. 
+ 
+    x_rotations_ : ndarray of shape (n_features, n_components) 
+        The projection matrix used to transform `X`. 
+ 
+    y_rotations_ : ndarray of shape (n_targets, n_components) 
+        The projection matrix used to transform `Y`. 
+ 
+    coef_ : ndarray of shape (n_targets, n_features) 
+        The coefficients of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+    intercept_ : ndarray of shape (n_targets,) 
+        The intercepts of the linear model such that `Y` is approximated as 
+        `Y = X @ coef_.T + intercept_`. 
+ 
+        .. versionadded:: 1.1 
+ 
+    n_iter_ : list of shape (n_components,) 
+        Number of iterations of the power method, for each 
+        component. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PLSCanonical : Partial Least Squares transformer and regressor. 
+    PLSSVD : Partial Least Square SVD. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import CCA 
+    &gt;&gt;&gt; X = [[0., 0., 1.], [1.,0.,0.], [2.,2.,2.], [3.,5.,4.]] 
+    &gt;&gt;&gt; y = [[0.1, -0.2], [0.9, 1.1], [6.2, 5.9], [11.9, 12.3]] 
+    &gt;&gt;&gt; cca = CCA(n_components=1) 
+    &gt;&gt;&gt; cca.fit(X, y) 
+    CCA(n_components=1) 
+    &gt;&gt;&gt; X_c, Y_c = cca.transform(X, y) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {**</span><span class="s1">_PLS</span><span class="s4">.</span><span class="s1">_parameter_constraints</span><span class="s4">}</span>
+    <span class="s3">for </span><span class="s1">param </span><span class="s3">in </span><span class="s4">(</span><span class="s5">&quot;deflation_mode&quot;</span><span class="s4">, </span><span class="s5">&quot;mode&quot;</span><span class="s4">, </span><span class="s5">&quot;algorithm&quot;</span><span class="s4">):</span>
+        <span class="s1">_parameter_constraints</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">(</span><span class="s1">param</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">=</span><span class="s6">2</span><span class="s4">, *, </span><span class="s1">scale</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">max_iter</span><span class="s4">=</span><span class="s6">500</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-06</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">n_components</span><span class="s4">=</span><span class="s1">n_components</span><span class="s4">,</span>
+            <span class="s1">scale</span><span class="s4">=</span><span class="s1">scale</span><span class="s4">,</span>
+            <span class="s1">deflation_mode</span><span class="s4">=</span><span class="s5">&quot;canonical&quot;</span><span class="s4">,</span>
+            <span class="s1">mode</span><span class="s4">=</span><span class="s5">&quot;B&quot;</span><span class="s4">,</span>
+            <span class="s1">algorithm</span><span class="s4">=</span><span class="s5">&quot;nipals&quot;</span><span class="s4">,</span>
+            <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">copy</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">PLSSVD</span><span class="s4">(</span><span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s4">, </span><span class="s1">TransformerMixin</span><span class="s4">, </span><span class="s1">BaseEstimator</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Partial Least Square SVD. 
+ 
+    This transformer simply performs a SVD on the cross-covariance matrix 
+    `X'Y`. It is able to project both the training data `X` and the targets 
+    `Y`. The training data `X` is projected on the left singular vectors, while 
+    the targets are projected on the right singular vectors. 
+ 
+    Read more in the :ref:`User Guide &lt;cross_decomposition&gt;`. 
+ 
+    .. versionadded:: 0.8 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=2 
+        The number of components to keep. Should be in `[1, 
+        min(n_samples, n_features, n_targets)]`. 
+ 
+    scale : bool, default=True 
+        Whether to scale `X` and `Y`. 
+ 
+    copy : bool, default=True 
+        Whether to copy `X` and `Y` in fit before applying centering, and 
+        potentially scaling. If `False`, these operations will be done inplace, 
+        modifying both arrays. 
+ 
+    Attributes 
+    ---------- 
+    x_weights_ : ndarray of shape (n_features, n_components) 
+        The left singular vectors of the SVD of the cross-covariance matrix. 
+        Used to project `X` in :meth:`transform`. 
+ 
+    y_weights_ : ndarray of (n_targets, n_components) 
+        The right singular vectors of the SVD of the cross-covariance matrix. 
+        Used to project `X` in :meth:`transform`. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    See Also 
+    -------- 
+    PLSCanonical : Partial Least Squares transformer and regressor. 
+    CCA : Canonical Correlation Analysis. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from sklearn.cross_decomposition import PLSSVD 
+    &gt;&gt;&gt; X = np.array([[0., 0., 1.], 
+    ...               [1., 0., 0.], 
+    ...               [2., 2., 2.], 
+    ...               [2., 5., 4.]]) 
+    &gt;&gt;&gt; y = np.array([[0.1, -0.2], 
+    ...               [0.9, 1.1], 
+    ...               [6.2, 5.9], 
+    ...               [11.9, 12.3]]) 
+    &gt;&gt;&gt; pls = PLSSVD(n_components=2).fit(X, y) 
+    &gt;&gt;&gt; X_c, y_c = pls.transform(X, y) 
+    &gt;&gt;&gt; X_c.shape, y_c.shape 
+    ((4, 2), (4, 2)) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s5">&quot;n_components&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;scale&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;copy&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">=</span><span class="s6">2</span><span class="s4">, *, </span><span class="s1">scale</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_components </span><span class="s4">= </span><span class="s1">n_components</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">scale </span><span class="s4">= </span><span class="s1">scale</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">copy </span><span class="s4">= </span><span class="s1">copy</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit model to data. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training samples. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Targets. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets) 
+            Targets. 
+ 
+            .. deprecated:: 1.5 
+               `Y` is deprecated in 1.5 and will be removed in 1.7. Use `y` instead. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Fitted estimator. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">_deprecate_Y_when_required</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+        <span class="s1">check_consistent_length</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">,</span>
+            <span class="s1">force_writeable</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">,</span>
+            <span class="s1">ensure_min_samples</span><span class="s4">=</span><span class="s6">2</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span>
+            <span class="s1">y</span><span class="s4">,</span>
+            <span class="s1">input_name</span><span class="s4">=</span><span class="s5">&quot;y&quot;</span><span class="s4">,</span>
+            <span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">,</span>
+            <span class="s1">force_writeable</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">,</span>
+            <span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">y</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+            <span class="s1">y </span><span class="s4">= </span><span class="s1">y</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+
+        <span class="s2"># we'll compute the SVD of the cross-covariance matrix = X.T.dot(y)</span>
+        <span class="s2"># This matrix rank is at most min(n_samples, n_features, n_targets) so</span>
+        <span class="s2"># n_components cannot be bigger than that.</span>
+        <span class="s1">n_components </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_components</span>
+        <span class="s1">rank_upper_bound </span><span class="s4">= </span><span class="s1">min</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">], </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">], </span><span class="s1">y</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">])</span>
+        <span class="s3">if </span><span class="s1">n_components </span><span class="s4">&gt; </span><span class="s1">rank_upper_bound</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">f&quot;`n_components` upper bound is </span><span class="s3">{</span><span class="s1">rank_upper_bound</span><span class="s3">}</span><span class="s5">. &quot;</span>
+                <span class="s5">f&quot;Got </span><span class="s3">{</span><span class="s1">n_components</span><span class="s3">} </span><span class="s5">instead. Reduce `n_components`.&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_mean</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_mean</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_std</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_std </span><span class="s4">= </span><span class="s1">_center_scale_xy</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">scale</span>
+        <span class="s4">)</span>
+
+        <span class="s2"># Compute SVD of cross-covariance matrix</span>
+        <span class="s1">C </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">y</span><span class="s4">)</span>
+        <span class="s1">U</span><span class="s4">, </span><span class="s1">s</span><span class="s4">, </span><span class="s1">Vt </span><span class="s4">= </span><span class="s1">svd</span><span class="s4">(</span><span class="s1">C</span><span class="s4">, </span><span class="s1">full_matrices</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s1">U </span><span class="s4">= </span><span class="s1">U</span><span class="s4">[:, :</span><span class="s1">n_components</span><span class="s4">]</span>
+        <span class="s1">Vt </span><span class="s4">= </span><span class="s1">Vt</span><span class="s4">[:</span><span class="s1">n_components</span><span class="s4">]</span>
+        <span class="s1">U</span><span class="s4">, </span><span class="s1">Vt </span><span class="s4">= </span><span class="s1">svd_flip</span><span class="s4">(</span><span class="s1">U</span><span class="s4">, </span><span class="s1">Vt</span><span class="s4">)</span>
+        <span class="s1">V </span><span class="s4">= </span><span class="s1">Vt</span><span class="s4">.</span><span class="s1">T</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">x_weights_ </span><span class="s4">= </span><span class="s1">U</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">y_weights_ </span><span class="s4">= </span><span class="s1">V</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_n_features_out </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_weights_</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">]</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Apply the dimensionality reduction. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Samples to be transformed. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets), \ 
+                default=None 
+            Targets. 
+ 
+        Y : array-like of shape (n_samples,) or (n_samples, n_targets), \ 
+                default=None 
+            Targets. 
+ 
+            .. deprecated:: 1.5 
+               `Y` is deprecated in 1.5 and will be removed in 1.7. Use `y` instead. 
+ 
+        Returns 
+        ------- 
+        x_scores : array-like or tuple of array-like 
+            The transformed data `X_transformed` if `Y is not None`, 
+            `(X_transformed, Y_transformed)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">y </span><span class="s4">= </span><span class="s1">_deprecate_Y_when_optional</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">Y</span><span class="s4">)</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">reset</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s1">Xr </span><span class="s4">= (</span><span class="s1">X </span><span class="s4">- </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_mean</span><span class="s4">) / </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_x_std</span>
+        <span class="s1">x_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">Xr</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">x_weights_</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">y </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">y </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">y</span><span class="s4">, </span><span class="s1">input_name</span><span class="s4">=</span><span class="s5">&quot;y&quot;</span><span class="s4">, </span><span class="s1">ensure_2d</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">y</span><span class="s4">.</span><span class="s1">ndim </span><span class="s4">== </span><span class="s6">1</span><span class="s4">:</span>
+                <span class="s1">y </span><span class="s4">= </span><span class="s1">y</span><span class="s4">.</span><span class="s1">reshape</span><span class="s4">(-</span><span class="s6">1</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s1">yr </span><span class="s4">= (</span><span class="s1">y </span><span class="s4">- </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_mean</span><span class="s4">) / </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_y_std</span>
+            <span class="s1">y_scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">yr</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">y_weights_</span><span class="s4">)</span>
+            <span class="s3">return </span><span class="s1">x_scores</span><span class="s4">, </span><span class="s1">y_scores</span>
+        <span class="s3">return </span><span class="s1">x_scores</span>
+
+    <span class="s3">def </span><span class="s1">fit_transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Learn and apply the dimensionality reduction. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training samples. 
+ 
+        y : array-like of shape (n_samples,) or (n_samples, n_targets), \ 
+                default=None 
+            Targets. 
+ 
+        Returns 
+        ------- 
+        out : array-like or tuple of array-like 
+            The transformed data `X_transformed` if `Y is not None`, 
+            `(X_transformed, Y_transformed)` otherwise. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fit</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">).</span><span class="s1">transform</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">)</span>
+</pre>
+</body>
+</html>

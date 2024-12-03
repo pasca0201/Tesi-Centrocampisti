@@ -1,0 +1,320 @@
+<html>
+<head>
+<title>parse_formula.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+.s1 { color: #7a7e85;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+parse_formula.py</font>
+</center></td></tr></table>
+<pre> <span class="s1"># This file is part of Patsy</span>
+<span class="s1"># Copyright (C) 2011 Nathaniel Smith &lt;njs@pobox.com&gt;</span>
+<span class="s1"># See file LICENSE.txt for license information.</span>
+
+<span class="s1"># This file defines a parser for a simple language based on S/R &quot;formulas&quot;</span>
+<span class="s1"># (which are described in sections 2.3 and 2.4 in Chambers &amp; Hastie, 1992). It</span>
+<span class="s1"># uses the machinery in patsy.parse_core to do the heavy-lifting -- its</span>
+<span class="s1"># biggest job is to handle tokenization.</span>
+
+<span class="s2">from </span><span class="s0">__future__ </span><span class="s2">import </span><span class="s0">print_function</span>
+
+<span class="s0">__all__ </span><span class="s3">= [</span><span class="s4">&quot;parse_formula&quot;</span><span class="s3">]</span>
+
+<span class="s1"># The Python tokenizer</span>
+<span class="s2">import </span><span class="s0">tokenize</span>
+
+<span class="s2">import </span><span class="s0">six</span>
+<span class="s2">from </span><span class="s0">six</span><span class="s3">.</span><span class="s0">moves </span><span class="s2">import </span><span class="s0">cStringIO </span><span class="s2">as </span><span class="s0">StringIO</span>
+
+<span class="s2">from </span><span class="s0">patsy </span><span class="s2">import </span><span class="s0">PatsyError</span>
+<span class="s2">from </span><span class="s0">patsy</span><span class="s3">.</span><span class="s0">origin </span><span class="s2">import </span><span class="s0">Origin</span>
+<span class="s2">from </span><span class="s0">patsy</span><span class="s3">.</span><span class="s0">infix_parser </span><span class="s2">import </span><span class="s0">Token</span><span class="s3">, </span><span class="s0">Operator</span><span class="s3">, </span><span class="s0">infix_parse</span><span class="s3">, </span><span class="s0">ParseNode</span>
+<span class="s2">from </span><span class="s0">patsy</span><span class="s3">.</span><span class="s0">tokens </span><span class="s2">import </span><span class="s0">python_tokenize</span><span class="s3">, </span><span class="s0">pretty_untokenize</span>
+<span class="s2">from </span><span class="s0">patsy</span><span class="s3">.</span><span class="s0">util </span><span class="s2">import </span><span class="s0">PushbackAdapter</span>
+
+<span class="s0">_atomic_token_types </span><span class="s3">= [</span><span class="s4">&quot;PYTHON_EXPR&quot;</span><span class="s3">, </span><span class="s4">&quot;ZERO&quot;</span><span class="s3">, </span><span class="s4">&quot;ONE&quot;</span><span class="s3">, </span><span class="s4">&quot;NUMBER&quot;</span><span class="s3">]</span>
+
+<span class="s2">def </span><span class="s0">_is_a</span><span class="s3">(</span><span class="s0">f</span><span class="s3">, </span><span class="s0">v</span><span class="s3">):</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s0">f</span><span class="s3">(</span><span class="s0">v</span><span class="s3">)</span>
+    <span class="s2">except </span><span class="s0">ValueError</span><span class="s3">:</span>
+        <span class="s2">return False</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return True</span>
+
+<span class="s1"># Helper function for _tokenize_formula:</span>
+<span class="s2">def </span><span class="s0">_read_python_expr</span><span class="s3">(</span><span class="s0">it</span><span class="s3">, </span><span class="s0">end_tokens</span><span class="s3">):</span>
+    <span class="s1"># Read out a full python expression, stopping when we hit an</span>
+    <span class="s1"># unnested end token.</span>
+    <span class="s0">pytypes </span><span class="s3">= []</span>
+    <span class="s0">token_strings </span><span class="s3">= []</span>
+    <span class="s0">origins </span><span class="s3">= []</span>
+    <span class="s0">bracket_level </span><span class="s3">= </span><span class="s5">0</span>
+    <span class="s2">for </span><span class="s0">pytype</span><span class="s3">, </span><span class="s0">token_string</span><span class="s3">, </span><span class="s0">origin </span><span class="s2">in </span><span class="s0">it</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s0">bracket_level </span><span class="s3">&gt;= </span><span class="s5">0</span>
+        <span class="s2">if </span><span class="s0">bracket_level </span><span class="s3">== </span><span class="s5">0 </span><span class="s2">and </span><span class="s0">token_string </span><span class="s2">in </span><span class="s0">end_tokens</span><span class="s3">:</span>
+            <span class="s0">it</span><span class="s3">.</span><span class="s0">push_back</span><span class="s3">((</span><span class="s0">pytype</span><span class="s3">, </span><span class="s0">token_string</span><span class="s3">, </span><span class="s0">origin</span><span class="s3">))</span>
+            <span class="s2">break</span>
+        <span class="s2">if </span><span class="s0">token_string </span><span class="s2">in </span><span class="s3">(</span><span class="s4">&quot;(&quot;</span><span class="s3">, </span><span class="s4">&quot;[&quot;</span><span class="s3">, </span><span class="s4">&quot;{&quot;</span><span class="s3">):</span>
+            <span class="s0">bracket_level </span><span class="s3">+= </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s0">token_string </span><span class="s2">in </span><span class="s3">(</span><span class="s4">&quot;)&quot;</span><span class="s3">, </span><span class="s4">&quot;]&quot;</span><span class="s3">, </span><span class="s4">&quot;}&quot;</span><span class="s3">):</span>
+            <span class="s0">bracket_level </span><span class="s3">-= </span><span class="s5">1</span>
+        <span class="s2">if </span><span class="s0">bracket_level </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s0">PatsyError</span><span class="s3">(</span><span class="s4">&quot;unmatched close bracket&quot;</span><span class="s3">, </span><span class="s0">origin</span><span class="s3">)</span>
+        <span class="s0">pytypes</span><span class="s3">.</span><span class="s0">append</span><span class="s3">(</span><span class="s0">pytype</span><span class="s3">)</span>
+        <span class="s0">token_strings</span><span class="s3">.</span><span class="s0">append</span><span class="s3">(</span><span class="s0">token_string</span><span class="s3">)</span>
+        <span class="s0">origins</span><span class="s3">.</span><span class="s0">append</span><span class="s3">(</span><span class="s0">origin</span><span class="s3">)</span>
+    <span class="s1"># Either we found an end_token, or we hit the end of the string</span>
+    <span class="s2">if </span><span class="s0">bracket_level </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s0">expr_text </span><span class="s3">= </span><span class="s0">pretty_untokenize</span><span class="s3">(</span><span class="s0">zip</span><span class="s3">(</span><span class="s0">pytypes</span><span class="s3">, </span><span class="s0">token_strings</span><span class="s3">))</span>
+        <span class="s2">if </span><span class="s0">expr_text </span><span class="s3">== </span><span class="s4">&quot;0&quot;</span><span class="s3">:</span>
+            <span class="s0">token_type </span><span class="s3">= </span><span class="s4">&quot;ZERO&quot;</span>
+        <span class="s2">elif </span><span class="s0">expr_text </span><span class="s3">== </span><span class="s4">&quot;1&quot;</span><span class="s3">:</span>
+            <span class="s0">token_type </span><span class="s3">= </span><span class="s4">&quot;ONE&quot;</span>
+        <span class="s2">elif </span><span class="s0">_is_a</span><span class="s3">(</span><span class="s0">int</span><span class="s3">, </span><span class="s0">expr_text</span><span class="s3">) </span><span class="s2">or </span><span class="s0">_is_a</span><span class="s3">(</span><span class="s0">float</span><span class="s3">, </span><span class="s0">expr_text</span><span class="s3">):</span>
+            <span class="s0">token_type </span><span class="s3">= </span><span class="s4">&quot;NUMBER&quot;</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0">token_type </span><span class="s3">= </span><span class="s4">&quot;PYTHON_EXPR&quot;</span>
+        <span class="s2">return </span><span class="s0">Token</span><span class="s3">(</span><span class="s0">token_type</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">.</span><span class="s0">combine</span><span class="s3">(</span><span class="s0">origins</span><span class="s3">), </span><span class="s0">extra</span><span class="s3">=</span><span class="s0">expr_text</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s0">PatsyError</span><span class="s3">(</span><span class="s4">&quot;unclosed bracket in embedded Python &quot;</span>
+                            <span class="s4">&quot;expression&quot;</span><span class="s3">,</span>
+                            <span class="s0">Origin</span><span class="s3">.</span><span class="s0">combine</span><span class="s3">(</span><span class="s0">origins</span><span class="s3">))</span>
+
+<span class="s2">def </span><span class="s0">_tokenize_formula</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s0">operator_strings</span><span class="s3">):</span>
+    <span class="s2">assert </span><span class="s4">&quot;(&quot; </span><span class="s2">not in </span><span class="s0">operator_strings</span>
+    <span class="s2">assert </span><span class="s4">&quot;)&quot; </span><span class="s2">not in </span><span class="s0">operator_strings</span>
+    <span class="s0">magic_token_types </span><span class="s3">= {</span><span class="s4">&quot;(&quot;</span><span class="s3">: </span><span class="s0">Token</span><span class="s3">.</span><span class="s0">LPAREN</span><span class="s3">,</span>
+                         <span class="s4">&quot;)&quot;</span><span class="s3">: </span><span class="s0">Token</span><span class="s3">.</span><span class="s0">RPAREN</span><span class="s3">,</span>
+                         <span class="s3">}</span>
+    <span class="s2">for </span><span class="s0">operator_string </span><span class="s2">in </span><span class="s0">operator_strings</span><span class="s3">:</span>
+        <span class="s0">magic_token_types</span><span class="s3">[</span><span class="s0">operator_string</span><span class="s3">] = </span><span class="s0">operator_string</span>
+    <span class="s1"># Once we enter a Python expression, a ( does not end it, but any other</span>
+    <span class="s1"># &quot;magic&quot; token does:</span>
+    <span class="s0">end_tokens </span><span class="s3">= </span><span class="s0">set</span><span class="s3">(</span><span class="s0">magic_token_types</span><span class="s3">)</span>
+    <span class="s0">end_tokens</span><span class="s3">.</span><span class="s0">remove</span><span class="s3">(</span><span class="s4">&quot;(&quot;</span><span class="s3">)</span>
+
+    <span class="s0">it </span><span class="s3">= </span><span class="s0">PushbackAdapter</span><span class="s3">(</span><span class="s0">python_tokenize</span><span class="s3">(</span><span class="s0">code</span><span class="s3">))</span>
+    <span class="s2">for </span><span class="s0">pytype</span><span class="s3">, </span><span class="s0">token_string</span><span class="s3">, </span><span class="s0">origin </span><span class="s2">in </span><span class="s0">it</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s0">token_string </span><span class="s2">in </span><span class="s0">magic_token_types</span><span class="s3">:</span>
+            <span class="s2">yield </span><span class="s0">Token</span><span class="s3">(</span><span class="s0">magic_token_types</span><span class="s3">[</span><span class="s0">token_string</span><span class="s3">], </span><span class="s0">origin</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0">it</span><span class="s3">.</span><span class="s0">push_back</span><span class="s3">((</span><span class="s0">pytype</span><span class="s3">, </span><span class="s0">token_string</span><span class="s3">, </span><span class="s0">origin</span><span class="s3">))</span>
+            <span class="s2">yield </span><span class="s0">_read_python_expr</span><span class="s3">(</span><span class="s0">it</span><span class="s3">, </span><span class="s0">end_tokens</span><span class="s3">)</span>
+
+<span class="s2">def </span><span class="s0">test__tokenize_formula</span><span class="s3">():</span>
+    <span class="s0">code </span><span class="s3">= </span><span class="s4">&quot;y ~ a + (foo(b,c +   2)) + -1 + 0 + 10&quot;</span>
+    <span class="s0">tokens </span><span class="s3">= </span><span class="s0">list</span><span class="s3">(</span><span class="s0">_tokenize_formula</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;-&quot;</span><span class="s3">, </span><span class="s4">&quot;~&quot;</span><span class="s3">]))</span>
+    <span class="s0">expecteds </span><span class="s3">= [(</span><span class="s4">&quot;PYTHON_EXPR&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">), </span><span class="s4">&quot;y&quot;</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">3</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;PYTHON_EXPR&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">4</span><span class="s3">, </span><span class="s5">5</span><span class="s3">), </span><span class="s4">&quot;a&quot;</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">6</span><span class="s3">, </span><span class="s5">7</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s0">Token</span><span class="s3">.</span><span class="s0">LPAREN</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">8</span><span class="s3">, </span><span class="s5">9</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;PYTHON_EXPR&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">9</span><span class="s3">, </span><span class="s5">23</span><span class="s3">), </span><span class="s4">&quot;foo(b, c + 2)&quot;</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s0">Token</span><span class="s3">.</span><span class="s0">RPAREN</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">23</span><span class="s3">, </span><span class="s5">24</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">25</span><span class="s3">, </span><span class="s5">26</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;-&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">27</span><span class="s3">, </span><span class="s5">28</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;ONE&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">28</span><span class="s3">, </span><span class="s5">29</span><span class="s3">), </span><span class="s4">&quot;1&quot;</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">30</span><span class="s3">, </span><span class="s5">31</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;ZERO&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">32</span><span class="s3">, </span><span class="s5">33</span><span class="s3">), </span><span class="s4">&quot;0&quot;</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">34</span><span class="s3">, </span><span class="s5">35</span><span class="s3">), </span><span class="s2">None</span><span class="s3">),</span>
+                 <span class="s3">(</span><span class="s4">&quot;NUMBER&quot;</span><span class="s3">, </span><span class="s0">Origin</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s5">36</span><span class="s3">, </span><span class="s5">38</span><span class="s3">), </span><span class="s4">&quot;10&quot;</span><span class="s3">),</span>
+                 <span class="s3">]</span>
+    <span class="s2">for </span><span class="s0">got</span><span class="s3">, </span><span class="s0">expected </span><span class="s2">in </span><span class="s0">zip</span><span class="s3">(</span><span class="s0">tokens</span><span class="s3">, </span><span class="s0">expecteds</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s0">isinstance</span><span class="s3">(</span><span class="s0">got</span><span class="s3">, </span><span class="s0">Token</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s0">got</span><span class="s3">.</span><span class="s0">type </span><span class="s3">== </span><span class="s0">expected</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s2">assert </span><span class="s0">got</span><span class="s3">.</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">expected</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]</span>
+        <span class="s2">assert </span><span class="s0">got</span><span class="s3">.</span><span class="s0">extra </span><span class="s3">== </span><span class="s0">expected</span><span class="s3">[</span><span class="s5">2</span><span class="s3">]</span>
+
+<span class="s0">_unary_tilde </span><span class="s3">= </span><span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, -</span><span class="s5">100</span><span class="s3">)</span>
+<span class="s0">_default_ops </span><span class="s3">= [</span>
+    <span class="s0">_unary_tilde</span><span class="s3">,</span>
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, -</span><span class="s5">100</span><span class="s3">),</span>
+
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">100</span><span class="s3">),</span>
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;-&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">100</span><span class="s3">),</span>
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;*&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">200</span><span class="s3">),</span>
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;/&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">200</span><span class="s3">),</span>
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;:&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">300</span><span class="s3">),</span>
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;**&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">500</span><span class="s3">),</span>
+
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">100</span><span class="s3">),</span>
+    <span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;-&quot;</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">100</span><span class="s3">),</span>
+<span class="s3">]</span>
+
+<span class="s2">def </span><span class="s0">parse_formula</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s0">extra_operators</span><span class="s3">=[]):</span>
+    <span class="s2">if not </span><span class="s0">code</span><span class="s3">.</span><span class="s0">strip</span><span class="s3">():</span>
+        <span class="s0">code </span><span class="s3">= </span><span class="s4">&quot;~ 1&quot;</span>
+
+    <span class="s2">for </span><span class="s0">op </span><span class="s2">in </span><span class="s0">extra_operators</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s0">op</span><span class="s3">.</span><span class="s0">precedence </span><span class="s3">&lt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s0">ValueError</span><span class="s3">(</span><span class="s4">&quot;all operators must have precedence &gt;= 0&quot;</span><span class="s3">)</span>
+
+    <span class="s0">operators </span><span class="s3">= </span><span class="s0">_default_ops </span><span class="s3">+ </span><span class="s0">extra_operators</span>
+    <span class="s0">operator_strings </span><span class="s3">= [</span><span class="s0">op</span><span class="s3">.</span><span class="s0">token_type </span><span class="s2">for </span><span class="s0">op </span><span class="s2">in </span><span class="s0">operators</span><span class="s3">]</span>
+    <span class="s0">tree </span><span class="s3">= </span><span class="s0">infix_parse</span><span class="s3">(</span><span class="s0">_tokenize_formula</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s0">operator_strings</span><span class="s3">),</span>
+                       <span class="s0">operators</span><span class="s3">,</span>
+                       <span class="s0">_atomic_token_types</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s0">isinstance</span><span class="s3">(</span><span class="s0">tree</span><span class="s3">, </span><span class="s0">ParseNode</span><span class="s3">) </span><span class="s2">or </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">type </span><span class="s3">!= </span><span class="s4">&quot;~&quot;</span><span class="s3">:</span>
+        <span class="s0">tree </span><span class="s3">= </span><span class="s0">ParseNode</span><span class="s3">(</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, [</span><span class="s0">tree</span><span class="s3">], </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">origin</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s0">tree</span>
+
+<span class="s1">#############</span>
+
+<span class="s0">_parser_tests </span><span class="s3">= {</span>
+    <span class="s4">&quot;&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;1&quot;</span><span class="s3">],</span>
+    <span class="s4">&quot; &quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;1&quot;</span><span class="s3">],</span>
+    <span class="s4">&quot; </span><span class="s2">\n </span><span class="s4">&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;1&quot;</span><span class="s3">],</span>
+
+    <span class="s4">&quot;1&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;1&quot;</span><span class="s3">],</span>
+    <span class="s4">&quot;a&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">],</span>
+    <span class="s4">&quot;a ~ b&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">],</span>
+
+    <span class="s4">&quot;(a ~ b)&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">],</span>
+    <span class="s4">&quot;a ~ ((((b))))&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">],</span>
+    <span class="s4">&quot;a ~ ((((+b))))&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]],</span>
+
+    <span class="s4">&quot;a + b + c&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">], </span><span class="s4">&quot;c&quot;</span><span class="s3">]],</span>
+    <span class="s4">&quot;a + (b ~ c) + d&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">]], </span><span class="s4">&quot;d&quot;</span><span class="s3">]],</span>
+
+    <span class="s4">&quot;a + np.log(a, base=10)&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;np.log(a, base=10)&quot;</span><span class="s3">]],</span>
+    <span class="s1"># Note different spacing:</span>
+    <span class="s4">&quot;a + np . log(a , base = 10)&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;np.log(a, base=10)&quot;</span><span class="s3">]],</span>
+
+    <span class="s1"># Check precedence</span>
+    <span class="s4">&quot;a + b ~ c * d&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">], [</span><span class="s4">&quot;*&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">, </span><span class="s4">&quot;d&quot;</span><span class="s3">]],</span>
+    <span class="s4">&quot;a + b * c&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, [</span><span class="s4">&quot;*&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">]]],</span>
+    <span class="s4">&quot;-a**2&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;-&quot;</span><span class="s3">, [</span><span class="s4">&quot;**&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;2&quot;</span><span class="s3">]]],</span>
+    <span class="s4">&quot;-a:b&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;-&quot;</span><span class="s3">, [</span><span class="s4">&quot;:&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]]],</span>
+    <span class="s4">&quot;a + b:c&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, [</span><span class="s4">&quot;:&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">]]],</span>
+    <span class="s4">&quot;(a + b):c&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;:&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">], </span><span class="s4">&quot;c&quot;</span><span class="s3">]],</span>
+    <span class="s4">&quot;a*b:c&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;*&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, [</span><span class="s4">&quot;:&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">]]],</span>
+
+    <span class="s4">&quot;a+b / c&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;+&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, [</span><span class="s4">&quot;/&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">]]],</span>
+    <span class="s4">&quot;~ a&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">],</span>
+
+    <span class="s4">&quot;-1&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;-&quot;</span><span class="s3">, </span><span class="s4">&quot;1&quot;</span><span class="s3">]],</span>
+    <span class="s3">}</span>
+
+<span class="s2">def </span><span class="s0">_compare_trees</span><span class="s3">(</span><span class="s0">got</span><span class="s3">, </span><span class="s0">expected</span><span class="s3">):</span>
+    <span class="s2">assert </span><span class="s0">isinstance</span><span class="s3">(</span><span class="s0">got</span><span class="s3">, </span><span class="s0">ParseNode</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s0">got</span><span class="s3">.</span><span class="s0">args</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s0">got</span><span class="s3">.</span><span class="s0">type </span><span class="s3">== </span><span class="s0">expected</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+        <span class="s2">for </span><span class="s0">arg</span><span class="s3">, </span><span class="s0">expected_arg </span><span class="s2">in </span><span class="s0">zip</span><span class="s3">(</span><span class="s0">got</span><span class="s3">.</span><span class="s0">args</span><span class="s3">, </span><span class="s0">expected</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]):</span>
+            <span class="s0">_compare_trees</span><span class="s3">(</span><span class="s0">arg</span><span class="s3">, </span><span class="s0">expected_arg</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s0">got</span><span class="s3">.</span><span class="s0">type </span><span class="s2">in </span><span class="s0">_atomic_token_types</span>
+        <span class="s2">assert </span><span class="s0">got</span><span class="s3">.</span><span class="s0">token</span><span class="s3">.</span><span class="s0">extra </span><span class="s3">== </span><span class="s0">expected</span>
+
+<span class="s2">def </span><span class="s0">_do_parse_test</span><span class="s3">(</span><span class="s0">test_cases</span><span class="s3">, </span><span class="s0">extra_operators</span><span class="s3">):</span>
+    <span class="s2">for </span><span class="s0">code</span><span class="s3">, </span><span class="s0">expected </span><span class="s2">in </span><span class="s0">six</span><span class="s3">.</span><span class="s0">iteritems</span><span class="s3">(</span><span class="s0">test_cases</span><span class="s3">):</span>
+        <span class="s0">actual </span><span class="s3">= </span><span class="s0">parse_formula</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s0">extra_operators</span><span class="s3">=</span><span class="s0">extra_operators</span><span class="s3">)</span>
+        <span class="s0">print</span><span class="s3">(</span><span class="s0">repr</span><span class="s3">(</span><span class="s0">code</span><span class="s3">), </span><span class="s0">repr</span><span class="s3">(</span><span class="s0">expected</span><span class="s3">))</span>
+        <span class="s0">print</span><span class="s3">(</span><span class="s0">actual</span><span class="s3">)</span>
+        <span class="s0">_compare_trees</span><span class="s3">(</span><span class="s0">actual</span><span class="s3">, </span><span class="s0">expected</span><span class="s3">)</span>
+
+<span class="s2">def </span><span class="s0">test_parse_formula</span><span class="s3">():</span>
+    <span class="s0">_do_parse_test</span><span class="s3">(</span><span class="s0">_parser_tests</span><span class="s3">, [])</span>
+
+<span class="s2">def </span><span class="s0">test_parse_origin</span><span class="s3">():</span>
+    <span class="s0">tree </span><span class="s3">= </span><span class="s0">parse_formula</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">Origin</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">9</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">token</span><span class="s3">.</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">Origin</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">3</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">args</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">Origin</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">args</span><span class="s3">[</span><span class="s5">1</span><span class="s3">].</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">Origin</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">, </span><span class="s5">4</span><span class="s3">, </span><span class="s5">9</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">args</span><span class="s3">[</span><span class="s5">1</span><span class="s3">].</span><span class="s0">token</span><span class="s3">.</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">Origin</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">, </span><span class="s5">6</span><span class="s3">, </span><span class="s5">7</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">args</span><span class="s3">[</span><span class="s5">1</span><span class="s3">].</span><span class="s0">args</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">Origin</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">, </span><span class="s5">4</span><span class="s3">, </span><span class="s5">5</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s0">tree</span><span class="s3">.</span><span class="s0">args</span><span class="s3">[</span><span class="s5">1</span><span class="s3">].</span><span class="s0">args</span><span class="s3">[</span><span class="s5">1</span><span class="s3">].</span><span class="s0">origin </span><span class="s3">== </span><span class="s0">Origin</span><span class="s3">(</span><span class="s4">&quot;a ~ b + c&quot;</span><span class="s3">, </span><span class="s5">8</span><span class="s3">, </span><span class="s5">9</span><span class="s3">)</span>
+
+<span class="s1"># &lt;&gt; mark off where the error should be reported:</span>
+<span class="s0">_parser_error_tests </span><span class="s3">= [</span>
+    <span class="s4">&quot;a &lt;+&gt;&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + &lt;(&gt;&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;a + b &lt;# asdf&gt;&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;&lt;)&gt;&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + &lt;)&gt;&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;&lt;*&gt; a&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + &lt;*&gt;&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;a + &lt;foo[bar&gt;&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + &lt;foo{bar&gt;&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + &lt;foo(bar&gt;&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;a + &lt;[bar&gt;&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + &lt;{bar&gt;&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;a + &lt;{bar[]&gt;&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;a + foo&lt;]&gt;bar&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + foo[]&lt;]&gt;bar&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + foo{}&lt;}&gt;bar&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;a + foo&lt;)&gt;bar&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;a + b&lt;)&gt;&quot;</span><span class="s3">,</span>
+    <span class="s4">&quot;(a) &lt;.&gt;&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;&lt;(&gt;a + b&quot;</span><span class="s3">,</span>
+
+    <span class="s4">&quot;a +&lt; &gt;'foo&quot;</span><span class="s3">, </span><span class="s1"># Not the best placement for the error</span>
+<span class="s3">]</span>
+
+<span class="s1"># Split out so it can also be used by tests of the evaluator (which also</span>
+<span class="s1"># raises PatsyError's)</span>
+<span class="s2">def </span><span class="s0">_parsing_error_test</span><span class="s3">(</span><span class="s0">parse_fn</span><span class="s3">, </span><span class="s0">error_descs</span><span class="s3">): </span><span class="s1"># pragma: no cover</span>
+    <span class="s2">for </span><span class="s0">error_desc </span><span class="s2">in </span><span class="s0">error_descs</span><span class="s3">:</span>
+        <span class="s0">letters </span><span class="s3">= []</span>
+        <span class="s0">start </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s0">end </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">for </span><span class="s0">letter </span><span class="s2">in </span><span class="s0">error_desc</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s0">letter </span><span class="s3">== </span><span class="s4">&quot;&lt;&quot;</span><span class="s3">:</span>
+                <span class="s0">start </span><span class="s3">= </span><span class="s0">len</span><span class="s3">(</span><span class="s0">letters</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s0">letter </span><span class="s3">== </span><span class="s4">&quot;&gt;&quot;</span><span class="s3">:</span>
+                <span class="s0">end </span><span class="s3">= </span><span class="s0">len</span><span class="s3">(</span><span class="s0">letters</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s0">letters</span><span class="s3">.</span><span class="s0">append</span><span class="s3">(</span><span class="s0">letter</span><span class="s3">)</span>
+        <span class="s0">bad_code </span><span class="s3">= </span><span class="s4">&quot;&quot;</span><span class="s3">.</span><span class="s0">join</span><span class="s3">(</span><span class="s0">letters</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s0">start </span><span class="s2">is not None and </span><span class="s0">end </span><span class="s2">is not None</span>
+        <span class="s0">print</span><span class="s3">(</span><span class="s0">error_desc</span><span class="s3">)</span>
+        <span class="s0">print</span><span class="s3">(</span><span class="s0">repr</span><span class="s3">(</span><span class="s0">bad_code</span><span class="s3">), </span><span class="s0">start</span><span class="s3">, </span><span class="s0">end</span><span class="s3">)</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s0">parse_fn</span><span class="s3">(</span><span class="s0">bad_code</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s0">PatsyError </span><span class="s2">as </span><span class="s0">e</span><span class="s3">:</span>
+            <span class="s0">print</span><span class="s3">(</span><span class="s0">e</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s0">e</span><span class="s3">.</span><span class="s0">origin</span><span class="s3">.</span><span class="s0">code </span><span class="s3">== </span><span class="s0">bad_code</span>
+            <span class="s2">assert </span><span class="s0">e</span><span class="s3">.</span><span class="s0">origin</span><span class="s3">.</span><span class="s0">start </span><span class="s2">in </span><span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s0">start</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s0">e</span><span class="s3">.</span><span class="s0">origin</span><span class="s3">.</span><span class="s0">end </span><span class="s2">in </span><span class="s3">(</span><span class="s0">end</span><span class="s3">, </span><span class="s0">len</span><span class="s3">(</span><span class="s0">bad_code</span><span class="s3">))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert False</span><span class="s3">, </span><span class="s4">&quot;parser failed to report an error!&quot;</span>
+
+<span class="s2">def </span><span class="s0">test_parse_errors</span><span class="s3">(</span><span class="s0">extra_operators</span><span class="s3">=[]):</span>
+    <span class="s2">def </span><span class="s0">parse_fn</span><span class="s3">(</span><span class="s0">code</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s0">parse_formula</span><span class="s3">(</span><span class="s0">code</span><span class="s3">, </span><span class="s0">extra_operators</span><span class="s3">=</span><span class="s0">extra_operators</span><span class="s3">)</span>
+    <span class="s0">_parsing_error_test</span><span class="s3">(</span><span class="s0">parse_fn</span><span class="s3">, </span><span class="s0">_parser_error_tests</span><span class="s3">)</span>
+
+<span class="s0">_extra_op_parser_tests </span><span class="s3">= {</span>
+    <span class="s4">&quot;a | b&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;|&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]],</span>
+    <span class="s4">&quot;a * b|c&quot;</span><span class="s3">: [</span><span class="s4">&quot;~&quot;</span><span class="s3">, [</span><span class="s4">&quot;*&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, [</span><span class="s4">&quot;|&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">]]],</span>
+    <span class="s3">}</span>
+
+<span class="s2">def </span><span class="s0">test_parse_extra_op</span><span class="s3">():</span>
+    <span class="s0">extra_operators </span><span class="s3">= [</span><span class="s0">Operator</span><span class="s3">(</span><span class="s4">&quot;|&quot;</span><span class="s3">, </span><span class="s5">2</span><span class="s3">, </span><span class="s5">250</span><span class="s3">)]</span>
+    <span class="s0">_do_parse_test</span><span class="s3">(</span><span class="s0">_parser_tests</span><span class="s3">,</span>
+                   <span class="s0">extra_operators</span><span class="s3">=</span><span class="s0">extra_operators</span><span class="s3">)</span>
+    <span class="s0">_do_parse_test</span><span class="s3">(</span><span class="s0">_extra_op_parser_tests</span><span class="s3">,</span>
+                   <span class="s0">extra_operators</span><span class="s3">=</span><span class="s0">extra_operators</span><span class="s3">)</span>
+    <span class="s0">test_parse_errors</span><span class="s3">(</span><span class="s0">extra_operators</span><span class="s3">=</span><span class="s0">extra_operators</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

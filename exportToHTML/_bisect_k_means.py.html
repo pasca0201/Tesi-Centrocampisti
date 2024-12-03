@@ -1,0 +1,553 @@
+<html>
+<head>
+<title>_bisect_k_means.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_bisect_k_means.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Bisecting K-means clustering.&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Michal Krawczyk &lt;mkrwczyk.1@gmail.com&gt;</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">import </span><span class="s1">scipy</span><span class="s4">.</span><span class="s1">sparse </span><span class="s3">as </span><span class="s1">sp</span>
+
+<span class="s3">from </span><span class="s4">..</span><span class="s1">base </span><span class="s3">import </span><span class="s1">_fit_context</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_openmp_helpers </span><span class="s3">import </span><span class="s1">_openmp_effective_n_threads</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">Interval</span><span class="s4">, </span><span class="s1">StrOptions</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">extmath </span><span class="s3">import </span><span class="s1">row_norms</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">validation </span><span class="s3">import </span><span class="s1">_check_sample_weight</span><span class="s4">, </span><span class="s1">check_is_fitted</span><span class="s4">, </span><span class="s1">check_random_state</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_k_means_common </span><span class="s3">import </span><span class="s1">_inertia_dense</span><span class="s4">, </span><span class="s1">_inertia_sparse</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_kmeans </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">_BaseKMeans</span><span class="s4">,</span>
+    <span class="s1">_kmeans_single_elkan</span><span class="s4">,</span>
+    <span class="s1">_kmeans_single_lloyd</span><span class="s4">,</span>
+    <span class="s1">_labels_inertia_threadpool_limit</span><span class="s4">,</span>
+<span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">_BisectingTree</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Tree structure representing the hierarchical clusters of BisectingKMeans.&quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">center</span><span class="s4">, </span><span class="s1">indices</span><span class="s4">, </span><span class="s1">score</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Create a new cluster node in the tree. 
+ 
+        The node holds the center of this cluster and the indices of the data points 
+        that belong to it. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">center </span><span class="s4">= </span><span class="s1">center</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">indices </span><span class="s4">= </span><span class="s1">indices</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">score </span><span class="s4">= </span><span class="s1">score</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">left </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">right </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">split</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">labels</span><span class="s4">, </span><span class="s1">centers</span><span class="s4">, </span><span class="s1">scores</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Split the cluster node into two subclusters.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">left </span><span class="s4">= </span><span class="s1">_BisectingTree</span><span class="s4">(</span>
+            <span class="s1">indices</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">[</span><span class="s1">labels </span><span class="s4">== </span><span class="s5">0</span><span class="s4">], </span><span class="s1">center</span><span class="s4">=</span><span class="s1">centers</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">score</span><span class="s4">=</span><span class="s1">scores</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+        <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">right </span><span class="s4">= </span><span class="s1">_BisectingTree</span><span class="s4">(</span>
+            <span class="s1">indices</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">[</span><span class="s1">labels </span><span class="s4">== </span><span class="s5">1</span><span class="s4">], </span><span class="s1">center</span><span class="s4">=</span><span class="s1">centers</span><span class="s4">[</span><span class="s5">1</span><span class="s4">], </span><span class="s1">score</span><span class="s4">=</span><span class="s1">scores</span><span class="s4">[</span><span class="s5">1</span><span class="s4">]</span>
+        <span class="s4">)</span>
+
+        <span class="s2"># reset the indices attribute to save memory</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">indices </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">def </span><span class="s1">get_cluster_to_bisect</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the cluster node to bisect next. 
+ 
+        It's based on the score of the cluster, which can be either the number of 
+        data points assigned to that cluster or the inertia of that cluster 
+        (see `bisecting_strategy` for details). 
+        &quot;&quot;&quot;</span>
+        <span class="s1">max_score </span><span class="s4">= </span><span class="s3">None</span>
+
+        <span class="s3">for </span><span class="s1">cluster_leaf </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">iter_leaves</span><span class="s4">():</span>
+            <span class="s3">if </span><span class="s1">max_score </span><span class="s3">is None or </span><span class="s1">cluster_leaf</span><span class="s4">.</span><span class="s1">score </span><span class="s4">&gt; </span><span class="s1">max_score</span><span class="s4">:</span>
+                <span class="s1">max_score </span><span class="s4">= </span><span class="s1">cluster_leaf</span><span class="s4">.</span><span class="s1">score</span>
+                <span class="s1">best_cluster_leaf </span><span class="s4">= </span><span class="s1">cluster_leaf</span>
+
+        <span class="s3">return </span><span class="s1">best_cluster_leaf</span>
+
+    <span class="s3">def </span><span class="s1">iter_leaves</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Iterate over all the cluster leaves in the tree.&quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">left </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s3">yield </span><span class="s1">self</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">yield from </span><span class="s1">self</span><span class="s4">.</span><span class="s1">left</span><span class="s4">.</span><span class="s1">iter_leaves</span><span class="s4">()</span>
+            <span class="s3">yield from </span><span class="s1">self</span><span class="s4">.</span><span class="s1">right</span><span class="s4">.</span><span class="s1">iter_leaves</span><span class="s4">()</span>
+
+
+<span class="s3">class </span><span class="s1">BisectingKMeans</span><span class="s4">(</span><span class="s1">_BaseKMeans</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Bisecting K-Means clustering. 
+ 
+    Read more in the :ref:`User Guide &lt;bisect_k_means&gt;`. 
+ 
+    .. versionadded:: 1.1 
+ 
+    Parameters 
+    ---------- 
+    n_clusters : int, default=8 
+        The number of clusters to form as well as the number of 
+        centroids to generate. 
+ 
+    init : {'k-means++', 'random'} or callable, default='random' 
+        Method for initialization: 
+ 
+        'k-means++' : selects initial cluster centers for k-mean 
+        clustering in a smart way to speed up convergence. See section 
+        Notes in k_init for more details. 
+ 
+        'random': choose `n_clusters` observations (rows) at random from data 
+        for the initial centroids. 
+ 
+        If a callable is passed, it should take arguments X, n_clusters and a 
+        random state and return an initialization. 
+ 
+    n_init : int, default=1 
+        Number of time the inner k-means algorithm will be run with different 
+        centroid seeds in each bisection. 
+        That will result producing for each bisection best output of n_init 
+        consecutive runs in terms of inertia. 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        Determines random number generation for centroid initialization 
+        in inner K-Means. Use an int to make the randomness deterministic. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+    max_iter : int, default=300 
+        Maximum number of iterations of the inner k-means algorithm at each 
+        bisection. 
+ 
+    verbose : int, default=0 
+        Verbosity mode. 
+ 
+    tol : float, default=1e-4 
+        Relative tolerance with regards to Frobenius norm of the difference 
+        in the cluster centers of two consecutive iterations  to declare 
+        convergence. Used in inner k-means algorithm at each bisection to pick 
+        best possible clusters. 
+ 
+    copy_x : bool, default=True 
+        When pre-computing distances it is more numerically accurate to center 
+        the data first. If copy_x is True (default), then the original data is 
+        not modified. If False, the original data is modified, and put back 
+        before the function returns, but small numerical differences may be 
+        introduced by subtracting and then adding the data mean. Note that if 
+        the original data is not C-contiguous, a copy will be made even if 
+        copy_x is False. If the original data is sparse, but not in CSR format, 
+        a copy will be made even if copy_x is False. 
+ 
+    algorithm : {&quot;lloyd&quot;, &quot;elkan&quot;}, default=&quot;lloyd&quot; 
+        Inner K-means algorithm used in bisection. 
+        The classical EM-style algorithm is `&quot;lloyd&quot;`. 
+        The `&quot;elkan&quot;` variation can be more efficient on some datasets with 
+        well-defined clusters, by using the triangle inequality. However it's 
+        more memory intensive due to the allocation of an extra array of shape 
+        `(n_samples, n_clusters)`. 
+ 
+    bisecting_strategy : {&quot;biggest_inertia&quot;, &quot;largest_cluster&quot;},\ 
+            default=&quot;biggest_inertia&quot; 
+        Defines how bisection should be performed: 
+ 
+         - &quot;biggest_inertia&quot; means that BisectingKMeans will always check 
+            all calculated cluster for cluster with biggest SSE 
+            (Sum of squared errors) and bisect it. This approach concentrates on 
+            precision, but may be costly in terms of execution time (especially for 
+            larger amount of data points). 
+ 
+         - &quot;largest_cluster&quot; - BisectingKMeans will always split cluster with 
+            largest amount of points assigned to it from all clusters 
+            previously calculated. That should work faster than picking by SSE 
+            ('biggest_inertia') and may produce similar results in most cases. 
+ 
+    Attributes 
+    ---------- 
+    cluster_centers_ : ndarray of shape (n_clusters, n_features) 
+        Coordinates of cluster centers. If the algorithm stops before fully 
+        converging (see ``tol`` and ``max_iter``), these will not be 
+        consistent with ``labels_``. 
+ 
+    labels_ : ndarray of shape (n_samples,) 
+        Labels of each point. 
+ 
+    inertia_ : float 
+        Sum of squared distances of samples to their closest cluster center, 
+        weighted by the sample weights if provided. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+    See Also 
+    -------- 
+    KMeans : Original implementation of K-Means algorithm. 
+ 
+    Notes 
+    ----- 
+    It might be inefficient when n_cluster is less than 3, due to unnecessary 
+    calculations for that case. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.cluster import BisectingKMeans 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; X = np.array([[1, 1], [10, 1], [3, 1], 
+    ...               [10, 0], [2, 1], [10, 2], 
+    ...               [10, 8], [10, 9], [10, 10]]) 
+    &gt;&gt;&gt; bisect_means = BisectingKMeans(n_clusters=3, random_state=0).fit(X) 
+    &gt;&gt;&gt; bisect_means.labels_ 
+    array([0, 2, 0, 2, 0, 2, 1, 1, 1], dtype=int32) 
+    &gt;&gt;&gt; bisect_means.predict([[0, 0], [12, 3]]) 
+    array([0, 2], dtype=int32) 
+    &gt;&gt;&gt; bisect_means.cluster_centers_ 
+    array([[ 2., 1.], 
+           [10., 9.], 
+           [10., 1.]]) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s4">**</span><span class="s1">_BaseKMeans</span><span class="s4">.</span><span class="s1">_parameter_constraints</span><span class="s4">,</span>
+        <span class="s6">&quot;init&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s6">&quot;k-means++&quot;</span><span class="s4">, </span><span class="s6">&quot;random&quot;</span><span class="s4">}), </span><span class="s1">callable</span><span class="s4">],</span>
+        <span class="s6">&quot;n_init&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s5">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s6">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s6">&quot;copy_x&quot;</span><span class="s4">: [</span><span class="s6">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s6">&quot;algorithm&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s6">&quot;lloyd&quot;</span><span class="s4">, </span><span class="s6">&quot;elkan&quot;</span><span class="s4">})],</span>
+        <span class="s6">&quot;bisecting_strategy&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s6">&quot;biggest_inertia&quot;</span><span class="s4">, </span><span class="s6">&quot;largest_cluster&quot;</span><span class="s4">})],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">n_clusters</span><span class="s4">=</span><span class="s5">8</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">init</span><span class="s4">=</span><span class="s6">&quot;random&quot;</span><span class="s4">,</span>
+        <span class="s1">n_init</span><span class="s4">=</span><span class="s5">1</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s5">300</span><span class="s4">,</span>
+        <span class="s1">verbose</span><span class="s4">=</span><span class="s5">0</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s5">1e-4</span><span class="s4">,</span>
+        <span class="s1">copy_x</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+        <span class="s1">algorithm</span><span class="s4">=</span><span class="s6">&quot;lloyd&quot;</span><span class="s4">,</span>
+        <span class="s1">bisecting_strategy</span><span class="s4">=</span><span class="s6">&quot;biggest_inertia&quot;</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">(</span>
+            <span class="s1">n_clusters</span><span class="s4">=</span><span class="s1">n_clusters</span><span class="s4">,</span>
+            <span class="s1">init</span><span class="s4">=</span><span class="s1">init</span><span class="s4">,</span>
+            <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s1">verbose</span><span class="s4">=</span><span class="s1">verbose</span><span class="s4">,</span>
+            <span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">,</span>
+            <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s1">n_init</span><span class="s4">=</span><span class="s1">n_init</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">copy_x </span><span class="s4">= </span><span class="s1">copy_x</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">= </span><span class="s1">algorithm</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">bisecting_strategy </span><span class="s4">= </span><span class="s1">bisecting_strategy</span>
+
+    <span class="s3">def </span><span class="s1">_warn_mkl_vcomp</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">n_active_threads</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Warn when vcomp and mkl are both present&quot;&quot;&quot;</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+            <span class="s6">&quot;BisectingKMeans is known to have a memory leak on Windows &quot;</span>
+            <span class="s6">&quot;with MKL, when there are less chunks than available &quot;</span>
+            <span class="s6">&quot;threads. You can avoid it by setting the environment&quot;</span>
+            <span class="s6">f&quot; variable OMP_NUM_THREADS=</span><span class="s3">{</span><span class="s1">n_active_threads</span><span class="s3">}</span><span class="s6">.&quot;</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_inertia_per_cluster</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">centers</span><span class="s4">, </span><span class="s1">labels</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Calculate the sum of squared errors (inertia) per cluster. 
+ 
+        Parameters 
+        ---------- 
+        X : {ndarray, csr_matrix} of shape (n_samples, n_features) 
+            The input samples. 
+ 
+        centers : ndarray of shape (n_clusters=2, n_features) 
+            The cluster centers. 
+ 
+        labels : ndarray of shape (n_samples,) 
+            Index of the cluster each sample belongs to. 
+ 
+        sample_weight : ndarray of shape (n_samples,) 
+            The weights for each observation in X. 
+ 
+        Returns 
+        ------- 
+        inertia_per_cluster : ndarray of shape (n_clusters=2,) 
+            Sum of squared errors (inertia) for each cluster. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">n_clusters </span><span class="s4">= </span><span class="s1">centers</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]  </span><span class="s2"># = 2 since centers comes from a bisection</span>
+        <span class="s1">_inertia </span><span class="s4">= </span><span class="s1">_inertia_sparse </span><span class="s3">if </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">X</span><span class="s4">) </span><span class="s3">else </span><span class="s1">_inertia_dense</span>
+
+        <span class="s1">inertia_per_cluster </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">(</span><span class="s1">n_clusters</span><span class="s4">)</span>
+        <span class="s3">for </span><span class="s1">label </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_clusters</span><span class="s4">):</span>
+            <span class="s1">inertia_per_cluster</span><span class="s4">[</span><span class="s1">label</span><span class="s4">] = </span><span class="s1">_inertia</span><span class="s4">(</span>
+                <span class="s1">X</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">centers</span><span class="s4">, </span><span class="s1">labels</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_n_threads</span><span class="s4">, </span><span class="s1">single_label</span><span class="s4">=</span><span class="s1">label</span>
+            <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">inertia_per_cluster</span>
+
+    <span class="s3">def </span><span class="s1">_bisect</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">x_squared_norms</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">cluster_to_bisect</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Split a cluster into 2 subsclusters. 
+ 
+        Parameters 
+        ---------- 
+        X : {ndarray, csr_matrix} of shape (n_samples, n_features) 
+            Training instances to cluster. 
+ 
+        x_squared_norms : ndarray of shape (n_samples,) 
+            Squared euclidean norm of each data point. 
+ 
+        sample_weight : ndarray of shape (n_samples,) 
+            The weights for each observation in X. 
+ 
+        cluster_to_bisect : _BisectingTree node object 
+            The cluster node to split. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">X</span><span class="s4">[</span><span class="s1">cluster_to_bisect</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">]</span>
+        <span class="s1">x_squared_norms </span><span class="s4">= </span><span class="s1">x_squared_norms</span><span class="s4">[</span><span class="s1">cluster_to_bisect</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">]</span>
+        <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">sample_weight</span><span class="s4">[</span><span class="s1">cluster_to_bisect</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">]</span>
+
+        <span class="s1">best_inertia </span><span class="s4">= </span><span class="s3">None</span>
+
+        <span class="s2"># Split samples in X into 2 clusters.</span>
+        <span class="s2"># Repeating `n_init` times to obtain best clusters</span>
+        <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_init</span><span class="s4">):</span>
+            <span class="s1">centers_init </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_init_centroids</span><span class="s4">(</span>
+                <span class="s1">X</span><span class="s4">,</span>
+                <span class="s1">x_squared_norms</span><span class="s4">=</span><span class="s1">x_squared_norms</span><span class="s4">,</span>
+                <span class="s1">init</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">init</span><span class="s4">,</span>
+                <span class="s1">random_state</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_random_state</span><span class="s4">,</span>
+                <span class="s1">n_centroids</span><span class="s4">=</span><span class="s5">2</span><span class="s4">,</span>
+                <span class="s1">sample_weight</span><span class="s4">=</span><span class="s1">sample_weight</span><span class="s4">,</span>
+            <span class="s4">)</span>
+
+            <span class="s1">labels</span><span class="s4">, </span><span class="s1">inertia</span><span class="s4">, </span><span class="s1">centers</span><span class="s4">, </span><span class="s1">_ </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_kmeans_single</span><span class="s4">(</span>
+                <span class="s1">X</span><span class="s4">,</span>
+                <span class="s1">sample_weight</span><span class="s4">,</span>
+                <span class="s1">centers_init</span><span class="s4">,</span>
+                <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter</span><span class="s4">,</span>
+                <span class="s1">verbose</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">verbose</span><span class="s4">,</span>
+                <span class="s1">tol</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">tol</span><span class="s4">,</span>
+                <span class="s1">n_threads</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_n_threads</span><span class="s4">,</span>
+            <span class="s4">)</span>
+
+            <span class="s2"># allow small tolerance on the inertia to accommodate for</span>
+            <span class="s2"># non-deterministic rounding errors due to parallel computation</span>
+            <span class="s3">if </span><span class="s1">best_inertia </span><span class="s3">is None or </span><span class="s1">inertia </span><span class="s4">&lt; </span><span class="s1">best_inertia </span><span class="s4">* (</span><span class="s5">1 </span><span class="s4">- </span><span class="s5">1e-6</span><span class="s4">):</span>
+                <span class="s1">best_labels </span><span class="s4">= </span><span class="s1">labels</span>
+                <span class="s1">best_centers </span><span class="s4">= </span><span class="s1">centers</span>
+                <span class="s1">best_inertia </span><span class="s4">= </span><span class="s1">inertia</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">verbose</span><span class="s4">:</span>
+            <span class="s1">print</span><span class="s4">(</span><span class="s6">f&quot;New centroids from bisection: </span><span class="s3">{</span><span class="s1">best_centers</span><span class="s3">}</span><span class="s6">&quot;</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">bisecting_strategy </span><span class="s4">== </span><span class="s6">&quot;biggest_inertia&quot;</span><span class="s4">:</span>
+            <span class="s1">scores </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_inertia_per_cluster</span><span class="s4">(</span>
+                <span class="s1">X</span><span class="s4">, </span><span class="s1">best_centers</span><span class="s4">, </span><span class="s1">best_labels</span><span class="s4">, </span><span class="s1">sample_weight</span>
+            <span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:  </span><span class="s2"># bisecting_strategy == &quot;largest_cluster&quot;</span>
+            <span class="s2"># Using minlength to make sure that we have the counts for both labels even</span>
+            <span class="s2"># if all samples are labelled 0.</span>
+            <span class="s1">scores </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">bincount</span><span class="s4">(</span><span class="s1">best_labels</span><span class="s4">, </span><span class="s1">minlength</span><span class="s4">=</span><span class="s5">2</span><span class="s4">)</span>
+
+        <span class="s1">cluster_to_bisect</span><span class="s4">.</span><span class="s1">split</span><span class="s4">(</span><span class="s1">best_labels</span><span class="s4">, </span><span class="s1">best_centers</span><span class="s4">, </span><span class="s1">scores</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Compute bisecting k-means clustering. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+ 
+            Training instances to cluster. 
+ 
+            .. note:: The data will be converted to C ordering, 
+                which will cause a memory copy 
+                if the given data is not C-contiguous. 
+ 
+        y : Ignored 
+            Not used, present here for API consistency by convention. 
+ 
+        sample_weight : array-like of shape (n_samples,), default=None 
+            The weights for each observation in X. If None, all observations 
+            are assigned equal weight. `sample_weight` is not used during 
+            initialization if `init` is a callable. 
+ 
+        Returns 
+        ------- 
+        self 
+            Fitted estimator. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">accept_sparse</span><span class="s4">=</span><span class="s6">&quot;csr&quot;</span><span class="s4">,</span>
+            <span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">],</span>
+            <span class="s1">order</span><span class="s4">=</span><span class="s6">&quot;C&quot;</span><span class="s4">,</span>
+            <span class="s1">copy</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">copy_x</span><span class="s4">,</span>
+            <span class="s1">accept_large_sparse</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_check_params_vs_input</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_random_state </span><span class="s4">= </span><span class="s1">check_random_state</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">random_state</span><span class="s4">)</span>
+        <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">_check_sample_weight</span><span class="s4">(</span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_n_threads </span><span class="s4">= </span><span class="s1">_openmp_effective_n_threads</span><span class="s4">()</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s6">&quot;lloyd&quot; </span><span class="s3">or </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_clusters </span><span class="s4">== </span><span class="s5">1</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_kmeans_single </span><span class="s4">= </span><span class="s1">_kmeans_single_lloyd</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_check_mkl_vcomp</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">])</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_kmeans_single </span><span class="s4">= </span><span class="s1">_kmeans_single_elkan</span>
+
+        <span class="s2"># Subtract of mean of X for more accurate distance computations</span>
+        <span class="s3">if not </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_X_mean </span><span class="s4">= </span><span class="s1">X</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s5">0</span><span class="s4">)</span>
+            <span class="s1">X </span><span class="s4">-= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_X_mean</span>
+
+        <span class="s2"># Initialize the hierarchical clusters tree</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_bisecting_tree </span><span class="s4">= </span><span class="s1">_BisectingTree</span><span class="s4">(</span>
+            <span class="s1">indices</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">arange</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]),</span>
+            <span class="s1">center</span><span class="s4">=</span><span class="s1">X</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s5">0</span><span class="s4">),</span>
+            <span class="s1">score</span><span class="s4">=</span><span class="s5">0</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+        <span class="s1">x_squared_norms </span><span class="s4">= </span><span class="s1">row_norms</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">squared</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">_ </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_clusters </span><span class="s4">- </span><span class="s5">1</span><span class="s4">):</span>
+            <span class="s2"># Chose cluster to bisect</span>
+            <span class="s1">cluster_to_bisect </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_bisecting_tree</span><span class="s4">.</span><span class="s1">get_cluster_to_bisect</span><span class="s4">()</span>
+
+            <span class="s2"># Split this cluster into 2 subclusters</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_bisect</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">x_squared_norms</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">cluster_to_bisect</span><span class="s4">)</span>
+
+        <span class="s2"># Aggregate final labels and centers from the bisecting tree</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">labels_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], -</span><span class="s5">1</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_centers_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">((</span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_clusters</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">1</span><span class="s4">]), </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">i</span><span class="s4">, </span><span class="s1">cluster_node </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_bisecting_tree</span><span class="s4">.</span><span class="s1">iter_leaves</span><span class="s4">()):</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">labels_</span><span class="s4">[</span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">indices</span><span class="s4">] = </span><span class="s1">i</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_centers_</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = </span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">center</span>
+            <span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">label </span><span class="s4">= </span><span class="s1">i  </span><span class="s2"># label final clusters for future prediction</span>
+            <span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">indices </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># release memory</span>
+
+        <span class="s2"># Restore original data</span>
+        <span class="s3">if not </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">X</span><span class="s4">):</span>
+            <span class="s1">X </span><span class="s4">+= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_X_mean</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_centers_ </span><span class="s4">+= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_X_mean</span>
+
+        <span class="s1">_inertia </span><span class="s4">= </span><span class="s1">_inertia_sparse </span><span class="s3">if </span><span class="s1">sp</span><span class="s4">.</span><span class="s1">issparse</span><span class="s4">(</span><span class="s1">X</span><span class="s4">) </span><span class="s3">else </span><span class="s1">_inertia_dense</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">inertia_ </span><span class="s4">= </span><span class="s1">_inertia</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_centers_</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">labels_</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_n_threads</span>
+        <span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_n_features_out </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">cluster_centers_</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">]</span>
+
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">predict</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict which cluster each sample in X belongs to. 
+ 
+        Prediction is made by going down the hierarchical tree 
+        in searching of closest leaf cluster. 
+ 
+        In the vector quantization literature, `cluster_centers_` is called 
+        the code book and each value returned by `predict` is the index of 
+        the closest code in the code book. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            New data to predict. 
+ 
+        Returns 
+        ------- 
+        labels : ndarray of shape (n_samples,) 
+            Index of the cluster each sample belongs to. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_check_test_data</span><span class="s4">(</span><span class="s1">X</span><span class="s4">)</span>
+        <span class="s1">x_squared_norms </span><span class="s4">= </span><span class="s1">row_norms</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">squared</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+
+        <span class="s2"># sample weights are unused but necessary in cython helpers</span>
+        <span class="s1">sample_weight </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">ones_like</span><span class="s4">(</span><span class="s1">x_squared_norms</span><span class="s4">)</span>
+
+        <span class="s1">labels </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_predict_recursive</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_bisecting_tree</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">labels</span>
+
+    <span class="s3">def </span><span class="s1">_predict_recursive</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">sample_weight</span><span class="s4">, </span><span class="s1">cluster_node</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Predict recursively by going down the hierarchical tree. 
+ 
+        Parameters 
+        ---------- 
+        X : {ndarray, csr_matrix} of shape (n_samples, n_features) 
+            The data points, currently assigned to `cluster_node`, to predict between 
+            the subclusters of this node. 
+ 
+        sample_weight : ndarray of shape (n_samples,) 
+            The weights for each observation in X. 
+ 
+        cluster_node : _BisectingTree node object 
+            The cluster node of the hierarchical tree. 
+ 
+        Returns 
+        ------- 
+        labels : ndarray of shape (n_samples,) 
+            Index of the cluster each sample belongs to. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">left </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s2"># This cluster has no subcluster. Labels are just the label of the cluster.</span>
+            <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], </span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">label</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+
+        <span class="s2"># Determine if data points belong to the left or right subcluster</span>
+        <span class="s1">centers </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">vstack</span><span class="s4">((</span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">left</span><span class="s4">.</span><span class="s1">center</span><span class="s4">, </span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">right</span><span class="s4">.</span><span class="s1">center</span><span class="s4">))</span>
+        <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s6">&quot;_X_mean&quot;</span><span class="s4">):</span>
+            <span class="s1">centers </span><span class="s4">+= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_X_mean</span>
+
+        <span class="s1">cluster_labels </span><span class="s4">= </span><span class="s1">_labels_inertia_threadpool_limit</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">,</span>
+            <span class="s1">sample_weight</span><span class="s4">,</span>
+            <span class="s1">centers</span><span class="s4">,</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_n_threads</span><span class="s4">,</span>
+            <span class="s1">return_inertia</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">mask </span><span class="s4">= </span><span class="s1">cluster_labels </span><span class="s4">== </span><span class="s5">0</span>
+
+        <span class="s2"># Compute the labels for each subset of the data points.</span>
+        <span class="s1">labels </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">full</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s5">0</span><span class="s4">], -</span><span class="s5">1</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int32</span><span class="s4">)</span>
+
+        <span class="s1">labels</span><span class="s4">[</span><span class="s1">mask</span><span class="s4">] = </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_predict_recursive</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">[</span><span class="s1">mask</span><span class="s4">], </span><span class="s1">sample_weight</span><span class="s4">[</span><span class="s1">mask</span><span class="s4">], </span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">left</span>
+        <span class="s4">)</span>
+
+        <span class="s1">labels</span><span class="s4">[~</span><span class="s1">mask</span><span class="s4">] = </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_predict_recursive</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">[~</span><span class="s1">mask</span><span class="s4">], </span><span class="s1">sample_weight</span><span class="s4">[~</span><span class="s1">mask</span><span class="s4">], </span><span class="s1">cluster_node</span><span class="s4">.</span><span class="s1">right</span>
+        <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">labels</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s4">{</span><span class="s6">&quot;preserves_dtype&quot;</span><span class="s4">: [</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">]}</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,802 @@
+<html>
+<head>
+<title>_numdiff.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #2aacb8;}
+.s6 { color: #7a7e85;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_numdiff.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Routines for numerical differentiation.&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">norm</span>
+
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">LinearOperator</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">sparse </span><span class="s2">import </span><span class="s1">issparse</span><span class="s3">, </span><span class="s1">csc_matrix</span><span class="s3">, </span><span class="s1">csr_matrix</span><span class="s3">, </span><span class="s1">coo_matrix</span><span class="s3">, </span><span class="s1">find</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">_group_columns </span><span class="s2">import </span><span class="s1">group_dense</span><span class="s3">, </span><span class="s1">group_sparse</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">_lib</span><span class="s3">.</span><span class="s1">_array_api </span><span class="s2">import </span><span class="s1">atleast_nd</span><span class="s3">, </span><span class="s1">array_namespace</span>
+
+
+<span class="s2">def </span><span class="s1">_adjust_scheme_to_bounds</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">num_steps</span><span class="s3">, </span><span class="s1">scheme</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Adjust final difference scheme to the presence of bounds. 
+ 
+    Parameters 
+    ---------- 
+    x0 : ndarray, shape (n,) 
+        Point at which we wish to estimate derivative. 
+    h : ndarray, shape (n,) 
+        Desired absolute finite difference steps. 
+    num_steps : int 
+        Number of `h` steps in one direction required to implement finite 
+        difference scheme. For example, 2 means that we need to evaluate 
+        f(x0 + 2 * h) or f(x0 - 2 * h) 
+    scheme : {'1-sided', '2-sided'} 
+        Whether steps in one or both directions are required. In other 
+        words '1-sided' applies to forward and backward schemes, '2-sided' 
+        applies to center schemes. 
+    lb : ndarray, shape (n,) 
+        Lower bounds on independent variables. 
+    ub : ndarray, shape (n,) 
+        Upper bounds on independent variables. 
+ 
+    Returns 
+    ------- 
+    h_adjusted : ndarray, shape (n,) 
+        Adjusted absolute step sizes. Step size decreases only if a sign flip 
+        or switching to one-sided scheme doesn't allow to take a full step. 
+    use_one_sided : ndarray of bool, shape (n,) 
+        Whether to switch to one-sided scheme. Informative only for 
+        ``scheme='2-sided'``. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">scheme </span><span class="s3">== </span><span class="s4">'1-sided'</span><span class="s3">:</span>
+        <span class="s1">use_one_sided </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones_like</span><span class="s3">(</span><span class="s1">h</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">bool</span><span class="s3">)</span>
+    <span class="s2">elif </span><span class="s1">scheme </span><span class="s3">== </span><span class="s4">'2-sided'</span><span class="s3">:</span>
+        <span class="s1">h </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">h</span><span class="s3">)</span>
+        <span class="s1">use_one_sided </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">h</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">bool</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;`scheme` must be '1-sided' or '2-sided'.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">((</span><span class="s1">lb </span><span class="s3">== -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">) &amp; (</span><span class="s1">ub </span><span class="s3">== </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)):</span>
+        <span class="s2">return </span><span class="s1">h</span><span class="s3">, </span><span class="s1">use_one_sided</span>
+
+    <span class="s1">h_total </span><span class="s3">= </span><span class="s1">h </span><span class="s3">* </span><span class="s1">num_steps</span>
+    <span class="s1">h_adjusted </span><span class="s3">= </span><span class="s1">h</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+    <span class="s1">lower_dist </span><span class="s3">= </span><span class="s1">x0 </span><span class="s3">- </span><span class="s1">lb</span>
+    <span class="s1">upper_dist </span><span class="s3">= </span><span class="s1">ub </span><span class="s3">- </span><span class="s1">x0</span>
+
+    <span class="s2">if </span><span class="s1">scheme </span><span class="s3">== </span><span class="s4">'1-sided'</span><span class="s3">:</span>
+        <span class="s1">x </span><span class="s3">= </span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">h_total</span>
+        <span class="s1">violated </span><span class="s3">= (</span><span class="s1">x </span><span class="s3">&lt; </span><span class="s1">lb</span><span class="s3">) | (</span><span class="s1">x </span><span class="s3">&gt; </span><span class="s1">ub</span><span class="s3">)</span>
+        <span class="s1">fitting </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">h_total</span><span class="s3">) &lt;= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s1">lower_dist</span><span class="s3">, </span><span class="s1">upper_dist</span><span class="s3">)</span>
+        <span class="s1">h_adjusted</span><span class="s3">[</span><span class="s1">violated </span><span class="s3">&amp; </span><span class="s1">fitting</span><span class="s3">] *= -</span><span class="s5">1</span>
+
+        <span class="s1">forward </span><span class="s3">= (</span><span class="s1">upper_dist </span><span class="s3">&gt;= </span><span class="s1">lower_dist</span><span class="s3">) &amp; ~</span><span class="s1">fitting</span>
+        <span class="s1">h_adjusted</span><span class="s3">[</span><span class="s1">forward</span><span class="s3">] = </span><span class="s1">upper_dist</span><span class="s3">[</span><span class="s1">forward</span><span class="s3">] / </span><span class="s1">num_steps</span>
+        <span class="s1">backward </span><span class="s3">= (</span><span class="s1">upper_dist </span><span class="s3">&lt; </span><span class="s1">lower_dist</span><span class="s3">) &amp; ~</span><span class="s1">fitting</span>
+        <span class="s1">h_adjusted</span><span class="s3">[</span><span class="s1">backward</span><span class="s3">] = -</span><span class="s1">lower_dist</span><span class="s3">[</span><span class="s1">backward</span><span class="s3">] / </span><span class="s1">num_steps</span>
+    <span class="s2">elif </span><span class="s1">scheme </span><span class="s3">== </span><span class="s4">'2-sided'</span><span class="s3">:</span>
+        <span class="s1">central </span><span class="s3">= (</span><span class="s1">lower_dist </span><span class="s3">&gt;= </span><span class="s1">h_total</span><span class="s3">) &amp; (</span><span class="s1">upper_dist </span><span class="s3">&gt;= </span><span class="s1">h_total</span><span class="s3">)</span>
+
+        <span class="s1">forward </span><span class="s3">= (</span><span class="s1">upper_dist </span><span class="s3">&gt;= </span><span class="s1">lower_dist</span><span class="s3">) &amp; ~</span><span class="s1">central</span>
+        <span class="s1">h_adjusted</span><span class="s3">[</span><span class="s1">forward</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">minimum</span><span class="s3">(</span>
+            <span class="s1">h</span><span class="s3">[</span><span class="s1">forward</span><span class="s3">], </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">upper_dist</span><span class="s3">[</span><span class="s1">forward</span><span class="s3">] / </span><span class="s1">num_steps</span><span class="s3">)</span>
+        <span class="s1">use_one_sided</span><span class="s3">[</span><span class="s1">forward</span><span class="s3">] = </span><span class="s2">True</span>
+
+        <span class="s1">backward </span><span class="s3">= (</span><span class="s1">upper_dist </span><span class="s3">&lt; </span><span class="s1">lower_dist</span><span class="s3">) &amp; ~</span><span class="s1">central</span>
+        <span class="s1">h_adjusted</span><span class="s3">[</span><span class="s1">backward</span><span class="s3">] = -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">minimum</span><span class="s3">(</span>
+            <span class="s1">h</span><span class="s3">[</span><span class="s1">backward</span><span class="s3">], </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">lower_dist</span><span class="s3">[</span><span class="s1">backward</span><span class="s3">] / </span><span class="s1">num_steps</span><span class="s3">)</span>
+        <span class="s1">use_one_sided</span><span class="s3">[</span><span class="s1">backward</span><span class="s3">] = </span><span class="s2">True</span>
+
+        <span class="s1">min_dist </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">minimum</span><span class="s3">(</span><span class="s1">upper_dist</span><span class="s3">, </span><span class="s1">lower_dist</span><span class="s3">) / </span><span class="s1">num_steps</span>
+        <span class="s1">adjusted_central </span><span class="s3">= (~</span><span class="s1">central </span><span class="s3">&amp; (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">h_adjusted</span><span class="s3">) &lt;= </span><span class="s1">min_dist</span><span class="s3">))</span>
+        <span class="s1">h_adjusted</span><span class="s3">[</span><span class="s1">adjusted_central</span><span class="s3">] = </span><span class="s1">min_dist</span><span class="s3">[</span><span class="s1">adjusted_central</span><span class="s3">]</span>
+        <span class="s1">use_one_sided</span><span class="s3">[</span><span class="s1">adjusted_central</span><span class="s3">] = </span><span class="s2">False</span>
+
+    <span class="s2">return </span><span class="s1">h_adjusted</span><span class="s3">, </span><span class="s1">use_one_sided</span>
+
+
+<span class="s3">@</span><span class="s1">functools</span><span class="s3">.</span><span class="s1">lru_cache</span>
+<span class="s2">def </span><span class="s1">_eps_for_method</span><span class="s3">(</span><span class="s1">x0_dtype</span><span class="s3">, </span><span class="s1">f0_dtype</span><span class="s3">, </span><span class="s1">method</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Calculates relative EPS step to use for a given data type 
+    and numdiff step method. 
+ 
+    Progressively smaller steps are used for larger floating point types. 
+ 
+    Parameters 
+    ---------- 
+    f0_dtype: np.dtype 
+        dtype of function evaluation 
+ 
+    x0_dtype: np.dtype 
+        dtype of parameter vector 
+ 
+    method: {'2-point', '3-point', 'cs'} 
+ 
+    Returns 
+    ------- 
+    EPS: float 
+        relative step size. May be np.float16, np.float32, np.float64 
+ 
+    Notes 
+    ----- 
+    The default relative step will be np.float64. However, if x0 or f0 are 
+    smaller floating point types (np.float16, np.float32), then the smallest 
+    floating point type is chosen. 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># the default EPS value</span>
+    <span class="s1">EPS </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">).</span><span class="s1">eps</span>
+
+    <span class="s1">x0_is_fp </span><span class="s3">= </span><span class="s2">False</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">x0_dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inexact</span><span class="s3">):</span>
+        <span class="s6"># if you're a floating point type then over-ride the default EPS</span>
+        <span class="s1">EPS </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">x0_dtype</span><span class="s3">).</span><span class="s1">eps</span>
+        <span class="s1">x0_itemsize </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s1">x0_dtype</span><span class="s3">).</span><span class="s1">itemsize</span>
+        <span class="s1">x0_is_fp </span><span class="s3">= </span><span class="s2">True</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">f0_dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inexact</span><span class="s3">):</span>
+        <span class="s1">f0_itemsize </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s1">f0_dtype</span><span class="s3">).</span><span class="s1">itemsize</span>
+        <span class="s6"># choose the smallest itemsize between x0 and f0</span>
+        <span class="s2">if </span><span class="s1">x0_is_fp </span><span class="s2">and </span><span class="s1">f0_itemsize </span><span class="s3">&lt; </span><span class="s1">x0_itemsize</span><span class="s3">:</span>
+            <span class="s1">EPS </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">finfo</span><span class="s3">(</span><span class="s1">f0_dtype</span><span class="s3">).</span><span class="s1">eps</span>
+
+    <span class="s2">if </span><span class="s1">method </span><span class="s2">in </span><span class="s3">[</span><span class="s4">&quot;2-point&quot;</span><span class="s3">, </span><span class="s4">&quot;cs&quot;</span><span class="s3">]:</span>
+        <span class="s2">return </span><span class="s1">EPS</span><span class="s3">**</span><span class="s5">0.5</span>
+    <span class="s2">elif </span><span class="s1">method </span><span class="s2">in </span><span class="s3">[</span><span class="s4">&quot;3-point&quot;</span><span class="s3">]:</span>
+        <span class="s2">return </span><span class="s1">EPS</span><span class="s3">**(</span><span class="s5">1</span><span class="s3">/</span><span class="s5">3</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;Unknown step method, should be one of &quot;</span>
+                           <span class="s4">&quot;{'2-point', '3-point', 'cs'}&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_compute_absolute_step</span><span class="s3">(</span><span class="s1">rel_step</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">method</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Computes an absolute step from a relative step for finite difference 
+    calculation. 
+ 
+    Parameters 
+    ---------- 
+    rel_step: None or array-like 
+        Relative step for the finite difference calculation 
+    x0 : np.ndarray 
+        Parameter vector 
+    f0 : np.ndarray or scalar 
+    method : {'2-point', '3-point', 'cs'} 
+ 
+    Returns 
+    ------- 
+    h : float 
+        The absolute step size 
+ 
+    Notes 
+    ----- 
+    `h` will always be np.float64. However, if `x0` or `f0` are 
+    smaller floating point dtypes (e.g. np.float32), then the absolute 
+    step size will be calculated from the smallest floating point size. 
+    &quot;&quot;&quot;</span>
+    <span class="s6"># this is used instead of np.sign(x0) because we need</span>
+    <span class="s6"># sign_x0 to be 1 when x0 == 0.</span>
+    <span class="s1">sign_x0 </span><span class="s3">= (</span><span class="s1">x0 </span><span class="s3">&gt;= </span><span class="s5">0</span><span class="s3">).</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s5">2 </span><span class="s3">- </span><span class="s5">1</span>
+
+    <span class="s1">rstep </span><span class="s3">= </span><span class="s1">_eps_for_method</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">method</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">rel_step </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">abs_step </span><span class="s3">= </span><span class="s1">rstep </span><span class="s3">* </span><span class="s1">sign_x0 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s5">1.0</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">))</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s6"># User has requested specific relative steps.</span>
+        <span class="s6"># Don't multiply by max(1, abs(x0) because if x0 &lt; 1 then their</span>
+        <span class="s6"># requested step is not used.</span>
+        <span class="s1">abs_step </span><span class="s3">= </span><span class="s1">rel_step </span><span class="s3">* </span><span class="s1">sign_x0 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">)</span>
+
+        <span class="s6"># however we don't want an abs_step of 0, which can happen if</span>
+        <span class="s6"># rel_step is 0, or x0 is 0. Instead, substitute a realistic step</span>
+        <span class="s1">dx </span><span class="s3">= ((</span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">abs_step</span><span class="s3">) - </span><span class="s1">x0</span><span class="s3">)</span>
+        <span class="s1">abs_step </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">where</span><span class="s3">(</span><span class="s1">dx </span><span class="s3">== </span><span class="s5">0</span><span class="s3">,</span>
+                            <span class="s1">rstep </span><span class="s3">* </span><span class="s1">sign_x0 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s5">1.0</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">)),</span>
+                            <span class="s1">abs_step</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">abs_step</span>
+
+
+<span class="s2">def </span><span class="s1">_prepare_bounds</span><span class="s3">(</span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Prepares new-style bounds from a two-tuple specifying the lower and upper 
+    limits for values in x0. If a value is not bound then the lower/upper bound 
+    will be expected to be -np.inf/np.inf. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; _prepare_bounds([(0, 1, 2), (1, 2, np.inf)], [0.5, 1.5, 2.5]) 
+    (array([0., 1., 2.]), array([ 1.,  2., inf])) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">lb</span><span class="s3">, </span><span class="s1">ub </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">) </span><span class="s2">for </span><span class="s1">b </span><span class="s2">in </span><span class="s1">bounds</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">lb</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">lb </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">resize</span><span class="s3">(</span><span class="s1">lb</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">ub</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">ub </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">resize</span><span class="s3">(</span><span class="s1">ub</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span>
+
+
+<span class="s2">def </span><span class="s1">group_columns</span><span class="s3">(</span><span class="s1">A</span><span class="s3">, </span><span class="s1">order</span><span class="s3">=</span><span class="s5">0</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Group columns of a 2-D matrix for sparse finite differencing [1]_. 
+ 
+    Two columns are in the same group if in each row at least one of them 
+    has zero. A greedy sequential algorithm is used to construct groups. 
+ 
+    Parameters 
+    ---------- 
+    A : array_like or sparse matrix, shape (m, n) 
+        Matrix of which to group columns. 
+    order : int, iterable of int with shape (n,) or None 
+        Permutation array which defines the order of columns enumeration. 
+        If int or None, a random permutation is used with `order` used as 
+        a random seed. Default is 0, that is use a random permutation but 
+        guarantee repeatability. 
+ 
+    Returns 
+    ------- 
+    groups : ndarray of int, shape (n,) 
+        Contains values from 0 to n_groups-1, where n_groups is the number 
+        of found groups. Each value ``groups[i]`` is an index of a group to 
+        which ith column assigned. The procedure was helpful only if 
+        n_groups is significantly less than n. 
+ 
+    References 
+    ---------- 
+    .. [1] A. Curtis, M. J. D. Powell, and J. Reid, &quot;On the estimation of 
+           sparse Jacobian matrices&quot;, Journal of the Institute of Mathematics 
+           and its Applications, 13 (1974), pp. 117-120. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A</span><span class="s3">):</span>
+        <span class="s1">A </span><span class="s3">= </span><span class="s1">csc_matrix</span><span class="s3">(</span><span class="s1">A</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">A </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_2d</span><span class="s3">(</span><span class="s1">A</span><span class="s3">)</span>
+        <span class="s1">A </span><span class="s3">= (</span><span class="s1">A </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">).</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">int32</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">A</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">!= </span><span class="s5">2</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;`A` must be 2-dimensional.&quot;</span><span class="s3">)</span>
+
+    <span class="s1">m</span><span class="s3">, </span><span class="s1">n </span><span class="s3">= </span><span class="s1">A</span><span class="s3">.</span><span class="s1">shape</span>
+
+    <span class="s2">if </span><span class="s1">order </span><span class="s2">is None or </span><span class="s1">np</span><span class="s3">.</span><span class="s1">isscalar</span><span class="s3">(</span><span class="s1">order</span><span class="s3">):</span>
+        <span class="s1">rng </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">RandomState</span><span class="s3">(</span><span class="s1">order</span><span class="s3">)</span>
+        <span class="s1">order </span><span class="s3">= </span><span class="s1">rng</span><span class="s3">.</span><span class="s1">permutation</span><span class="s3">(</span><span class="s1">n</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">order </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">order</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">order</span><span class="s3">.</span><span class="s1">shape </span><span class="s3">!= (</span><span class="s1">n</span><span class="s3">,):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;`order` has incorrect shape.&quot;</span><span class="s3">)</span>
+
+    <span class="s1">A </span><span class="s3">= </span><span class="s1">A</span><span class="s3">[:, </span><span class="s1">order</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">A</span><span class="s3">):</span>
+        <span class="s1">groups </span><span class="s3">= </span><span class="s1">group_sparse</span><span class="s3">(</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">, </span><span class="s1">A</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">, </span><span class="s1">A</span><span class="s3">.</span><span class="s1">indptr</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">groups </span><span class="s3">= </span><span class="s1">group_dense</span><span class="s3">(</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">, </span><span class="s1">A</span><span class="s3">)</span>
+
+    <span class="s1">groups</span><span class="s3">[</span><span class="s1">order</span><span class="s3">] = </span><span class="s1">groups</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+    <span class="s2">return </span><span class="s1">groups</span>
+
+
+<span class="s2">def </span><span class="s1">approx_derivative</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">method</span><span class="s3">=</span><span class="s4">'3-point'</span><span class="s3">, </span><span class="s1">rel_step</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">abs_step</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                      <span class="s1">f0</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">=(-</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">), </span><span class="s1">sparsity</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                      <span class="s1">as_linear_operator</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">args</span><span class="s3">=(), </span><span class="s1">kwargs</span><span class="s3">={}):</span>
+    <span class="s0">&quot;&quot;&quot;Compute finite difference approximation of the derivatives of a 
+    vector-valued function. 
+ 
+    If a function maps from R^n to R^m, its derivatives form m-by-n matrix 
+    called the Jacobian, where an element (i, j) is a partial derivative of 
+    f[i] with respect to x[j]. 
+ 
+    Parameters 
+    ---------- 
+    fun : callable 
+        Function of which to estimate the derivatives. The argument x 
+        passed to this function is ndarray of shape (n,) (never a scalar 
+        even if n=1). It must return 1-D array_like of shape (m,) or a scalar. 
+    x0 : array_like of shape (n,) or float 
+        Point at which to estimate the derivatives. Float will be converted 
+        to a 1-D array. 
+    method : {'3-point', '2-point', 'cs'}, optional 
+        Finite difference method to use: 
+            - '2-point' - use the first order accuracy forward or backward 
+                          difference. 
+            - '3-point' - use central difference in interior points and the 
+                          second order accuracy forward or backward difference 
+                          near the boundary. 
+            - 'cs' - use a complex-step finite difference scheme. This assumes 
+                     that the user function is real-valued and can be 
+                     analytically continued to the complex plane. Otherwise, 
+                     produces bogus results. 
+    rel_step : None or array_like, optional 
+        Relative step size to use. If None (default) the absolute step size is 
+        computed as ``h = rel_step * sign(x0) * max(1, abs(x0))``, with 
+        `rel_step` being selected automatically, see Notes. Otherwise 
+        ``h = rel_step * sign(x0) * abs(x0)``. For ``method='3-point'`` the 
+        sign of `h` is ignored. The calculated step size is possibly adjusted 
+        to fit into the bounds. 
+    abs_step : array_like, optional 
+        Absolute step size to use, possibly adjusted to fit into the bounds. 
+        For ``method='3-point'`` the sign of `abs_step` is ignored. By default 
+        relative steps are used, only if ``abs_step is not None`` are absolute 
+        steps used. 
+    f0 : None or array_like, optional 
+        If not None it is assumed to be equal to ``fun(x0)``, in this case 
+        the ``fun(x0)`` is not called. Default is None. 
+    bounds : tuple of array_like, optional 
+        Lower and upper bounds on independent variables. Defaults to no bounds. 
+        Each bound must match the size of `x0` or be a scalar, in the latter 
+        case the bound will be the same for all variables. Use it to limit the 
+        range of function evaluation. Bounds checking is not implemented 
+        when `as_linear_operator` is True. 
+    sparsity : {None, array_like, sparse matrix, 2-tuple}, optional 
+        Defines a sparsity structure of the Jacobian matrix. If the Jacobian 
+        matrix is known to have only few non-zero elements in each row, then 
+        it's possible to estimate its several columns by a single function 
+        evaluation [3]_. To perform such economic computations two ingredients 
+        are required: 
+ 
+        * structure : array_like or sparse matrix of shape (m, n). A zero 
+          element means that a corresponding element of the Jacobian 
+          identically equals to zero. 
+        * groups : array_like of shape (n,). A column grouping for a given 
+          sparsity structure, use `group_columns` to obtain it. 
+ 
+        A single array or a sparse matrix is interpreted as a sparsity 
+        structure, and groups are computed inside the function. A tuple is 
+        interpreted as (structure, groups). If None (default), a standard 
+        dense differencing will be used. 
+ 
+        Note, that sparse differencing makes sense only for large Jacobian 
+        matrices where each row contains few non-zero elements. 
+    as_linear_operator : bool, optional 
+        When True the function returns an `scipy.sparse.linalg.LinearOperator`. 
+        Otherwise it returns a dense array or a sparse matrix depending on 
+        `sparsity`. The linear operator provides an efficient way of computing 
+        ``J.dot(p)`` for any vector ``p`` of shape (n,), but does not allow 
+        direct access to individual elements of the matrix. By default 
+        `as_linear_operator` is False. 
+    args, kwargs : tuple and dict, optional 
+        Additional arguments passed to `fun`. Both empty by default. 
+        The calling signature is ``fun(x, *args, **kwargs)``. 
+ 
+    Returns 
+    ------- 
+    J : {ndarray, sparse matrix, LinearOperator} 
+        Finite difference approximation of the Jacobian matrix. 
+        If `as_linear_operator` is True returns a LinearOperator 
+        with shape (m, n). Otherwise it returns a dense array or sparse 
+        matrix depending on how `sparsity` is defined. If `sparsity` 
+        is None then a ndarray with shape (m, n) is returned. If 
+        `sparsity` is not None returns a csr_matrix with shape (m, n). 
+        For sparse matrices and linear operators it is always returned as 
+        a 2-D structure, for ndarrays, if m=1 it is returned 
+        as a 1-D gradient array with shape (n,). 
+ 
+    See Also 
+    -------- 
+    check_derivative : Check correctness of a function computing derivatives. 
+ 
+    Notes 
+    ----- 
+    If `rel_step` is not provided, it assigned as ``EPS**(1/s)``, where EPS is 
+    determined from the smallest floating point dtype of `x0` or `fun(x0)`, 
+    ``np.finfo(x0.dtype).eps``, s=2 for '2-point' method and 
+    s=3 for '3-point' method. Such relative step approximately minimizes a sum 
+    of truncation and round-off errors, see [1]_. Relative steps are used by 
+    default. However, absolute steps are used when ``abs_step is not None``. 
+    If any of the absolute or relative steps produces an indistinguishable 
+    difference from the original `x0`, ``(x0 + dx) - x0 == 0``, then a 
+    automatic step size is substituted for that particular entry. 
+ 
+    A finite difference scheme for '3-point' method is selected automatically. 
+    The well-known central difference scheme is used for points sufficiently 
+    far from the boundary, and 3-point forward or backward scheme is used for 
+    points near the boundary. Both schemes have the second-order accuracy in 
+    terms of Taylor expansion. Refer to [2]_ for the formulas of 3-point 
+    forward and backward difference schemes. 
+ 
+    For dense differencing when m=1 Jacobian is returned with a shape (n,), 
+    on the other hand when n=1 Jacobian is returned with a shape (m, 1). 
+    Our motivation is the following: a) It handles a case of gradient 
+    computation (m=1) in a conventional way. b) It clearly separates these two 
+    different cases. b) In all cases np.atleast_2d can be called to get 2-D 
+    Jacobian with correct dimensions. 
+ 
+    References 
+    ---------- 
+    .. [1] W. H. Press et. al. &quot;Numerical Recipes. The Art of Scientific 
+           Computing. 3rd edition&quot;, sec. 5.7. 
+ 
+    .. [2] A. Curtis, M. J. D. Powell, and J. Reid, &quot;On the estimation of 
+           sparse Jacobian matrices&quot;, Journal of the Institute of Mathematics 
+           and its Applications, 13 (1974), pp. 117-120. 
+ 
+    .. [3] B. Fornberg, &quot;Generation of Finite Difference Formulas on 
+           Arbitrarily Spaced Grids&quot;, Mathematics of Computation 51, 1988. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.optimize._numdiff import approx_derivative 
+    &gt;&gt;&gt; 
+    &gt;&gt;&gt; def f(x, c1, c2): 
+    ...     return np.array([x[0] * np.sin(c1 * x[1]), 
+    ...                      x[0] * np.cos(c2 * x[1])]) 
+    ... 
+    &gt;&gt;&gt; x0 = np.array([1.0, 0.5 * np.pi]) 
+    &gt;&gt;&gt; approx_derivative(f, x0, args=(1, 2)) 
+    array([[ 1.,  0.], 
+           [-1.,  0.]]) 
+ 
+    Bounds can be used to limit the region of function evaluation. 
+    In the example below we compute left and right derivative at point 1.0. 
+ 
+    &gt;&gt;&gt; def g(x): 
+    ...     return x**2 if x &gt;= 1 else x 
+    ... 
+    &gt;&gt;&gt; x0 = 1.0 
+    &gt;&gt;&gt; approx_derivative(g, x0, bounds=(-np.inf, 1.0)) 
+    array([ 1.]) 
+    &gt;&gt;&gt; approx_derivative(g, x0, bounds=(1.0, np.inf)) 
+    array([ 2.]) 
+    &quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">method </span><span class="s2">not in </span><span class="s3">[</span><span class="s4">'2-point'</span><span class="s3">, </span><span class="s4">'3-point'</span><span class="s3">, </span><span class="s4">'cs'</span><span class="s3">]:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Unknown method '%s'. &quot; </span><span class="s3">% </span><span class="s1">method</span><span class="s3">)</span>
+
+    <span class="s1">xp </span><span class="s3">= </span><span class="s1">array_namespace</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">)</span>
+    <span class="s1">_x </span><span class="s3">= </span><span class="s1">atleast_nd</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">, </span><span class="s1">ndim</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">xp</span><span class="s3">=</span><span class="s1">xp</span><span class="s3">)</span>
+    <span class="s1">_dtype </span><span class="s3">= </span><span class="s1">xp</span><span class="s3">.</span><span class="s1">float64</span>
+    <span class="s2">if </span><span class="s1">xp</span><span class="s3">.</span><span class="s1">isdtype</span><span class="s3">(</span><span class="s1">_x</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s4">&quot;real floating&quot;</span><span class="s3">):</span>
+        <span class="s1">_dtype </span><span class="s3">= </span><span class="s1">_x</span><span class="s3">.</span><span class="s1">dtype</span>
+
+    <span class="s6"># promotes to floating</span>
+    <span class="s1">x0 </span><span class="s3">= </span><span class="s1">xp</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">_x</span><span class="s3">, </span><span class="s1">_dtype</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">&gt; </span><span class="s5">1</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;`x0` must have at most 1 dimension.&quot;</span><span class="s3">)</span>
+
+    <span class="s1">lb</span><span class="s3">, </span><span class="s1">ub </span><span class="s3">= </span><span class="s1">_prepare_bounds</span><span class="s3">(</span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">lb</span><span class="s3">.</span><span class="s1">shape </span><span class="s3">!= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">shape </span><span class="s2">or </span><span class="s1">ub</span><span class="s3">.</span><span class="s1">shape </span><span class="s3">!= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Inconsistent shapes between bounds and `x0`.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">as_linear_operator </span><span class="s2">and not </span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">lb</span><span class="s3">))</span>
+                                   <span class="s2">and </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isinf</span><span class="s3">(</span><span class="s1">ub</span><span class="s3">))):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Bounds not supported when &quot;</span>
+                         <span class="s4">&quot;`as_linear_operator` is True.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">fun_wrapped</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+        <span class="s6"># send user function same fp type as x0. (but only if cs is not being</span>
+        <span class="s6"># used</span>
+        <span class="s2">if </span><span class="s1">xp</span><span class="s3">.</span><span class="s1">isdtype</span><span class="s3">(</span><span class="s1">x</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s4">&quot;real floating&quot;</span><span class="s3">):</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">xp</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">)</span>
+
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_1d</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">))</span>
+        <span class="s2">if </span><span class="s1">f</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">&gt; </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;`fun` return value has &quot;</span>
+                               <span class="s4">&quot;more than 1 dimension.&quot;</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">f</span>
+
+    <span class="s2">if </span><span class="s1">f0 </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">f0 </span><span class="s3">= </span><span class="s1">fun_wrapped</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">f0 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_1d</span><span class="s3">(</span><span class="s1">f0</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">f0</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">&gt; </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;`f0` passed has more than 1 dimension.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">((</span><span class="s1">x0 </span><span class="s3">&lt; </span><span class="s1">lb</span><span class="s3">) | (</span><span class="s1">x0 </span><span class="s3">&gt; </span><span class="s1">ub</span><span class="s3">)):</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;`x0` violates bound constraints.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">as_linear_operator</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">rel_step </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">rel_step </span><span class="s3">= </span><span class="s1">_eps_for_method</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">method</span><span class="s3">)</span>
+
+        <span class="s2">return </span><span class="s1">_linear_operator_difference</span><span class="s3">(</span><span class="s1">fun_wrapped</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">,</span>
+                                           <span class="s1">f0</span><span class="s3">, </span><span class="s1">rel_step</span><span class="s3">, </span><span class="s1">method</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s6"># by default we use rel_step</span>
+        <span class="s2">if </span><span class="s1">abs_step </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">h </span><span class="s3">= </span><span class="s1">_compute_absolute_step</span><span class="s3">(</span><span class="s1">rel_step</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">method</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s6"># user specifies an absolute step</span>
+            <span class="s1">sign_x0 </span><span class="s3">= (</span><span class="s1">x0 </span><span class="s3">&gt;= </span><span class="s5">0</span><span class="s3">).</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">float</span><span class="s3">) * </span><span class="s5">2 </span><span class="s3">- </span><span class="s5">1</span>
+            <span class="s1">h </span><span class="s3">= </span><span class="s1">abs_step</span>
+
+            <span class="s6"># cannot have a zero step. This might happen if x0 is very large</span>
+            <span class="s6"># or small. In which case fall back to relative step.</span>
+            <span class="s1">dx </span><span class="s3">= ((</span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">h</span><span class="s3">) - </span><span class="s1">x0</span><span class="s3">)</span>
+            <span class="s1">h </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">where</span><span class="s3">(</span><span class="s1">dx </span><span class="s3">== </span><span class="s5">0</span><span class="s3">,</span>
+                         <span class="s1">_eps_for_method</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">method</span><span class="s3">) *</span>
+                         <span class="s1">sign_x0 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s5">1.0</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">)),</span>
+                         <span class="s1">h</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'2-point'</span><span class="s3">:</span>
+            <span class="s1">h</span><span class="s3">, </span><span class="s1">use_one_sided </span><span class="s3">= </span><span class="s1">_adjust_scheme_to_bounds</span><span class="s3">(</span>
+                <span class="s1">x0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s4">'1-sided'</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'3-point'</span><span class="s3">:</span>
+            <span class="s1">h</span><span class="s3">, </span><span class="s1">use_one_sided </span><span class="s3">= </span><span class="s1">_adjust_scheme_to_bounds</span><span class="s3">(</span>
+                <span class="s1">x0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s4">'2-sided'</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'cs'</span><span class="s3">:</span>
+            <span class="s1">use_one_sided </span><span class="s3">= </span><span class="s2">False</span>
+
+        <span class="s2">if </span><span class="s1">sparsity </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">_dense_difference</span><span class="s3">(</span><span class="s1">fun_wrapped</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">,</span>
+                                     <span class="s1">use_one_sided</span><span class="s3">, </span><span class="s1">method</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">sparsity</span><span class="s3">) </span><span class="s2">and </span><span class="s1">len</span><span class="s3">(</span><span class="s1">sparsity</span><span class="s3">) == </span><span class="s5">2</span><span class="s3">:</span>
+                <span class="s1">structure</span><span class="s3">, </span><span class="s1">groups </span><span class="s3">= </span><span class="s1">sparsity</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">structure </span><span class="s3">= </span><span class="s1">sparsity</span>
+                <span class="s1">groups </span><span class="s3">= </span><span class="s1">group_columns</span><span class="s3">(</span><span class="s1">sparsity</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">structure</span><span class="s3">):</span>
+                <span class="s1">structure </span><span class="s3">= </span><span class="s1">csc_matrix</span><span class="s3">(</span><span class="s1">structure</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">structure </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_2d</span><span class="s3">(</span><span class="s1">structure</span><span class="s3">)</span>
+
+            <span class="s1">groups </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">atleast_1d</span><span class="s3">(</span><span class="s1">groups</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">_sparse_difference</span><span class="s3">(</span><span class="s1">fun_wrapped</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">,</span>
+                                      <span class="s1">use_one_sided</span><span class="s3">, </span><span class="s1">structure</span><span class="s3">,</span>
+                                      <span class="s1">groups</span><span class="s3">, </span><span class="s1">method</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_linear_operator_difference</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">method</span><span class="s3">):</span>
+    <span class="s1">m </span><span class="s3">= </span><span class="s1">f0</span><span class="s3">.</span><span class="s1">size</span>
+    <span class="s1">n </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">size</span>
+
+    <span class="s2">if </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'2-point'</span><span class="s3">:</span>
+        <span class="s2">def </span><span class="s1">matvec</span><span class="s3">(</span><span class="s1">p</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array_equal</span><span class="s3">(</span><span class="s1">p</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)):</span>
+                <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">m</span><span class="s3">)</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">h </span><span class="s3">/ </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">dx</span><span class="s3">*</span><span class="s1">p</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) - </span><span class="s1">f0</span>
+            <span class="s2">return </span><span class="s1">df </span><span class="s3">/ </span><span class="s1">dx</span>
+
+    <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'3-point'</span><span class="s3">:</span>
+        <span class="s2">def </span><span class="s1">matvec</span><span class="s3">(</span><span class="s1">p</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array_equal</span><span class="s3">(</span><span class="s1">p</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)):</span>
+                <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">m</span><span class="s3">)</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s5">2</span><span class="s3">*</span><span class="s1">h </span><span class="s3">/ </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)</span>
+            <span class="s1">x1 </span><span class="s3">= </span><span class="s1">x0 </span><span class="s3">- (</span><span class="s1">dx</span><span class="s3">/</span><span class="s5">2</span><span class="s3">)*</span><span class="s1">p</span>
+            <span class="s1">x2 </span><span class="s3">= </span><span class="s1">x0 </span><span class="s3">+ (</span><span class="s1">dx</span><span class="s3">/</span><span class="s5">2</span><span class="s3">)*</span><span class="s1">p</span>
+            <span class="s1">f1 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x1</span><span class="s3">)</span>
+            <span class="s1">f2 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x2</span><span class="s3">)</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">f2 </span><span class="s3">- </span><span class="s1">f1</span>
+            <span class="s2">return </span><span class="s1">df </span><span class="s3">/ </span><span class="s1">dx</span>
+
+    <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'cs'</span><span class="s3">:</span>
+        <span class="s2">def </span><span class="s1">matvec</span><span class="s3">(</span><span class="s1">p</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array_equal</span><span class="s3">(</span><span class="s1">p</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)):</span>
+                <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">m</span><span class="s3">)</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">h </span><span class="s3">/ </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">p</span><span class="s3">)</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">dx</span><span class="s3">*</span><span class="s1">p</span><span class="s3">*</span><span class="s5">1.j</span>
+            <span class="s1">f1 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">f1</span><span class="s3">.</span><span class="s1">imag</span>
+            <span class="s2">return </span><span class="s1">df </span><span class="s3">/ </span><span class="s1">dx</span>
+
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;Never be here.&quot;</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">LinearOperator</span><span class="s3">((</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">), </span><span class="s1">matvec</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_dense_difference</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">use_one_sided</span><span class="s3">, </span><span class="s1">method</span><span class="s3">):</span>
+    <span class="s1">m </span><span class="s3">= </span><span class="s1">f0</span><span class="s3">.</span><span class="s1">size</span>
+    <span class="s1">n </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">size</span>
+    <span class="s1">J_transposed </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">n</span><span class="s3">, </span><span class="s1">m</span><span class="s3">))</span>
+    <span class="s1">x1 </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">x2 </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">xc </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">complex</span><span class="s3">, </span><span class="s1">copy</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">h</span><span class="s3">.</span><span class="s1">size</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'2-point'</span><span class="s3">:</span>
+            <span class="s1">x1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s1">h</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">x1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] - </span><span class="s1">x0</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]  </span><span class="s6"># Recompute dx as exactly representable number.</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x1</span><span class="s3">) - </span><span class="s1">f0</span>
+        <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'3-point' </span><span class="s2">and </span><span class="s1">use_one_sided</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]:</span>
+            <span class="s1">x1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s1">h</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">x2</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">h</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">x2</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] - </span><span class="s1">x0</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">f1 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x1</span><span class="s3">)</span>
+            <span class="s1">f2 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x2</span><span class="s3">)</span>
+            <span class="s1">df </span><span class="s3">= -</span><span class="s5">3.0 </span><span class="s3">* </span><span class="s1">f0 </span><span class="s3">+ </span><span class="s5">4 </span><span class="s3">* </span><span class="s1">f1 </span><span class="s3">- </span><span class="s1">f2</span>
+        <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'3-point' </span><span class="s2">and not </span><span class="s1">use_one_sided</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]:</span>
+            <span class="s1">x1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] -= </span><span class="s1">h</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">x2</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s1">h</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">x2</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] - </span><span class="s1">x1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+            <span class="s1">f1 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x1</span><span class="s3">)</span>
+            <span class="s1">f2 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x2</span><span class="s3">)</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">f2 </span><span class="s3">- </span><span class="s1">f1</span>
+        <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'cs'</span><span class="s3">:</span>
+            <span class="s1">xc</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] += </span><span class="s1">h</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] * </span><span class="s5">1.j</span>
+            <span class="s1">f1 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">xc</span><span class="s3">)</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">f1</span><span class="s3">.</span><span class="s1">imag</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">h</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s4">&quot;Never be here.&quot;</span><span class="s3">)</span>
+
+        <span class="s1">J_transposed</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">df </span><span class="s3">/ </span><span class="s1">dx</span>
+        <span class="s1">x1</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">x2</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">xc</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] = </span><span class="s1">x0</span><span class="s3">[</span><span class="s1">i</span><span class="s3">]</span>
+
+    <span class="s2">if </span><span class="s1">m </span><span class="s3">== </span><span class="s5">1</span><span class="s3">:</span>
+        <span class="s1">J_transposed </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">(</span><span class="s1">J_transposed</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">J_transposed</span><span class="s3">.</span><span class="s1">T</span>
+
+
+<span class="s2">def </span><span class="s1">_sparse_difference</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">use_one_sided</span><span class="s3">,</span>
+                       <span class="s1">structure</span><span class="s3">, </span><span class="s1">groups</span><span class="s3">, </span><span class="s1">method</span><span class="s3">):</span>
+    <span class="s1">m </span><span class="s3">= </span><span class="s1">f0</span><span class="s3">.</span><span class="s1">size</span>
+    <span class="s1">n </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">size</span>
+    <span class="s1">row_indices </span><span class="s3">= []</span>
+    <span class="s1">col_indices </span><span class="s3">= []</span>
+    <span class="s1">fractions </span><span class="s3">= []</span>
+
+    <span class="s1">n_groups </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">groups</span><span class="s3">) + </span><span class="s5">1</span>
+    <span class="s2">for </span><span class="s1">group </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">n_groups</span><span class="s3">):</span>
+        <span class="s6"># Perturb variables which are in the same group simultaneously.</span>
+        <span class="s1">e </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">equal</span><span class="s3">(</span><span class="s1">group</span><span class="s3">, </span><span class="s1">groups</span><span class="s3">)</span>
+        <span class="s1">h_vec </span><span class="s3">= </span><span class="s1">h </span><span class="s3">* </span><span class="s1">e</span>
+        <span class="s2">if </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'2-point'</span><span class="s3">:</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">h_vec</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">x </span><span class="s3">- </span><span class="s1">x0</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x</span><span class="s3">) - </span><span class="s1">f0</span>
+            <span class="s6"># The result is  written to columns which correspond to perturbed</span>
+            <span class="s6"># variables.</span>
+            <span class="s1">cols</span><span class="s3">, = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">e</span><span class="s3">)</span>
+            <span class="s6"># Find all non-zero elements in selected columns of Jacobian.</span>
+            <span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">find</span><span class="s3">(</span><span class="s1">structure</span><span class="s3">[:, </span><span class="s1">cols</span><span class="s3">])</span>
+            <span class="s6"># Restore column indices in the full array.</span>
+            <span class="s1">j </span><span class="s3">= </span><span class="s1">cols</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+        <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'3-point'</span><span class="s3">:</span>
+            <span class="s6"># Here we do conceptually the same but separate one-sided</span>
+            <span class="s6"># and two-sided schemes.</span>
+            <span class="s1">x1 </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+            <span class="s1">x2 </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+            <span class="s1">mask_1 </span><span class="s3">= </span><span class="s1">use_one_sided </span><span class="s3">&amp; </span><span class="s1">e</span>
+            <span class="s1">x1</span><span class="s3">[</span><span class="s1">mask_1</span><span class="s3">] += </span><span class="s1">h_vec</span><span class="s3">[</span><span class="s1">mask_1</span><span class="s3">]</span>
+            <span class="s1">x2</span><span class="s3">[</span><span class="s1">mask_1</span><span class="s3">] += </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">h_vec</span><span class="s3">[</span><span class="s1">mask_1</span><span class="s3">]</span>
+
+            <span class="s1">mask_2 </span><span class="s3">= ~</span><span class="s1">use_one_sided </span><span class="s3">&amp; </span><span class="s1">e</span>
+            <span class="s1">x1</span><span class="s3">[</span><span class="s1">mask_2</span><span class="s3">] -= </span><span class="s1">h_vec</span><span class="s3">[</span><span class="s1">mask_2</span><span class="s3">]</span>
+            <span class="s1">x2</span><span class="s3">[</span><span class="s1">mask_2</span><span class="s3">] += </span><span class="s1">h_vec</span><span class="s3">[</span><span class="s1">mask_2</span><span class="s3">]</span>
+
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">n</span><span class="s3">)</span>
+            <span class="s1">dx</span><span class="s3">[</span><span class="s1">mask_1</span><span class="s3">] = </span><span class="s1">x2</span><span class="s3">[</span><span class="s1">mask_1</span><span class="s3">] - </span><span class="s1">x0</span><span class="s3">[</span><span class="s1">mask_1</span><span class="s3">]</span>
+            <span class="s1">dx</span><span class="s3">[</span><span class="s1">mask_2</span><span class="s3">] = </span><span class="s1">x2</span><span class="s3">[</span><span class="s1">mask_2</span><span class="s3">] - </span><span class="s1">x1</span><span class="s3">[</span><span class="s1">mask_2</span><span class="s3">]</span>
+
+            <span class="s1">f1 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x1</span><span class="s3">)</span>
+            <span class="s1">f2 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x2</span><span class="s3">)</span>
+
+            <span class="s1">cols</span><span class="s3">, = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">e</span><span class="s3">)</span>
+            <span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">find</span><span class="s3">(</span><span class="s1">structure</span><span class="s3">[:, </span><span class="s1">cols</span><span class="s3">])</span>
+            <span class="s1">j </span><span class="s3">= </span><span class="s1">cols</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+
+            <span class="s1">mask </span><span class="s3">= </span><span class="s1">use_one_sided</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">(</span><span class="s1">m</span><span class="s3">)</span>
+
+            <span class="s1">rows </span><span class="s3">= </span><span class="s1">i</span><span class="s3">[</span><span class="s1">mask</span><span class="s3">]</span>
+            <span class="s1">df</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">] = -</span><span class="s5">3 </span><span class="s3">* </span><span class="s1">f0</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">] + </span><span class="s5">4 </span><span class="s3">* </span><span class="s1">f1</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">] - </span><span class="s1">f2</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">]</span>
+
+            <span class="s1">rows </span><span class="s3">= </span><span class="s1">i</span><span class="s3">[~</span><span class="s1">mask</span><span class="s3">]</span>
+            <span class="s1">df</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">] = </span><span class="s1">f2</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">] - </span><span class="s1">f1</span><span class="s3">[</span><span class="s1">rows</span><span class="s3">]</span>
+        <span class="s2">elif </span><span class="s1">method </span><span class="s3">== </span><span class="s4">'cs'</span><span class="s3">:</span>
+            <span class="s1">f1 </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">h_vec</span><span class="s3">*</span><span class="s5">1.j</span><span class="s3">)</span>
+            <span class="s1">df </span><span class="s3">= </span><span class="s1">f1</span><span class="s3">.</span><span class="s1">imag</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">h_vec</span>
+            <span class="s1">cols</span><span class="s3">, = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">e</span><span class="s3">)</span>
+            <span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">find</span><span class="s3">(</span><span class="s1">structure</span><span class="s3">[:, </span><span class="s1">cols</span><span class="s3">])</span>
+            <span class="s1">j </span><span class="s3">= </span><span class="s1">cols</span><span class="s3">[</span><span class="s1">j</span><span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Never be here.&quot;</span><span class="s3">)</span>
+
+        <span class="s6"># All that's left is to compute the fraction. We store i, j and</span>
+        <span class="s6"># fractions as separate arrays and later construct coo_matrix.</span>
+        <span class="s1">row_indices</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">i</span><span class="s3">)</span>
+        <span class="s1">col_indices</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">j</span><span class="s3">)</span>
+        <span class="s1">fractions</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">df</span><span class="s3">[</span><span class="s1">i</span><span class="s3">] / </span><span class="s1">dx</span><span class="s3">[</span><span class="s1">j</span><span class="s3">])</span>
+
+    <span class="s1">row_indices </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">hstack</span><span class="s3">(</span><span class="s1">row_indices</span><span class="s3">)</span>
+    <span class="s1">col_indices </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">hstack</span><span class="s3">(</span><span class="s1">col_indices</span><span class="s3">)</span>
+    <span class="s1">fractions </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">hstack</span><span class="s3">(</span><span class="s1">fractions</span><span class="s3">)</span>
+    <span class="s1">J </span><span class="s3">= </span><span class="s1">coo_matrix</span><span class="s3">((</span><span class="s1">fractions</span><span class="s3">, (</span><span class="s1">row_indices</span><span class="s3">, </span><span class="s1">col_indices</span><span class="s3">)), </span><span class="s1">shape</span><span class="s3">=(</span><span class="s1">m</span><span class="s3">, </span><span class="s1">n</span><span class="s3">))</span>
+    <span class="s2">return </span><span class="s1">csr_matrix</span><span class="s3">(</span><span class="s1">J</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">check_derivative</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">=(-</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">), </span><span class="s1">args</span><span class="s3">=(),</span>
+                     <span class="s1">kwargs</span><span class="s3">={}):</span>
+    <span class="s0">&quot;&quot;&quot;Check correctness of a function computing derivatives (Jacobian or 
+    gradient) by comparison with a finite difference approximation. 
+ 
+    Parameters 
+    ---------- 
+    fun : callable 
+        Function of which to estimate the derivatives. The argument x 
+        passed to this function is ndarray of shape (n,) (never a scalar 
+        even if n=1). It must return 1-D array_like of shape (m,) or a scalar. 
+    jac : callable 
+        Function which computes Jacobian matrix of `fun`. It must work with 
+        argument x the same way as `fun`. The return value must be array_like 
+        or sparse matrix with an appropriate shape. 
+    x0 : array_like of shape (n,) or float 
+        Point at which to estimate the derivatives. Float will be converted 
+        to 1-D array. 
+    bounds : 2-tuple of array_like, optional 
+        Lower and upper bounds on independent variables. Defaults to no bounds. 
+        Each bound must match the size of `x0` or be a scalar, in the latter 
+        case the bound will be the same for all variables. Use it to limit the 
+        range of function evaluation. 
+    args, kwargs : tuple and dict, optional 
+        Additional arguments passed to `fun` and `jac`. Both empty by default. 
+        The calling signature is ``fun(x, *args, **kwargs)`` and the same 
+        for `jac`. 
+ 
+    Returns 
+    ------- 
+    accuracy : float 
+        The maximum among all relative errors for elements with absolute values 
+        higher than 1 and absolute errors for elements with absolute values 
+        less or equal than 1. If `accuracy` is on the order of 1e-6 or lower, 
+        then it is likely that your `jac` implementation is correct. 
+ 
+    See Also 
+    -------- 
+    approx_derivative : Compute finite difference approximation of derivative. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; from scipy.optimize._numdiff import check_derivative 
+    &gt;&gt;&gt; 
+    &gt;&gt;&gt; 
+    &gt;&gt;&gt; def f(x, c1, c2): 
+    ...     return np.array([x[0] * np.sin(c1 * x[1]), 
+    ...                      x[0] * np.cos(c2 * x[1])]) 
+    ... 
+    &gt;&gt;&gt; def jac(x, c1, c2): 
+    ...     return np.array([ 
+    ...         [np.sin(c1 * x[1]),  c1 * x[0] * np.cos(c1 * x[1])], 
+    ...         [np.cos(c2 * x[1]), -c2 * x[0] * np.sin(c2 * x[1])] 
+    ...     ]) 
+    ... 
+    &gt;&gt;&gt; 
+    &gt;&gt;&gt; x0 = np.array([1.0, 0.5 * np.pi]) 
+    &gt;&gt;&gt; check_derivative(f, jac, x0, args=(1, 2)) 
+    2.4492935982947064e-16 
+    &quot;&quot;&quot;</span>
+    <span class="s1">J_to_test </span><span class="s3">= </span><span class="s1">jac</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">, *</span><span class="s1">args</span><span class="s3">, **</span><span class="s1">kwargs</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">J_to_test</span><span class="s3">):</span>
+        <span class="s1">J_diff </span><span class="s3">= </span><span class="s1">approx_derivative</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">=</span><span class="s1">bounds</span><span class="s3">, </span><span class="s1">sparsity</span><span class="s3">=</span><span class="s1">J_to_test</span><span class="s3">,</span>
+                                   <span class="s1">args</span><span class="s3">=</span><span class="s1">args</span><span class="s3">, </span><span class="s1">kwargs</span><span class="s3">=</span><span class="s1">kwargs</span><span class="s3">)</span>
+        <span class="s1">J_to_test </span><span class="s3">= </span><span class="s1">csr_matrix</span><span class="s3">(</span><span class="s1">J_to_test</span><span class="s3">)</span>
+        <span class="s1">abs_err </span><span class="s3">= </span><span class="s1">J_to_test </span><span class="s3">- </span><span class="s1">J_diff</span>
+        <span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">, </span><span class="s1">abs_err_data </span><span class="s3">= </span><span class="s1">find</span><span class="s3">(</span><span class="s1">abs_err</span><span class="s3">)</span>
+        <span class="s1">J_diff_data </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">J_diff</span><span class="s3">[</span><span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">]).</span><span class="s1">ravel</span><span class="s3">()</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">abs_err_data</span><span class="s3">) /</span>
+                      <span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s5">1</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">J_diff_data</span><span class="s3">)))</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">J_diff </span><span class="s3">= </span><span class="s1">approx_derivative</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">bounds</span><span class="s3">=</span><span class="s1">bounds</span><span class="s3">,</span>
+                                   <span class="s1">args</span><span class="s3">=</span><span class="s1">args</span><span class="s3">, </span><span class="s1">kwargs</span><span class="s3">=</span><span class="s1">kwargs</span><span class="s3">)</span>
+        <span class="s1">abs_err </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">J_to_test </span><span class="s3">- </span><span class="s1">J_diff</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span><span class="s1">abs_err </span><span class="s3">/ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s5">1</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">abs</span><span class="s3">(</span><span class="s1">J_diff</span><span class="s3">)))</span>
+</pre>
+</body>
+</html>

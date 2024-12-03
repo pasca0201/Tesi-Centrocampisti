@@ -1,0 +1,818 @@
+<html>
+<head>
+<title>_fastica.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_fastica.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Python implementation of the fast ICA algorithms. 
+ 
+Reference: Tables 8.3 and 8.4 page 196 in the book: 
+Independent Component Analysis, by  Hyvarinen et al. 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Authors: Pierre Lafaye de Micheaux, Stefan van der Walt, Gael Varoquaux,</span>
+<span class="s2">#          Bertrand Thirion, Alexandre Gramfort, Denis A. Engemann</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">from </span><span class="s1">numbers </span><span class="s3">import </span><span class="s1">Integral</span><span class="s4">, </span><span class="s1">Real</span>
+
+<span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+<span class="s3">from </span><span class="s1">scipy </span><span class="s3">import </span><span class="s1">linalg</span>
+
+<span class="s3">from </span><span class="s4">..</span><span class="s1">base </span><span class="s3">import </span><span class="s4">(</span>
+    <span class="s1">BaseEstimator</span><span class="s4">,</span>
+    <span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s4">,</span>
+    <span class="s1">TransformerMixin</span><span class="s4">,</span>
+    <span class="s1">_fit_context</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">ConvergenceWarning</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils </span><span class="s3">import </span><span class="s1">as_float_array</span><span class="s4">, </span><span class="s1">check_array</span><span class="s4">, </span><span class="s1">check_random_state</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">_param_validation </span><span class="s3">import </span><span class="s1">Interval</span><span class="s4">, </span><span class="s1">Options</span><span class="s4">, </span><span class="s1">StrOptions</span><span class="s4">, </span><span class="s1">validate_params</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">utils</span><span class="s4">.</span><span class="s1">validation </span><span class="s3">import </span><span class="s1">check_is_fitted</span>
+
+<span class="s1">__all__ </span><span class="s4">= [</span><span class="s5">&quot;fastica&quot;</span><span class="s4">, </span><span class="s5">&quot;FastICA&quot;</span><span class="s4">]</span>
+
+
+<span class="s3">def </span><span class="s1">_gs_decorrelation</span><span class="s4">(</span><span class="s1">w</span><span class="s4">, </span><span class="s1">W</span><span class="s4">, </span><span class="s1">j</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Orthonormalize w wrt the first j rows of W. 
+ 
+    Parameters 
+    ---------- 
+    w : ndarray of shape (n,) 
+        Array to be orthogonalized 
+ 
+    W : ndarray of shape (p, n) 
+        Null space definition 
+ 
+    j : int &lt; p 
+        The no of (from the first) rows of Null space W wrt which w is 
+        orthogonalized. 
+ 
+    Notes 
+    ----- 
+    Assumes that W is orthogonal 
+    w changed in place 
+    &quot;&quot;&quot;</span>
+    <span class="s1">w </span><span class="s4">-= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">multi_dot</span><span class="s4">([</span><span class="s1">w</span><span class="s4">, </span><span class="s1">W</span><span class="s4">[:</span><span class="s1">j</span><span class="s4">].</span><span class="s1">T</span><span class="s4">, </span><span class="s1">W</span><span class="s4">[:</span><span class="s1">j</span><span class="s4">]])</span>
+    <span class="s3">return </span><span class="s1">w</span>
+
+
+<span class="s3">def </span><span class="s1">_sym_decorrelation</span><span class="s4">(</span><span class="s1">W</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Symmetric decorrelation 
+    i.e. W &lt;- (W * W.T) ^{-1/2} * W 
+    &quot;&quot;&quot;</span>
+    <span class="s1">s</span><span class="s4">, </span><span class="s1">u </span><span class="s4">= </span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">eigh</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">W</span><span class="s4">, </span><span class="s1">W</span><span class="s4">.</span><span class="s1">T</span><span class="s4">))</span>
+    <span class="s2"># Avoid sqrt of negative values because of rounding errors. Note that</span>
+    <span class="s2"># np.sqrt(tiny) is larger than tiny and therefore this clipping also</span>
+    <span class="s2"># prevents division by zero in the next step.</span>
+    <span class="s1">s </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">clip</span><span class="s4">(</span><span class="s1">s</span><span class="s4">, </span><span class="s1">a_min</span><span class="s4">=</span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">W</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">).</span><span class="s1">tiny</span><span class="s4">, </span><span class="s1">a_max</span><span class="s4">=</span><span class="s3">None</span><span class="s4">)</span>
+
+    <span class="s2"># u (resp. s) contains the eigenvectors (resp. square roots of</span>
+    <span class="s2"># the eigenvalues) of W * W.T</span>
+    <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">multi_dot</span><span class="s4">([</span><span class="s1">u </span><span class="s4">* (</span><span class="s6">1.0 </span><span class="s4">/ </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">(</span><span class="s1">s</span><span class="s4">)), </span><span class="s1">u</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">W</span><span class="s4">])</span>
+
+
+<span class="s3">def </span><span class="s1">_ica_def</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">, </span><span class="s1">g</span><span class="s4">, </span><span class="s1">fun_args</span><span class="s4">, </span><span class="s1">max_iter</span><span class="s4">, </span><span class="s1">w_init</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Deflationary FastICA using fun approx to neg-entropy function 
+ 
+    Used internally by FastICA. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">n_components </span><span class="s4">= </span><span class="s1">w_init</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+    <span class="s1">W </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">zeros</span><span class="s4">((</span><span class="s1">n_components</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">), </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">X</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+    <span class="s1">n_iter </span><span class="s4">= []</span>
+
+    <span class="s2"># j is the index of the extracted component</span>
+    <span class="s3">for </span><span class="s1">j </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">n_components</span><span class="s4">):</span>
+        <span class="s1">w </span><span class="s4">= </span><span class="s1">w_init</span><span class="s4">[</span><span class="s1">j</span><span class="s4">, :].</span><span class="s1">copy</span><span class="s4">()</span>
+        <span class="s1">w </span><span class="s4">/= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">((</span><span class="s1">w</span><span class="s4">**</span><span class="s6">2</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">())</span>
+
+        <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">max_iter</span><span class="s4">):</span>
+            <span class="s1">gwtx</span><span class="s4">, </span><span class="s1">g_wtx </span><span class="s4">= </span><span class="s1">g</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">w</span><span class="s4">.</span><span class="s1">T</span><span class="s4">, </span><span class="s1">X</span><span class="s4">), </span><span class="s1">fun_args</span><span class="s4">)</span>
+
+            <span class="s1">w1 </span><span class="s4">= (</span><span class="s1">X </span><span class="s4">* </span><span class="s1">gwtx</span><span class="s4">).</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=</span><span class="s6">1</span><span class="s4">) - </span><span class="s1">g_wtx</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">() * </span><span class="s1">w</span>
+
+            <span class="s1">_gs_decorrelation</span><span class="s4">(</span><span class="s1">w1</span><span class="s4">, </span><span class="s1">W</span><span class="s4">, </span><span class="s1">j</span><span class="s4">)</span>
+
+            <span class="s1">w1 </span><span class="s4">/= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">((</span><span class="s1">w1</span><span class="s4">**</span><span class="s6">2</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">())</span>
+
+            <span class="s1">lim </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">abs</span><span class="s4">((</span><span class="s1">w1 </span><span class="s4">* </span><span class="s1">w</span><span class="s4">).</span><span class="s1">sum</span><span class="s4">()) - </span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s1">w </span><span class="s4">= </span><span class="s1">w1</span>
+            <span class="s3">if </span><span class="s1">lim </span><span class="s4">&lt; </span><span class="s1">tol</span><span class="s4">:</span>
+                <span class="s3">break</span>
+
+        <span class="s1">n_iter</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">i </span><span class="s4">+ </span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s1">W</span><span class="s4">[</span><span class="s1">j</span><span class="s4">, :] = </span><span class="s1">w</span>
+
+    <span class="s3">return </span><span class="s1">W</span><span class="s4">, </span><span class="s1">max</span><span class="s4">(</span><span class="s1">n_iter</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_ica_par</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">tol</span><span class="s4">, </span><span class="s1">g</span><span class="s4">, </span><span class="s1">fun_args</span><span class="s4">, </span><span class="s1">max_iter</span><span class="s4">, </span><span class="s1">w_init</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Parallel FastICA. 
+ 
+    Used internally by FastICA --main loop 
+ 
+    &quot;&quot;&quot;</span>
+    <span class="s1">W </span><span class="s4">= </span><span class="s1">_sym_decorrelation</span><span class="s4">(</span><span class="s1">w_init</span><span class="s4">)</span>
+    <span class="s3">del </span><span class="s1">w_init</span>
+    <span class="s1">p_ </span><span class="s4">= </span><span class="s1">float</span><span class="s4">(</span><span class="s1">X</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">1</span><span class="s4">])</span>
+    <span class="s3">for </span><span class="s1">ii </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s1">max_iter</span><span class="s4">):</span>
+        <span class="s1">gwtx</span><span class="s4">, </span><span class="s1">g_wtx </span><span class="s4">= </span><span class="s1">g</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">W</span><span class="s4">, </span><span class="s1">X</span><span class="s4">), </span><span class="s1">fun_args</span><span class="s4">)</span>
+        <span class="s1">W1 </span><span class="s4">= </span><span class="s1">_sym_decorrelation</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">gwtx</span><span class="s4">, </span><span class="s1">X</span><span class="s4">.</span><span class="s1">T</span><span class="s4">) / </span><span class="s1">p_ </span><span class="s4">- </span><span class="s1">g_wtx</span><span class="s4">[:, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">newaxis</span><span class="s4">] * </span><span class="s1">W</span><span class="s4">)</span>
+        <span class="s3">del </span><span class="s1">gwtx</span><span class="s4">, </span><span class="s1">g_wtx</span>
+        <span class="s2"># builtin max, abs are faster than numpy counter parts.</span>
+        <span class="s2"># np.einsum allows having the lowest memory footprint.</span>
+        <span class="s2"># It is faster than np.diag(np.dot(W1, W.T)).</span>
+        <span class="s1">lim </span><span class="s4">= </span><span class="s1">max</span><span class="s4">(</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">abs</span><span class="s4">(</span><span class="s1">np</span><span class="s4">.</span><span class="s1">einsum</span><span class="s4">(</span><span class="s5">&quot;ij,ij-&gt;i&quot;</span><span class="s4">, </span><span class="s1">W1</span><span class="s4">, </span><span class="s1">W</span><span class="s4">)) - </span><span class="s6">1</span><span class="s4">))</span>
+        <span class="s1">W </span><span class="s4">= </span><span class="s1">W1</span>
+        <span class="s3">if </span><span class="s1">lim </span><span class="s4">&lt; </span><span class="s1">tol</span><span class="s4">:</span>
+            <span class="s3">break</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+            <span class="s4">(</span>
+                <span class="s5">&quot;FastICA did not converge. Consider increasing &quot;</span>
+                <span class="s5">&quot;tolerance or the maximum number of iterations.&quot;</span>
+            <span class="s4">),</span>
+            <span class="s1">ConvergenceWarning</span><span class="s4">,</span>
+        <span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">W</span><span class="s4">, </span><span class="s1">ii </span><span class="s4">+ </span><span class="s6">1</span>
+
+
+<span class="s2"># Some standard non-linear functions.</span>
+<span class="s2"># XXX: these should be optimized, as they can be a bottleneck.</span>
+<span class="s3">def </span><span class="s1">_logcosh</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">fun_args</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s1">alpha </span><span class="s4">= </span><span class="s1">fun_args</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">&quot;alpha&quot;</span><span class="s4">, </span><span class="s6">1.0</span><span class="s4">)  </span><span class="s2"># comment it out?</span>
+
+    <span class="s1">x </span><span class="s4">*= </span><span class="s1">alpha</span>
+    <span class="s1">gx </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">tanh</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">x</span><span class="s4">)  </span><span class="s2"># apply the tanh inplace</span>
+    <span class="s1">g_x </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">(</span><span class="s1">x</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">], </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">x</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+    <span class="s2"># XXX compute in chunks to avoid extra allocation</span>
+    <span class="s3">for </span><span class="s1">i</span><span class="s4">, </span><span class="s1">gx_i </span><span class="s3">in </span><span class="s1">enumerate</span><span class="s4">(</span><span class="s1">gx</span><span class="s4">):  </span><span class="s2"># please don't vectorize.</span>
+        <span class="s1">g_x</span><span class="s4">[</span><span class="s1">i</span><span class="s4">] = (</span><span class="s1">alpha </span><span class="s4">* (</span><span class="s6">1 </span><span class="s4">- </span><span class="s1">gx_i</span><span class="s4">**</span><span class="s6">2</span><span class="s4">)).</span><span class="s1">mean</span><span class="s4">()</span>
+    <span class="s3">return </span><span class="s1">gx</span><span class="s4">, </span><span class="s1">g_x</span>
+
+
+<span class="s3">def </span><span class="s1">_exp</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">fun_args</span><span class="s4">):</span>
+    <span class="s1">exp </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">exp</span><span class="s4">(-(</span><span class="s1">x</span><span class="s4">**</span><span class="s6">2</span><span class="s4">) / </span><span class="s6">2</span><span class="s4">)</span>
+    <span class="s1">gx </span><span class="s4">= </span><span class="s1">x </span><span class="s4">* </span><span class="s1">exp</span>
+    <span class="s1">g_x </span><span class="s4">= (</span><span class="s6">1 </span><span class="s4">- </span><span class="s1">x</span><span class="s4">**</span><span class="s6">2</span><span class="s4">) * </span><span class="s1">exp</span>
+    <span class="s3">return </span><span class="s1">gx</span><span class="s4">, </span><span class="s1">g_x</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=-</span><span class="s6">1</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_cube</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">fun_args</span><span class="s4">):</span>
+    <span class="s3">return </span><span class="s1">x</span><span class="s4">**</span><span class="s6">3</span><span class="s4">, (</span><span class="s6">3 </span><span class="s4">* </span><span class="s1">x</span><span class="s4">**</span><span class="s6">2</span><span class="s4">).</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=-</span><span class="s6">1</span><span class="s4">)</span>
+
+
+<span class="s4">@</span><span class="s1">validate_params</span><span class="s4">(</span>
+    <span class="s4">{</span>
+        <span class="s5">&quot;X&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;return_X_mean&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;compute_sources&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+        <span class="s5">&quot;return_n_iter&quot;</span><span class="s4">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s4">],</span>
+    <span class="s4">},</span>
+    <span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+<span class="s4">)</span>
+<span class="s3">def </span><span class="s1">fastica</span><span class="s4">(</span>
+    <span class="s1">X</span><span class="s4">,</span>
+    <span class="s1">n_components</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">*,</span>
+    <span class="s1">algorithm</span><span class="s4">=</span><span class="s5">&quot;parallel&quot;</span><span class="s4">,</span>
+    <span class="s1">whiten</span><span class="s4">=</span><span class="s5">&quot;unit-variance&quot;</span><span class="s4">,</span>
+    <span class="s1">fun</span><span class="s4">=</span><span class="s5">&quot;logcosh&quot;</span><span class="s4">,</span>
+    <span class="s1">fun_args</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">200</span><span class="s4">,</span>
+    <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-04</span><span class="s4">,</span>
+    <span class="s1">w_init</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">whiten_solver</span><span class="s4">=</span><span class="s5">&quot;svd&quot;</span><span class="s4">,</span>
+    <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s1">return_X_mean</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+    <span class="s1">compute_sources</span><span class="s4">=</span><span class="s3">True</span><span class="s4">,</span>
+    <span class="s1">return_n_iter</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+<span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Perform Fast Independent Component Analysis. 
+ 
+    The implementation is based on [1]_. 
+ 
+    Read more in the :ref:`User Guide &lt;ICA&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    X : array-like of shape (n_samples, n_features) 
+        Training vector, where `n_samples` is the number of samples and 
+        `n_features` is the number of features. 
+ 
+    n_components : int, default=None 
+        Number of components to use. If None is passed, all are used. 
+ 
+    algorithm : {'parallel', 'deflation'}, default='parallel' 
+        Specify which algorithm to use for FastICA. 
+ 
+    whiten : str or bool, default='unit-variance' 
+        Specify the whitening strategy to use. 
+ 
+        - If 'arbitrary-variance', a whitening with variance 
+          arbitrary is used. 
+        - If 'unit-variance', the whitening matrix is rescaled to ensure that 
+          each recovered source has unit variance. 
+        - If False, the data is already considered to be whitened, and no 
+          whitening is performed. 
+ 
+        .. versionchanged:: 1.3 
+            The default value of `whiten` changed to 'unit-variance' in 1.3. 
+ 
+    fun : {'logcosh', 'exp', 'cube'} or callable, default='logcosh' 
+        The functional form of the G function used in the 
+        approximation to neg-entropy. Could be either 'logcosh', 'exp', 
+        or 'cube'. 
+        You can also provide your own function. It should return a tuple 
+        containing the value of the function, and of its derivative, in the 
+        point. The derivative should be averaged along its last dimension. 
+        Example:: 
+ 
+            def my_g(x): 
+                return x ** 3, (3 * x ** 2).mean(axis=-1) 
+ 
+    fun_args : dict, default=None 
+        Arguments to send to the functional form. 
+        If empty or None and if fun='logcosh', fun_args will take value 
+        {'alpha' : 1.0}. 
+ 
+    max_iter : int, default=200 
+        Maximum number of iterations to perform. 
+ 
+    tol : float, default=1e-4 
+        A positive scalar giving the tolerance at which the 
+        un-mixing matrix is considered to have converged. 
+ 
+    w_init : ndarray of shape (n_components, n_components), default=None 
+        Initial un-mixing array. If `w_init=None`, then an array of values 
+        drawn from a normal distribution is used. 
+ 
+    whiten_solver : {&quot;eigh&quot;, &quot;svd&quot;}, default=&quot;svd&quot; 
+        The solver to use for whitening. 
+ 
+        - &quot;svd&quot; is more stable numerically if the problem is degenerate, and 
+          often faster when `n_samples &lt;= n_features`. 
+ 
+        - &quot;eigh&quot; is generally more memory efficient when 
+          `n_samples &gt;= n_features`, and can be faster when 
+          `n_samples &gt;= 50 * n_features`. 
+ 
+        .. versionadded:: 1.2 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        Used to initialize ``w_init`` when not specified, with a 
+        normal distribution. Pass an int, for reproducible results 
+        across multiple function calls. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+    return_X_mean : bool, default=False 
+        If True, X_mean is returned too. 
+ 
+    compute_sources : bool, default=True 
+        If False, sources are not computed, but only the rotation matrix. 
+        This can save memory when working with big data. Defaults to True. 
+ 
+    return_n_iter : bool, default=False 
+        Whether or not to return the number of iterations. 
+ 
+    Returns 
+    ------- 
+    K : ndarray of shape (n_components, n_features) or None 
+        If whiten is 'True', K is the pre-whitening matrix that projects data 
+        onto the first n_components principal components. If whiten is 'False', 
+        K is 'None'. 
+ 
+    W : ndarray of shape (n_components, n_components) 
+        The square matrix that unmixes the data after whitening. 
+        The mixing matrix is the pseudo-inverse of matrix ``W K`` 
+        if K is not None, else it is the inverse of W. 
+ 
+    S : ndarray of shape (n_samples, n_components) or None 
+        Estimated source matrix. 
+ 
+    X_mean : ndarray of shape (n_features,) 
+        The mean over features. Returned only if return_X_mean is True. 
+ 
+    n_iter : int 
+        If the algorithm is &quot;deflation&quot;, n_iter is the 
+        maximum number of iterations run across all components. Else 
+        they are just the number of iterations taken to converge. This is 
+        returned only when return_n_iter is set to `True`. 
+ 
+    Notes 
+    ----- 
+    The data matrix X is considered to be a linear combination of 
+    non-Gaussian (independent) components i.e. X = AS where columns of S 
+    contain the independent components and A is a linear mixing 
+    matrix. In short ICA attempts to `un-mix' the data by estimating an 
+    un-mixing matrix W where ``S = W K X.`` 
+    While FastICA was proposed to estimate as many sources 
+    as features, it is possible to estimate less by setting 
+    n_components &lt; n_features. It this case K is not a square matrix 
+    and the estimated A is the pseudo-inverse of ``W K``. 
+ 
+    This implementation was originally made for data of shape 
+    [n_features, n_samples]. Now the input is transposed 
+    before the algorithm is applied. This makes it slightly 
+    faster for Fortran-ordered input. 
+ 
+    References 
+    ---------- 
+    .. [1] A. Hyvarinen and E. Oja, &quot;Fast Independent Component Analysis&quot;, 
+           Algorithms and Applications, Neural Networks, 13(4-5), 2000, 
+           pp. 411-430. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_digits 
+    &gt;&gt;&gt; from sklearn.decomposition import fastica 
+    &gt;&gt;&gt; X, _ = load_digits(return_X_y=True) 
+    &gt;&gt;&gt; K, W, S = fastica(X, n_components=7, random_state=0, whiten='unit-variance') 
+    &gt;&gt;&gt; K.shape 
+    (7, 64) 
+    &gt;&gt;&gt; W.shape 
+    (7, 7) 
+    &gt;&gt;&gt; S.shape 
+    (1797, 7) 
+    &quot;&quot;&quot;</span>
+    <span class="s1">est </span><span class="s4">= </span><span class="s1">FastICA</span><span class="s4">(</span>
+        <span class="s1">n_components</span><span class="s4">=</span><span class="s1">n_components</span><span class="s4">,</span>
+        <span class="s1">algorithm</span><span class="s4">=</span><span class="s1">algorithm</span><span class="s4">,</span>
+        <span class="s1">whiten</span><span class="s4">=</span><span class="s1">whiten</span><span class="s4">,</span>
+        <span class="s1">fun</span><span class="s4">=</span><span class="s1">fun</span><span class="s4">,</span>
+        <span class="s1">fun_args</span><span class="s4">=</span><span class="s1">fun_args</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s1">max_iter</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s1">tol</span><span class="s4">,</span>
+        <span class="s1">w_init</span><span class="s4">=</span><span class="s1">w_init</span><span class="s4">,</span>
+        <span class="s1">whiten_solver</span><span class="s4">=</span><span class="s1">whiten_solver</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s1">random_state</span><span class="s4">,</span>
+    <span class="s4">)</span>
+    <span class="s1">est</span><span class="s4">.</span><span class="s1">_validate_params</span><span class="s4">()</span>
+    <span class="s1">S </span><span class="s4">= </span><span class="s1">est</span><span class="s4">.</span><span class="s1">_fit_transform</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">compute_sources</span><span class="s4">=</span><span class="s1">compute_sources</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">est</span><span class="s4">.</span><span class="s1">whiten </span><span class="s3">in </span><span class="s4">[</span><span class="s5">&quot;unit-variance&quot;</span><span class="s4">, </span><span class="s5">&quot;arbitrary-variance&quot;</span><span class="s4">]:</span>
+        <span class="s1">K </span><span class="s4">= </span><span class="s1">est</span><span class="s4">.</span><span class="s1">whitening_</span>
+        <span class="s1">X_mean </span><span class="s4">= </span><span class="s1">est</span><span class="s4">.</span><span class="s1">mean_</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">K </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">X_mean </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s1">returned_values </span><span class="s4">= [</span><span class="s1">K</span><span class="s4">, </span><span class="s1">est</span><span class="s4">.</span><span class="s1">_unmixing</span><span class="s4">, </span><span class="s1">S</span><span class="s4">]</span>
+    <span class="s3">if </span><span class="s1">return_X_mean</span><span class="s4">:</span>
+        <span class="s1">returned_values</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">X_mean</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">return_n_iter</span><span class="s4">:</span>
+        <span class="s1">returned_values</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">est</span><span class="s4">.</span><span class="s1">n_iter_</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">returned_values</span>
+
+
+<span class="s3">class </span><span class="s1">FastICA</span><span class="s4">(</span><span class="s1">ClassNamePrefixFeaturesOutMixin</span><span class="s4">, </span><span class="s1">TransformerMixin</span><span class="s4">, </span><span class="s1">BaseEstimator</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;FastICA: a fast algorithm for Independent Component Analysis. 
+ 
+    The implementation is based on [1]_. 
+ 
+    Read more in the :ref:`User Guide &lt;ICA&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    n_components : int, default=None 
+        Number of components to use. If None is passed, all are used. 
+ 
+    algorithm : {'parallel', 'deflation'}, default='parallel' 
+        Specify which algorithm to use for FastICA. 
+ 
+    whiten : str or bool, default='unit-variance' 
+        Specify the whitening strategy to use. 
+ 
+        - If 'arbitrary-variance', a whitening with variance 
+          arbitrary is used. 
+        - If 'unit-variance', the whitening matrix is rescaled to ensure that 
+          each recovered source has unit variance. 
+        - If False, the data is already considered to be whitened, and no 
+          whitening is performed. 
+ 
+        .. versionchanged:: 1.3 
+            The default value of `whiten` changed to 'unit-variance' in 1.3. 
+ 
+    fun : {'logcosh', 'exp', 'cube'} or callable, default='logcosh' 
+        The functional form of the G function used in the 
+        approximation to neg-entropy. Could be either 'logcosh', 'exp', 
+        or 'cube'. 
+        You can also provide your own function. It should return a tuple 
+        containing the value of the function, and of its derivative, in the 
+        point. The derivative should be averaged along its last dimension. 
+        Example:: 
+ 
+            def my_g(x): 
+                return x ** 3, (3 * x ** 2).mean(axis=-1) 
+ 
+    fun_args : dict, default=None 
+        Arguments to send to the functional form. 
+        If empty or None and if fun='logcosh', fun_args will take value 
+        {'alpha' : 1.0}. 
+ 
+    max_iter : int, default=200 
+        Maximum number of iterations during fit. 
+ 
+    tol : float, default=1e-4 
+        A positive scalar giving the tolerance at which the 
+        un-mixing matrix is considered to have converged. 
+ 
+    w_init : array-like of shape (n_components, n_components), default=None 
+        Initial un-mixing array. If `w_init=None`, then an array of values 
+        drawn from a normal distribution is used. 
+ 
+    whiten_solver : {&quot;eigh&quot;, &quot;svd&quot;}, default=&quot;svd&quot; 
+        The solver to use for whitening. 
+ 
+        - &quot;svd&quot; is more stable numerically if the problem is degenerate, and 
+          often faster when `n_samples &lt;= n_features`. 
+ 
+        - &quot;eigh&quot; is generally more memory efficient when 
+          `n_samples &gt;= n_features`, and can be faster when 
+          `n_samples &gt;= 50 * n_features`. 
+ 
+        .. versionadded:: 1.2 
+ 
+    random_state : int, RandomState instance or None, default=None 
+        Used to initialize ``w_init`` when not specified, with a 
+        normal distribution. Pass an int, for reproducible results 
+        across multiple function calls. 
+        See :term:`Glossary &lt;random_state&gt;`. 
+ 
+    Attributes 
+    ---------- 
+    components_ : ndarray of shape (n_components, n_features) 
+        The linear operator to apply to the data to get the independent 
+        sources. This is equal to the unmixing matrix when ``whiten`` is 
+        False, and equal to ``np.dot(unmixing_matrix, self.whitening_)`` when 
+        ``whiten`` is True. 
+ 
+    mixing_ : ndarray of shape (n_features, n_components) 
+        The pseudo-inverse of ``components_``. It is the linear operator 
+        that maps independent sources to the data. 
+ 
+    mean_ : ndarray of shape(n_features,) 
+        The mean over features. Only set if `self.whiten` is True. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    n_iter_ : int 
+        If the algorithm is &quot;deflation&quot;, n_iter is the 
+        maximum number of iterations run across all components. Else 
+        they are just the number of iterations taken to converge. 
+ 
+    whitening_ : ndarray of shape (n_components, n_features) 
+        Only set if whiten is 'True'. This is the pre-whitening matrix 
+        that projects data onto the first `n_components` principal components. 
+ 
+    See Also 
+    -------- 
+    PCA : Principal component analysis (PCA). 
+    IncrementalPCA : Incremental principal components analysis (IPCA). 
+    KernelPCA : Kernel Principal component analysis (KPCA). 
+    MiniBatchSparsePCA : Mini-batch Sparse Principal Components Analysis. 
+    SparsePCA : Sparse Principal Components Analysis (SparsePCA). 
+ 
+    References 
+    ---------- 
+    .. [1] A. Hyvarinen and E. Oja, Independent Component Analysis: 
+           Algorithms and Applications, Neural Networks, 13(4-5), 2000, 
+           pp. 411-430. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.datasets import load_digits 
+    &gt;&gt;&gt; from sklearn.decomposition import FastICA 
+    &gt;&gt;&gt; X, _ = load_digits(return_X_y=True) 
+    &gt;&gt;&gt; transformer = FastICA(n_components=7, 
+    ...         random_state=0, 
+    ...         whiten='unit-variance') 
+    &gt;&gt;&gt; X_transformed = transformer.fit_transform(X) 
+    &gt;&gt;&gt; X_transformed.shape 
+    (1797, 7) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s4">: </span><span class="s1">dict </span><span class="s4">= {</span>
+        <span class="s5">&quot;n_components&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">), </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;algorithm&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;parallel&quot;</span><span class="s4">, </span><span class="s5">&quot;deflation&quot;</span><span class="s4">})],</span>
+        <span class="s5">&quot;whiten&quot;</span><span class="s4">: [</span>
+            <span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;arbitrary-variance&quot;</span><span class="s4">, </span><span class="s5">&quot;unit-variance&quot;</span><span class="s4">}),</span>
+            <span class="s1">Options</span><span class="s4">(</span><span class="s1">bool</span><span class="s4">, {</span><span class="s3">False</span><span class="s4">}),</span>
+        <span class="s4">],</span>
+        <span class="s5">&quot;fun&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;logcosh&quot;</span><span class="s4">, </span><span class="s5">&quot;exp&quot;</span><span class="s4">, </span><span class="s5">&quot;cube&quot;</span><span class="s4">}), </span><span class="s1">callable</span><span class="s4">],</span>
+        <span class="s5">&quot;fun_args&quot;</span><span class="s4">: [</span><span class="s1">dict</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;max_iter&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Integral</span><span class="s4">, </span><span class="s6">1</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;tol&quot;</span><span class="s4">: [</span><span class="s1">Interval</span><span class="s4">(</span><span class="s1">Real</span><span class="s4">, </span><span class="s6">0.0</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">closed</span><span class="s4">=</span><span class="s5">&quot;left&quot;</span><span class="s4">)],</span>
+        <span class="s5">&quot;w_init&quot;</span><span class="s4">: [</span><span class="s5">&quot;array-like&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">],</span>
+        <span class="s5">&quot;whiten_solver&quot;</span><span class="s4">: [</span><span class="s1">StrOptions</span><span class="s4">({</span><span class="s5">&quot;eigh&quot;</span><span class="s4">, </span><span class="s5">&quot;svd&quot;</span><span class="s4">})],</span>
+        <span class="s5">&quot;random_state&quot;</span><span class="s4">: [</span><span class="s5">&quot;random_state&quot;</span><span class="s4">],</span>
+    <span class="s4">}</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s1">n_components</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">algorithm</span><span class="s4">=</span><span class="s5">&quot;parallel&quot;</span><span class="s4">,</span>
+        <span class="s1">whiten</span><span class="s4">=</span><span class="s5">&quot;unit-variance&quot;</span><span class="s4">,</span>
+        <span class="s1">fun</span><span class="s4">=</span><span class="s5">&quot;logcosh&quot;</span><span class="s4">,</span>
+        <span class="s1">fun_args</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">max_iter</span><span class="s4">=</span><span class="s6">200</span><span class="s4">,</span>
+        <span class="s1">tol</span><span class="s4">=</span><span class="s6">1e-4</span><span class="s4">,</span>
+        <span class="s1">w_init</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+        <span class="s1">whiten_solver</span><span class="s4">=</span><span class="s5">&quot;svd&quot;</span><span class="s4">,</span>
+        <span class="s1">random_state</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init__</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_components </span><span class="s4">= </span><span class="s1">n_components</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">= </span><span class="s1">algorithm</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">whiten </span><span class="s4">= </span><span class="s1">whiten</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">fun </span><span class="s4">= </span><span class="s1">fun</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">fun_args </span><span class="s4">= </span><span class="s1">fun_args</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter </span><span class="s4">= </span><span class="s1">max_iter</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">tol </span><span class="s4">= </span><span class="s1">tol</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">w_init </span><span class="s4">= </span><span class="s1">w_init</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">whiten_solver </span><span class="s4">= </span><span class="s1">whiten_solver</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">random_state </span><span class="s4">= </span><span class="s1">random_state</span>
+
+    <span class="s3">def </span><span class="s1">_fit_transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">compute_sources</span><span class="s4">=</span><span class="s3">False</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training data, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+        compute_sources : bool, default=False 
+            If False, sources are not computes but only the rotation matrix. 
+            This can save memory when working with big data. Defaults to False. 
+ 
+        Returns 
+        ------- 
+        S : ndarray of shape (n_samples, n_components) or None 
+            Sources matrix. `None` if `compute_sources` is `False`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">XT </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">], </span><span class="s1">ensure_min_samples</span><span class="s4">=</span><span class="s6">2</span>
+        <span class="s4">).</span><span class="s1">T</span>
+        <span class="s1">fun_args </span><span class="s4">= {} </span><span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fun_args </span><span class="s3">is None else </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fun_args</span>
+        <span class="s1">random_state </span><span class="s4">= </span><span class="s1">check_random_state</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">random_state</span><span class="s4">)</span>
+
+        <span class="s1">alpha </span><span class="s4">= </span><span class="s1">fun_args</span><span class="s4">.</span><span class="s1">get</span><span class="s4">(</span><span class="s5">&quot;alpha&quot;</span><span class="s4">, </span><span class="s6">1.0</span><span class="s4">)</span>
+        <span class="s3">if not </span><span class="s6">1 </span><span class="s4">&lt;= </span><span class="s1">alpha </span><span class="s4">&lt;= </span><span class="s6">2</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s5">&quot;alpha must be in [1,2]&quot;</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fun </span><span class="s4">== </span><span class="s5">&quot;logcosh&quot;</span><span class="s4">:</span>
+            <span class="s1">g </span><span class="s4">= </span><span class="s1">_logcosh</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fun </span><span class="s4">== </span><span class="s5">&quot;exp&quot;</span><span class="s4">:</span>
+            <span class="s1">g </span><span class="s4">= </span><span class="s1">_exp</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fun </span><span class="s4">== </span><span class="s5">&quot;cube&quot;</span><span class="s4">:</span>
+            <span class="s1">g </span><span class="s4">= </span><span class="s1">_cube</span>
+        <span class="s3">elif </span><span class="s1">callable</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">fun</span><span class="s4">):</span>
+
+            <span class="s3">def </span><span class="s1">g</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, </span><span class="s1">fun_args</span><span class="s4">):</span>
+                <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">fun</span><span class="s4">(</span><span class="s1">x</span><span class="s4">, **</span><span class="s1">fun_args</span><span class="s4">)</span>
+
+        <span class="s1">n_features</span><span class="s4">, </span><span class="s1">n_samples </span><span class="s4">= </span><span class="s1">XT</span><span class="s4">.</span><span class="s1">shape</span>
+        <span class="s1">n_components </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">n_components</span>
+        <span class="s3">if not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten </span><span class="s3">and </span><span class="s1">n_components </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">n_components </span><span class="s4">= </span><span class="s3">None</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Ignoring n_components with whiten=False.&quot;</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">n_components </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">n_components </span><span class="s4">= </span><span class="s1">min</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">n_features</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">n_components </span><span class="s4">&gt; </span><span class="s1">min</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">n_features</span><span class="s4">):</span>
+            <span class="s1">n_components </span><span class="s4">= </span><span class="s1">min</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">, </span><span class="s1">n_features</span><span class="s4">)</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                <span class="s5">&quot;n_components is too large: it will be set to %s&quot; </span><span class="s4">% </span><span class="s1">n_components</span>
+            <span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">:</span>
+            <span class="s2"># Centering the features of X</span>
+            <span class="s1">X_mean </span><span class="s4">= </span><span class="s1">XT</span><span class="s4">.</span><span class="s1">mean</span><span class="s4">(</span><span class="s1">axis</span><span class="s4">=-</span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s1">XT </span><span class="s4">-= </span><span class="s1">X_mean</span><span class="s4">[:, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">newaxis</span><span class="s4">]</span>
+
+            <span class="s2"># Whitening and preprocessing by PCA</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten_solver </span><span class="s4">== </span><span class="s5">&quot;eigh&quot;</span><span class="s4">:</span>
+                <span class="s2"># Faster when num_samples &gt;&gt; n_features</span>
+                <span class="s1">d</span><span class="s4">, </span><span class="s1">u </span><span class="s4">= </span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">eigh</span><span class="s4">(</span><span class="s1">XT</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">))</span>
+                <span class="s1">sort_indices </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">argsort</span><span class="s4">(</span><span class="s1">d</span><span class="s4">)[::-</span><span class="s6">1</span><span class="s4">]</span>
+                <span class="s1">eps </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">finfo</span><span class="s4">(</span><span class="s1">d</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">).</span><span class="s1">eps </span><span class="s4">* </span><span class="s6">10</span>
+                <span class="s1">degenerate_idx </span><span class="s4">= </span><span class="s1">d </span><span class="s4">&lt; </span><span class="s1">eps</span>
+                <span class="s3">if </span><span class="s1">np</span><span class="s4">.</span><span class="s1">any</span><span class="s4">(</span><span class="s1">degenerate_idx</span><span class="s4">):</span>
+                    <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span>
+                        <span class="s5">&quot;There are some small singular values, using &quot;</span>
+                        <span class="s5">&quot;whiten_solver = 'svd' might lead to more &quot;</span>
+                        <span class="s5">&quot;accurate results.&quot;</span>
+                    <span class="s4">)</span>
+                <span class="s1">d</span><span class="s4">[</span><span class="s1">degenerate_idx</span><span class="s4">] = </span><span class="s1">eps  </span><span class="s2"># For numerical issues</span>
+                <span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">(</span><span class="s1">d</span><span class="s4">, </span><span class="s1">out</span><span class="s4">=</span><span class="s1">d</span><span class="s4">)</span>
+                <span class="s1">d</span><span class="s4">, </span><span class="s1">u </span><span class="s4">= </span><span class="s1">d</span><span class="s4">[</span><span class="s1">sort_indices</span><span class="s4">], </span><span class="s1">u</span><span class="s4">[:, </span><span class="s1">sort_indices</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten_solver </span><span class="s4">== </span><span class="s5">&quot;svd&quot;</span><span class="s4">:</span>
+                <span class="s1">u</span><span class="s4">, </span><span class="s1">d </span><span class="s4">= </span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">svd</span><span class="s4">(</span><span class="s1">XT</span><span class="s4">, </span><span class="s1">full_matrices</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">check_finite</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)[:</span><span class="s6">2</span><span class="s4">]</span>
+
+            <span class="s2"># Give consistent eigenvectors for both svd solvers</span>
+            <span class="s1">u </span><span class="s4">*= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sign</span><span class="s4">(</span><span class="s1">u</span><span class="s4">[</span><span class="s6">0</span><span class="s4">])</span>
+
+            <span class="s1">K </span><span class="s4">= (</span><span class="s1">u </span><span class="s4">/ </span><span class="s1">d</span><span class="s4">).</span><span class="s1">T</span><span class="s4">[:</span><span class="s1">n_components</span><span class="s4">]  </span><span class="s2"># see (6.33) p.140</span>
+            <span class="s3">del </span><span class="s1">u</span><span class="s4">, </span><span class="s1">d</span>
+            <span class="s1">X1 </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">K</span><span class="s4">, </span><span class="s1">XT</span><span class="s4">)</span>
+            <span class="s2"># see (13.6) p.267 Here X1 is white and data</span>
+            <span class="s2"># in X has been projected onto a subspace by PCA</span>
+            <span class="s1">X1 </span><span class="s4">*= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">sqrt</span><span class="s4">(</span><span class="s1">n_samples</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s2"># X must be casted to floats to avoid typing issues with numpy</span>
+            <span class="s2"># 2.0 and the line below</span>
+            <span class="s1">X1 </span><span class="s4">= </span><span class="s1">as_float_array</span><span class="s4">(</span><span class="s1">XT</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)  </span><span class="s2"># copy has been taken care of</span>
+
+        <span class="s1">w_init </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">w_init</span>
+        <span class="s3">if </span><span class="s1">w_init </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">w_init </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span>
+                <span class="s1">random_state</span><span class="s4">.</span><span class="s1">normal</span><span class="s4">(</span><span class="s1">size</span><span class="s4">=(</span><span class="s1">n_components</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">)), </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">X1</span><span class="s4">.</span><span class="s1">dtype</span>
+            <span class="s4">)</span>
+
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">w_init </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">asarray</span><span class="s4">(</span><span class="s1">w_init</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">w_init</span><span class="s4">.</span><span class="s1">shape </span><span class="s4">!= (</span><span class="s1">n_components</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">):</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">&quot;w_init has invalid shape -- should be %(shape)s&quot;</span>
+                    <span class="s4">% {</span><span class="s5">&quot;shape&quot;</span><span class="s4">: (</span><span class="s1">n_components</span><span class="s4">, </span><span class="s1">n_components</span><span class="s4">)}</span>
+                <span class="s4">)</span>
+
+        <span class="s1">kwargs </span><span class="s4">= {</span>
+            <span class="s5">&quot;tol&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">tol</span><span class="s4">,</span>
+            <span class="s5">&quot;g&quot;</span><span class="s4">: </span><span class="s1">g</span><span class="s4">,</span>
+            <span class="s5">&quot;fun_args&quot;</span><span class="s4">: </span><span class="s1">fun_args</span><span class="s4">,</span>
+            <span class="s5">&quot;max_iter&quot;</span><span class="s4">: </span><span class="s1">self</span><span class="s4">.</span><span class="s1">max_iter</span><span class="s4">,</span>
+            <span class="s5">&quot;w_init&quot;</span><span class="s4">: </span><span class="s1">w_init</span><span class="s4">,</span>
+        <span class="s4">}</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s5">&quot;parallel&quot;</span><span class="s4">:</span>
+            <span class="s1">W</span><span class="s4">, </span><span class="s1">n_iter </span><span class="s4">= </span><span class="s1">_ica_par</span><span class="s4">(</span><span class="s1">X1</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">elif </span><span class="s1">self</span><span class="s4">.</span><span class="s1">algorithm </span><span class="s4">== </span><span class="s5">&quot;deflation&quot;</span><span class="s4">:</span>
+            <span class="s1">W</span><span class="s4">, </span><span class="s1">n_iter </span><span class="s4">= </span><span class="s1">_ica_def</span><span class="s4">(</span><span class="s1">X1</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">)</span>
+        <span class="s3">del </span><span class="s1">X1</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">n_iter_ </span><span class="s4">= </span><span class="s1">n_iter</span>
+
+        <span class="s3">if </span><span class="s1">compute_sources</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">:</span>
+                <span class="s1">S </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">multi_dot</span><span class="s4">([</span><span class="s1">W</span><span class="s4">, </span><span class="s1">K</span><span class="s4">, </span><span class="s1">XT</span><span class="s4">]).</span><span class="s1">T</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">S </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">W</span><span class="s4">, </span><span class="s1">XT</span><span class="s4">).</span><span class="s1">T</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">S </span><span class="s4">= </span><span class="s3">None</span>
+
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten </span><span class="s4">== </span><span class="s5">&quot;unit-variance&quot;</span><span class="s4">:</span>
+                <span class="s3">if not </span><span class="s1">compute_sources</span><span class="s4">:</span>
+                    <span class="s1">S </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">multi_dot</span><span class="s4">([</span><span class="s1">W</span><span class="s4">, </span><span class="s1">K</span><span class="s4">, </span><span class="s1">XT</span><span class="s4">]).</span><span class="s1">T</span>
+                <span class="s1">S_std </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">std</span><span class="s4">(</span><span class="s1">S</span><span class="s4">, </span><span class="s1">axis</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">keepdims</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+                <span class="s1">S </span><span class="s4">/= </span><span class="s1">S_std</span>
+                <span class="s1">W </span><span class="s4">/= </span><span class="s1">S_std</span><span class="s4">.</span><span class="s1">T</span>
+
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">components_ </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">W</span><span class="s4">, </span><span class="s1">K</span><span class="s4">)</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">mean_ </span><span class="s4">= </span><span class="s1">X_mean</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">whitening_ </span><span class="s4">= </span><span class="s1">K</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">components_ </span><span class="s4">= </span><span class="s1">W</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">mixing_ </span><span class="s4">= </span><span class="s1">linalg</span><span class="s4">.</span><span class="s1">pinv</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">components_</span><span class="s4">, </span><span class="s1">check_finite</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_unmixing </span><span class="s4">= </span><span class="s1">W</span>
+
+        <span class="s3">return </span><span class="s1">S</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit_transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model and recover the sources from X. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training data, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+        y : Ignored 
+            Not used, present for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        X_new : ndarray of shape (n_samples, n_components) 
+            Estimated sources obtained by transforming the data with the 
+            estimated unmixing matrix. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_fit_transform</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">compute_sources</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">_fit_context</span><span class="s4">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+    <span class="s3">def </span><span class="s1">fit</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">y</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Fit the model to X. 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Training data, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+        y : Ignored 
+            Not used, present for API consistency by convention. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns the instance itself. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_fit_transform</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">compute_sources</span><span class="s4">=</span><span class="s3">False</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Recover the sources from X (apply the unmixing matrix). 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_features) 
+            Data to transform, where `n_samples` is the number of samples 
+            and `n_features` is the number of features. 
+ 
+        copy : bool, default=True 
+            If False, data passed to fit can be overwritten. Defaults to True. 
+ 
+        Returns 
+        ------- 
+        X_new : ndarray of shape (n_samples, n_components) 
+            Estimated sources obtained by transforming the data with the 
+            estimated unmixing matrix. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_validate_data</span><span class="s4">(</span>
+            <span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=(</span><span class="s1">copy </span><span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">), </span><span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">], </span><span class="s1">reset</span><span class="s4">=</span><span class="s3">False</span>
+        <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">:</span>
+            <span class="s1">X </span><span class="s4">-= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">mean_</span>
+
+        <span class="s3">return </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">components_</span><span class="s4">.</span><span class="s1">T</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">inverse_transform</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Transform the sources back to the mixed data (apply mixing matrix). 
+ 
+        Parameters 
+        ---------- 
+        X : array-like of shape (n_samples, n_components) 
+            Sources, where `n_samples` is the number of samples 
+            and `n_components` is the number of components. 
+        copy : bool, default=True 
+            If False, data passed to fit are overwritten. Defaults to True. 
+ 
+        Returns 
+        ------- 
+        X_new : ndarray of shape (n_samples, n_features) 
+            Reconstructed data obtained with the mixing matrix. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">check_is_fitted</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">check_array</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">copy</span><span class="s4">=(</span><span class="s1">copy </span><span class="s3">and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">), </span><span class="s1">dtype</span><span class="s4">=[</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">])</span>
+        <span class="s1">X </span><span class="s4">= </span><span class="s1">np</span><span class="s4">.</span><span class="s1">dot</span><span class="s4">(</span><span class="s1">X</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">mixing_</span><span class="s4">.</span><span class="s1">T</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">whiten</span><span class="s4">:</span>
+            <span class="s1">X </span><span class="s4">+= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">mean_</span>
+
+        <span class="s3">return </span><span class="s1">X</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">_n_features_out</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Number of transformed output features.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">components_</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+
+    <span class="s3">def </span><span class="s1">_more_tags</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s4">{</span><span class="s5">&quot;preserves_dtype&quot;</span><span class="s4">: [</span><span class="s1">np</span><span class="s4">.</span><span class="s1">float32</span><span class="s4">, </span><span class="s1">np</span><span class="s4">.</span><span class="s1">float64</span><span class="s4">]}</span>
+</pre>
+</body>
+</html>

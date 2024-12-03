@@ -1,0 +1,552 @@
+<html>
+<head>
+<title>backend_cairo.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #2aacb8;}
+.s5 { color: #7a7e85;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+backend_cairo.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+A Cairo backend for Matplotlib 
+============================== 
+:Author: Steve Chaplin and others 
+ 
+This backend depends on cairocffi or pycairo. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">functools</span>
+<span class="s2">import </span><span class="s1">gzip</span>
+<span class="s2">import </span><span class="s1">math</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">cairo</span>
+    <span class="s2">if </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">version_info </span><span class="s3">&lt; (</span><span class="s4">1</span><span class="s3">, </span><span class="s4">14</span><span class="s3">, </span><span class="s4">0</span><span class="s3">):  </span><span class="s5"># Introduced set_device_scale.</span>
+        <span class="s2">raise </span><span class="s1">ImportError</span><span class="s3">(</span><span class="s6">f&quot;Cairo backend requires cairo&gt;=1.14.0, &quot;</span>
+                          <span class="s6">f&quot;but only </span><span class="s2">{</span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">version_info</span><span class="s2">} </span><span class="s6">is available&quot;</span><span class="s3">)</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s2">try</span><span class="s3">:</span>
+        <span class="s2">import </span><span class="s1">cairocffi </span><span class="s2">as </span><span class="s1">cairo</span>
+    <span class="s2">except </span><span class="s1">ImportError </span><span class="s2">as </span><span class="s1">err</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ImportError</span><span class="s3">(</span>
+            <span class="s6">&quot;cairo backend requires that pycairo&gt;=1.14.0 or cairocffi &quot;</span>
+            <span class="s6">&quot;is installed&quot;</span><span class="s3">) </span><span class="s2">from </span><span class="s1">err</span>
+
+<span class="s2">from </span><span class="s3">.. </span><span class="s2">import </span><span class="s1">_api</span><span class="s3">, </span><span class="s1">cbook</span><span class="s3">, </span><span class="s1">font_manager</span>
+<span class="s2">from </span><span class="s1">matplotlib</span><span class="s3">.</span><span class="s1">backend_bases </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">_Backend</span><span class="s3">, </span><span class="s1">FigureCanvasBase</span><span class="s3">, </span><span class="s1">FigureManagerBase</span><span class="s3">, </span><span class="s1">GraphicsContextBase</span><span class="s3">,</span>
+    <span class="s1">RendererBase</span><span class="s3">)</span>
+<span class="s2">from </span><span class="s1">matplotlib</span><span class="s3">.</span><span class="s1">font_manager </span><span class="s2">import </span><span class="s1">ttfFontProperty</span>
+<span class="s2">from </span><span class="s1">matplotlib</span><span class="s3">.</span><span class="s1">path </span><span class="s2">import </span><span class="s1">Path</span>
+<span class="s2">from </span><span class="s1">matplotlib</span><span class="s3">.</span><span class="s1">transforms </span><span class="s2">import </span><span class="s1">Affine2D</span>
+
+
+<span class="s2">def </span><span class="s1">_set_rgba</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">color</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">forced_alpha</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">color</span><span class="s3">) == </span><span class="s4">3 </span><span class="s2">or </span><span class="s1">forced_alpha</span><span class="s3">:</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_source_rgba</span><span class="s3">(*</span><span class="s1">color</span><span class="s3">[:</span><span class="s4">3</span><span class="s3">], </span><span class="s1">alpha</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_source_rgba</span><span class="s3">(*</span><span class="s1">color</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_append_path</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">path</span><span class="s3">, </span><span class="s1">transform</span><span class="s3">, </span><span class="s1">clip</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s2">for </span><span class="s1">points</span><span class="s3">, </span><span class="s1">code </span><span class="s2">in </span><span class="s1">path</span><span class="s3">.</span><span class="s1">iter_segments</span><span class="s3">(</span>
+            <span class="s1">transform</span><span class="s3">, </span><span class="s1">remove_nans</span><span class="s3">=</span><span class="s2">True</span><span class="s3">, </span><span class="s1">clip</span><span class="s3">=</span><span class="s1">clip</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">code </span><span class="s3">== </span><span class="s1">Path</span><span class="s3">.</span><span class="s1">MOVETO</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">move_to</span><span class="s3">(*</span><span class="s1">points</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">code </span><span class="s3">== </span><span class="s1">Path</span><span class="s3">.</span><span class="s1">CLOSEPOLY</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">close_path</span><span class="s3">()</span>
+        <span class="s2">elif </span><span class="s1">code </span><span class="s3">== </span><span class="s1">Path</span><span class="s3">.</span><span class="s1">LINETO</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">line_to</span><span class="s3">(*</span><span class="s1">points</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">code </span><span class="s3">== </span><span class="s1">Path</span><span class="s3">.</span><span class="s1">CURVE3</span><span class="s3">:</span>
+            <span class="s1">cur </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">get_current_point</span><span class="s3">())</span>
+            <span class="s1">a </span><span class="s3">= </span><span class="s1">points</span><span class="s3">[:</span><span class="s4">2</span><span class="s3">]</span>
+            <span class="s1">b </span><span class="s3">= </span><span class="s1">points</span><span class="s3">[-</span><span class="s4">2</span><span class="s3">:]</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">curve_to</span><span class="s3">(*(</span><span class="s1">cur </span><span class="s3">/ </span><span class="s4">3 </span><span class="s3">+ </span><span class="s1">a </span><span class="s3">* </span><span class="s4">2 </span><span class="s3">/ </span><span class="s4">3</span><span class="s3">), *(</span><span class="s1">a </span><span class="s3">* </span><span class="s4">2 </span><span class="s3">/ </span><span class="s4">3 </span><span class="s3">+ </span><span class="s1">b </span><span class="s3">/ </span><span class="s4">3</span><span class="s3">), *</span><span class="s1">b</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">code </span><span class="s3">== </span><span class="s1">Path</span><span class="s3">.</span><span class="s1">CURVE4</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">curve_to</span><span class="s3">(*</span><span class="s1">points</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_cairo_font_args_from_font_prop</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Convert a `.FontProperties` or a `.FontEntry` to arguments that can be 
+    passed to `.Context.select_font_face`. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">def </span><span class="s1">attr</span><span class="s3">(</span><span class="s1">field</span><span class="s3">):</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">, </span><span class="s6">f&quot;get_</span><span class="s2">{</span><span class="s1">field</span><span class="s2">}</span><span class="s6">&quot;</span><span class="s3">)()</span>
+        <span class="s2">except </span><span class="s1">AttributeError</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">, </span><span class="s1">field</span><span class="s3">)</span>
+
+    <span class="s1">name </span><span class="s3">= </span><span class="s1">attr</span><span class="s3">(</span><span class="s6">&quot;name&quot;</span><span class="s3">)</span>
+    <span class="s1">slant </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">, </span><span class="s6">f&quot;FONT_SLANT_</span><span class="s2">{</span><span class="s1">attr</span><span class="s3">(</span><span class="s6">'style'</span><span class="s3">).</span><span class="s1">upper</span><span class="s3">()</span><span class="s2">}</span><span class="s6">&quot;</span><span class="s3">)</span>
+    <span class="s1">weight </span><span class="s3">= </span><span class="s1">attr</span><span class="s3">(</span><span class="s6">&quot;weight&quot;</span><span class="s3">)</span>
+    <span class="s1">weight </span><span class="s3">= (</span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">FONT_WEIGHT_NORMAL</span>
+              <span class="s2">if </span><span class="s1">font_manager</span><span class="s3">.</span><span class="s1">weight_dict</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">weight</span><span class="s3">, </span><span class="s1">weight</span><span class="s3">) &lt; </span><span class="s4">550</span>
+              <span class="s2">else </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">FONT_WEIGHT_BOLD</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">name</span><span class="s3">, </span><span class="s1">slant</span><span class="s3">, </span><span class="s1">weight</span>
+
+
+<span class="s2">class </span><span class="s1">RendererCairo</span><span class="s3">(</span><span class="s1">RendererBase</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">dpi</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gc </span><span class="s3">= </span><span class="s1">GraphicsContextCairo</span><span class="s3">(</span><span class="s1">renderer</span><span class="s3">=</span><span class="s1">self</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">width </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">height </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">text_ctx </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">Context</span><span class="s3">(</span>
+           <span class="s1">cairo</span><span class="s3">.</span><span class="s1">ImageSurface</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">FORMAT_ARGB32</span><span class="s3">, </span><span class="s4">1</span><span class="s3">, </span><span class="s4">1</span><span class="s3">))</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">set_context</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">ctx</span><span class="s3">):</span>
+        <span class="s1">surface </span><span class="s3">= </span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">get_target</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">, </span><span class="s6">&quot;get_width&quot;</span><span class="s3">) </span><span class="s2">and </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">, </span><span class="s6">&quot;get_height&quot;</span><span class="s3">):</span>
+            <span class="s1">size </span><span class="s3">= </span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_width</span><span class="s3">(), </span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_height</span><span class="s3">()</span>
+        <span class="s2">elif </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">, </span><span class="s6">&quot;get_extents&quot;</span><span class="s3">):  </span><span class="s5"># GTK4 RecordingSurface.</span>
+            <span class="s1">ext </span><span class="s3">= </span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_extents</span><span class="s3">()</span>
+            <span class="s1">size </span><span class="s3">= </span><span class="s1">ext</span><span class="s3">.</span><span class="s1">width</span><span class="s3">, </span><span class="s1">ext</span><span class="s3">.</span><span class="s1">height</span>
+        <span class="s2">else</span><span class="s3">:  </span><span class="s5"># vector surfaces.</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">reset_clip</span><span class="s3">()</span>
+            <span class="s1">rect</span><span class="s3">, *</span><span class="s1">rest </span><span class="s3">= </span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">copy_clip_rectangle_list</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">rest</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">TypeError</span><span class="s3">(</span><span class="s6">&quot;Cannot infer surface size&quot;</span><span class="s3">)</span>
+            <span class="s1">_</span><span class="s3">, </span><span class="s1">_</span><span class="s3">, *</span><span class="s1">size </span><span class="s3">= </span><span class="s1">rect</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx </span><span class="s3">= </span><span class="s1">ctx</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">width</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">height </span><span class="s3">= </span><span class="s1">size</span>
+
+    <span class="s3">@</span><span class="s1">staticmethod</span>
+    <span class="s2">def </span><span class="s1">_fill_and_stroke</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">fill_c</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">alpha_overrides</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">fill_c </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+            <span class="s1">_set_rgba</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">fill_c</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">alpha_overrides</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">fill_preserve</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">stroke</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">draw_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">, </span><span class="s1">path</span><span class="s3">, </span><span class="s1">transform</span><span class="s3">, </span><span class="s1">rgbFace</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span>
+        <span class="s5"># Clip the path to the actual rendering extents if it isn't filled.</span>
+        <span class="s1">clip </span><span class="s3">= (</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">clip_extents</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">rgbFace </span><span class="s2">is None and </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_hatch</span><span class="s3">() </span><span class="s2">is None</span>
+                <span class="s2">else None</span><span class="s3">)</span>
+        <span class="s1">transform </span><span class="s3">= (</span><span class="s1">transform</span>
+                     <span class="s3">+ </span><span class="s1">Affine2D</span><span class="s3">().</span><span class="s1">scale</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">).</span><span class="s1">translate</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">height</span><span class="s3">))</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+        <span class="s1">_append_path</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">path</span><span class="s3">, </span><span class="s1">transform</span><span class="s3">, </span><span class="s1">clip</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">rgbFace </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+            <span class="s1">_set_rgba</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">rgbFace</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_alpha</span><span class="s3">(), </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_forced_alpha</span><span class="s3">())</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">fill_preserve</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+        <span class="s1">hatch_path </span><span class="s3">= </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_hatch_path</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">hatch_path</span><span class="s3">:</span>
+            <span class="s1">dpi </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">dpi</span><span class="s3">)</span>
+            <span class="s1">hatch_surface </span><span class="s3">= </span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">get_target</span><span class="s3">().</span><span class="s1">create_similar</span><span class="s3">(</span>
+                <span class="s1">cairo</span><span class="s3">.</span><span class="s1">Content</span><span class="s3">.</span><span class="s1">COLOR_ALPHA</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">)</span>
+            <span class="s1">hatch_ctx </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">Context</span><span class="s3">(</span><span class="s1">hatch_surface</span><span class="s3">)</span>
+            <span class="s1">_append_path</span><span class="s3">(</span><span class="s1">hatch_ctx</span><span class="s3">, </span><span class="s1">hatch_path</span><span class="s3">,</span>
+                         <span class="s1">Affine2D</span><span class="s3">().</span><span class="s1">scale</span><span class="s3">(</span><span class="s1">dpi</span><span class="s3">, -</span><span class="s1">dpi</span><span class="s3">).</span><span class="s1">translate</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">dpi</span><span class="s3">),</span>
+                         <span class="s2">None</span><span class="s3">)</span>
+            <span class="s1">hatch_ctx</span><span class="s3">.</span><span class="s1">set_line_width</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_hatch_linewidth</span><span class="s3">()))</span>
+            <span class="s1">hatch_ctx</span><span class="s3">.</span><span class="s1">set_source_rgba</span><span class="s3">(*</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_hatch_color</span><span class="s3">())</span>
+            <span class="s1">hatch_ctx</span><span class="s3">.</span><span class="s1">fill_preserve</span><span class="s3">()</span>
+            <span class="s1">hatch_ctx</span><span class="s3">.</span><span class="s1">stroke</span><span class="s3">()</span>
+            <span class="s1">hatch_pattern </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">SurfacePattern</span><span class="s3">(</span><span class="s1">hatch_surface</span><span class="s3">)</span>
+            <span class="s1">hatch_pattern</span><span class="s3">.</span><span class="s1">set_extend</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">Extend</span><span class="s3">.</span><span class="s1">REPEAT</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_source</span><span class="s3">(</span><span class="s1">hatch_pattern</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">fill_preserve</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">stroke</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">draw_markers</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">, </span><span class="s1">marker_path</span><span class="s3">, </span><span class="s1">marker_trans</span><span class="s3">, </span><span class="s1">path</span><span class="s3">, </span><span class="s1">transform</span><span class="s3">,</span>
+                     <span class="s1">rgbFace</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s5"># docstring inherited</span>
+
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+        <span class="s5"># Create the path for the marker; it needs to be flipped here already!</span>
+        <span class="s1">_append_path</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">marker_path</span><span class="s3">, </span><span class="s1">marker_trans </span><span class="s3">+ </span><span class="s1">Affine2D</span><span class="s3">().</span><span class="s1">scale</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">))</span>
+        <span class="s1">marker_path </span><span class="s3">= </span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">copy_path_flat</span><span class="s3">()</span>
+
+        <span class="s5"># Figure out whether the path has a fill</span>
+        <span class="s1">x1</span><span class="s3">, </span><span class="s1">y1</span><span class="s3">, </span><span class="s1">x2</span><span class="s3">, </span><span class="s1">y2 </span><span class="s3">= </span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">fill_extents</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">x1 </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">y1 </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">x2 </span><span class="s3">== </span><span class="s4">0 </span><span class="s2">and </span><span class="s1">y2 </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+            <span class="s1">filled </span><span class="s3">= </span><span class="s2">False</span>
+            <span class="s5"># No fill, just unset this (so we don't try to fill it later on)</span>
+            <span class="s1">rgbFace </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">filled </span><span class="s3">= </span><span class="s2">True</span>
+
+        <span class="s1">transform </span><span class="s3">= (</span><span class="s1">transform</span>
+                     <span class="s3">+ </span><span class="s1">Affine2D</span><span class="s3">().</span><span class="s1">scale</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">).</span><span class="s1">translate</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">height</span><span class="s3">))</span>
+
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+        <span class="s2">for </span><span class="s1">i</span><span class="s3">, (</span><span class="s1">vertices</span><span class="s3">, </span><span class="s1">codes</span><span class="s3">) </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span>
+                <span class="s1">path</span><span class="s3">.</span><span class="s1">iter_segments</span><span class="s3">(</span><span class="s1">transform</span><span class="s3">, </span><span class="s1">simplify</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)):</span>
+            <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">vertices</span><span class="s3">):</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">vertices</span><span class="s3">[-</span><span class="s4">2</span><span class="s3">:]</span>
+                <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+
+                <span class="s5"># Translate and apply path</span>
+                <span class="s1">ctx</span><span class="s3">.</span><span class="s1">translate</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+                <span class="s1">ctx</span><span class="s3">.</span><span class="s1">append_path</span><span class="s3">(</span><span class="s1">marker_path</span><span class="s3">)</span>
+
+                <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+
+                <span class="s5"># Slower code path if there is a fill; we need to draw</span>
+                <span class="s5"># the fill and stroke for each marker at the same time.</span>
+                <span class="s5"># Also flush out the drawing every once in a while to</span>
+                <span class="s5"># prevent the paths from getting way too long.</span>
+                <span class="s2">if </span><span class="s1">filled </span><span class="s2">or </span><span class="s1">i </span><span class="s3">% </span><span class="s4">1000 </span><span class="s3">== </span><span class="s4">0</span><span class="s3">:</span>
+                    <span class="s1">self</span><span class="s3">.</span><span class="s1">_fill_and_stroke</span><span class="s3">(</span>
+                        <span class="s1">ctx</span><span class="s3">, </span><span class="s1">rgbFace</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_alpha</span><span class="s3">(), </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_forced_alpha</span><span class="s3">())</span>
+
+        <span class="s5"># Fast path, if there is no fill, draw everything in one step</span>
+        <span class="s2">if not </span><span class="s1">filled</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_fill_and_stroke</span><span class="s3">(</span>
+                <span class="s1">ctx</span><span class="s3">, </span><span class="s1">rgbFace</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_alpha</span><span class="s3">(), </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_forced_alpha</span><span class="s3">())</span>
+
+    <span class="s2">def </span><span class="s1">draw_image</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">im</span><span class="s3">):</span>
+        <span class="s1">im </span><span class="s3">= </span><span class="s1">cbook</span><span class="s3">.</span><span class="s1">_unmultiplied_rgba8888_to_premultiplied_argb32</span><span class="s3">(</span><span class="s1">im</span><span class="s3">[::-</span><span class="s4">1</span><span class="s3">])</span>
+        <span class="s1">surface </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">ImageSurface</span><span class="s3">.</span><span class="s1">create_for_data</span><span class="s3">(</span>
+            <span class="s1">im</span><span class="s3">.</span><span class="s1">ravel</span><span class="s3">().</span><span class="s1">data</span><span class="s3">, </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">FORMAT_ARGB32</span><span class="s3">,</span>
+            <span class="s1">im</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">], </span><span class="s1">im</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">], </span><span class="s1">im</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">1</span><span class="s3">] * </span><span class="s4">4</span><span class="s3">)</span>
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span>
+        <span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">height </span><span class="s3">- </span><span class="s1">y </span><span class="s3">- </span><span class="s1">im</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s4">0</span><span class="s3">]</span>
+
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_source_surface</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">, </span><span class="s1">float</span><span class="s3">(</span><span class="s1">x</span><span class="s3">), </span><span class="s1">float</span><span class="s3">(</span><span class="s1">y</span><span class="s3">))</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">paint</span><span class="s3">()</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">draw_text</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">angle</span><span class="s3">, </span><span class="s1">ismath</span><span class="s3">=</span><span class="s2">False</span><span class="s3">, </span><span class="s1">mtext</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s5"># docstring inherited</span>
+
+        <span class="s5"># Note: (x, y) are device/display coords, not user-coords, unlike other</span>
+        <span class="s5"># draw_* methods</span>
+        <span class="s2">if </span><span class="s1">ismath</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_draw_mathtext</span><span class="s3">(</span><span class="s1">gc</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">angle</span><span class="s3">)</span>
+
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">ctx </span><span class="s3">= </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">move_to</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">select_font_face</span><span class="s3">(*</span><span class="s1">_cairo_font_args_from_font_prop</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">))</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_font_size</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">.</span><span class="s1">get_size_in_points</span><span class="s3">()))</span>
+            <span class="s1">opts </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">FontOptions</span><span class="s3">()</span>
+            <span class="s1">opts</span><span class="s3">.</span><span class="s1">set_antialias</span><span class="s3">(</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">get_antialiased</span><span class="s3">())</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_font_options</span><span class="s3">(</span><span class="s1">opts</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">angle</span><span class="s3">:</span>
+                <span class="s1">ctx</span><span class="s3">.</span><span class="s1">rotate</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">deg2rad</span><span class="s3">(-</span><span class="s1">angle</span><span class="s3">))</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">show_text</span><span class="s3">(</span><span class="s1">s</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">_draw_mathtext</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">gc</span><span class="s3">, </span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">angle</span><span class="s3">):</span>
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span>
+        <span class="s1">width</span><span class="s3">, </span><span class="s1">height</span><span class="s3">, </span><span class="s1">descent</span><span class="s3">, </span><span class="s1">glyphs</span><span class="s3">, </span><span class="s1">rects </span><span class="s3">= </span><span class="s1">\</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_text2path</span><span class="s3">.</span><span class="s1">mathtext_parser</span><span class="s3">.</span><span class="s1">parse</span><span class="s3">(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dpi</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">)</span>
+
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">translate</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">angle</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">rotate</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">deg2rad</span><span class="s3">(-</span><span class="s1">angle</span><span class="s3">))</span>
+
+        <span class="s2">for </span><span class="s1">font</span><span class="s3">, </span><span class="s1">fontsize</span><span class="s3">, </span><span class="s1">idx</span><span class="s3">, </span><span class="s1">ox</span><span class="s3">, </span><span class="s1">oy </span><span class="s2">in </span><span class="s1">glyphs</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">move_to</span><span class="s3">(</span><span class="s1">ox</span><span class="s3">, -</span><span class="s1">oy</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">select_font_face</span><span class="s3">(</span>
+                <span class="s3">*</span><span class="s1">_cairo_font_args_from_font_prop</span><span class="s3">(</span><span class="s1">ttfFontProperty</span><span class="s3">(</span><span class="s1">font</span><span class="s3">)))</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_font_size</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s1">fontsize</span><span class="s3">))</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">show_text</span><span class="s3">(</span><span class="s1">chr</span><span class="s3">(</span><span class="s1">idx</span><span class="s3">))</span>
+
+        <span class="s2">for </span><span class="s1">ox</span><span class="s3">, </span><span class="s1">oy</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h </span><span class="s2">in </span><span class="s1">rects</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">rectangle</span><span class="s3">(</span><span class="s1">ox</span><span class="s3">, -</span><span class="s1">oy</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, -</span><span class="s1">h</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_source_rgb</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">fill_preserve</span><span class="s3">()</span>
+
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">get_canvas_width_height</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">width</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">height</span>
+
+    <span class="s2">def </span><span class="s1">get_text_width_height_descent</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">ismath</span><span class="s3">):</span>
+        <span class="s5"># docstring inherited</span>
+
+        <span class="s2">if </span><span class="s1">ismath </span><span class="s3">== </span><span class="s6">'TeX'</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">super</span><span class="s3">().</span><span class="s1">get_text_width_height_descent</span><span class="s3">(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">, </span><span class="s1">ismath</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">ismath</span><span class="s3">:</span>
+            <span class="s1">width</span><span class="s3">, </span><span class="s1">height</span><span class="s3">, </span><span class="s1">descent</span><span class="s3">, *</span><span class="s1">_ </span><span class="s3">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">_text2path</span><span class="s3">.</span><span class="s1">mathtext_parser</span><span class="s3">.</span><span class="s1">parse</span><span class="s3">(</span><span class="s1">s</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dpi</span><span class="s3">, </span><span class="s1">prop</span><span class="s3">)</span>
+            <span class="s2">return </span><span class="s1">width</span><span class="s3">, </span><span class="s1">height</span><span class="s3">, </span><span class="s1">descent</span>
+
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">text_ctx</span>
+        <span class="s5"># problem - scale remembers last setting and font can become</span>
+        <span class="s5"># enormous causing program to crash</span>
+        <span class="s5"># save/restore prevents the problem</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">select_font_face</span><span class="s3">(*</span><span class="s1">_cairo_font_args_from_font_prop</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">))</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_font_size</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s1">prop</span><span class="s3">.</span><span class="s1">get_size_in_points</span><span class="s3">()))</span>
+
+        <span class="s1">y_bearing</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h </span><span class="s3">= </span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">text_extents</span><span class="s3">(</span><span class="s1">s</span><span class="s3">)[</span><span class="s4">1</span><span class="s3">:</span><span class="s4">4</span><span class="s3">]</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+
+        <span class="s2">return </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">, </span><span class="s1">h </span><span class="s3">+ </span><span class="s1">y_bearing</span>
+
+    <span class="s2">def </span><span class="s1">new_gc</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">save</span><span class="s3">()</span>
+        <span class="s5"># FIXME: The following doesn't properly implement a stack-like behavior</span>
+        <span class="s5"># and relies instead on the (non-guaranteed) fact that artists never</span>
+        <span class="s5"># rely on nesting gc states, so directly resetting the attributes (IOW</span>
+        <span class="s5"># a single-level stack) is enough.</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">_alpha </span><span class="s3">= </span><span class="s4">1</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">_forced_alpha </span><span class="s3">= </span><span class="s2">False  </span><span class="s5"># if True, _alpha overrides A from RGBA</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">_hatch </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">gc</span>
+
+    <span class="s2">def </span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">points</span><span class="s3">):</span>
+        <span class="s5"># docstring inherited</span>
+        <span class="s2">return </span><span class="s1">points </span><span class="s3">/ </span><span class="s4">72 </span><span class="s3">* </span><span class="s1">self</span><span class="s3">.</span><span class="s1">dpi</span>
+
+
+<span class="s2">class </span><span class="s1">GraphicsContextCairo</span><span class="s3">(</span><span class="s1">GraphicsContextBase</span><span class="s3">):</span>
+    <span class="s1">_joind </span><span class="s3">= {</span>
+        <span class="s6">'bevel'</span><span class="s3">:  </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">LINE_JOIN_BEVEL</span><span class="s3">,</span>
+        <span class="s6">'miter'</span><span class="s3">:  </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">LINE_JOIN_MITER</span><span class="s3">,</span>
+        <span class="s6">'round'</span><span class="s3">:  </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">LINE_JOIN_ROUND</span><span class="s3">,</span>
+    <span class="s3">}</span>
+
+    <span class="s1">_capd </span><span class="s3">= {</span>
+        <span class="s6">'butt'</span><span class="s3">:        </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">LINE_CAP_BUTT</span><span class="s3">,</span>
+        <span class="s6">'projecting'</span><span class="s3">:  </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">LINE_CAP_SQUARE</span><span class="s3">,</span>
+        <span class="s6">'round'</span><span class="s3">:       </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">LINE_CAP_ROUND</span><span class="s3">,</span>
+    <span class="s3">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">__init__</span><span class="s3">()</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">renderer </span><span class="s3">= </span><span class="s1">renderer</span>
+
+    <span class="s2">def </span><span class="s1">restore</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">restore</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">set_alpha</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">set_alpha</span><span class="s3">(</span><span class="s1">alpha</span><span class="s3">)</span>
+        <span class="s1">_set_rgba</span><span class="s3">(</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_rgb</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_alpha</span><span class="s3">(), </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_forced_alpha</span><span class="s3">())</span>
+
+    <span class="s2">def </span><span class="s1">set_antialiased</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">b</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_antialias</span><span class="s3">(</span>
+            <span class="s1">cairo</span><span class="s3">.</span><span class="s1">ANTIALIAS_DEFAULT </span><span class="s2">if </span><span class="s1">b </span><span class="s2">else </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">ANTIALIAS_NONE</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_antialiased</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">get_antialias</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">set_capstyle</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">cs</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_line_cap</span><span class="s3">(</span><span class="s1">_api</span><span class="s3">.</span><span class="s1">check_getitem</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_capd</span><span class="s3">, </span><span class="s1">capstyle</span><span class="s3">=</span><span class="s1">cs</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_capstyle </span><span class="s3">= </span><span class="s1">cs</span>
+
+    <span class="s2">def </span><span class="s1">set_clip_rectangle</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">rectangle</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">rectangle</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s1">x</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">round</span><span class="s3">(</span><span class="s1">rectangle</span><span class="s3">.</span><span class="s1">bounds</span><span class="s3">)</span>
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">rectangle</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">renderer</span><span class="s3">.</span><span class="s1">height </span><span class="s3">- </span><span class="s1">h </span><span class="s3">- </span><span class="s1">y</span><span class="s3">, </span><span class="s1">w</span><span class="s3">, </span><span class="s1">h</span><span class="s3">)</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">clip</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">set_clip_path</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">path</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">path</span><span class="s3">:</span>
+            <span class="s2">return</span>
+        <span class="s1">tpath</span><span class="s3">, </span><span class="s1">affine </span><span class="s3">= </span><span class="s1">path</span><span class="s3">.</span><span class="s1">get_transformed_path_and_affine</span><span class="s3">()</span>
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">new_path</span><span class="s3">()</span>
+        <span class="s1">affine </span><span class="s3">= (</span><span class="s1">affine</span>
+                  <span class="s3">+ </span><span class="s1">Affine2D</span><span class="s3">().</span><span class="s1">scale</span><span class="s3">(</span><span class="s4">1</span><span class="s3">, -</span><span class="s4">1</span><span class="s3">).</span><span class="s1">translate</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">renderer</span><span class="s3">.</span><span class="s1">height</span><span class="s3">))</span>
+        <span class="s1">_append_path</span><span class="s3">(</span><span class="s1">ctx</span><span class="s3">, </span><span class="s1">tpath</span><span class="s3">, </span><span class="s1">affine</span><span class="s3">)</span>
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">clip</span><span class="s3">()</span>
+
+    <span class="s2">def </span><span class="s1">set_dashes</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">dashes</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_dashes </span><span class="s3">= </span><span class="s1">offset</span><span class="s3">, </span><span class="s1">dashes</span>
+        <span class="s2">if </span><span class="s1">dashes </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_dash</span><span class="s3">([], </span><span class="s4">0</span><span class="s3">)  </span><span class="s5"># switch dashes off</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_dash</span><span class="s3">(</span>
+                <span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">renderer</span><span class="s3">.</span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">dashes</span><span class="s3">))),</span>
+                <span class="s1">offset</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">set_foreground</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fg</span><span class="s3">, </span><span class="s1">isRGBA</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">super</span><span class="s3">().</span><span class="s1">set_foreground</span><span class="s3">(</span><span class="s1">fg</span><span class="s3">, </span><span class="s1">isRGBA</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_rgb</span><span class="s3">) == </span><span class="s4">3</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_source_rgb</span><span class="s3">(*</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_rgb</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_source_rgba</span><span class="s3">(*</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_rgb</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">get_rgb</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">get_source</span><span class="s3">().</span><span class="s1">get_rgba</span><span class="s3">()[:</span><span class="s4">3</span><span class="s3">]</span>
+
+    <span class="s2">def </span><span class="s1">set_joinstyle</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">js</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_line_join</span><span class="s3">(</span><span class="s1">_api</span><span class="s3">.</span><span class="s1">check_getitem</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_joind</span><span class="s3">, </span><span class="s1">joinstyle</span><span class="s3">=</span><span class="s1">js</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_joinstyle </span><span class="s3">= </span><span class="s1">js</span>
+
+    <span class="s2">def </span><span class="s1">set_linewidth</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">w</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_linewidth </span><span class="s3">= </span><span class="s1">float</span><span class="s3">(</span><span class="s1">w</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">set_line_width</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">renderer</span><span class="s3">.</span><span class="s1">points_to_pixels</span><span class="s3">(</span><span class="s1">w</span><span class="s3">))</span>
+
+
+<span class="s2">class </span><span class="s1">_CairoRegion</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">slices</span><span class="s3">, </span><span class="s1">data</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_slices </span><span class="s3">= </span><span class="s1">slices</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_data </span><span class="s3">= </span><span class="s1">data</span>
+
+
+<span class="s2">class </span><span class="s1">FigureCanvasCairo</span><span class="s3">(</span><span class="s1">FigureCanvasBase</span><span class="s3">):</span>
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">_renderer</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5"># In theory, _renderer should be set in __init__, but GUI canvas</span>
+        <span class="s5"># subclasses (FigureCanvasFooCairo) don't always interact well with</span>
+        <span class="s5"># multiple inheritance (FigureCanvasFoo inits but doesn't super-init</span>
+        <span class="s5"># FigureCanvasCairo), so initialize it in the getter instead.</span>
+        <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s6">&quot;_cached_renderer&quot;</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_cached_renderer </span><span class="s3">= </span><span class="s1">RendererCairo</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">.</span><span class="s1">dpi</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_cached_renderer</span>
+
+    <span class="s2">def </span><span class="s1">get_renderer</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span>
+
+    <span class="s2">def </span><span class="s1">copy_from_bbox</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">bbox</span><span class="s3">):</span>
+        <span class="s1">surface </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">get_target</span><span class="s3">()</span>
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">, </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">ImageSurface</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                <span class="s6">&quot;copy_from_bbox only works when rendering to an ImageSurface&quot;</span><span class="s3">)</span>
+        <span class="s1">sw </span><span class="s3">= </span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_width</span><span class="s3">()</span>
+        <span class="s1">sh </span><span class="s3">= </span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_height</span><span class="s3">()</span>
+        <span class="s1">x0 </span><span class="s3">= </span><span class="s1">math</span><span class="s3">.</span><span class="s1">ceil</span><span class="s3">(</span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x0</span><span class="s3">)</span>
+        <span class="s1">x1 </span><span class="s3">= </span><span class="s1">math</span><span class="s3">.</span><span class="s1">floor</span><span class="s3">(</span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x1</span><span class="s3">)</span>
+        <span class="s1">y0 </span><span class="s3">= </span><span class="s1">math</span><span class="s3">.</span><span class="s1">ceil</span><span class="s3">(</span><span class="s1">sh </span><span class="s3">- </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y1</span><span class="s3">)</span>
+        <span class="s1">y1 </span><span class="s3">= </span><span class="s1">math</span><span class="s3">.</span><span class="s1">floor</span><span class="s3">(</span><span class="s1">sh </span><span class="s3">- </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y0</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s3">(</span><span class="s4">0 </span><span class="s3">&lt;= </span><span class="s1">x0 </span><span class="s2">and </span><span class="s1">x1 </span><span class="s3">&lt;= </span><span class="s1">sw </span><span class="s2">and </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">&lt;= </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x1</span>
+                <span class="s2">and </span><span class="s4">0 </span><span class="s3">&lt;= </span><span class="s1">y0 </span><span class="s2">and </span><span class="s1">y1 </span><span class="s3">&lt;= </span><span class="s1">sh </span><span class="s2">and </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">&lt;= </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y1</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s6">&quot;Invalid bbox&quot;</span><span class="s3">)</span>
+        <span class="s1">sls </span><span class="s3">= </span><span class="s1">slice</span><span class="s3">(</span><span class="s1">y0</span><span class="s3">, </span><span class="s1">y0 </span><span class="s3">+ </span><span class="s1">max</span><span class="s3">(</span><span class="s1">y1 </span><span class="s3">- </span><span class="s1">y0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">)), </span><span class="s1">slice</span><span class="s3">(</span><span class="s1">x0</span><span class="s3">, </span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">max</span><span class="s3">(</span><span class="s1">x1 </span><span class="s3">- </span><span class="s1">x0</span><span class="s3">, </span><span class="s4">0</span><span class="s3">))</span>
+        <span class="s1">data </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">frombuffer</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_data</span><span class="s3">(), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint32</span><span class="s3">)</span>
+                <span class="s3">.</span><span class="s1">reshape</span><span class="s3">((</span><span class="s1">sh</span><span class="s3">, </span><span class="s1">sw</span><span class="s3">))[</span><span class="s1">sls</span><span class="s3">].</span><span class="s1">copy</span><span class="s3">())</span>
+        <span class="s2">return </span><span class="s1">_CairoRegion</span><span class="s3">(</span><span class="s1">sls</span><span class="s3">, </span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">restore_region</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">region</span><span class="s3">):</span>
+        <span class="s1">surface </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span><span class="s3">.</span><span class="s1">get_target</span><span class="s3">()</span>
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">, </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">ImageSurface</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span>
+                <span class="s6">&quot;restore_region only works when rendering to an ImageSurface&quot;</span><span class="s3">)</span>
+        <span class="s1">surface</span><span class="s3">.</span><span class="s1">flush</span><span class="s3">()</span>
+        <span class="s1">sw </span><span class="s3">= </span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_width</span><span class="s3">()</span>
+        <span class="s1">sh </span><span class="s3">= </span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_height</span><span class="s3">()</span>
+        <span class="s1">sly</span><span class="s3">, </span><span class="s1">slx </span><span class="s3">= </span><span class="s1">region</span><span class="s3">.</span><span class="s1">_slices</span>
+        <span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">frombuffer</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">.</span><span class="s1">get_data</span><span class="s3">(), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint32</span><span class="s3">)</span>
+         <span class="s3">.</span><span class="s1">reshape</span><span class="s3">((</span><span class="s1">sh</span><span class="s3">, </span><span class="s1">sw</span><span class="s3">))[</span><span class="s1">sly</span><span class="s3">, </span><span class="s1">slx</span><span class="s3">]) = </span><span class="s1">region</span><span class="s3">.</span><span class="s1">_data</span>
+        <span class="s1">surface</span><span class="s3">.</span><span class="s1">mark_dirty_rectangle</span><span class="s3">(</span>
+            <span class="s1">slx</span><span class="s3">.</span><span class="s1">start</span><span class="s3">, </span><span class="s1">sly</span><span class="s3">.</span><span class="s1">start</span><span class="s3">, </span><span class="s1">slx</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">- </span><span class="s1">slx</span><span class="s3">.</span><span class="s1">start</span><span class="s3">, </span><span class="s1">sly</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">- </span><span class="s1">sly</span><span class="s3">.</span><span class="s1">start</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">print_png</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fobj</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_get_printed_image_surface</span><span class="s3">().</span><span class="s1">write_to_png</span><span class="s3">(</span><span class="s1">fobj</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">print_rgba</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fobj</span><span class="s3">):</span>
+        <span class="s1">width</span><span class="s3">, </span><span class="s1">height </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_width_height</span><span class="s3">()</span>
+        <span class="s1">buf </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_get_printed_image_surface</span><span class="s3">().</span><span class="s1">get_data</span><span class="s3">()</span>
+        <span class="s1">fobj</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">cbook</span><span class="s3">.</span><span class="s1">_premultiplied_argb32_to_unmultiplied_rgba8888</span><span class="s3">(</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">).</span><span class="s1">reshape</span><span class="s3">((</span><span class="s1">width</span><span class="s3">, </span><span class="s1">height</span><span class="s3">, </span><span class="s4">4</span><span class="s3">))))</span>
+
+    <span class="s1">print_raw </span><span class="s3">= </span><span class="s1">print_rgba</span>
+
+    <span class="s2">def </span><span class="s1">_get_printed_image_surface</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">.</span><span class="s1">dpi</span>
+        <span class="s1">width</span><span class="s3">, </span><span class="s1">height </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">get_width_height</span><span class="s3">()</span>
+        <span class="s1">surface </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">ImageSurface</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">FORMAT_ARGB32</span><span class="s3">, </span><span class="s1">width</span><span class="s3">, </span><span class="s1">height</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">.</span><span class="s1">set_context</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">Context</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">.</span><span class="s1">draw</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">surface</span>
+
+    <span class="s2">def </span><span class="s1">_save</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">fmt</span><span class="s3">, </span><span class="s1">fobj</span><span class="s3">, *, </span><span class="s1">orientation</span><span class="s3">=</span><span class="s6">'portrait'</span><span class="s3">):</span>
+        <span class="s5"># save PDF/PS/SVG</span>
+
+        <span class="s1">dpi </span><span class="s3">= </span><span class="s4">72</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">dpi</span>
+        <span class="s1">w_in</span><span class="s3">, </span><span class="s1">h_in </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">.</span><span class="s1">get_size_inches</span><span class="s3">()</span>
+        <span class="s1">width_in_points</span><span class="s3">, </span><span class="s1">height_in_points </span><span class="s3">= </span><span class="s1">w_in </span><span class="s3">* </span><span class="s1">dpi</span><span class="s3">, </span><span class="s1">h_in </span><span class="s3">* </span><span class="s1">dpi</span>
+
+        <span class="s2">if </span><span class="s1">orientation </span><span class="s3">== </span><span class="s6">'landscape'</span><span class="s3">:</span>
+            <span class="s1">width_in_points</span><span class="s3">, </span><span class="s1">height_in_points </span><span class="s3">= (</span>
+                <span class="s1">height_in_points</span><span class="s3">, </span><span class="s1">width_in_points</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">fmt </span><span class="s3">== </span><span class="s6">'ps'</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">, </span><span class="s6">'PSSurface'</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s6">'cairo has not been compiled with PS '</span>
+                                   <span class="s6">'support enabled'</span><span class="s3">)</span>
+            <span class="s1">surface </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">PSSurface</span><span class="s3">(</span><span class="s1">fobj</span><span class="s3">, </span><span class="s1">width_in_points</span><span class="s3">, </span><span class="s1">height_in_points</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">fmt </span><span class="s3">== </span><span class="s6">'pdf'</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">, </span><span class="s6">'PDFSurface'</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s6">'cairo has not been compiled with PDF '</span>
+                                   <span class="s6">'support enabled'</span><span class="s3">)</span>
+            <span class="s1">surface </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">PDFSurface</span><span class="s3">(</span><span class="s1">fobj</span><span class="s3">, </span><span class="s1">width_in_points</span><span class="s3">, </span><span class="s1">height_in_points</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">fmt </span><span class="s2">in </span><span class="s3">(</span><span class="s6">'svg'</span><span class="s3">, </span><span class="s6">'svgz'</span><span class="s3">):</span>
+            <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">, </span><span class="s6">'SVGSurface'</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">RuntimeError</span><span class="s3">(</span><span class="s6">'cairo has not been compiled with SVG '</span>
+                                   <span class="s6">'support enabled'</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">fmt </span><span class="s3">== </span><span class="s6">'svgz'</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">fobj</span><span class="s3">, </span><span class="s1">str</span><span class="s3">):</span>
+                    <span class="s1">fobj </span><span class="s3">= </span><span class="s1">gzip</span><span class="s3">.</span><span class="s1">GzipFile</span><span class="s3">(</span><span class="s1">fobj</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">fobj </span><span class="s3">= </span><span class="s1">gzip</span><span class="s3">.</span><span class="s1">GzipFile</span><span class="s3">(</span><span class="s2">None</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">, </span><span class="s1">fileobj</span><span class="s3">=</span><span class="s1">fobj</span><span class="s3">)</span>
+            <span class="s1">surface </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">SVGSurface</span><span class="s3">(</span><span class="s1">fobj</span><span class="s3">, </span><span class="s1">width_in_points</span><span class="s3">, </span><span class="s1">height_in_points</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s6">f&quot;Unknown format: </span><span class="s2">{</span><span class="s1">fmt</span><span class="s2">!r}</span><span class="s6">&quot;</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">.</span><span class="s1">dpi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">.</span><span class="s1">dpi</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">.</span><span class="s1">set_context</span><span class="s3">(</span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">Context</span><span class="s3">(</span><span class="s1">surface</span><span class="s3">))</span>
+        <span class="s1">ctx </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">.</span><span class="s1">gc</span><span class="s3">.</span><span class="s1">ctx</span>
+
+        <span class="s2">if </span><span class="s1">orientation </span><span class="s3">== </span><span class="s6">'landscape'</span><span class="s3">:</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">rotate</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">pi </span><span class="s3">/ </span><span class="s4">2</span><span class="s3">)</span>
+            <span class="s1">ctx</span><span class="s3">.</span><span class="s1">translate</span><span class="s3">(</span><span class="s4">0</span><span class="s3">, -</span><span class="s1">height_in_points</span><span class="s3">)</span>
+            <span class="s5"># Perhaps add an '%%Orientation: Landscape' comment?</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">.</span><span class="s1">draw</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">_renderer</span><span class="s3">)</span>
+
+        <span class="s1">ctx</span><span class="s3">.</span><span class="s1">show_page</span><span class="s3">()</span>
+        <span class="s1">surface</span><span class="s3">.</span><span class="s1">finish</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">fmt </span><span class="s3">== </span><span class="s6">'svgz'</span><span class="s3">:</span>
+            <span class="s1">fobj</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+
+    <span class="s1">print_pdf </span><span class="s3">= </span><span class="s1">functools</span><span class="s3">.</span><span class="s1">partialmethod</span><span class="s3">(</span><span class="s1">_save</span><span class="s3">, </span><span class="s6">&quot;pdf&quot;</span><span class="s3">)</span>
+    <span class="s1">print_ps </span><span class="s3">= </span><span class="s1">functools</span><span class="s3">.</span><span class="s1">partialmethod</span><span class="s3">(</span><span class="s1">_save</span><span class="s3">, </span><span class="s6">&quot;ps&quot;</span><span class="s3">)</span>
+    <span class="s1">print_svg </span><span class="s3">= </span><span class="s1">functools</span><span class="s3">.</span><span class="s1">partialmethod</span><span class="s3">(</span><span class="s1">_save</span><span class="s3">, </span><span class="s6">&quot;svg&quot;</span><span class="s3">)</span>
+    <span class="s1">print_svgz </span><span class="s3">= </span><span class="s1">functools</span><span class="s3">.</span><span class="s1">partialmethod</span><span class="s3">(</span><span class="s1">_save</span><span class="s3">, </span><span class="s6">&quot;svgz&quot;</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">_Backend</span><span class="s3">.</span><span class="s1">export</span>
+<span class="s2">class </span><span class="s1">_BackendCairo</span><span class="s3">(</span><span class="s1">_Backend</span><span class="s3">):</span>
+    <span class="s1">backend_version </span><span class="s3">= </span><span class="s1">cairo</span><span class="s3">.</span><span class="s1">version</span>
+    <span class="s1">FigureCanvas </span><span class="s3">= </span><span class="s1">FigureCanvasCairo</span>
+    <span class="s1">FigureManager </span><span class="s3">= </span><span class="s1">FigureManagerBase</span>
+</pre>
+</body>
+</html>

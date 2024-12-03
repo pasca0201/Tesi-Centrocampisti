@@ -1,0 +1,331 @@
+<html>
+<head>
+<title>_quantile.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #5f826b; font-style: italic;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_quantile.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># Authors: David Dale &lt;dale.david@mail.ru&gt;</span>
+<span class="s0">#          Christian Lorentzen &lt;lorentzen.ch@gmail.com&gt;</span>
+<span class="s0"># License: BSD 3 clause</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">from </span><span class="s1">numbers </span><span class="s2">import </span><span class="s1">Real</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">scipy </span><span class="s2">import </span><span class="s1">sparse</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">optimize </span><span class="s2">import </span><span class="s1">linprog</span>
+
+<span class="s2">from </span><span class="s3">..</span><span class="s1">base </span><span class="s2">import </span><span class="s1">BaseEstimator</span><span class="s3">, </span><span class="s1">RegressorMixin</span><span class="s3">, </span><span class="s1">_fit_context</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">exceptions </span><span class="s2">import </span><span class="s1">ConvergenceWarning</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils </span><span class="s2">import </span><span class="s1">_safe_indexing</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">_param_validation </span><span class="s2">import </span><span class="s1">Interval</span><span class="s3">, </span><span class="s1">StrOptions</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">fixes </span><span class="s2">import </span><span class="s1">parse_version</span><span class="s3">, </span><span class="s1">sp_version</span>
+<span class="s2">from </span><span class="s3">..</span><span class="s1">utils</span><span class="s3">.</span><span class="s1">validation </span><span class="s2">import </span><span class="s1">_check_sample_weight</span>
+<span class="s2">from </span><span class="s3">.</span><span class="s1">_base </span><span class="s2">import </span><span class="s1">LinearModel</span>
+
+
+<span class="s2">class </span><span class="s1">QuantileRegressor</span><span class="s3">(</span><span class="s1">LinearModel</span><span class="s3">, </span><span class="s1">RegressorMixin</span><span class="s3">, </span><span class="s1">BaseEstimator</span><span class="s3">):</span>
+    <span class="s4">&quot;&quot;&quot;Linear regression model that predicts conditional quantiles. 
+ 
+    The linear :class:`QuantileRegressor` optimizes the pinball loss for a 
+    desired `quantile` and is robust to outliers. 
+ 
+    This model uses an L1 regularization like 
+    :class:`~sklearn.linear_model.Lasso`. 
+ 
+    Read more in the :ref:`User Guide &lt;quantile_regression&gt;`. 
+ 
+    .. versionadded:: 1.0 
+ 
+    Parameters 
+    ---------- 
+    quantile : float, default=0.5 
+        The quantile that the model tries to predict. It must be strictly 
+        between 0 and 1. If 0.5 (default), the model predicts the 50% 
+        quantile, i.e. the median. 
+ 
+    alpha : float, default=1.0 
+        Regularization constant that multiplies the L1 penalty term. 
+ 
+    fit_intercept : bool, default=True 
+        Whether or not to fit the intercept. 
+ 
+    solver : {'highs-ds', 'highs-ipm', 'highs', 'interior-point', \ 
+            'revised simplex'}, default='highs' 
+        Method used by :func:`scipy.optimize.linprog` to solve the linear 
+        programming formulation. 
+ 
+        From `scipy&gt;=1.6.0`, it is recommended to use the highs methods because 
+        they are the fastest ones. Solvers &quot;highs-ds&quot;, &quot;highs-ipm&quot; and &quot;highs&quot; 
+        support sparse input data and, in fact, always convert to sparse csc. 
+ 
+        From `scipy&gt;=1.11.0`, &quot;interior-point&quot; is not available anymore. 
+ 
+        .. versionchanged:: 1.4 
+           The default of `solver` changed to `&quot;highs&quot;` in version 1.4. 
+ 
+    solver_options : dict, default=None 
+        Additional parameters passed to :func:`scipy.optimize.linprog` as 
+        options. If `None` and if `solver='interior-point'`, then 
+        `{&quot;lstsq&quot;: True}` is passed to :func:`scipy.optimize.linprog` for the 
+        sake of stability. 
+ 
+    Attributes 
+    ---------- 
+    coef_ : array of shape (n_features,) 
+        Estimated coefficients for the features. 
+ 
+    intercept_ : float 
+        The intercept of the model, aka bias term. 
+ 
+    n_features_in_ : int 
+        Number of features seen during :term:`fit`. 
+ 
+        .. versionadded:: 0.24 
+ 
+    feature_names_in_ : ndarray of shape (`n_features_in_`,) 
+        Names of features seen during :term:`fit`. Defined only when `X` 
+        has feature names that are all strings. 
+ 
+        .. versionadded:: 1.0 
+ 
+    n_iter_ : int 
+        The actual number of iterations performed by the solver. 
+ 
+    See Also 
+    -------- 
+    Lasso : The Lasso is a linear model that estimates sparse coefficients 
+        with l1 regularization. 
+    HuberRegressor : Linear regression model that is robust to outliers. 
+ 
+    Examples 
+    -------- 
+    &gt;&gt;&gt; from sklearn.linear_model import QuantileRegressor 
+    &gt;&gt;&gt; import numpy as np 
+    &gt;&gt;&gt; n_samples, n_features = 10, 2 
+    &gt;&gt;&gt; rng = np.random.RandomState(0) 
+    &gt;&gt;&gt; y = rng.randn(n_samples) 
+    &gt;&gt;&gt; X = rng.randn(n_samples, n_features) 
+    &gt;&gt;&gt; # the two following lines are optional in practice 
+    &gt;&gt;&gt; from sklearn.utils.fixes import sp_version, parse_version 
+    &gt;&gt;&gt; solver = &quot;highs&quot; if sp_version &gt;= parse_version(&quot;1.6.0&quot;) else &quot;interior-point&quot; 
+    &gt;&gt;&gt; reg = QuantileRegressor(quantile=0.8, solver=solver).fit(X, y) 
+    &gt;&gt;&gt; np.mean(y &lt;= reg.predict(X)) 
+    np.float64(0.8) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">_parameter_constraints</span><span class="s3">: </span><span class="s1">dict </span><span class="s3">= {</span>
+        <span class="s5">&quot;quantile&quot;</span><span class="s3">: [</span><span class="s1">Interval</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s5">&quot;neither&quot;</span><span class="s3">)],</span>
+        <span class="s5">&quot;alpha&quot;</span><span class="s3">: [</span><span class="s1">Interval</span><span class="s3">(</span><span class="s1">Real</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">closed</span><span class="s3">=</span><span class="s5">&quot;left&quot;</span><span class="s3">)],</span>
+        <span class="s5">&quot;fit_intercept&quot;</span><span class="s3">: [</span><span class="s5">&quot;boolean&quot;</span><span class="s3">],</span>
+        <span class="s5">&quot;solver&quot;</span><span class="s3">: [</span>
+            <span class="s1">StrOptions</span><span class="s3">(</span>
+                <span class="s3">{</span>
+                    <span class="s5">&quot;highs-ds&quot;</span><span class="s3">,</span>
+                    <span class="s5">&quot;highs-ipm&quot;</span><span class="s3">,</span>
+                    <span class="s5">&quot;highs&quot;</span><span class="s3">,</span>
+                    <span class="s5">&quot;interior-point&quot;</span><span class="s3">,</span>
+                    <span class="s5">&quot;revised simplex&quot;</span><span class="s3">,</span>
+                <span class="s3">}</span>
+            <span class="s3">),</span>
+        <span class="s3">],</span>
+        <span class="s5">&quot;solver_options&quot;</span><span class="s3">: [</span><span class="s1">dict</span><span class="s3">, </span><span class="s2">None</span><span class="s3">],</span>
+    <span class="s3">}</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span>
+        <span class="s1">self</span><span class="s3">,</span>
+        <span class="s3">*,</span>
+        <span class="s1">quantile</span><span class="s3">=</span><span class="s6">0.5</span><span class="s3">,</span>
+        <span class="s1">alpha</span><span class="s3">=</span><span class="s6">1.0</span><span class="s3">,</span>
+        <span class="s1">fit_intercept</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+        <span class="s1">solver</span><span class="s3">=</span><span class="s5">&quot;highs&quot;</span><span class="s3">,</span>
+        <span class="s1">solver_options</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+    <span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">quantile </span><span class="s3">= </span><span class="s1">quantile</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">alpha </span><span class="s3">= </span><span class="s1">alpha</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept </span><span class="s3">= </span><span class="s1">fit_intercept</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">solver </span><span class="s3">= </span><span class="s1">solver</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">solver_options </span><span class="s3">= </span><span class="s1">solver_options</span>
+
+    <span class="s3">@</span><span class="s1">_fit_context</span><span class="s3">(</span><span class="s1">prefer_skip_nested_validation</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s2">def </span><span class="s1">fit</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, </span><span class="s1">y</span><span class="s3">, </span><span class="s1">sample_weight</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s4">&quot;&quot;&quot;Fit the model according to the given training data. 
+ 
+        Parameters 
+        ---------- 
+        X : {array-like, sparse matrix} of shape (n_samples, n_features) 
+            Training data. 
+ 
+        y : array-like of shape (n_samples,) 
+            Target values. 
+ 
+        sample_weight : array-like of shape (n_samples,), default=None 
+            Sample weights. 
+ 
+        Returns 
+        ------- 
+        self : object 
+            Returns self. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">X</span><span class="s3">, </span><span class="s1">y </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_validate_data</span><span class="s3">(</span>
+            <span class="s1">X</span><span class="s3">,</span>
+            <span class="s1">y</span><span class="s3">,</span>
+            <span class="s1">accept_sparse</span><span class="s3">=[</span><span class="s5">&quot;csc&quot;</span><span class="s3">, </span><span class="s5">&quot;csr&quot;</span><span class="s3">, </span><span class="s5">&quot;coo&quot;</span><span class="s3">],</span>
+            <span class="s1">y_numeric</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+            <span class="s1">multi_output</span><span class="s3">=</span><span class="s2">False</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">sample_weight </span><span class="s3">= </span><span class="s1">_check_sample_weight</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">, </span><span class="s1">X</span><span class="s3">)</span>
+
+        <span class="s1">n_features </span><span class="s3">= </span><span class="s1">X</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span>
+        <span class="s1">n_params </span><span class="s3">= </span><span class="s1">n_features</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+            <span class="s1">n_params </span><span class="s3">+= </span><span class="s6">1</span>
+            <span class="s0"># Note that centering y and X with _preprocess_data does not work</span>
+            <span class="s0"># for quantile regression.</span>
+
+        <span class="s0"># The objective is defined as 1/n * sum(pinball loss) + alpha * L1.</span>
+        <span class="s0"># So we rescale the penalty term, which is equivalent.</span>
+        <span class="s1">alpha </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">) * </span><span class="s1">self</span><span class="s3">.</span><span class="s1">alpha</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">solver </span><span class="s2">in </span><span class="s3">(</span>
+            <span class="s5">&quot;highs-ds&quot;</span><span class="s3">,</span>
+            <span class="s5">&quot;highs-ipm&quot;</span><span class="s3">,</span>
+            <span class="s5">&quot;highs&quot;</span><span class="s3">,</span>
+        <span class="s3">) </span><span class="s2">and </span><span class="s1">sp_version </span><span class="s3">&lt; </span><span class="s1">parse_version</span><span class="s3">(</span><span class="s5">&quot;1.6.0&quot;</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s5">f&quot;Solver </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">solver</span><span class="s2">} </span><span class="s5">is only available &quot;</span>
+                <span class="s5">f&quot;with scipy&gt;=1.6.0, got </span><span class="s2">{</span><span class="s1">sp_version</span><span class="s2">}</span><span class="s5">&quot;</span>
+            <span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">solver </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">solver</span>
+
+        <span class="s2">if </span><span class="s1">solver </span><span class="s3">== </span><span class="s5">&quot;interior-point&quot; </span><span class="s2">and </span><span class="s1">sp_version </span><span class="s3">&gt;= </span><span class="s1">parse_version</span><span class="s3">(</span><span class="s5">&quot;1.11.0&quot;</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s5">f&quot;Solver </span><span class="s2">{</span><span class="s1">solver</span><span class="s2">} </span><span class="s5">is not anymore available in SciPy &gt;= 1.11.0.&quot;</span>
+            <span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">issparse</span><span class="s3">(</span><span class="s1">X</span><span class="s3">) </span><span class="s2">and </span><span class="s1">solver </span><span class="s2">not in </span><span class="s3">[</span><span class="s5">&quot;highs&quot;</span><span class="s3">, </span><span class="s5">&quot;highs-ds&quot;</span><span class="s3">, </span><span class="s5">&quot;highs-ipm&quot;</span><span class="s3">]:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span>
+                <span class="s5">f&quot;Solver </span><span class="s2">{</span><span class="s1">self</span><span class="s3">.</span><span class="s1">solver</span><span class="s2">} </span><span class="s5">does not support sparse X. &quot;</span>
+                <span class="s5">&quot;Use solver 'highs' for example.&quot;</span>
+            <span class="s3">)</span>
+        <span class="s0"># make default solver more stable</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">solver_options </span><span class="s2">is None and </span><span class="s1">solver </span><span class="s3">== </span><span class="s5">&quot;interior-point&quot;</span><span class="s3">:</span>
+            <span class="s1">solver_options </span><span class="s3">= {</span><span class="s5">&quot;lstsq&quot;</span><span class="s3">: </span><span class="s2">True</span><span class="s3">}</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">solver_options </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">solver_options</span>
+
+        <span class="s0"># After rescaling alpha, the minimization problem is</span>
+        <span class="s0">#     min sum(pinball loss) + alpha * L1</span>
+        <span class="s0"># Use linear programming formulation of quantile regression</span>
+        <span class="s0">#     min_x c x</span>
+        <span class="s0">#           A_eq x = b_eq</span>
+        <span class="s0">#                0 &lt;= x</span>
+        <span class="s0"># x = (s0, s, t0, t, u, v) = slack variables &gt;= 0</span>
+        <span class="s0"># intercept = s0 - t0</span>
+        <span class="s0"># coef = s - t</span>
+        <span class="s0"># c = (0, alpha * 1_p, 0, alpha * 1_p, quantile * 1_n, (1-quantile) * 1_n)</span>
+        <span class="s0"># residual = y - X@coef - intercept = u - v</span>
+        <span class="s0"># A_eq = (1_n, X, -1_n, -X, diag(1_n), -diag(1_n))</span>
+        <span class="s0"># b_eq = y</span>
+        <span class="s0"># p = n_features</span>
+        <span class="s0"># n = n_samples</span>
+        <span class="s0"># 1_n = vector of length n with entries equal one</span>
+        <span class="s0"># see https://stats.stackexchange.com/questions/384909/</span>
+        <span class="s0">#</span>
+        <span class="s0"># Filtering out zero sample weights from the beginning makes life</span>
+        <span class="s0"># easier for the linprog solver.</span>
+        <span class="s1">indices </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s1">n_indices </span><span class="s3">= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">indices</span><span class="s3">)  </span><span class="s0"># use n_mask instead of n_samples</span>
+        <span class="s2">if </span><span class="s1">n_indices </span><span class="s3">&lt; </span><span class="s1">len</span><span class="s3">(</span><span class="s1">sample_weight</span><span class="s3">):</span>
+            <span class="s1">sample_weight </span><span class="s3">= </span><span class="s1">sample_weight</span><span class="s3">[</span><span class="s1">indices</span><span class="s3">]</span>
+            <span class="s1">X </span><span class="s3">= </span><span class="s1">_safe_indexing</span><span class="s3">(</span><span class="s1">X</span><span class="s3">, </span><span class="s1">indices</span><span class="s3">)</span>
+            <span class="s1">y </span><span class="s3">= </span><span class="s1">_safe_indexing</span><span class="s3">(</span><span class="s1">y</span><span class="s3">, </span><span class="s1">indices</span><span class="s3">)</span>
+        <span class="s1">c </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">(</span>
+            <span class="s3">[</span>
+                <span class="s1">np</span><span class="s3">.</span><span class="s1">full</span><span class="s3">(</span><span class="s6">2 </span><span class="s3">* </span><span class="s1">n_params</span><span class="s3">, </span><span class="s1">fill_value</span><span class="s3">=</span><span class="s1">alpha</span><span class="s3">),</span>
+                <span class="s1">sample_weight </span><span class="s3">* </span><span class="s1">self</span><span class="s3">.</span><span class="s1">quantile</span><span class="s3">,</span>
+                <span class="s1">sample_weight </span><span class="s3">* (</span><span class="s6">1 </span><span class="s3">- </span><span class="s1">self</span><span class="s3">.</span><span class="s1">quantile</span><span class="s3">),</span>
+            <span class="s3">]</span>
+        <span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+            <span class="s0"># do not penalize the intercept</span>
+            <span class="s1">c</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] = </span><span class="s6">0</span>
+            <span class="s1">c</span><span class="s3">[</span><span class="s1">n_params</span><span class="s3">] = </span><span class="s6">0</span>
+
+        <span class="s2">if </span><span class="s1">solver </span><span class="s2">in </span><span class="s3">[</span><span class="s5">&quot;highs&quot;</span><span class="s3">, </span><span class="s5">&quot;highs-ds&quot;</span><span class="s3">, </span><span class="s5">&quot;highs-ipm&quot;</span><span class="s3">]:</span>
+            <span class="s0"># Note that highs methods always use a sparse CSC memory layout internally,</span>
+            <span class="s0"># even for optimization problems parametrized using dense numpy arrays.</span>
+            <span class="s0"># Therefore, we work with CSC matrices as early as possible to limit</span>
+            <span class="s0"># unnecessary repeated memory copies.</span>
+            <span class="s1">eye </span><span class="s3">= </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">eye</span><span class="s3">(</span><span class="s1">n_indices</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">X</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">format</span><span class="s3">=</span><span class="s5">&quot;csc&quot;</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">ones </span><span class="s3">= </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">csc_matrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">=(</span><span class="s1">n_indices</span><span class="s3">, </span><span class="s6">1</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">X</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">))</span>
+                <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">hstack</span><span class="s3">([</span><span class="s1">ones</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, -</span><span class="s1">ones</span><span class="s3">, -</span><span class="s1">X</span><span class="s3">, </span><span class="s1">eye</span><span class="s3">, -</span><span class="s1">eye</span><span class="s3">], </span><span class="s1">format</span><span class="s3">=</span><span class="s5">&quot;csc&quot;</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">hstack</span><span class="s3">([</span><span class="s1">X</span><span class="s3">, -</span><span class="s1">X</span><span class="s3">, </span><span class="s1">eye</span><span class="s3">, -</span><span class="s1">eye</span><span class="s3">], </span><span class="s1">format</span><span class="s3">=</span><span class="s5">&quot;csc&quot;</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">eye </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">eye</span><span class="s3">(</span><span class="s1">n_indices</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+                <span class="s1">ones </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s1">n_indices</span><span class="s3">, </span><span class="s6">1</span><span class="s3">))</span>
+                <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">([</span><span class="s1">ones</span><span class="s3">, </span><span class="s1">X</span><span class="s3">, -</span><span class="s1">ones</span><span class="s3">, -</span><span class="s1">X</span><span class="s3">, </span><span class="s1">eye</span><span class="s3">, -</span><span class="s1">eye</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=</span><span class="s6">1</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">A_eq </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">concatenate</span><span class="s3">([</span><span class="s1">X</span><span class="s3">, -</span><span class="s1">X</span><span class="s3">, </span><span class="s1">eye</span><span class="s3">, -</span><span class="s1">eye</span><span class="s3">], </span><span class="s1">axis</span><span class="s3">=</span><span class="s6">1</span><span class="s3">)</span>
+
+        <span class="s1">b_eq </span><span class="s3">= </span><span class="s1">y</span>
+
+        <span class="s1">result </span><span class="s3">= </span><span class="s1">linprog</span><span class="s3">(</span>
+            <span class="s1">c</span><span class="s3">=</span><span class="s1">c</span><span class="s3">,</span>
+            <span class="s1">A_eq</span><span class="s3">=</span><span class="s1">A_eq</span><span class="s3">,</span>
+            <span class="s1">b_eq</span><span class="s3">=</span><span class="s1">b_eq</span><span class="s3">,</span>
+            <span class="s1">method</span><span class="s3">=</span><span class="s1">solver</span><span class="s3">,</span>
+            <span class="s1">options</span><span class="s3">=</span><span class="s1">solver_options</span><span class="s3">,</span>
+        <span class="s3">)</span>
+        <span class="s1">solution </span><span class="s3">= </span><span class="s1">result</span><span class="s3">.</span><span class="s1">x</span>
+        <span class="s2">if not </span><span class="s1">result</span><span class="s3">.</span><span class="s1">success</span><span class="s3">:</span>
+            <span class="s1">failure </span><span class="s3">= {</span>
+                <span class="s6">1</span><span class="s3">: </span><span class="s5">&quot;Iteration limit reached.&quot;</span><span class="s3">,</span>
+                <span class="s6">2</span><span class="s3">: </span><span class="s5">&quot;Problem appears to be infeasible.&quot;</span><span class="s3">,</span>
+                <span class="s6">3</span><span class="s3">: </span><span class="s5">&quot;Problem appears to be unbounded.&quot;</span><span class="s3">,</span>
+                <span class="s6">4</span><span class="s3">: </span><span class="s5">&quot;Numerical difficulties encountered.&quot;</span><span class="s3">,</span>
+            <span class="s3">}</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span>
+                <span class="s5">&quot;Linear programming for QuantileRegressor did not succeed.</span><span class="s2">\n</span><span class="s5">&quot;</span>
+                <span class="s5">f&quot;Status is </span><span class="s2">{</span><span class="s1">result</span><span class="s3">.</span><span class="s1">status</span><span class="s2">}</span><span class="s5">: &quot;</span>
+                <span class="s3">+ </span><span class="s1">failure</span><span class="s3">.</span><span class="s1">setdefault</span><span class="s3">(</span><span class="s1">result</span><span class="s3">.</span><span class="s1">status</span><span class="s3">, </span><span class="s5">&quot;unknown reason&quot;</span><span class="s3">)</span>
+                <span class="s3">+ </span><span class="s5">&quot;</span><span class="s2">\n</span><span class="s5">&quot;</span>
+                <span class="s3">+ </span><span class="s5">&quot;Result message of linprog:</span><span class="s2">\n</span><span class="s5">&quot;</span>
+                <span class="s3">+ </span><span class="s1">result</span><span class="s3">.</span><span class="s1">message</span><span class="s3">,</span>
+                <span class="s1">ConvergenceWarning</span><span class="s3">,</span>
+            <span class="s3">)</span>
+
+        <span class="s0"># positive slack - negative slack</span>
+        <span class="s0"># solution is an array with (params_pos, params_neg, u, v)</span>
+        <span class="s1">params </span><span class="s3">= </span><span class="s1">solution</span><span class="s3">[:</span><span class="s1">n_params</span><span class="s3">] - </span><span class="s1">solution</span><span class="s3">[</span><span class="s1">n_params </span><span class="s3">: </span><span class="s6">2 </span><span class="s3">* </span><span class="s1">n_params</span><span class="s3">]</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">n_iter_ </span><span class="s3">= </span><span class="s1">result</span><span class="s3">.</span><span class="s1">nit</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">fit_intercept</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">coef_ </span><span class="s3">= </span><span class="s1">params</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">intercept_ </span><span class="s3">= </span><span class="s1">params</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">coef_ </span><span class="s3">= </span><span class="s1">params</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">intercept_ </span><span class="s3">= </span><span class="s6">0.0</span>
+        <span class="s2">return </span><span class="s1">self</span>
+</pre>
+</body>
+</html>

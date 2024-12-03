@@ -1,0 +1,817 @@
+<html>
+<head>
+<title>_constrained_layout.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_constrained_layout.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Adjust subplot layouts so that there are no overlapping Axes or Axes 
+decorations.  All Axes decorations are dealt with (labels, ticks, titles, 
+ticklabels) and some dependent artists are also dealt with (colorbar, 
+suptitle). 
+ 
+Layout is done via `~matplotlib.gridspec`, with one constraint per gridspec, 
+so it is possible to have overlapping Axes if the gridspecs overlap (i.e. 
+using `~matplotlib.gridspec.GridSpecFromSubplotSpec`).  Axes placed using 
+``figure.subplots()`` or ``figure.add_subplots()`` will participate in the 
+layout.  Axes manually placed via ``figure.add_axes()`` will not. 
+ 
+See Tutorial: :ref:`constrainedlayout_guide` 
+ 
+General idea: 
+------------- 
+ 
+First, a figure has a gridspec that divides the figure into nrows and ncols, 
+with heights and widths set by ``height_ratios`` and ``width_ratios``, 
+often just set to 1 for an equal grid. 
+ 
+Subplotspecs that are derived from this gridspec can contain either a 
+``SubPanel``, a ``GridSpecFromSubplotSpec``, or an ``Axes``.  The ``SubPanel`` 
+and ``GridSpecFromSubplotSpec`` are dealt with recursively and each contain an 
+analogous layout. 
+ 
+Each ``GridSpec`` has a ``_layoutgrid`` attached to it.  The ``_layoutgrid`` 
+has the same logical layout as the ``GridSpec``.   Each row of the grid spec 
+has a top and bottom &quot;margin&quot; and each column has a left and right &quot;margin&quot;. 
+The &quot;inner&quot; height of each row is constrained to be the same (or as modified 
+by ``height_ratio``), and the &quot;inner&quot; width of each column is 
+constrained to be the same (as modified by ``width_ratio``), where &quot;inner&quot; 
+is the width or height of each column/row minus the size of the margins. 
+ 
+Then the size of the margins for each row and column are determined as the 
+max width of the decorators on each Axes that has decorators in that margin. 
+For instance, a normal Axes would have a left margin that includes the 
+left ticklabels, and the ylabel if it exists.  The right margin may include a 
+colorbar, the bottom margin the xaxis decorations, and the top margin the 
+title. 
+ 
+With these constraints, the solver then finds appropriate bounds for the 
+columns and rows.  It's possible that the margins take up the whole figure, 
+in which case the algorithm is not applied and a warning is raised. 
+ 
+See the tutorial :ref:`constrainedlayout_guide` 
+for more discussion of the algorithm with examples. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">logging</span>
+
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+
+<span class="s2">from </span><span class="s1">matplotlib </span><span class="s2">import </span><span class="s1">_api</span><span class="s3">, </span><span class="s1">artist </span><span class="s2">as </span><span class="s1">martist</span>
+<span class="s2">import </span><span class="s1">matplotlib</span><span class="s3">.</span><span class="s1">transforms </span><span class="s2">as </span><span class="s1">mtransforms</span>
+<span class="s2">import </span><span class="s1">matplotlib</span><span class="s3">.</span><span class="s1">_layoutgrid </span><span class="s2">as </span><span class="s1">mlayoutgrid</span>
+
+
+<span class="s1">_log </span><span class="s3">= </span><span class="s1">logging</span><span class="s3">.</span><span class="s1">getLogger</span><span class="s3">(</span><span class="s1">__name__</span><span class="s3">)</span>
+
+
+<span class="s4">######################################################</span>
+<span class="s2">def </span><span class="s1">do_constrained_layout</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">, </span><span class="s1">w_pad</span><span class="s3">,</span>
+                          <span class="s1">hspace</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">rect</span><span class="s3">=(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s3">),</span>
+                          <span class="s1">compress</span><span class="s3">=</span><span class="s2">False</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Do the constrained_layout.  Called at draw time in 
+     ``figure.constrained_layout()`` 
+ 
+    Parameters 
+    ---------- 
+    fig : `~matplotlib.figure.Figure` 
+        `.Figure` instance to do the layout in. 
+ 
+    h_pad, w_pad : float 
+      Padding around the Axes elements in figure-normalized units. 
+ 
+    hspace, wspace : float 
+       Fraction of the figure to dedicate to space between the 
+       Axes.  These are evenly spread between the gaps between the Axes. 
+       A value of 0.2 for a three-column layout would have a space 
+       of 0.1 of the figure width between each column. 
+       If h/wspace &lt; h/w_pad, then the pads are used instead. 
+ 
+    rect : tuple of 4 floats 
+        Rectangle in figure coordinates to perform constrained layout in 
+        [left, bottom, width, height], each from 0-1. 
+ 
+    compress : bool 
+        Whether to shift Axes so that white space in between them is 
+        removed. This is useful for simple grids of fixed-aspect Axes (e.g. 
+        a grid of images). 
+ 
+    Returns 
+    ------- 
+    layoutgrid : private debugging structure 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">renderer </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_get_renderer</span><span class="s3">()</span>
+    <span class="s4"># make layoutgrid tree...</span>
+    <span class="s1">layoutgrids </span><span class="s3">= </span><span class="s1">make_layoutgrids</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">, </span><span class="s2">None</span><span class="s3">, </span><span class="s1">rect</span><span class="s3">=</span><span class="s1">rect</span><span class="s3">)</span>
+    <span class="s2">if not </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s6">'hasgrids'</span><span class="s3">]:</span>
+        <span class="s1">_api</span><span class="s3">.</span><span class="s1">warn_external</span><span class="s3">(</span><span class="s6">'There are no gridspecs with layoutgrids. '</span>
+                           <span class="s6">'Possibly did not call parent GridSpec with the'</span>
+                           <span class="s6">' &quot;figure&quot; keyword'</span><span class="s3">)</span>
+        <span class="s2">return</span>
+
+    <span class="s2">for </span><span class="s1">_ </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s5">2</span><span class="s3">):</span>
+        <span class="s4"># do the algorithm twice.  This has to be done because decorations</span>
+        <span class="s4"># change size after the first re-position (i.e. x/yticklabels get</span>
+        <span class="s4"># larger/smaller).  This second reposition tends to be much milder,</span>
+        <span class="s4"># so doing twice makes things work OK.</span>
+
+        <span class="s4"># make margins for all the Axes and subfigures in the</span>
+        <span class="s4"># figure.  Add margins for colorbars...</span>
+        <span class="s1">make_layout_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">,</span>
+                            <span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">hspace</span><span class="s3">=</span><span class="s1">hspace</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s1">wspace</span><span class="s3">)</span>
+        <span class="s1">make_margin_suptitles</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">,</span>
+                              <span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">)</span>
+
+        <span class="s4"># if a layout is such that a columns (or rows) margin has no</span>
+        <span class="s4"># constraints, we need to make all such instances in the grid</span>
+        <span class="s4"># match in margin size.</span>
+        <span class="s1">match_submerged_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">)</span>
+
+        <span class="s4"># update all the variables in the layout.</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">update_variables</span><span class="s3">()</span>
+
+        <span class="s1">warn_collapsed </span><span class="s3">= (</span><span class="s6">'constrained_layout not applied because '</span>
+                          <span class="s6">'axes sizes collapsed to zero.  Try making '</span>
+                          <span class="s6">'figure larger or Axes decorations smaller.'</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">check_no_collapsed_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">):</span>
+            <span class="s1">reposition_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">,</span>
+                            <span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">hspace</span><span class="s3">=</span><span class="s1">hspace</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s1">wspace</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">compress</span><span class="s3">:</span>
+                <span class="s1">layoutgrids </span><span class="s3">= </span><span class="s1">compress_fixed_aspect</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">)</span>
+                <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">update_variables</span><span class="s3">()</span>
+                <span class="s2">if </span><span class="s1">check_no_collapsed_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">):</span>
+                    <span class="s1">reposition_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">,</span>
+                                    <span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">hspace</span><span class="s3">=</span><span class="s1">hspace</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s1">wspace</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s1">_api</span><span class="s3">.</span><span class="s1">warn_external</span><span class="s3">(</span><span class="s1">warn_collapsed</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">_api</span><span class="s3">.</span><span class="s1">warn_external</span><span class="s3">(</span><span class="s1">warn_collapsed</span><span class="s3">)</span>
+        <span class="s1">reset_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">make_layoutgrids</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">, </span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">rect</span><span class="s3">=(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">1</span><span class="s3">)):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make the layoutgrid tree. 
+ 
+    (Sub)Figures get a layoutgrid so we can have figure margins. 
+ 
+    Gridspecs that are attached to Axes get a layoutgrid so Axes 
+    can have margins. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">layoutgrids </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">layoutgrids </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">()</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s6">'hasgrids'</span><span class="s3">] = </span><span class="s2">False</span>
+    <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">, </span><span class="s6">'_parent'</span><span class="s3">):</span>
+        <span class="s4"># top figure;  pass rect as parent to allow user-specified</span>
+        <span class="s4"># margins</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">] = </span><span class="s1">mlayoutgrid</span><span class="s3">.</span><span class="s1">LayoutGrid</span><span class="s3">(</span><span class="s1">parent</span><span class="s3">=</span><span class="s1">rect</span><span class="s3">, </span><span class="s1">name</span><span class="s3">=</span><span class="s6">'figlb'</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s4"># subfigure</span>
+        <span class="s1">gs </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_subplotspec</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+        <span class="s4"># it is possible the gridspec containing this subfigure hasn't</span>
+        <span class="s4"># been added to the tree yet:</span>
+        <span class="s1">layoutgrids </span><span class="s3">= </span><span class="s1">make_layoutgrids_gs</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">gs</span><span class="s3">)</span>
+        <span class="s4"># add the layoutgrid for the subfigure:</span>
+        <span class="s1">parentlb </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">]</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">] = </span><span class="s1">mlayoutgrid</span><span class="s3">.</span><span class="s1">LayoutGrid</span><span class="s3">(</span>
+            <span class="s1">parent</span><span class="s3">=</span><span class="s1">parentlb</span><span class="s3">,</span>
+            <span class="s1">name</span><span class="s3">=</span><span class="s6">'panellb'</span><span class="s3">,</span>
+            <span class="s1">parent_inner</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+            <span class="s1">nrows</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ncols</span><span class="s3">=</span><span class="s5">1</span><span class="s3">,</span>
+            <span class="s1">parent_pos</span><span class="s3">=(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_subplotspec</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">,</span>
+                        <span class="s1">fig</span><span class="s3">.</span><span class="s1">_subplotspec</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">))</span>
+    <span class="s4"># recursively do all subfigures in this figure...</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">subfigs</span><span class="s3">:</span>
+        <span class="s1">layoutgrids </span><span class="s3">= </span><span class="s1">make_layoutgrids</span><span class="s3">(</span><span class="s1">sfig</span><span class="s3">, </span><span class="s1">layoutgrids</span><span class="s3">)</span>
+
+    <span class="s4"># for each Axes at the local level add its gridspec:</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_localaxes</span><span class="s3">:</span>
+        <span class="s1">gs </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s1">layoutgrids </span><span class="s3">= </span><span class="s1">make_layoutgrids_gs</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">gs</span><span class="s3">)</span>
+
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">make_layoutgrids_gs</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">gs</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make the layoutgrid for a gridspec (and anything nested in the gridspec) 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">if </span><span class="s1">gs </span><span class="s2">in </span><span class="s1">layoutgrids </span><span class="s2">or </span><span class="s1">gs</span><span class="s3">.</span><span class="s1">figure </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">layoutgrids</span>
+    <span class="s4"># in order to do constrained_layout there has to be at least *one*</span>
+    <span class="s4"># gridspec in the tree:</span>
+    <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s6">'hasgrids'</span><span class="s3">] = </span><span class="s2">True</span>
+    <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">gs</span><span class="s3">, </span><span class="s6">'_subplot_spec'</span><span class="s3">):</span>
+        <span class="s4"># normal gridspec</span>
+        <span class="s1">parent </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">figure</span><span class="s3">]</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">] = </span><span class="s1">mlayoutgrid</span><span class="s3">.</span><span class="s1">LayoutGrid</span><span class="s3">(</span>
+                <span class="s1">parent</span><span class="s3">=</span><span class="s1">parent</span><span class="s3">,</span>
+                <span class="s1">parent_inner</span><span class="s3">=</span><span class="s2">True</span><span class="s3">,</span>
+                <span class="s1">name</span><span class="s3">=</span><span class="s6">'gridspec'</span><span class="s3">,</span>
+                <span class="s1">ncols</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_ncols</span><span class="s3">, </span><span class="s1">nrows</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_nrows</span><span class="s3">,</span>
+                <span class="s1">width_ratios</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">get_width_ratios</span><span class="s3">(),</span>
+                <span class="s1">height_ratios</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">get_height_ratios</span><span class="s3">())</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s4"># this is a gridspecfromsubplotspec:</span>
+        <span class="s1">subplot_spec </span><span class="s3">= </span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_subplot_spec</span>
+        <span class="s1">parentgs </span><span class="s3">= </span><span class="s1">subplot_spec</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+        <span class="s4"># if a nested gridspec it is possible the parent is not in there yet:</span>
+        <span class="s2">if </span><span class="s1">parentgs </span><span class="s2">not in </span><span class="s1">layoutgrids</span><span class="s3">:</span>
+            <span class="s1">layoutgrids </span><span class="s3">= </span><span class="s1">make_layoutgrids_gs</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">parentgs</span><span class="s3">)</span>
+        <span class="s1">subspeclb </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">parentgs</span><span class="s3">]</span>
+        <span class="s4"># gridspecfromsubplotspec need an outer container:</span>
+        <span class="s4"># get a unique representation:</span>
+        <span class="s1">rep </span><span class="s3">= (</span><span class="s1">gs</span><span class="s3">, </span><span class="s6">'top'</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">rep </span><span class="s2">not in </span><span class="s1">layoutgrids</span><span class="s3">:</span>
+            <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">rep</span><span class="s3">] = </span><span class="s1">mlayoutgrid</span><span class="s3">.</span><span class="s1">LayoutGrid</span><span class="s3">(</span>
+                <span class="s1">parent</span><span class="s3">=</span><span class="s1">subspeclb</span><span class="s3">,</span>
+                <span class="s1">name</span><span class="s3">=</span><span class="s6">'top'</span><span class="s3">,</span>
+                <span class="s1">nrows</span><span class="s3">=</span><span class="s5">1</span><span class="s3">, </span><span class="s1">ncols</span><span class="s3">=</span><span class="s5">1</span><span class="s3">,</span>
+                <span class="s1">parent_pos</span><span class="s3">=(</span><span class="s1">subplot_spec</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">, </span><span class="s1">subplot_spec</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">))</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">] = </span><span class="s1">mlayoutgrid</span><span class="s3">.</span><span class="s1">LayoutGrid</span><span class="s3">(</span>
+                <span class="s1">parent</span><span class="s3">=</span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">rep</span><span class="s3">],</span>
+                <span class="s1">name</span><span class="s3">=</span><span class="s6">'gridspec'</span><span class="s3">,</span>
+                <span class="s1">nrows</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_nrows</span><span class="s3">, </span><span class="s1">ncols</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_ncols</span><span class="s3">,</span>
+                <span class="s1">width_ratios</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">get_width_ratios</span><span class="s3">(),</span>
+                <span class="s1">height_ratios</span><span class="s3">=</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">get_height_ratios</span><span class="s3">())</span>
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">check_no_collapsed_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Check that no Axes have collapsed to zero size. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">subfigs</span><span class="s3">:</span>
+        <span class="s1">ok </span><span class="s3">= </span><span class="s1">check_no_collapsed_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">sfig</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">ok</span><span class="s3">:</span>
+            <span class="s2">return False</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">axes</span><span class="s3">:</span>
+        <span class="s1">gs </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">in </span><span class="s1">layoutgrids</span><span class="s3">:  </span><span class="s4"># also implies gs is not None.</span>
+            <span class="s1">lg </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">]</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">nrows</span><span class="s3">):</span>
+                <span class="s2">for </span><span class="s1">j </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">ncols</span><span class="s3">):</span>
+                    <span class="s1">bb </span><span class="s3">= </span><span class="s1">lg</span><span class="s3">.</span><span class="s1">get_inner_bbox</span><span class="s3">(</span><span class="s1">i</span><span class="s3">, </span><span class="s1">j</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">bb</span><span class="s3">.</span><span class="s1">width </span><span class="s3">&lt;= </span><span class="s5">0 </span><span class="s2">or </span><span class="s1">bb</span><span class="s3">.</span><span class="s1">height </span><span class="s3">&lt;= </span><span class="s5">0</span><span class="s3">:</span>
+                        <span class="s2">return False</span>
+    <span class="s2">return True</span>
+
+
+<span class="s2">def </span><span class="s1">compress_fixed_aspect</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">):</span>
+    <span class="s1">gs </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">axes</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">() </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">continue</span>
+        <span class="s1">ax</span><span class="s3">.</span><span class="s1">apply_aspect</span><span class="s3">()</span>
+        <span class="s1">sub </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">()</span>
+        <span class="s1">_gs </span><span class="s3">= </span><span class="s1">sub</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">gs </span><span class="s3">= </span><span class="s1">_gs</span>
+            <span class="s1">extraw </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">ncols</span><span class="s3">)</span>
+            <span class="s1">extrah </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">nrows</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">_gs </span><span class="s3">!= </span><span class="s1">gs</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s6">'Cannot do compressed layout if Axes are not'</span>
+                             <span class="s6">'all from the same gridspec'</span><span class="s3">)</span>
+        <span class="s1">orig </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_position</span><span class="s3">(</span><span class="s1">original</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s1">actual </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_position</span><span class="s3">(</span><span class="s1">original</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+        <span class="s1">dw </span><span class="s3">= </span><span class="s1">orig</span><span class="s3">.</span><span class="s1">width </span><span class="s3">- </span><span class="s1">actual</span><span class="s3">.</span><span class="s1">width</span>
+        <span class="s2">if </span><span class="s1">dw </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">extraw</span><span class="s3">[</span><span class="s1">sub</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s1">extraw</span><span class="s3">[</span><span class="s1">sub</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">], </span><span class="s1">dw</span><span class="s3">)</span>
+        <span class="s1">dh </span><span class="s3">= </span><span class="s1">orig</span><span class="s3">.</span><span class="s1">height </span><span class="s3">- </span><span class="s1">actual</span><span class="s3">.</span><span class="s1">height</span>
+        <span class="s2">if </span><span class="s1">dh </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">extrah</span><span class="s3">[</span><span class="s1">sub</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">maximum</span><span class="s3">(</span><span class="s1">extrah</span><span class="s3">[</span><span class="s1">sub</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">], </span><span class="s1">dh</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">gs </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s6">'Cannot do compressed layout if no Axes '</span>
+                         <span class="s6">'are part of a gridspec.'</span><span class="s3">)</span>
+    <span class="s1">w </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">extraw</span><span class="s3">) / </span><span class="s5">2</span>
+    <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'left'</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+    <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'right'</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+
+    <span class="s1">h </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">extrah</span><span class="s3">) / </span><span class="s5">2</span>
+    <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'top'</span><span class="s3">, </span><span class="s1">h</span><span class="s3">)</span>
+    <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'bottom'</span><span class="s3">, </span><span class="s1">h</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">layoutgrids</span>
+
+
+<span class="s2">def </span><span class="s1">get_margin_from_padding</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, *, </span><span class="s1">w_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">,</span>
+                            <span class="s1">hspace</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s5">0</span><span class="s3">):</span>
+
+    <span class="s1">ss </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">_subplotspec</span>
+    <span class="s1">gs </span><span class="s3">= </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+
+    <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">gs</span><span class="s3">, </span><span class="s6">'hspace'</span><span class="s3">):</span>
+        <span class="s1">_hspace </span><span class="s3">= (</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">hspace </span><span class="s2">if </span><span class="s1">gs</span><span class="s3">.</span><span class="s1">hspace </span><span class="s2">is not None else </span><span class="s1">hspace</span><span class="s3">)</span>
+        <span class="s1">_wspace </span><span class="s3">= (</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">wspace </span><span class="s2">if </span><span class="s1">gs</span><span class="s3">.</span><span class="s1">wspace </span><span class="s2">is not None else </span><span class="s1">wspace</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">_hspace </span><span class="s3">= (</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_hspace </span><span class="s2">if </span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_hspace </span><span class="s2">is not None else </span><span class="s1">hspace</span><span class="s3">)</span>
+        <span class="s1">_wspace </span><span class="s3">= (</span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_wspace </span><span class="s2">if </span><span class="s1">gs</span><span class="s3">.</span><span class="s1">_wspace </span><span class="s2">is not None else </span><span class="s1">wspace</span><span class="s3">)</span>
+
+    <span class="s1">_wspace </span><span class="s3">= </span><span class="s1">_wspace </span><span class="s3">/ </span><span class="s5">2</span>
+    <span class="s1">_hspace </span><span class="s3">= </span><span class="s1">_hspace </span><span class="s3">/ </span><span class="s5">2</span>
+
+    <span class="s1">nrows</span><span class="s3">, </span><span class="s1">ncols </span><span class="s3">= </span><span class="s1">gs</span><span class="s3">.</span><span class="s1">get_geometry</span><span class="s3">()</span>
+    <span class="s4"># there are two margins for each direction.  The &quot;cb&quot;</span>
+    <span class="s4"># margins are for pads and colorbars, the non-&quot;cb&quot; are</span>
+    <span class="s4"># for the Axes decorations (labels etc).</span>
+    <span class="s1">margin </span><span class="s3">= {</span><span class="s6">'leftcb'</span><span class="s3">: </span><span class="s1">w_pad</span><span class="s3">, </span><span class="s6">'rightcb'</span><span class="s3">: </span><span class="s1">w_pad</span><span class="s3">,</span>
+              <span class="s6">'bottomcb'</span><span class="s3">: </span><span class="s1">h_pad</span><span class="s3">, </span><span class="s6">'topcb'</span><span class="s3">: </span><span class="s1">h_pad</span><span class="s3">,</span>
+              <span class="s6">'left'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">, </span><span class="s6">'right'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">,</span>
+              <span class="s6">'top'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">, </span><span class="s6">'bottom'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">}</span>
+    <span class="s2">if </span><span class="s1">_wspace </span><span class="s3">/ </span><span class="s1">ncols </span><span class="s3">&gt; </span><span class="s1">w_pad</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">start </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">margin</span><span class="s3">[</span><span class="s6">'leftcb'</span><span class="s3">] = </span><span class="s1">_wspace </span><span class="s3">/ </span><span class="s1">ncols</span>
+        <span class="s2">if </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">&lt; </span><span class="s1">ncols</span><span class="s3">:</span>
+            <span class="s1">margin</span><span class="s3">[</span><span class="s6">'rightcb'</span><span class="s3">] = </span><span class="s1">_wspace </span><span class="s3">/ </span><span class="s1">ncols</span>
+    <span class="s2">if </span><span class="s1">_hspace </span><span class="s3">/ </span><span class="s1">nrows </span><span class="s3">&gt; </span><span class="s1">h_pad</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">&lt; </span><span class="s1">nrows</span><span class="s3">:</span>
+            <span class="s1">margin</span><span class="s3">[</span><span class="s6">'bottomcb'</span><span class="s3">] = </span><span class="s1">_hspace </span><span class="s3">/ </span><span class="s1">nrows</span>
+        <span class="s2">if </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">start </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">margin</span><span class="s3">[</span><span class="s6">'topcb'</span><span class="s3">] = </span><span class="s1">_hspace </span><span class="s3">/ </span><span class="s1">nrows</span>
+
+    <span class="s2">return </span><span class="s1">margin</span>
+
+
+<span class="s2">def </span><span class="s1">make_layout_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, *, </span><span class="s1">w_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">,</span>
+                        <span class="s1">hspace</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s5">0</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    For each Axes, make a margin between the *pos* layoutbox and the 
+    *axes* layoutbox be a minimum size that can accommodate the 
+    decorations on the axis. 
+ 
+    Then make room for colorbars. 
+ 
+    Parameters 
+    ---------- 
+    layoutgrids : dict 
+    fig : `~matplotlib.figure.Figure` 
+        `.Figure` instance to do the layout in. 
+    renderer : `~matplotlib.backend_bases.RendererBase` subclass. 
+        The renderer to use. 
+    w_pad, h_pad : float, default: 0 
+        Width and height padding (in fraction of figure). 
+    hspace, wspace : float, default: 0 
+        Width and height padding as fraction of figure size divided by 
+        number of columns or rows. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">subfigs</span><span class="s3">:  </span><span class="s4"># recursively make child panel margins</span>
+        <span class="s1">ss </span><span class="s3">= </span><span class="s1">sfig</span><span class="s3">.</span><span class="s1">_subplotspec</span>
+        <span class="s1">gs </span><span class="s3">= </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+
+        <span class="s1">make_layout_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">sfig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">,</span>
+                            <span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">,</span>
+                            <span class="s1">hspace</span><span class="s3">=</span><span class="s1">hspace</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s1">wspace</span><span class="s3">)</span>
+
+        <span class="s1">margins </span><span class="s3">= </span><span class="s1">get_margin_from_padding</span><span class="s3">(</span><span class="s1">sfig</span><span class="s3">, </span><span class="s1">w_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">,</span>
+                                          <span class="s1">hspace</span><span class="s3">=</span><span class="s1">hspace</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s1">wspace</span><span class="s3">)</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">].</span><span class="s1">edit_outer_margin_mins</span><span class="s3">(</span><span class="s1">margins</span><span class="s3">, </span><span class="s1">ss</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_localaxes</span><span class="s3">:</span>
+        <span class="s2">if not </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">() </span><span class="s2">or not </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_in_layout</span><span class="s3">():</span>
+            <span class="s2">continue</span>
+
+        <span class="s1">ss </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">()</span>
+        <span class="s1">gs </span><span class="s3">= </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">not in </span><span class="s1">layoutgrids</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">margin </span><span class="s3">= </span><span class="s1">get_margin_from_padding</span><span class="s3">(</span><span class="s1">ax</span><span class="s3">, </span><span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">,</span>
+                                         <span class="s1">hspace</span><span class="s3">=</span><span class="s1">hspace</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s1">wspace</span><span class="s3">)</span>
+        <span class="s1">pos</span><span class="s3">, </span><span class="s1">bbox </span><span class="s3">= </span><span class="s1">get_pos_and_bbox</span><span class="s3">(</span><span class="s1">ax</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">)</span>
+        <span class="s4"># the margin is the distance between the bounding box of the Axes</span>
+        <span class="s4"># and its position (plus the padding from above)</span>
+        <span class="s1">margin</span><span class="s3">[</span><span class="s6">'left'</span><span class="s3">] += </span><span class="s1">pos</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">- </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x0</span>
+        <span class="s1">margin</span><span class="s3">[</span><span class="s6">'right'</span><span class="s3">] += </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x1 </span><span class="s3">- </span><span class="s1">pos</span><span class="s3">.</span><span class="s1">x1</span>
+        <span class="s4"># remember that rows are ordered from top:</span>
+        <span class="s1">margin</span><span class="s3">[</span><span class="s6">'bottom'</span><span class="s3">] += </span><span class="s1">pos</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">- </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y0</span>
+        <span class="s1">margin</span><span class="s3">[</span><span class="s6">'top'</span><span class="s3">] += </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y1 </span><span class="s3">- </span><span class="s1">pos</span><span class="s3">.</span><span class="s1">y1</span>
+
+        <span class="s4"># make margin for colorbars.  These margins go in the</span>
+        <span class="s4"># padding margin, versus the margin for Axes decorators.</span>
+        <span class="s2">for </span><span class="s1">cbax </span><span class="s2">in </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">_colorbars</span><span class="s3">:</span>
+            <span class="s4"># note pad is a fraction of the parent width...</span>
+            <span class="s1">pad </span><span class="s3">= </span><span class="s1">colorbar_get_pad</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">cbax</span><span class="s3">)</span>
+            <span class="s4"># colorbars can be child of more than one subplot spec:</span>
+            <span class="s1">cbp_rspan</span><span class="s3">, </span><span class="s1">cbp_cspan </span><span class="s3">= </span><span class="s1">get_cb_parent_spans</span><span class="s3">(</span><span class="s1">cbax</span><span class="s3">)</span>
+            <span class="s1">loc </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'location'</span><span class="s3">]</span>
+            <span class="s1">cbpos</span><span class="s3">, </span><span class="s1">cbbbox </span><span class="s3">= </span><span class="s1">get_pos_and_bbox</span><span class="s3">(</span><span class="s1">cbax</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">loc </span><span class="s3">== </span><span class="s6">'right'</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">cbp_cspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">:</span>
+                    <span class="s4"># only increase if the colorbar is on the right edge</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'rightcb'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">width </span><span class="s3">+ </span><span class="s1">pad</span>
+            <span class="s2">elif </span><span class="s1">loc </span><span class="s3">== </span><span class="s6">'left'</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">cbp_cspan</span><span class="s3">.</span><span class="s1">start </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">start</span><span class="s3">:</span>
+                    <span class="s4"># only increase if the colorbar is on the left edge</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'leftcb'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">width </span><span class="s3">+ </span><span class="s1">pad</span>
+            <span class="s2">elif </span><span class="s1">loc </span><span class="s3">== </span><span class="s6">'top'</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">cbp_rspan</span><span class="s3">.</span><span class="s1">start </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">start</span><span class="s3">:</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'topcb'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s1">pad</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">cbp_rspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">:</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'bottomcb'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s1">pad</span>
+            <span class="s4"># If the colorbars are wider than the parent box in the</span>
+            <span class="s4"># cross direction</span>
+            <span class="s2">if </span><span class="s1">loc </span><span class="s2">in </span><span class="s3">[</span><span class="s6">'top'</span><span class="s3">, </span><span class="s6">'bottom'</span><span class="s3">]:</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">cbp_cspan</span><span class="s3">.</span><span class="s1">start </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">start </span><span class="s2">and</span>
+                        <span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">&lt; </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x0</span><span class="s3">):</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'left'</span><span class="s3">] += </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">- </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">x0</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">cbp_cspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s2">and</span>
+                        <span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">x1 </span><span class="s3">&gt; </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x1</span><span class="s3">):</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'right'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">x1 </span><span class="s3">- </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">x1</span>
+            <span class="s4"># or taller:</span>
+            <span class="s2">if </span><span class="s1">loc </span><span class="s2">in </span><span class="s3">[</span><span class="s6">'left'</span><span class="s3">, </span><span class="s6">'right'</span><span class="s3">]:</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">cbp_rspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">stop </span><span class="s2">and</span>
+                        <span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">&lt; </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y0</span><span class="s3">):</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'bottom'</span><span class="s3">] += </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">- </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">y0</span>
+                <span class="s2">if </span><span class="s3">(</span><span class="s1">cbp_rspan</span><span class="s3">.</span><span class="s1">start </span><span class="s3">== </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">start </span><span class="s2">and</span>
+                        <span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">y1 </span><span class="s3">&gt; </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y1</span><span class="s3">):</span>
+                    <span class="s1">margin</span><span class="s3">[</span><span class="s6">'top'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">y1 </span><span class="s3">- </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">y1</span>
+        <span class="s4"># pass the new margins down to the layout grid for the solution...</span>
+        <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">].</span><span class="s1">edit_outer_margin_mins</span><span class="s3">(</span><span class="s1">margin</span><span class="s3">, </span><span class="s1">ss</span><span class="s3">)</span>
+
+    <span class="s4"># make margins for figure-level legends:</span>
+    <span class="s2">for </span><span class="s1">leg </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">legends</span><span class="s3">:</span>
+        <span class="s1">inv_trans_fig </span><span class="s3">= </span><span class="s2">None</span>
+        <span class="s2">if </span><span class="s1">leg</span><span class="s3">.</span><span class="s1">_outside_loc </span><span class="s2">and </span><span class="s1">leg</span><span class="s3">.</span><span class="s1">_bbox_to_anchor </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">inv_trans_fig </span><span class="s2">is None</span><span class="s3">:</span>
+                <span class="s1">inv_trans_fig </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transFigure</span><span class="s3">.</span><span class="s1">inverted</span><span class="s3">().</span><span class="s1">transform_bbox</span>
+            <span class="s1">bbox </span><span class="s3">= </span><span class="s1">inv_trans_fig</span><span class="s3">(</span><span class="s1">leg</span><span class="s3">.</span><span class="s1">get_tightbbox</span><span class="s3">(</span><span class="s1">renderer</span><span class="s3">))</span>
+            <span class="s1">w </span><span class="s3">= </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">width </span><span class="s3">+ </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">w_pad</span>
+            <span class="s1">h </span><span class="s3">= </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">h_pad</span>
+            <span class="s1">legendloc </span><span class="s3">= </span><span class="s1">leg</span><span class="s3">.</span><span class="s1">_outside_loc</span>
+            <span class="s2">if </span><span class="s1">legendloc </span><span class="s3">== </span><span class="s6">'lower'</span><span class="s3">:</span>
+                <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'bottom'</span><span class="s3">, </span><span class="s1">h</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">legendloc </span><span class="s3">== </span><span class="s6">'upper'</span><span class="s3">:</span>
+                <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'top'</span><span class="s3">, </span><span class="s1">h</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">legendloc </span><span class="s3">== </span><span class="s6">'right'</span><span class="s3">:</span>
+                <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'right'</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">legendloc </span><span class="s3">== </span><span class="s6">'left'</span><span class="s3">:</span>
+                <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'left'</span><span class="s3">, </span><span class="s1">w</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">make_margin_suptitles</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, *, </span><span class="s1">w_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">):</span>
+    <span class="s4"># Figure out how large the suptitle is and make the</span>
+    <span class="s4"># top level figure margin larger.</span>
+
+    <span class="s1">inv_trans_fig </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transFigure</span><span class="s3">.</span><span class="s1">inverted</span><span class="s3">().</span><span class="s1">transform_bbox</span>
+    <span class="s4"># get the h_pad and w_pad as distances in the local subfigure coordinates:</span>
+    <span class="s1">padbox </span><span class="s3">= </span><span class="s1">mtransforms</span><span class="s3">.</span><span class="s1">Bbox</span><span class="s3">([[</span><span class="s5">0</span><span class="s3">, </span><span class="s5">0</span><span class="s3">], [</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">]])</span>
+    <span class="s1">padbox </span><span class="s3">= (</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transFigure </span><span class="s3">-</span>
+              <span class="s1">fig</span><span class="s3">.</span><span class="s1">transSubfigure</span><span class="s3">).</span><span class="s1">transform_bbox</span><span class="s3">(</span><span class="s1">padbox</span><span class="s3">)</span>
+    <span class="s1">h_pad_local </span><span class="s3">= </span><span class="s1">padbox</span><span class="s3">.</span><span class="s1">height</span>
+    <span class="s1">w_pad_local </span><span class="s3">= </span><span class="s1">padbox</span><span class="s3">.</span><span class="s1">width</span>
+
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">subfigs</span><span class="s3">:</span>
+        <span class="s1">make_margin_suptitles</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">sfig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">,</span>
+                              <span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_suptitle </span><span class="s2">is not None and </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_suptitle</span><span class="s3">.</span><span class="s1">get_in_layout</span><span class="s3">():</span>
+        <span class="s1">p </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_suptitle</span><span class="s3">.</span><span class="s1">get_position</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_suptitle</span><span class="s3">, </span><span class="s6">'_autopos'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s1">fig</span><span class="s3">.</span><span class="s1">_suptitle</span><span class="s3">.</span><span class="s1">set_position</span><span class="s3">((</span><span class="s1">p</span><span class="s3">[</span><span class="s5">0</span><span class="s3">], </span><span class="s5">1 </span><span class="s3">- </span><span class="s1">h_pad_local</span><span class="s3">))</span>
+            <span class="s1">bbox </span><span class="s3">= </span><span class="s1">inv_trans_fig</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_suptitle</span><span class="s3">.</span><span class="s1">get_tightbbox</span><span class="s3">(</span><span class="s1">renderer</span><span class="s3">))</span>
+            <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'top'</span><span class="s3">, </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">h_pad</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supxlabel </span><span class="s2">is not None and </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supxlabel</span><span class="s3">.</span><span class="s1">get_in_layout</span><span class="s3">():</span>
+        <span class="s1">p </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supxlabel</span><span class="s3">.</span><span class="s1">get_position</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supxlabel</span><span class="s3">, </span><span class="s6">'_autopos'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s1">fig</span><span class="s3">.</span><span class="s1">_supxlabel</span><span class="s3">.</span><span class="s1">set_position</span><span class="s3">((</span><span class="s1">p</span><span class="s3">[</span><span class="s5">0</span><span class="s3">], </span><span class="s1">h_pad_local</span><span class="s3">))</span>
+            <span class="s1">bbox </span><span class="s3">= </span><span class="s1">inv_trans_fig</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supxlabel</span><span class="s3">.</span><span class="s1">get_tightbbox</span><span class="s3">(</span><span class="s1">renderer</span><span class="s3">))</span>
+            <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'bottom'</span><span class="s3">,</span>
+                                             <span class="s1">bbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">h_pad</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supylabel </span><span class="s2">is not None and </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supylabel</span><span class="s3">.</span><span class="s1">get_in_layout</span><span class="s3">():</span>
+        <span class="s1">p </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supylabel</span><span class="s3">.</span><span class="s1">get_position</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supylabel</span><span class="s3">, </span><span class="s6">'_autopos'</span><span class="s3">, </span><span class="s2">False</span><span class="s3">):</span>
+            <span class="s1">fig</span><span class="s3">.</span><span class="s1">_supylabel</span><span class="s3">.</span><span class="s1">set_position</span><span class="s3">((</span><span class="s1">w_pad_local</span><span class="s3">, </span><span class="s1">p</span><span class="s3">[</span><span class="s5">1</span><span class="s3">]))</span>
+            <span class="s1">bbox </span><span class="s3">= </span><span class="s1">inv_trans_fig</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_supylabel</span><span class="s3">.</span><span class="s1">get_tightbbox</span><span class="s3">(</span><span class="s1">renderer</span><span class="s3">))</span>
+            <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'left'</span><span class="s3">, </span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">width </span><span class="s3">+ </span><span class="s5">2 </span><span class="s3">* </span><span class="s1">w_pad</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">match_submerged_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Make the margins that are submerged inside an Axes the same size. 
+ 
+    This allows Axes that span two columns (or rows) that are offset 
+    from one another to have the same size. 
+ 
+    This gives the proper layout for something like:: 
+        fig = plt.figure(constrained_layout=True) 
+        axs = fig.subplot_mosaic(&quot;AAAB\nCCDD&quot;) 
+ 
+    Without this routine, the Axes D will be wider than C, because the 
+    margin width between the two columns in C has no width by default, 
+    whereas the margins between the two columns of D are set by the 
+    width of the margin between A and B. However, obviously the user would 
+    like C and D to be the same size, so we need to add constraints to these 
+    &quot;submerged&quot; margins. 
+ 
+    This routine makes all the interior margins the same, and the spacing 
+    between the three columns in A and the two column in C are all set to the 
+    margins between the two columns of D. 
+ 
+    See test_constrained_layout::test_constrained_layout12 for an example. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">subfigs</span><span class="s3">:</span>
+        <span class="s1">match_submerged_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">sfig</span><span class="s3">)</span>
+
+    <span class="s1">axs </span><span class="s3">= [</span><span class="s1">a </span><span class="s2">for </span><span class="s1">a </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">get_axes</span><span class="s3">()</span>
+           <span class="s2">if </span><span class="s1">a</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">() </span><span class="s2">is not None and </span><span class="s1">a</span><span class="s3">.</span><span class="s1">get_in_layout</span><span class="s3">()]</span>
+
+    <span class="s2">for </span><span class="s1">ax1 </span><span class="s2">in </span><span class="s1">axs</span><span class="s3">:</span>
+        <span class="s1">ss1 </span><span class="s3">= </span><span class="s1">ax1</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">() </span><span class="s2">not in </span><span class="s1">layoutgrids</span><span class="s3">:</span>
+            <span class="s1">axs</span><span class="s3">.</span><span class="s1">remove</span><span class="s3">(</span><span class="s1">ax1</span><span class="s3">)</span>
+            <span class="s2">continue</span>
+        <span class="s1">lg1 </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()]</span>
+
+        <span class="s4"># interior columns:</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">) &gt; </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s1">maxsubl </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'left'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]] +</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'leftcb'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]]</span>
+            <span class="s3">)</span>
+            <span class="s1">maxsubr </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'right'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]] +</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'rightcb'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]]</span>
+            <span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">ax2 </span><span class="s2">in </span><span class="s1">axs</span><span class="s3">:</span>
+                <span class="s1">ss2 </span><span class="s3">= </span><span class="s1">ax2</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">()</span>
+                <span class="s1">lg2 </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()]</span>
+                <span class="s2">if </span><span class="s1">lg2 </span><span class="s2">is not None and </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">) &gt; </span><span class="s5">1</span><span class="s3">:</span>
+                    <span class="s1">maxsubl2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                        <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'left'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]] +</span>
+                        <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'leftcb'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]])</span>
+                    <span class="s2">if </span><span class="s1">maxsubl2 </span><span class="s3">&gt; </span><span class="s1">maxsubl</span><span class="s3">:</span>
+                        <span class="s1">maxsubl </span><span class="s3">= </span><span class="s1">maxsubl2</span>
+                    <span class="s1">maxsubr2 </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                        <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'right'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]] +</span>
+                        <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'rightcb'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]])</span>
+                    <span class="s2">if </span><span class="s1">maxsubr2 </span><span class="s3">&gt; </span><span class="s1">maxsubr</span><span class="s3">:</span>
+                        <span class="s1">maxsubr </span><span class="s3">= </span><span class="s1">maxsubr2</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]:</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'left'</span><span class="s3">, </span><span class="s1">maxsubl</span><span class="s3">, </span><span class="s1">cell</span><span class="s3">=</span><span class="s1">i</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]:</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'right'</span><span class="s3">, </span><span class="s1">maxsubr</span><span class="s3">, </span><span class="s1">cell</span><span class="s3">=</span><span class="s1">i</span><span class="s3">)</span>
+
+        <span class="s4"># interior rows:</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">) &gt; </span><span class="s5">1</span><span class="s3">:</span>
+            <span class="s1">maxsubt </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'top'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]] +</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'topcb'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]]</span>
+            <span class="s3">)</span>
+            <span class="s1">maxsubb </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'bottom'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]] +</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'bottomcb'</span><span class="s3">][</span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]]</span>
+            <span class="s3">)</span>
+
+            <span class="s2">for </span><span class="s1">ax2 </span><span class="s2">in </span><span class="s1">axs</span><span class="s3">:</span>
+                <span class="s1">ss2 </span><span class="s3">= </span><span class="s1">ax2</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">()</span>
+                <span class="s1">lg2 </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()]</span>
+                <span class="s2">if </span><span class="s1">lg2 </span><span class="s2">is not None</span><span class="s3">:</span>
+                    <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">) &gt; </span><span class="s5">1</span><span class="s3">:</span>
+                        <span class="s1">maxsubt </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">([</span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                            <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'top'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]] +</span>
+                            <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'topcb'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]]</span>
+                        <span class="s3">), </span><span class="s1">maxsubt</span><span class="s3">])</span>
+                        <span class="s1">maxsubb </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">([</span><span class="s1">np</span><span class="s3">.</span><span class="s1">max</span><span class="s3">(</span>
+                            <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'bottom'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]] +</span>
+                            <span class="s1">lg2</span><span class="s3">.</span><span class="s1">margin_vals</span><span class="s3">[</span><span class="s6">'bottomcb'</span><span class="s3">][</span><span class="s1">ss2</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]]</span>
+                        <span class="s3">), </span><span class="s1">maxsubb</span><span class="s3">])</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[</span><span class="s5">1</span><span class="s3">:]:</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'top'</span><span class="s3">, </span><span class="s1">maxsubt</span><span class="s3">, </span><span class="s1">cell</span><span class="s3">=</span><span class="s1">i</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">ss1</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">[:-</span><span class="s5">1</span><span class="s3">]:</span>
+                <span class="s1">lg1</span><span class="s3">.</span><span class="s1">edit_margin_min</span><span class="s3">(</span><span class="s6">'bottom'</span><span class="s3">, </span><span class="s1">maxsubb</span><span class="s3">, </span><span class="s1">cell</span><span class="s3">=</span><span class="s1">i</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">get_cb_parent_spans</span><span class="s3">(</span><span class="s1">cbax</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Figure out which subplotspecs this colorbar belongs to. 
+ 
+    Parameters 
+    ---------- 
+    cbax : `~matplotlib.axes.Axes` 
+        Axes for the colorbar. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">rowstart </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+    <span class="s1">rowstop </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+    <span class="s1">colstart </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+    <span class="s1">colstop </span><span class="s3">= -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+    <span class="s2">for </span><span class="s1">parent </span><span class="s2">in </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'parents'</span><span class="s3">]:</span>
+        <span class="s1">ss </span><span class="s3">= </span><span class="s1">parent</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">()</span>
+        <span class="s1">rowstart </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">start</span><span class="s3">, </span><span class="s1">rowstart</span><span class="s3">)</span>
+        <span class="s1">rowstop </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">, </span><span class="s1">rowstop</span><span class="s3">)</span>
+        <span class="s1">colstart </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">start</span><span class="s3">, </span><span class="s1">colstart</span><span class="s3">)</span>
+        <span class="s1">colstop </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">, </span><span class="s1">colstop</span><span class="s3">)</span>
+
+    <span class="s1">rowspan </span><span class="s3">= </span><span class="s1">range</span><span class="s3">(</span><span class="s1">rowstart</span><span class="s3">, </span><span class="s1">rowstop</span><span class="s3">)</span>
+    <span class="s1">colspan </span><span class="s3">= </span><span class="s1">range</span><span class="s3">(</span><span class="s1">colstart</span><span class="s3">, </span><span class="s1">colstop</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">rowspan</span><span class="s3">, </span><span class="s1">colspan</span>
+
+
+<span class="s2">def </span><span class="s1">get_pos_and_bbox</span><span class="s3">(</span><span class="s1">ax</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Get the position and the bbox for the Axes. 
+ 
+    Parameters 
+    ---------- 
+    ax : `~matplotlib.axes.Axes` 
+    renderer : `~matplotlib.backend_bases.RendererBase` subclass. 
+ 
+    Returns 
+    ------- 
+    pos : `~matplotlib.transforms.Bbox` 
+        Position in figure coordinates. 
+    bbox : `~matplotlib.transforms.Bbox` 
+        Tight bounding box in figure coordinates. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">fig </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">figure</span>
+    <span class="s1">pos </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_position</span><span class="s3">(</span><span class="s1">original</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s4"># pos is in panel co-ords, but we need in figure for the layout</span>
+    <span class="s1">pos </span><span class="s3">= </span><span class="s1">pos</span><span class="s3">.</span><span class="s1">transformed</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transSubfigure </span><span class="s3">- </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transFigure</span><span class="s3">)</span>
+    <span class="s1">tightbbox </span><span class="s3">= </span><span class="s1">martist</span><span class="s3">.</span><span class="s1">_get_tightbbox_for_layout_only</span><span class="s3">(</span><span class="s1">ax</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">tightbbox </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">bbox </span><span class="s3">= </span><span class="s1">pos</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">bbox </span><span class="s3">= </span><span class="s1">tightbbox</span><span class="s3">.</span><span class="s1">transformed</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transFigure</span><span class="s3">.</span><span class="s1">inverted</span><span class="s3">())</span>
+    <span class="s2">return </span><span class="s1">pos</span><span class="s3">, </span><span class="s1">bbox</span>
+
+
+<span class="s2">def </span><span class="s1">reposition_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, *,</span>
+                    <span class="s1">w_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">hspace</span><span class="s3">=</span><span class="s5">0</span><span class="s3">, </span><span class="s1">wspace</span><span class="s3">=</span><span class="s5">0</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Reposition all the Axes based on the new inner bounding box. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">trans_fig_to_subfig </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transFigure </span><span class="s3">- </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transSubfigure</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">subfigs</span><span class="s3">:</span>
+        <span class="s1">bbox </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">sfig</span><span class="s3">].</span><span class="s1">get_outer_bbox</span><span class="s3">()</span>
+        <span class="s1">sfig</span><span class="s3">.</span><span class="s1">_redo_transform_rel_fig</span><span class="s3">(</span>
+            <span class="s1">bbox</span><span class="s3">=</span><span class="s1">bbox</span><span class="s3">.</span><span class="s1">transformed</span><span class="s3">(</span><span class="s1">trans_fig_to_subfig</span><span class="s3">))</span>
+        <span class="s1">reposition_axes</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">sfig</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">,</span>
+                        <span class="s1">w_pad</span><span class="s3">=</span><span class="s1">w_pad</span><span class="s3">, </span><span class="s1">h_pad</span><span class="s3">=</span><span class="s1">h_pad</span><span class="s3">,</span>
+                        <span class="s1">wspace</span><span class="s3">=</span><span class="s1">wspace</span><span class="s3">, </span><span class="s1">hspace</span><span class="s3">=</span><span class="s1">hspace</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">_localaxes</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">() </span><span class="s2">is None or not </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_in_layout</span><span class="s3">():</span>
+            <span class="s2">continue</span>
+
+        <span class="s4"># grid bbox is in Figure coordinates, but we specify in panel</span>
+        <span class="s4"># coordinates...</span>
+        <span class="s1">ss </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_subplotspec</span><span class="s3">()</span>
+        <span class="s1">gs </span><span class="s3">= </span><span class="s1">ss</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+        <span class="s2">if </span><span class="s1">gs </span><span class="s2">not in </span><span class="s1">layoutgrids</span><span class="s3">:</span>
+            <span class="s2">return</span>
+
+        <span class="s1">bbox </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">].</span><span class="s1">get_inner_bbox</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">=</span><span class="s1">ss</span><span class="s3">.</span><span class="s1">rowspan</span><span class="s3">,</span>
+                                              <span class="s1">cols</span><span class="s3">=</span><span class="s1">ss</span><span class="s3">.</span><span class="s1">colspan</span><span class="s3">)</span>
+
+        <span class="s4"># transform from figure to panel for set_position:</span>
+        <span class="s1">newbbox </span><span class="s3">= </span><span class="s1">trans_fig_to_subfig</span><span class="s3">.</span><span class="s1">transform_bbox</span><span class="s3">(</span><span class="s1">bbox</span><span class="s3">)</span>
+        <span class="s1">ax</span><span class="s3">.</span><span class="s1">_set_position</span><span class="s3">(</span><span class="s1">newbbox</span><span class="s3">)</span>
+
+        <span class="s4"># move the colorbars:</span>
+        <span class="s4"># we need to keep track of oldw and oldh if there is more than</span>
+        <span class="s4"># one colorbar:</span>
+        <span class="s1">offset </span><span class="s3">= {</span><span class="s6">'left'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">, </span><span class="s6">'right'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">, </span><span class="s6">'bottom'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">, </span><span class="s6">'top'</span><span class="s3">: </span><span class="s5">0</span><span class="s3">}</span>
+        <span class="s2">for </span><span class="s1">nn</span><span class="s3">, </span><span class="s1">cbax </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">ax</span><span class="s3">.</span><span class="s1">_colorbars</span><span class="s3">[::-</span><span class="s5">1</span><span class="s3">]):</span>
+            <span class="s2">if </span><span class="s1">ax </span><span class="s3">== </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'parents'</span><span class="s3">][</span><span class="s5">0</span><span class="s3">]:</span>
+                <span class="s1">reposition_colorbar</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">cbax</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">,</span>
+                                    <span class="s1">offset</span><span class="s3">=</span><span class="s1">offset</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">reposition_colorbar</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">cbax</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">, *, </span><span class="s1">offset</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Place the colorbar in its new place. 
+ 
+    Parameters 
+    ---------- 
+    layoutgrids : dict 
+    cbax : `~matplotlib.axes.Axes` 
+        Axes for the colorbar. 
+    renderer : `~matplotlib.backend_bases.RendererBase` subclass. 
+        The renderer to use. 
+    offset : array-like 
+        Offset the colorbar needs to be pushed to in order to 
+        account for multiple colorbars. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">parents </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'parents'</span><span class="s3">]</span>
+    <span class="s1">gs </span><span class="s3">= </span><span class="s1">parents</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+    <span class="s1">fig </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">figure</span>
+    <span class="s1">trans_fig_to_subfig </span><span class="s3">= </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transFigure </span><span class="s3">- </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transSubfigure</span>
+
+    <span class="s1">cb_rspans</span><span class="s3">, </span><span class="s1">cb_cspans </span><span class="s3">= </span><span class="s1">get_cb_parent_spans</span><span class="s3">(</span><span class="s1">cbax</span><span class="s3">)</span>
+    <span class="s1">bboxparent </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">].</span><span class="s1">get_bbox_for_cb</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">=</span><span class="s1">cb_rspans</span><span class="s3">,</span>
+                                                 <span class="s1">cols</span><span class="s3">=</span><span class="s1">cb_cspans</span><span class="s3">)</span>
+    <span class="s1">pb </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">].</span><span class="s1">get_inner_bbox</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">=</span><span class="s1">cb_rspans</span><span class="s3">, </span><span class="s1">cols</span><span class="s3">=</span><span class="s1">cb_cspans</span><span class="s3">)</span>
+
+    <span class="s1">location </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'location'</span><span class="s3">]</span>
+    <span class="s1">anchor </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'anchor'</span><span class="s3">]</span>
+    <span class="s1">fraction </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'fraction'</span><span class="s3">]</span>
+    <span class="s1">aspect </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'aspect'</span><span class="s3">]</span>
+    <span class="s1">shrink </span><span class="s3">= </span><span class="s1">cbax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'shrink'</span><span class="s3">]</span>
+
+    <span class="s1">cbpos</span><span class="s3">, </span><span class="s1">cbbbox </span><span class="s3">= </span><span class="s1">get_pos_and_bbox</span><span class="s3">(</span><span class="s1">cbax</span><span class="s3">, </span><span class="s1">renderer</span><span class="s3">)</span>
+
+    <span class="s4"># Colorbar gets put at extreme edge of outer bbox of the subplotspec</span>
+    <span class="s4"># It needs to be moved in by: 1) a pad 2) its &quot;margin&quot; 3) by</span>
+    <span class="s4"># any colorbars already added at this location:</span>
+    <span class="s1">cbpad </span><span class="s3">= </span><span class="s1">colorbar_get_pad</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">cbax</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">location </span><span class="s2">in </span><span class="s3">(</span><span class="s6">'left'</span><span class="s3">, </span><span class="s6">'right'</span><span class="s3">):</span>
+        <span class="s4"># fraction and shrink are fractions of parent</span>
+        <span class="s1">pbcb </span><span class="s3">= </span><span class="s1">pb</span><span class="s3">.</span><span class="s1">shrunk</span><span class="s3">(</span><span class="s1">fraction</span><span class="s3">, </span><span class="s1">shrink</span><span class="s3">).</span><span class="s1">anchored</span><span class="s3">(</span><span class="s1">anchor</span><span class="s3">, </span><span class="s1">pb</span><span class="s3">)</span>
+        <span class="s4"># The colorbar is at the left side of the parent.  Need</span>
+        <span class="s4"># to translate to right (or left)</span>
+        <span class="s2">if </span><span class="s1">location </span><span class="s3">== </span><span class="s6">'right'</span><span class="s3">:</span>
+            <span class="s1">lmargin </span><span class="s3">= </span><span class="s1">cbpos</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">- </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">x0</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">bboxparent</span><span class="s3">.</span><span class="s1">x1 </span><span class="s3">- </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">+ </span><span class="s1">offset</span><span class="s3">[</span><span class="s6">'right'</span><span class="s3">]</span>
+            <span class="s1">dx </span><span class="s3">+= </span><span class="s1">cbpad </span><span class="s3">+ </span><span class="s1">lmargin</span>
+            <span class="s1">offset</span><span class="s3">[</span><span class="s6">'right'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">width </span><span class="s3">+ </span><span class="s1">cbpad</span>
+            <span class="s1">pbcb </span><span class="s3">= </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">translated</span><span class="s3">(</span><span class="s1">dx</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">lmargin </span><span class="s3">= </span><span class="s1">cbpos</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">- </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">x0</span>
+            <span class="s1">dx </span><span class="s3">= </span><span class="s1">bboxparent</span><span class="s3">.</span><span class="s1">x0 </span><span class="s3">- </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">x0  </span><span class="s4"># edge of parent</span>
+            <span class="s1">dx </span><span class="s3">+= -</span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">width </span><span class="s3">- </span><span class="s1">cbpad </span><span class="s3">+ </span><span class="s1">lmargin </span><span class="s3">- </span><span class="s1">offset</span><span class="s3">[</span><span class="s6">'left'</span><span class="s3">]</span>
+            <span class="s1">offset</span><span class="s3">[</span><span class="s6">'left'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">width </span><span class="s3">+ </span><span class="s1">cbpad</span>
+            <span class="s1">pbcb </span><span class="s3">= </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">translated</span><span class="s3">(</span><span class="s1">dx</span><span class="s3">, </span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:  </span><span class="s4"># horizontal axes:</span>
+        <span class="s1">pbcb </span><span class="s3">= </span><span class="s1">pb</span><span class="s3">.</span><span class="s1">shrunk</span><span class="s3">(</span><span class="s1">shrink</span><span class="s3">, </span><span class="s1">fraction</span><span class="s3">).</span><span class="s1">anchored</span><span class="s3">(</span><span class="s1">anchor</span><span class="s3">, </span><span class="s1">pb</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">location </span><span class="s3">== </span><span class="s6">'top'</span><span class="s3">:</span>
+            <span class="s1">bmargin </span><span class="s3">= </span><span class="s1">cbpos</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">- </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">y0</span>
+            <span class="s1">dy </span><span class="s3">= </span><span class="s1">bboxparent</span><span class="s3">.</span><span class="s1">y1 </span><span class="s3">- </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">+ </span><span class="s1">offset</span><span class="s3">[</span><span class="s6">'top'</span><span class="s3">]</span>
+            <span class="s1">dy </span><span class="s3">+= </span><span class="s1">cbpad </span><span class="s3">+ </span><span class="s1">bmargin</span>
+            <span class="s1">offset</span><span class="s3">[</span><span class="s6">'top'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s1">cbpad</span>
+            <span class="s1">pbcb </span><span class="s3">= </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">translated</span><span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">dy</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">bmargin </span><span class="s3">= </span><span class="s1">cbpos</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">- </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">y0</span>
+            <span class="s1">dy </span><span class="s3">= </span><span class="s1">bboxparent</span><span class="s3">.</span><span class="s1">y0 </span><span class="s3">- </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">y0</span>
+            <span class="s1">dy </span><span class="s3">+= -</span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">- </span><span class="s1">cbpad </span><span class="s3">+ </span><span class="s1">bmargin </span><span class="s3">- </span><span class="s1">offset</span><span class="s3">[</span><span class="s6">'bottom'</span><span class="s3">]</span>
+            <span class="s1">offset</span><span class="s3">[</span><span class="s6">'bottom'</span><span class="s3">] += </span><span class="s1">cbbbox</span><span class="s3">.</span><span class="s1">height </span><span class="s3">+ </span><span class="s1">cbpad</span>
+            <span class="s1">pbcb </span><span class="s3">= </span><span class="s1">pbcb</span><span class="s3">.</span><span class="s1">translated</span><span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s1">dy</span><span class="s3">)</span>
+
+    <span class="s1">pbcb </span><span class="s3">= </span><span class="s1">trans_fig_to_subfig</span><span class="s3">.</span><span class="s1">transform_bbox</span><span class="s3">(</span><span class="s1">pbcb</span><span class="s3">)</span>
+    <span class="s1">cbax</span><span class="s3">.</span><span class="s1">set_transform</span><span class="s3">(</span><span class="s1">fig</span><span class="s3">.</span><span class="s1">transSubfigure</span><span class="s3">)</span>
+    <span class="s1">cbax</span><span class="s3">.</span><span class="s1">_set_position</span><span class="s3">(</span><span class="s1">pbcb</span><span class="s3">)</span>
+    <span class="s1">cbax</span><span class="s3">.</span><span class="s1">set_anchor</span><span class="s3">(</span><span class="s1">anchor</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">location </span><span class="s2">in </span><span class="s3">[</span><span class="s6">'bottom'</span><span class="s3">, </span><span class="s6">'top'</span><span class="s3">]:</span>
+        <span class="s1">aspect </span><span class="s3">= </span><span class="s5">1 </span><span class="s3">/ </span><span class="s1">aspect</span>
+    <span class="s1">cbax</span><span class="s3">.</span><span class="s1">set_box_aspect</span><span class="s3">(</span><span class="s1">aspect</span><span class="s3">)</span>
+    <span class="s1">cbax</span><span class="s3">.</span><span class="s1">set_aspect</span><span class="s3">(</span><span class="s6">'auto'</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">offset</span>
+
+
+<span class="s2">def </span><span class="s1">reset_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">fig</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot; 
+    Reset the margins in the layoutboxes of *fig*. 
+ 
+    Margins are usually set as a minimum, so if the figure gets smaller 
+    the minimum needs to be zero in order for it to grow again. 
+    &quot;&quot;&quot;</span>
+    <span class="s2">for </span><span class="s1">sfig </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">subfigs</span><span class="s3">:</span>
+        <span class="s1">reset_margins</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">sfig</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">ax </span><span class="s2">in </span><span class="s1">fig</span><span class="s3">.</span><span class="s1">axes</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_in_layout</span><span class="s3">():</span>
+            <span class="s1">gs </span><span class="s3">= </span><span class="s1">ax</span><span class="s3">.</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+            <span class="s2">if </span><span class="s1">gs </span><span class="s2">in </span><span class="s1">layoutgrids</span><span class="s3">:  </span><span class="s4"># also implies gs is not None.</span>
+                <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">].</span><span class="s1">reset_margins</span><span class="s3">()</span>
+    <span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">fig</span><span class="s3">].</span><span class="s1">reset_margins</span><span class="s3">()</span>
+
+
+<span class="s2">def </span><span class="s1">colorbar_get_pad</span><span class="s3">(</span><span class="s1">layoutgrids</span><span class="s3">, </span><span class="s1">cax</span><span class="s3">):</span>
+    <span class="s1">parents </span><span class="s3">= </span><span class="s1">cax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'parents'</span><span class="s3">]</span>
+    <span class="s1">gs </span><span class="s3">= </span><span class="s1">parents</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">get_gridspec</span><span class="s3">()</span>
+
+    <span class="s1">cb_rspans</span><span class="s3">, </span><span class="s1">cb_cspans </span><span class="s3">= </span><span class="s1">get_cb_parent_spans</span><span class="s3">(</span><span class="s1">cax</span><span class="s3">)</span>
+    <span class="s1">bboxouter </span><span class="s3">= </span><span class="s1">layoutgrids</span><span class="s3">[</span><span class="s1">gs</span><span class="s3">].</span><span class="s1">get_inner_bbox</span><span class="s3">(</span><span class="s1">rows</span><span class="s3">=</span><span class="s1">cb_rspans</span><span class="s3">, </span><span class="s1">cols</span><span class="s3">=</span><span class="s1">cb_cspans</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">cax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'location'</span><span class="s3">] </span><span class="s2">in </span><span class="s3">[</span><span class="s6">'right'</span><span class="s3">, </span><span class="s6">'left'</span><span class="s3">]:</span>
+        <span class="s1">size </span><span class="s3">= </span><span class="s1">bboxouter</span><span class="s3">.</span><span class="s1">width</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">size </span><span class="s3">= </span><span class="s1">bboxouter</span><span class="s3">.</span><span class="s1">height</span>
+
+    <span class="s2">return </span><span class="s1">cax</span><span class="s3">.</span><span class="s1">_colorbar_info</span><span class="s3">[</span><span class="s6">'pad'</span><span class="s3">] * </span><span class="s1">size</span>
+</pre>
+</body>
+</html>

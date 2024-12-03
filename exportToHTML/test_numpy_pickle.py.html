@@ -1,0 +1,1183 @@
+<html>
+<head>
+<title>test_numpy_pickle.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+test_numpy_pickle.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Test the numpy pickler as a replacement of the standard pickler.&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">copy</span>
+<span class="s2">import </span><span class="s1">os</span>
+<span class="s2">import </span><span class="s1">random</span>
+<span class="s2">import </span><span class="s1">re</span>
+<span class="s2">import </span><span class="s1">io</span>
+<span class="s2">import </span><span class="s1">sys</span>
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">gzip</span>
+<span class="s2">import </span><span class="s1">zlib</span>
+<span class="s2">import </span><span class="s1">bz2</span>
+<span class="s2">import </span><span class="s1">pickle</span>
+<span class="s2">import </span><span class="s1">socket</span>
+<span class="s2">from </span><span class="s1">contextlib </span><span class="s2">import </span><span class="s1">closing</span>
+<span class="s2">import </span><span class="s1">mmap</span>
+<span class="s2">from </span><span class="s1">pathlib </span><span class="s2">import </span><span class="s1">Path</span>
+
+<span class="s2">try</span><span class="s3">:</span>
+    <span class="s2">import </span><span class="s1">lzma</span>
+<span class="s2">except </span><span class="s1">ImportError</span><span class="s3">:</span>
+    <span class="s1">lzma </span><span class="s3">= </span><span class="s2">None</span>
+
+<span class="s2">import </span><span class="s1">pytest</span>
+
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">test</span><span class="s3">.</span><span class="s1">common </span><span class="s2">import </span><span class="s1">np</span><span class="s3">, </span><span class="s1">with_numpy</span><span class="s3">, </span><span class="s1">with_lz4</span><span class="s3">, </span><span class="s1">without_lz4</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">test</span><span class="s3">.</span><span class="s1">common </span><span class="s2">import </span><span class="s1">with_memory_profiler</span><span class="s3">, </span><span class="s1">memory_used</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">testing </span><span class="s2">import </span><span class="s1">parametrize</span><span class="s3">, </span><span class="s1">raises</span><span class="s3">, </span><span class="s1">warns</span>
+
+<span class="s4"># numpy_pickle is not a drop-in replacement of pickle, as it takes</span>
+<span class="s4"># filenames instead of open files as arguments.</span>
+<span class="s2">from </span><span class="s1">joblib </span><span class="s2">import </span><span class="s1">numpy_pickle</span><span class="s3">, </span><span class="s1">register_compressor</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">test </span><span class="s2">import </span><span class="s1">data</span>
+
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">numpy_pickle_utils </span><span class="s2">import </span><span class="s1">_IO_BUFFER_SIZE</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">numpy_pickle_utils </span><span class="s2">import </span><span class="s1">_detect_compressor</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">numpy_pickle_utils </span><span class="s2">import </span><span class="s1">_is_numpy_array_byte_order_mismatch</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">numpy_pickle_utils </span><span class="s2">import </span><span class="s1">_ensure_native_byte_order</span>
+<span class="s2">from </span><span class="s1">joblib</span><span class="s3">.</span><span class="s1">compressor </span><span class="s2">import </span><span class="s3">(</span><span class="s1">_COMPRESSORS</span><span class="s3">, </span><span class="s1">_LZ4_PREFIX</span><span class="s3">, </span><span class="s1">CompressorWrapper</span><span class="s3">,</span>
+                               <span class="s1">LZ4_NOT_INSTALLED_ERROR</span><span class="s3">, </span><span class="s1">BinaryZlibFile</span><span class="s3">)</span>
+
+
+<span class="s4">###############################################################################</span>
+<span class="s4"># Define a list of standard types.</span>
+<span class="s4"># Borrowed from dill, initial author: Micheal McKerns:</span>
+<span class="s4"># http://dev.danse.us/trac/pathos/browser/dill/dill_test2.py</span>
+
+<span class="s1">typelist </span><span class="s3">= []</span>
+
+<span class="s4"># testing types</span>
+<span class="s1">_none </span><span class="s3">= </span><span class="s2">None</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_none</span><span class="s3">)</span>
+<span class="s1">_type </span><span class="s3">= </span><span class="s1">type</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_type</span><span class="s3">)</span>
+<span class="s1">_bool </span><span class="s3">= </span><span class="s1">bool</span><span class="s3">(</span><span class="s5">1</span><span class="s3">)</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_bool</span><span class="s3">)</span>
+<span class="s1">_int </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s5">1</span><span class="s3">)</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_int</span><span class="s3">)</span>
+<span class="s1">_float </span><span class="s3">= </span><span class="s1">float</span><span class="s3">(</span><span class="s5">1</span><span class="s3">)</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_float</span><span class="s3">)</span>
+<span class="s1">_complex </span><span class="s3">= </span><span class="s1">complex</span><span class="s3">(</span><span class="s5">1</span><span class="s3">)</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_complex</span><span class="s3">)</span>
+<span class="s1">_string </span><span class="s3">= </span><span class="s1">str</span><span class="s3">(</span><span class="s5">1</span><span class="s3">)</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_string</span><span class="s3">)</span>
+<span class="s1">_tuple </span><span class="s3">= ()</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_tuple</span><span class="s3">)</span>
+<span class="s1">_list </span><span class="s3">= []</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_list</span><span class="s3">)</span>
+<span class="s1">_dict </span><span class="s3">= {}</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_dict</span><span class="s3">)</span>
+<span class="s1">_builtin </span><span class="s3">= </span><span class="s1">len</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_builtin</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_function</span><span class="s3">(</span><span class="s1">x</span><span class="s3">):</span>
+    <span class="s2">yield </span><span class="s1">x</span>
+
+
+<span class="s2">class </span><span class="s1">_class</span><span class="s3">:</span>
+    <span class="s2">def </span><span class="s1">_method</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+
+<span class="s2">class </span><span class="s1">_newclass</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s2">def </span><span class="s1">_method</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_function</span><span class="s3">)</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_class</span><span class="s3">)</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_newclass</span><span class="s3">)  </span><span class="s4"># &lt;type 'type'&gt;</span>
+<span class="s1">_instance </span><span class="s3">= </span><span class="s1">_class</span><span class="s3">()</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_instance</span><span class="s3">)</span>
+<span class="s1">_object </span><span class="s3">= </span><span class="s1">_newclass</span><span class="s3">()</span>
+<span class="s1">typelist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">_object</span><span class="s3">)  </span><span class="s4"># &lt;type 'class'&gt;</span>
+
+
+<span class="s4">###############################################################################</span>
+<span class="s4"># Tests</span>
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress'</span><span class="s3">, [</span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">])</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'member'</span><span class="s3">, </span><span class="s1">typelist</span><span class="s3">)</span>
+<span class="s2">def </span><span class="s1">test_standard_types</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">, </span><span class="s1">member</span><span class="s3">):</span>
+    <span class="s4"># Test pickling and saving with standard types.</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">member</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">compress</span><span class="s3">)</span>
+    <span class="s1">_member </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s4"># We compare the pickled instance to the reloaded one only if it</span>
+    <span class="s4"># can be compared to a copied one</span>
+    <span class="s2">if </span><span class="s1">member </span><span class="s3">== </span><span class="s1">copy</span><span class="s3">.</span><span class="s1">deepcopy</span><span class="s3">(</span><span class="s1">member</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s1">member </span><span class="s3">== </span><span class="s1">_member</span>
+
+
+<span class="s2">def </span><span class="s1">test_value_error</span><span class="s3">():</span>
+    <span class="s4"># Test inverting the input arguments to dump</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">):</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s6">'foo'</span><span class="s3">, </span><span class="s1">dict</span><span class="s3">())</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'wrong_compress'</span><span class="s3">, [-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">10</span><span class="s3">, </span><span class="s1">dict</span><span class="s3">()])</span>
+<span class="s2">def </span><span class="s1">test_compress_level_error</span><span class="s3">(</span><span class="s1">wrong_compress</span><span class="s3">):</span>
+    <span class="s4"># Verify that passing an invalid compress argument raises an error.</span>
+    <span class="s1">exception_msg </span><span class="s3">= (</span><span class="s6">'Non valid compress level given: '</span>
+                     <span class="s6">'&quot;{0}&quot;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">wrong_compress</span><span class="s3">))</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s6">'dummy'</span><span class="s3">, </span><span class="s6">'foo'</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">wrong_compress</span><span class="s3">)</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">exception_msg</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress'</span><span class="s3">, [</span><span class="s2">False</span><span class="s3">, </span><span class="s2">True</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s6">'zlib'</span><span class="s3">])</span>
+<span class="s2">def </span><span class="s1">test_numpy_persistence</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">rnd </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">RandomState</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">rnd</span><span class="s3">.</span><span class="s1">random_sample</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">2</span><span class="s3">))</span>
+    <span class="s4"># We use 'a.T' to have a non C-contiguous array.</span>
+    <span class="s2">for </span><span class="s1">index</span><span class="s3">, </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(((</span><span class="s1">a</span><span class="s3">,), (</span><span class="s1">a</span><span class="s3">.</span><span class="s1">T</span><span class="s3">,), (</span><span class="s1">a</span><span class="s3">, </span><span class="s1">a</span><span class="s3">), [</span><span class="s1">a</span><span class="s3">, </span><span class="s1">a</span><span class="s3">, </span><span class="s1">a</span><span class="s3">])):</span>
+        <span class="s1">filenames </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">compress</span><span class="s3">)</span>
+
+        <span class="s4"># All is cached in one file</span>
+        <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">filenames</span><span class="s3">) == </span><span class="s5">1</span>
+        <span class="s4"># Check that only one file was created</span>
+        <span class="s2">assert </span><span class="s1">filenames</span><span class="s3">[</span><span class="s5">0</span><span class="s3">] == </span><span class="s1">filename</span>
+        <span class="s4"># Check that this file does exist</span>
+        <span class="s2">assert </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">exists</span><span class="s3">(</span><span class="s1">filenames</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+
+        <span class="s4"># Unpickle the object</span>
+        <span class="s1">obj_ </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+        <span class="s4"># Check that the items are indeed arrays</span>
+        <span class="s2">for </span><span class="s1">item </span><span class="s2">in </span><span class="s1">obj_</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">item</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">)</span>
+        <span class="s4"># And finally, check that all the values are equal.</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">(</span><span class="s1">obj_</span><span class="s3">))</span>
+
+    <span class="s4"># Now test with an array subclass</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">(</span><span class="s1">filename </span><span class="s3">+ </span><span class="s6">'mmap'</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s6">'w+'</span><span class="s3">, </span><span class="s1">shape</span><span class="s3">=</span><span class="s5">4</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">float64</span><span class="s3">)</span>
+    <span class="s1">filenames </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">compress</span><span class="s3">)</span>
+    <span class="s4"># All is cached in one file</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">filenames</span><span class="s3">) == </span><span class="s5">1</span>
+
+    <span class="s1">obj_ </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s3">(</span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">) </span><span class="s2">is not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap </span><span class="s2">and</span>
+            <span class="s1">hasattr</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s6">'__array_prepare__'</span><span class="s3">)):</span>
+        <span class="s4"># We don't reconstruct memmaps</span>
+        <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_</span><span class="s3">, </span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">))</span>
+
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+
+    <span class="s4"># Test with an object containing multiple numpy arrays</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s1">ComplexTestObject</span><span class="s3">()</span>
+    <span class="s1">filenames </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">compress</span><span class="s3">)</span>
+    <span class="s4"># All is cached in one file</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">filenames</span><span class="s3">) == </span><span class="s5">1</span>
+
+    <span class="s1">obj_loaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">, </span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">))</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_obj</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">array_obj</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_numpy_persistence_bufferred_array_compression</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">big_array </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s1">_IO_BUFFER_SIZE </span><span class="s3">+ </span><span class="s5">100</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">)</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">big_array</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+    <span class="s1">arr_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">big_array</span><span class="s3">, </span><span class="s1">arr_reloaded</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_memmap_persistence</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">rnd </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">RandomState</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">rnd</span><span class="s3">.</span><span class="s1">random_sample</span><span class="s3">(</span><span class="s5">10</span><span class="s3">)</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test1.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+
+    <span class="s4"># Test with an object containing multiple numpy arrays</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test2.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s1">ComplexTestObject</span><span class="s3">()</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s1">obj_loaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">, </span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">))</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+    <span class="s2">assert not </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">writeable</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+    <span class="s2">assert not </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">writeable</span>
+    <span class="s4"># Memory map not allowed for numpy object arrays</span>
+    <span class="s2">assert not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_obj</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">,</span>
+                                  <span class="s1">obj</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">,</span>
+                                  <span class="s1">obj</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_obj</span><span class="s3">,</span>
+                                  <span class="s1">obj</span><span class="s3">.</span><span class="s1">array_obj</span><span class="s3">)</span>
+
+    <span class="s4"># Test we can write in memmapped arrays</span>
+    <span class="s1">obj_loaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r+'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">writeable</span>
+    <span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">[</span><span class="s5">0</span><span class="s3">:</span><span class="s5">10</span><span class="s3">] = </span><span class="s5">10.0</span>
+    <span class="s2">assert </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">writeable</span>
+    <span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">[</span><span class="s5">0</span><span class="s3">:</span><span class="s5">10</span><span class="s3">] = </span><span class="s5">10</span>
+
+    <span class="s1">obj_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">,</span>
+                                  <span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">,</span>
+                                  <span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">)</span>
+
+    <span class="s4"># Test w+ mode is caught and the mode has switched to r+</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'w+'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">writeable</span>
+    <span class="s2">assert </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_int</span><span class="s3">.</span><span class="s1">mode </span><span class="s3">== </span><span class="s6">'r+'</span>
+    <span class="s2">assert </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">writeable</span>
+    <span class="s2">assert </span><span class="s1">obj_loaded</span><span class="s3">.</span><span class="s1">array_float</span><span class="s3">.</span><span class="s1">mode </span><span class="s3">== </span><span class="s6">'r+'</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_memmap_persistence_mixed_dtypes</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># loading datastructures that have sub-arrays with dtype=object</span>
+    <span class="s4"># should not prevent memmapping on fixed size dtype sub-arrays.</span>
+    <span class="s1">rnd </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">RandomState</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">rnd</span><span class="s3">.</span><span class="s1">random_sample</span><span class="s3">(</span><span class="s5">10</span><span class="s3">)</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s5">1</span><span class="s3">, </span><span class="s6">'b'</span><span class="s3">], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">object</span><span class="s3">)</span>
+    <span class="s1">construct </span><span class="s3">= (</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">)</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">construct</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s1">a_clone</span><span class="s3">, </span><span class="s1">b_clone </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+
+    <span class="s4"># the floating point array has been memory mapped</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">a_clone</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+
+    <span class="s4"># the object-dtype array has been loaded in memory</span>
+    <span class="s2">assert not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">b_clone</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_masked_array_persistence</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># The special-case picker fails, because saving masked_array</span>
+    <span class="s4"># not implemented, but it just delegates to the standard pickler.</span>
+    <span class="s1">rnd </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">RandomState</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">rnd</span><span class="s3">.</span><span class="s1">random_sample</span><span class="s3">(</span><span class="s5">10</span><span class="s3">)</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ma</span><span class="s3">.</span><span class="s1">masked_greater</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s5">0.5</span><span class="s3">)</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s1">b </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">b</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ma</span><span class="s3">.</span><span class="s1">masked_array</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_compress_mmap_mode_warning</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># Test the warning in case of compress + mmap_mode</span>
+    <span class="s1">rnd </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">RandomState</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">rnd</span><span class="s3">.</span><span class="s1">random_sample</span><span class="s3">(</span><span class="s5">10</span><span class="s3">)</span>
+    <span class="s1">this_filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">this_filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s5">1</span><span class="s3">)</span>
+    <span class="s2">with </span><span class="s1">warns</span><span class="s3">(</span><span class="s1">UserWarning</span><span class="s3">) </span><span class="s2">as </span><span class="s1">warninfo</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">this_filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r+'</span><span class="s3">)</span>
+    <span class="s1">debug_msg </span><span class="s3">= </span><span class="s6">&quot;</span><span class="s2">\n</span><span class="s6">&quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">([</span><span class="s1">str</span><span class="s3">(</span><span class="s1">w</span><span class="s3">) </span><span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">warninfo</span><span class="s3">])</span>
+    <span class="s1">warninfo </span><span class="s3">= [</span><span class="s1">w</span><span class="s3">.</span><span class="s1">message </span><span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">warninfo</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">) == </span><span class="s5">1</span><span class="s3">, </span><span class="s1">debug_msg</span>
+    <span class="s2">assert </span><span class="s3">(</span>
+        <span class="s1">str</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]) ==</span>
+        <span class="s6">'mmap_mode &quot;r+&quot; is not compatible with compressed '</span>
+        <span class="s6">f'file </span><span class="s2">{</span><span class="s1">this_filename</span><span class="s2">}</span><span class="s6">. &quot;r+&quot; flag will be ignored.'</span>
+    <span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'cache_size'</span><span class="s3">, [</span><span class="s2">None</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">10</span><span class="s3">])</span>
+<span class="s2">def </span><span class="s1">test_cache_size_warning</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">cache_size</span><span class="s3">):</span>
+    <span class="s4"># Check deprecation warning raised when cache size is not None</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">rnd </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">RandomState</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">rnd</span><span class="s3">.</span><span class="s1">random_sample</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">2</span><span class="s3">))</span>
+
+    <span class="s1">warnings</span><span class="s3">.</span><span class="s1">simplefilter</span><span class="s3">(</span><span class="s6">&quot;always&quot;</span><span class="s3">)</span>
+    <span class="s2">with </span><span class="s1">warnings</span><span class="s3">.</span><span class="s1">catch_warnings</span><span class="s3">(</span><span class="s1">record</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">as </span><span class="s1">warninfo</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">cache_size</span><span class="s3">=</span><span class="s1">cache_size</span><span class="s3">)</span>
+    <span class="s1">expected_nb_warnings </span><span class="s3">= </span><span class="s5">1 </span><span class="s2">if </span><span class="s1">cache_size </span><span class="s2">is not None else </span><span class="s5">0</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">) == </span><span class="s1">expected_nb_warnings</span>
+    <span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">warninfo</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">w</span><span class="s3">.</span><span class="s1">category </span><span class="s3">== </span><span class="s1">DeprecationWarning</span>
+        <span class="s2">assert </span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">w</span><span class="s3">.</span><span class="s1">message</span><span class="s3">) ==</span>
+                <span class="s6">&quot;Please do not set 'cache_size' in joblib.dump, this &quot;</span>
+                <span class="s6">&quot;parameter has no effect and will be removed. You &quot;</span>
+                <span class="s6">&quot;used 'cache_size={0}'&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">cache_size</span><span class="s3">))</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s3">@</span><span class="s1">with_memory_profiler</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress'</span><span class="s3">, [</span><span class="s2">True</span><span class="s3">, </span><span class="s2">False</span><span class="s3">])</span>
+<span class="s2">def </span><span class="s1">test_memory_usage</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">):</span>
+    <span class="s4"># Verify memory stays within expected bounds.</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">small_array </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">10</span><span class="s3">))</span>
+    <span class="s1">big_array </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">=</span><span class="s5">100 </span><span class="s3">* </span><span class="s1">int</span><span class="s3">(</span><span class="s5">1e6</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">obj </span><span class="s2">in </span><span class="s3">(</span><span class="s1">small_array</span><span class="s3">, </span><span class="s1">big_array</span><span class="s3">):</span>
+        <span class="s1">size </span><span class="s3">= </span><span class="s1">obj</span><span class="s3">.</span><span class="s1">nbytes </span><span class="s3">/ </span><span class="s5">1e6</span>
+        <span class="s1">obj_filename </span><span class="s3">= </span><span class="s1">filename </span><span class="s3">+ </span><span class="s1">str</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">randint</span><span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">1000</span><span class="s3">))</span>
+        <span class="s1">mem_used </span><span class="s3">= </span><span class="s1">memory_used</span><span class="s3">(</span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">,</span>
+                               <span class="s1">obj</span><span class="s3">, </span><span class="s1">obj_filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">compress</span><span class="s3">)</span>
+
+        <span class="s4"># The memory used to dump the object shouldn't exceed the buffer</span>
+        <span class="s4"># size used to write array chunks (16MB).</span>
+        <span class="s1">write_buf_size </span><span class="s3">= </span><span class="s1">_IO_BUFFER_SIZE </span><span class="s3">+ </span><span class="s5">16 </span><span class="s3">* </span><span class="s5">1024 </span><span class="s3">** </span><span class="s5">2 </span><span class="s3">/ </span><span class="s5">1e6</span>
+        <span class="s2">assert </span><span class="s1">mem_used </span><span class="s3">&lt;= </span><span class="s1">write_buf_size</span>
+
+        <span class="s1">mem_used </span><span class="s3">= </span><span class="s1">memory_used</span><span class="s3">(</span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">, </span><span class="s1">obj_filename</span><span class="s3">)</span>
+        <span class="s4"># memory used should be less than array size + buffer size used to</span>
+        <span class="s4"># read the array chunk by chunk.</span>
+        <span class="s1">read_buf_size </span><span class="s3">= </span><span class="s5">32 </span><span class="s3">+ </span><span class="s1">_IO_BUFFER_SIZE  </span><span class="s4"># MiB</span>
+        <span class="s2">assert </span><span class="s1">mem_used </span><span class="s3">&lt; </span><span class="s1">size </span><span class="s3">+ </span><span class="s1">read_buf_size</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_compressed_pickle_dump_and_load</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">expected_list </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;i8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&gt;i8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;f8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&gt;f8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s5">1</span><span class="s3">, </span><span class="s6">'abc'</span><span class="s3">, {</span><span class="s6">'a'</span><span class="s3">: </span><span class="s5">1</span><span class="s3">, </span><span class="s6">'b'</span><span class="s3">: </span><span class="s5">2</span><span class="s3">}], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'O'</span><span class="s3">),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">256</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">).</span><span class="s1">tobytes</span><span class="s3">(),</span>
+                     <span class="s6">u&quot;C'est l'</span><span class="s2">\xe9</span><span class="s6">t</span><span class="s2">\xe9 </span><span class="s6">!&quot;</span><span class="s3">]</span>
+
+    <span class="s1">fname </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'temp.pkl.gz'</span><span class="s3">).</span><span class="s1">strpath</span>
+
+    <span class="s1">dumped_filenames </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">expected_list</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s5">1</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">dumped_filenames</span><span class="s3">) == </span><span class="s5">1</span>
+    <span class="s1">result_list </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">)</span>
+    <span class="s2">for </span><span class="s1">result</span><span class="s3">, </span><span class="s1">expected </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">result_list</span><span class="s3">, </span><span class="s1">expected_list</span><span class="s3">):</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">expected</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">):</span>
+            <span class="s1">expected </span><span class="s3">= </span><span class="s1">_ensure_native_byte_order</span><span class="s3">(</span><span class="s1">expected</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s1">result</span><span class="s3">.</span><span class="s1">dtype </span><span class="s3">== </span><span class="s1">expected</span><span class="s3">.</span><span class="s1">dtype</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_equal</span><span class="s3">(</span><span class="s1">result</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">result </span><span class="s3">== </span><span class="s1">expected</span>
+
+
+<span class="s2">def </span><span class="s1">_check_pickle</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">expected_list</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Helper function to test joblib pickle content. 
+ 
+    Note: currently only pickles containing an iterable are supported 
+    by this function. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">version_match </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s6">r'.+py(\d)(\d).+'</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s1">py_version_used_for_writing </span><span class="s3">= </span><span class="s1">int</span><span class="s3">(</span><span class="s1">version_match</span><span class="s3">.</span><span class="s1">group</span><span class="s3">(</span><span class="s5">1</span><span class="s3">))</span>
+
+    <span class="s1">py_version_to_default_pickle_protocol </span><span class="s3">= {</span><span class="s5">2</span><span class="s3">: </span><span class="s5">2</span><span class="s3">, </span><span class="s5">3</span><span class="s3">: </span><span class="s5">3</span><span class="s3">}</span>
+    <span class="s1">pickle_reading_protocol </span><span class="s3">= </span><span class="s1">py_version_to_default_pickle_protocol</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s5">4</span><span class="s3">)</span>
+    <span class="s1">pickle_writing_protocol </span><span class="s3">= </span><span class="s1">py_version_to_default_pickle_protocol</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span>
+        <span class="s1">py_version_used_for_writing</span><span class="s3">, </span><span class="s5">4</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">pickle_reading_protocol </span><span class="s3">&gt;= </span><span class="s1">pickle_writing_protocol</span><span class="s3">:</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">warnings</span><span class="s3">.</span><span class="s1">catch_warnings</span><span class="s3">(</span><span class="s1">record</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">as </span><span class="s1">warninfo</span><span class="s3">:</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">simplefilter</span><span class="s3">(</span><span class="s6">'always'</span><span class="s3">)</span>
+                <span class="s1">warnings</span><span class="s3">.</span><span class="s1">filterwarnings</span><span class="s3">(</span>
+                    <span class="s6">'ignore'</span><span class="s3">, </span><span class="s1">module</span><span class="s3">=</span><span class="s6">'numpy'</span><span class="s3">,</span>
+                    <span class="s1">message</span><span class="s3">=</span><span class="s6">'The compiler package is deprecated'</span><span class="s3">)</span>
+                <span class="s1">result_list </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s1">mmap_mode</span><span class="s3">)</span>
+            <span class="s1">filename_base </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">basename</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+            <span class="s1">expected_nb_deprecation_warnings </span><span class="s3">= </span><span class="s5">1 </span><span class="s2">if </span><span class="s3">(</span>
+                <span class="s6">&quot;_0.9&quot; </span><span class="s2">in </span><span class="s1">filename_base </span><span class="s2">or </span><span class="s6">&quot;_0.8.4&quot; </span><span class="s2">in </span><span class="s1">filename_base</span><span class="s3">) </span><span class="s2">else </span><span class="s5">0</span>
+
+            <span class="s1">expected_nb_user_warnings </span><span class="s3">= </span><span class="s5">3 </span><span class="s2">if </span><span class="s3">(</span>
+                <span class="s1">re</span><span class="s3">.</span><span class="s1">search</span><span class="s3">(</span><span class="s6">&quot;_0.1.+.pkl$&quot;</span><span class="s3">, </span><span class="s1">filename_base</span><span class="s3">) </span><span class="s2">and</span>
+                <span class="s1">mmap_mode </span><span class="s2">is not None</span><span class="s3">) </span><span class="s2">else </span><span class="s5">0</span>
+            <span class="s1">expected_nb_warnings </span><span class="s3">= </span><span class="s1">\</span>
+                <span class="s1">expected_nb_deprecation_warnings </span><span class="s3">+ </span><span class="s1">expected_nb_user_warnings</span>
+            <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">) == </span><span class="s1">expected_nb_warnings</span>
+
+            <span class="s1">deprecation_warnings </span><span class="s3">= [</span>
+                <span class="s1">w </span><span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">warninfo </span><span class="s2">if </span><span class="s1">issubclass</span><span class="s3">(</span>
+                    <span class="s1">w</span><span class="s3">.</span><span class="s1">category</span><span class="s3">, </span><span class="s1">DeprecationWarning</span><span class="s3">)]</span>
+            <span class="s1">user_warnings </span><span class="s3">= [</span>
+                <span class="s1">w </span><span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">warninfo </span><span class="s2">if </span><span class="s1">issubclass</span><span class="s3">(</span>
+                    <span class="s1">w</span><span class="s3">.</span><span class="s1">category</span><span class="s3">, </span><span class="s1">UserWarning</span><span class="s3">)]</span>
+            <span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">deprecation_warnings</span><span class="s3">:</span>
+                <span class="s2">assert </span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">w</span><span class="s3">.</span><span class="s1">message</span><span class="s3">) ==</span>
+                        <span class="s6">&quot;The file '{0}' has been generated with a joblib &quot;</span>
+                        <span class="s6">&quot;version less than 0.10. Please regenerate this &quot;</span>
+                        <span class="s6">&quot;pickle file.&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">))</span>
+
+            <span class="s2">for </span><span class="s1">w </span><span class="s2">in </span><span class="s1">user_warnings</span><span class="s3">:</span>
+                <span class="s1">escaped_filename </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+                <span class="s2">assert </span><span class="s1">re</span><span class="s3">.</span><span class="s1">search</span><span class="s3">(</span>
+                    <span class="s6">f&quot;memmapped.+</span><span class="s2">{</span><span class="s1">escaped_filename</span><span class="s2">}</span><span class="s6">.+segmentation fault&quot;</span><span class="s3">,</span>
+                    <span class="s1">str</span><span class="s3">(</span><span class="s1">w</span><span class="s3">.</span><span class="s1">message</span><span class="s3">))</span>
+
+            <span class="s2">for </span><span class="s1">result</span><span class="s3">, </span><span class="s1">expected </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">result_list</span><span class="s3">, </span><span class="s1">expected_list</span><span class="s3">):</span>
+                <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">expected</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">):</span>
+                    <span class="s1">expected </span><span class="s3">= </span><span class="s1">_ensure_native_byte_order</span><span class="s3">(</span><span class="s1">expected</span><span class="s3">)</span>
+                    <span class="s2">assert </span><span class="s1">result</span><span class="s3">.</span><span class="s1">dtype </span><span class="s3">== </span><span class="s1">expected</span><span class="s3">.</span><span class="s1">dtype</span>
+                    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_equal</span><span class="s3">(</span><span class="s1">result</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">)</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">assert </span><span class="s1">result </span><span class="s3">== </span><span class="s1">expected</span>
+        <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">exc</span><span class="s3">:</span>
+            <span class="s4"># When trying to read with python 3 a pickle generated</span>
+            <span class="s4"># with python 2 we expect a user-friendly error</span>
+            <span class="s2">if </span><span class="s1">py_version_used_for_writing </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:</span>
+                <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">exc</span><span class="s3">, </span><span class="s1">ValueError</span><span class="s3">)</span>
+                <span class="s1">message </span><span class="s3">= (</span><span class="s6">'You may be trying to read with '</span>
+                           <span class="s6">'python 3 a joblib pickle generated with python 2.'</span><span class="s3">)</span>
+                <span class="s2">assert </span><span class="s1">message </span><span class="s2">in </span><span class="s1">str</span><span class="s3">(</span><span class="s1">exc</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">filename</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s6">'.lz4'</span><span class="s3">) </span><span class="s2">and </span><span class="s1">with_lz4</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]:</span>
+                <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">exc</span><span class="s3">, </span><span class="s1">ValueError</span><span class="s3">)</span>
+                <span class="s2">assert </span><span class="s1">LZ4_NOT_INSTALLED_ERROR </span><span class="s2">in </span><span class="s1">str</span><span class="s3">(</span><span class="s1">exc</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">raise</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s4"># Pickle protocol used for writing is too high. We expect a</span>
+        <span class="s4"># &quot;unsupported pickle protocol&quot; error message</span>
+        <span class="s2">try</span><span class="s3">:</span>
+            <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+            <span class="s2">raise </span><span class="s1">AssertionError</span><span class="s3">(</span><span class="s6">'Numpy pickle loading should '</span>
+                                 <span class="s6">'have raised a ValueError exception'</span><span class="s3">)</span>
+        <span class="s2">except </span><span class="s1">ValueError </span><span class="s2">as </span><span class="s1">e</span><span class="s3">:</span>
+            <span class="s1">message </span><span class="s3">= </span><span class="s6">'unsupported pickle protocol: {0}'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+                <span class="s1">pickle_writing_protocol</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s1">message </span><span class="s2">in </span><span class="s1">str</span><span class="s3">(</span><span class="s1">e</span><span class="s3">.</span><span class="s1">args</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_joblib_pickle_across_python_versions</span><span class="s3">():</span>
+    <span class="s4"># We need to be specific about dtypes in particular endianness</span>
+    <span class="s4"># because the pickles can be generated on one architecture and</span>
+    <span class="s4"># the tests run on another one. See</span>
+    <span class="s4"># https://github.com/joblib/joblib/issues/279.</span>
+    <span class="s1">expected_list </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;i8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;f8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s5">1</span><span class="s3">, </span><span class="s6">'abc'</span><span class="s3">, {</span><span class="s6">'a'</span><span class="s3">: </span><span class="s5">1</span><span class="s3">, </span><span class="s6">'b'</span><span class="s3">: </span><span class="s5">2</span><span class="s3">}], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'O'</span><span class="s3">),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">256</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">).</span><span class="s1">tobytes</span><span class="s3">(),</span>
+                     <span class="s4"># np.matrix is a subclass of np.ndarray, here we want</span>
+                     <span class="s4"># to verify this type of object is correctly unpickled</span>
+                     <span class="s4"># among versions.</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">matrix</span><span class="s3">([</span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;i8'</span><span class="s3">)),</span>
+                     <span class="s6">u&quot;C'est l'</span><span class="s2">\xe9</span><span class="s6">t</span><span class="s2">\xe9 </span><span class="s6">!&quot;</span><span class="s3">]</span>
+
+    <span class="s4"># Testing all the compressed and non compressed</span>
+    <span class="s4"># pickles in joblib/test/data. These pickles were generated by</span>
+    <span class="s4"># the joblib/test/data/create_numpy_pickle.py script for the</span>
+    <span class="s4"># relevant python, joblib and numpy versions.</span>
+    <span class="s1">test_data_dir </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">abspath</span><span class="s3">(</span><span class="s1">data</span><span class="s3">.</span><span class="s1">__file__</span><span class="s3">))</span>
+
+    <span class="s1">pickle_extensions </span><span class="s3">= (</span><span class="s6">'.pkl'</span><span class="s3">, </span><span class="s6">'.gz'</span><span class="s3">, </span><span class="s6">'.gzip'</span><span class="s3">, </span><span class="s6">'.bz2'</span><span class="s3">, </span><span class="s6">'lz4'</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">lzma </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">pickle_extensions </span><span class="s3">+= (</span><span class="s6">'.xz'</span><span class="s3">, </span><span class="s6">'.lzma'</span><span class="s3">)</span>
+    <span class="s1">pickle_filenames </span><span class="s3">= [</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">test_data_dir</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">)</span>
+                        <span class="s2">for </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">os</span><span class="s3">.</span><span class="s1">listdir</span><span class="s3">(</span><span class="s1">test_data_dir</span><span class="s3">)</span>
+                        <span class="s2">if </span><span class="s1">any</span><span class="s3">(</span><span class="s1">fn</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s1">ext</span><span class="s3">) </span><span class="s2">for </span><span class="s1">ext </span><span class="s2">in </span><span class="s1">pickle_extensions</span><span class="s3">)]</span>
+
+    <span class="s2">for </span><span class="s1">fname </span><span class="s2">in </span><span class="s1">pickle_filenames</span><span class="s3">:</span>
+        <span class="s1">_check_pickle</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s1">expected_list</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_joblib_pickle_across_python_versions_with_mmap</span><span class="s3">():</span>
+    <span class="s1">expected_list </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;i8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;f8'</span><span class="s3">)),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s5">1</span><span class="s3">, </span><span class="s6">'abc'</span><span class="s3">, {</span><span class="s6">'a'</span><span class="s3">: </span><span class="s5">1</span><span class="s3">, </span><span class="s6">'b'</span><span class="s3">: </span><span class="s5">2</span><span class="s3">}], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'O'</span><span class="s3">),</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">256</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">).</span><span class="s1">tobytes</span><span class="s3">(),</span>
+                     <span class="s4"># np.matrix is a subclass of np.ndarray, here we want</span>
+                     <span class="s4"># to verify this type of object is correctly unpickled</span>
+                     <span class="s4"># among versions.</span>
+                     <span class="s1">np</span><span class="s3">.</span><span class="s1">matrix</span><span class="s3">([</span><span class="s5">0</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;i8'</span><span class="s3">)),</span>
+                     <span class="s6">u&quot;C'est l'</span><span class="s2">\xe9</span><span class="s6">t</span><span class="s2">\xe9 </span><span class="s6">!&quot;</span><span class="s3">]</span>
+
+    <span class="s1">test_data_dir </span><span class="s3">= </span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">dirname</span><span class="s3">(</span><span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">abspath</span><span class="s3">(</span><span class="s1">data</span><span class="s3">.</span><span class="s1">__file__</span><span class="s3">))</span>
+
+    <span class="s1">pickle_filenames </span><span class="s3">= [</span>
+        <span class="s1">os</span><span class="s3">.</span><span class="s1">path</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">test_data_dir</span><span class="s3">, </span><span class="s1">fn</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">fn </span><span class="s2">in </span><span class="s1">os</span><span class="s3">.</span><span class="s1">listdir</span><span class="s3">(</span><span class="s1">test_data_dir</span><span class="s3">) </span><span class="s2">if </span><span class="s1">fn</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s6">'.pkl'</span><span class="s3">)]</span>
+    <span class="s2">for </span><span class="s1">fname </span><span class="s2">in </span><span class="s1">pickle_filenames</span><span class="s3">:</span>
+        <span class="s1">_check_pickle</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s1">expected_list</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_numpy_array_byte_order_mismatch_detection</span><span class="s3">():</span>
+    <span class="s4"># List of numpy arrays with big endian byteorder.</span>
+    <span class="s1">be_arrays </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">2.0</span><span class="s3">), (</span><span class="s5">3</span><span class="s3">, </span><span class="s5">4.0</span><span class="s3">)],</span>
+                          <span class="s1">dtype</span><span class="s3">=[(</span><span class="s6">''</span><span class="s3">, </span><span class="s6">'&gt;i8'</span><span class="s3">), (</span><span class="s6">''</span><span class="s3">, </span><span class="s6">'&gt;f8'</span><span class="s3">)]),</span>
+                 <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&gt;i8'</span><span class="s3">)),</span>
+                 <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&gt;f8'</span><span class="s3">))]</span>
+
+    <span class="s4"># Verify the byteorder mismatch is correctly detected.</span>
+    <span class="s2">for </span><span class="s1">array </span><span class="s2">in </span><span class="s1">be_arrays</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">byteorder </span><span class="s3">== </span><span class="s6">'big'</span><span class="s3">:</span>
+            <span class="s2">assert not </span><span class="s1">_is_numpy_array_byte_order_mismatch</span><span class="s3">(</span><span class="s1">array</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">_is_numpy_array_byte_order_mismatch</span><span class="s3">(</span><span class="s1">array</span><span class="s3">)</span>
+        <span class="s1">converted </span><span class="s3">= </span><span class="s1">_ensure_native_byte_order</span><span class="s3">(</span><span class="s1">array</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">converted</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">fields</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">converted</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">fields</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+                <span class="s1">f</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">byteorder </span><span class="s3">== </span><span class="s6">'='</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">converted</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">byteorder </span><span class="s3">== </span><span class="s6">&quot;=&quot;</span>
+
+    <span class="s4"># List of numpy arrays with little endian byteorder.</span>
+    <span class="s1">le_arrays </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([(</span><span class="s5">1</span><span class="s3">, </span><span class="s5">2.0</span><span class="s3">), (</span><span class="s5">3</span><span class="s3">, </span><span class="s5">4.0</span><span class="s3">)],</span>
+                          <span class="s1">dtype</span><span class="s3">=[(</span><span class="s6">''</span><span class="s3">, </span><span class="s6">'&lt;i8'</span><span class="s3">), (</span><span class="s6">''</span><span class="s3">, </span><span class="s6">'&lt;f8'</span><span class="s3">)]),</span>
+                 <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;i8'</span><span class="s3">)),</span>
+                 <span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">(</span><span class="s6">'&lt;f8'</span><span class="s3">))]</span>
+
+    <span class="s4"># Verify the byteorder mismatch is correctly detected.</span>
+    <span class="s2">for </span><span class="s1">array </span><span class="s2">in </span><span class="s1">le_arrays</span><span class="s3">:</span>
+        <span class="s2">if </span><span class="s1">sys</span><span class="s3">.</span><span class="s1">byteorder </span><span class="s3">== </span><span class="s6">'little'</span><span class="s3">:</span>
+            <span class="s2">assert not </span><span class="s1">_is_numpy_array_byte_order_mismatch</span><span class="s3">(</span><span class="s1">array</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">_is_numpy_array_byte_order_mismatch</span><span class="s3">(</span><span class="s1">array</span><span class="s3">)</span>
+        <span class="s1">converted </span><span class="s3">= </span><span class="s1">_ensure_native_byte_order</span><span class="s3">(</span><span class="s1">array</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">converted</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">fields</span><span class="s3">:</span>
+            <span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">converted</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">fields</span><span class="s3">.</span><span class="s1">values</span><span class="s3">():</span>
+                <span class="s1">f</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">byteorder </span><span class="s3">== </span><span class="s6">'='</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">converted</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">.</span><span class="s1">byteorder </span><span class="s3">== </span><span class="s6">&quot;=&quot;</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress_tuple'</span><span class="s3">, [(</span><span class="s6">'zlib'</span><span class="s3">, </span><span class="s5">3</span><span class="s3">), (</span><span class="s6">'gzip'</span><span class="s3">, </span><span class="s5">3</span><span class="s3">)])</span>
+<span class="s2">def </span><span class="s1">test_compress_tuple_argument</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">compress_tuple</span><span class="s3">):</span>
+    <span class="s4"># Verify the tuple is correctly taken into account.</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s6">&quot;dummy&quot;</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">,</span>
+                      <span class="s1">compress</span><span class="s3">=</span><span class="s1">compress_tuple</span><span class="s3">)</span>
+    <span class="s4"># Verify the file contains the right magic number</span>
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">_detect_compressor</span><span class="s3">(</span><span class="s1">f</span><span class="s3">) == </span><span class="s1">compress_tuple</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress_tuple,message'</span><span class="s3">,</span>
+             <span class="s3">[((</span><span class="s6">'zlib'</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s6">'extra'</span><span class="s3">),        </span><span class="s4"># wrong compress tuple</span>
+               <span class="s6">'Compress argument tuple should contain exactly 2 elements'</span><span class="s3">),</span>
+              <span class="s3">((</span><span class="s6">'wrong'</span><span class="s3">, </span><span class="s5">3</span><span class="s3">),                </span><span class="s4"># wrong compress method</span>
+               <span class="s6">'Non valid compression method given: &quot;{}&quot;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s6">'wrong'</span><span class="s3">)),</span>
+              <span class="s3">((</span><span class="s6">'zlib'</span><span class="s3">, </span><span class="s6">'wrong'</span><span class="s3">),           </span><span class="s4"># wrong compress level</span>
+               <span class="s6">'Non valid compress level given: &quot;{}&quot;'</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s6">'wrong'</span><span class="s3">))])</span>
+<span class="s2">def </span><span class="s1">test_compress_tuple_argument_exception</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">compress_tuple</span><span class="s3">, </span><span class="s1">message</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s4"># Verify setting a wrong compress tuple raises a ValueError.</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s6">'dummy'</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">compress_tuple</span><span class="s3">)</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">message</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress_string'</span><span class="s3">, [</span><span class="s6">'zlib'</span><span class="s3">, </span><span class="s6">'gzip'</span><span class="s3">])</span>
+<span class="s2">def </span><span class="s1">test_compress_string_argument</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">compress_string</span><span class="s3">):</span>
+    <span class="s4"># Verify the string is correctly taken into account.</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s6">&quot;dummy&quot;</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">,</span>
+                      <span class="s1">compress</span><span class="s3">=</span><span class="s1">compress_string</span><span class="s3">)</span>
+    <span class="s4"># Verify the file contains the right magic number</span>
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">_detect_compressor</span><span class="s3">(</span><span class="s1">f</span><span class="s3">) == </span><span class="s1">compress_string</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress'</span><span class="s3">, [</span><span class="s5">1</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s5">6</span><span class="s3">])</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'cmethod'</span><span class="s3">, </span><span class="s1">_COMPRESSORS</span><span class="s3">)</span>
+<span class="s2">def </span><span class="s1">test_joblib_compression_formats</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">, </span><span class="s1">cmethod</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">objects </span><span class="s3">= (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">shape</span><span class="s3">=(</span><span class="s5">100</span><span class="s3">, </span><span class="s5">100</span><span class="s3">), </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'f8'</span><span class="s3">),</span>
+               <span class="s1">range</span><span class="s3">(</span><span class="s5">10</span><span class="s3">),</span>
+               <span class="s3">{</span><span class="s6">'a'</span><span class="s3">: </span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">: </span><span class="s6">'b'</span><span class="s3">}, [], (), {}, </span><span class="s5">0</span><span class="s3">, </span><span class="s5">1.0</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">cmethod </span><span class="s2">in </span><span class="s3">(</span><span class="s6">&quot;lzma&quot;</span><span class="s3">, </span><span class="s6">&quot;xz&quot;</span><span class="s3">) </span><span class="s2">and </span><span class="s1">lzma </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">pytest</span><span class="s3">.</span><span class="s1">skip</span><span class="s3">(</span><span class="s6">&quot;lzma is support not available&quot;</span><span class="s3">)</span>
+
+    <span class="s2">elif </span><span class="s1">cmethod </span><span class="s3">== </span><span class="s6">'lz4' </span><span class="s2">and </span><span class="s1">with_lz4</span><span class="s3">.</span><span class="s1">args</span><span class="s3">[</span><span class="s5">0</span><span class="s3">]:</span>
+        <span class="s4"># Skip the test if lz4 is not installed. We here use the with_lz4</span>
+        <span class="s4"># skipif fixture whose argument is True when lz4 is not installed</span>
+        <span class="s1">pytest</span><span class="s3">.</span><span class="s1">skip</span><span class="s3">(</span><span class="s6">&quot;lz4 is not installed.&quot;</span><span class="s3">)</span>
+
+    <span class="s1">dump_filename </span><span class="s3">= </span><span class="s1">filename </span><span class="s3">+ </span><span class="s6">&quot;.&quot; </span><span class="s3">+ </span><span class="s1">cmethod</span>
+    <span class="s2">for </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">objects</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">dump_filename</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=(</span><span class="s1">cmethod</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">))</span>
+        <span class="s4"># Verify the file contains the right magic number</span>
+        <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">dump_filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">_detect_compressor</span><span class="s3">(</span><span class="s1">f</span><span class="s3">) == </span><span class="s1">cmethod</span>
+        <span class="s4"># Verify the reloaded object is correct</span>
+        <span class="s1">obj_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">dump_filename</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">, </span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">))</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">):</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">obj_reloaded </span><span class="s3">== </span><span class="s1">obj</span>
+
+
+<span class="s2">def </span><span class="s1">_gzip_file_decompress</span><span class="s3">(</span><span class="s1">source_filename</span><span class="s3">, </span><span class="s1">target_filename</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Decompress a gzip file.&quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">closing</span><span class="s3">(</span><span class="s1">gzip</span><span class="s3">.</span><span class="s1">GzipFile</span><span class="s3">(</span><span class="s1">source_filename</span><span class="s3">, </span><span class="s6">&quot;rb&quot;</span><span class="s3">)) </span><span class="s2">as </span><span class="s1">fo</span><span class="s3">:</span>
+        <span class="s1">buf </span><span class="s3">= </span><span class="s1">fo</span><span class="s3">.</span><span class="s1">read</span><span class="s3">()</span>
+
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">target_filename</span><span class="s3">, </span><span class="s6">&quot;wb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fo</span><span class="s3">:</span>
+        <span class="s1">fo</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">_zlib_file_decompress</span><span class="s3">(</span><span class="s1">source_filename</span><span class="s3">, </span><span class="s1">target_filename</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Decompress a zlib file.&quot;&quot;&quot;</span>
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">source_filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fo</span><span class="s3">:</span>
+        <span class="s1">buf </span><span class="s3">= </span><span class="s1">zlib</span><span class="s3">.</span><span class="s1">decompress</span><span class="s3">(</span><span class="s1">fo</span><span class="s3">.</span><span class="s1">read</span><span class="s3">())</span>
+
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">target_filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fo</span><span class="s3">:</span>
+        <span class="s1">fo</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'extension,decompress'</span><span class="s3">,</span>
+             <span class="s3">[(</span><span class="s6">'.z'</span><span class="s3">, </span><span class="s1">_zlib_file_decompress</span><span class="s3">),</span>
+              <span class="s3">(</span><span class="s6">'.gz'</span><span class="s3">, </span><span class="s1">_gzip_file_decompress</span><span class="s3">)])</span>
+<span class="s2">def </span><span class="s1">test_load_externally_decompressed_files</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">extension</span><span class="s3">, </span><span class="s1">decompress</span><span class="s3">):</span>
+    <span class="s4"># Test that BinaryZlibFile generates valid gzip and zlib compressed files.</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s6">&quot;a string to persist&quot;</span>
+    <span class="s1">filename_raw </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+
+    <span class="s1">filename_compressed </span><span class="s3">= </span><span class="s1">filename_raw </span><span class="s3">+ </span><span class="s1">extension</span>
+    <span class="s4"># Use automatic extension detection to compress with the right method.</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">filename_compressed</span><span class="s3">)</span>
+
+    <span class="s4"># Decompress with the corresponding method</span>
+    <span class="s1">decompress</span><span class="s3">(</span><span class="s1">filename_compressed</span><span class="s3">, </span><span class="s1">filename_raw</span><span class="s3">)</span>
+
+    <span class="s4"># Test that the uncompressed pickle can be loaded and</span>
+    <span class="s4"># that the result is correct.</span>
+    <span class="s1">obj_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename_raw</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">obj </span><span class="s3">== </span><span class="s1">obj_reloaded</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'extension,cmethod'</span><span class="s3">,</span>
+             <span class="s4"># valid compressor extensions</span>
+             <span class="s3">[(</span><span class="s6">'.z'</span><span class="s3">, </span><span class="s6">'zlib'</span><span class="s3">),</span>
+              <span class="s3">(</span><span class="s6">'.gz'</span><span class="s3">, </span><span class="s6">'gzip'</span><span class="s3">),</span>
+              <span class="s3">(</span><span class="s6">'.bz2'</span><span class="s3">, </span><span class="s6">'bz2'</span><span class="s3">),</span>
+              <span class="s3">(</span><span class="s6">'.lzma'</span><span class="s3">, </span><span class="s6">'lzma'</span><span class="s3">),</span>
+              <span class="s3">(</span><span class="s6">'.xz'</span><span class="s3">, </span><span class="s6">'xz'</span><span class="s3">),</span>
+              <span class="s4"># invalid compressor extensions</span>
+              <span class="s3">(</span><span class="s6">'.pkl'</span><span class="s3">, </span><span class="s6">'not-compressed'</span><span class="s3">),</span>
+              <span class="s3">(</span><span class="s6">''</span><span class="s3">, </span><span class="s6">'not-compressed'</span><span class="s3">)])</span>
+<span class="s2">def </span><span class="s1">test_compression_using_file_extension</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">extension</span><span class="s3">, </span><span class="s1">cmethod</span><span class="s3">):</span>
+    <span class="s2">if </span><span class="s1">cmethod </span><span class="s2">in </span><span class="s3">(</span><span class="s6">&quot;lzma&quot;</span><span class="s3">, </span><span class="s6">&quot;xz&quot;</span><span class="s3">) </span><span class="s2">and </span><span class="s1">lzma </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">pytest</span><span class="s3">.</span><span class="s1">skip</span><span class="s3">(</span><span class="s6">&quot;lzma is missing&quot;</span><span class="s3">)</span>
+    <span class="s4"># test that compression method corresponds to the given filename extension.</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s6">&quot;object to dump&quot;</span>
+
+    <span class="s1">dump_fname </span><span class="s3">= </span><span class="s1">filename </span><span class="s3">+ </span><span class="s1">extension</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">dump_fname</span><span class="s3">)</span>
+    <span class="s4"># Verify the file contains the right magic number</span>
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">dump_fname</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">_detect_compressor</span><span class="s3">(</span><span class="s1">f</span><span class="s3">) == </span><span class="s1">cmethod</span>
+    <span class="s4"># Verify the reloaded object is correct</span>
+    <span class="s1">obj_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">dump_fname</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">, </span><span class="s1">type</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">))</span>
+    <span class="s2">assert </span><span class="s1">obj_reloaded </span><span class="s3">== </span><span class="s1">obj</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_file_handle_persistence</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">objs </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">random</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">10</span><span class="s3">)), </span><span class="s6">&quot;some data&quot;</span><span class="s3">]</span>
+    <span class="s1">fobjs </span><span class="s3">= [</span><span class="s1">bz2</span><span class="s3">.</span><span class="s1">BZ2File</span><span class="s3">, </span><span class="s1">gzip</span><span class="s3">.</span><span class="s1">GzipFile</span><span class="s3">]</span>
+    <span class="s2">if </span><span class="s1">lzma </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">fobjs </span><span class="s3">+= [</span><span class="s1">lzma</span><span class="s3">.</span><span class="s1">LZMAFile</span><span class="s3">]</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+
+    <span class="s2">for </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">objs</span><span class="s3">:</span>
+        <span class="s2">for </span><span class="s1">fobj </span><span class="s2">in </span><span class="s1">fobjs</span><span class="s3">:</span>
+            <span class="s2">with </span><span class="s1">fobj</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+            <span class="s4"># using the same decompressor prevents from internally</span>
+            <span class="s4"># decompress again.</span>
+            <span class="s2">with </span><span class="s1">fobj</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s1">obj_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+
+            <span class="s4"># when needed, the correct decompressor should be used when</span>
+            <span class="s4"># passing a raw file handle.</span>
+            <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+                <span class="s1">obj_reloaded_2 </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">):</span>
+                <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+                <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_reloaded_2</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">assert </span><span class="s1">obj_reloaded </span><span class="s3">== </span><span class="s1">obj</span>
+                <span class="s2">assert </span><span class="s1">obj_reloaded_2 </span><span class="s3">== </span><span class="s1">obj</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_in_memory_persistence</span><span class="s3">():</span>
+    <span class="s1">objs </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">random</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">10</span><span class="s3">)), </span><span class="s6">&quot;some data&quot;</span><span class="s3">]</span>
+    <span class="s2">for </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">objs</span><span class="s3">:</span>
+        <span class="s1">f </span><span class="s3">= </span><span class="s1">io</span><span class="s3">.</span><span class="s1">BytesIO</span><span class="s3">()</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+        <span class="s1">obj_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">):</span>
+            <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">obj_reloaded </span><span class="s3">== </span><span class="s1">obj</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_file_handle_persistence_mmap</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">random</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">10</span><span class="s3">))</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s1">obj_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r+'</span><span class="s3">)</span>
+
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj_reloaded</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_file_handle_persistence_compressed_mmap</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">random</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">10</span><span class="s3">))</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=(</span><span class="s6">'gzip'</span><span class="s3">, </span><span class="s5">3</span><span class="s3">))</span>
+
+    <span class="s2">with </span><span class="s1">closing</span><span class="s3">(</span><span class="s1">gzip</span><span class="s3">.</span><span class="s1">GzipFile</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">)) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">with </span><span class="s1">warns</span><span class="s3">(</span><span class="s1">UserWarning</span><span class="s3">) </span><span class="s2">as </span><span class="s1">warninfo</span><span class="s3">:</span>
+            <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r+'</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">) == </span><span class="s5">1</span>
+        <span class="s2">assert </span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">message</span><span class="s3">) ==</span>
+                <span class="s6">'&quot;%(fileobj)r&quot; is not a raw file, mmap_mode &quot;%(mmap_mode)s&quot; '</span>
+                <span class="s6">'flag will be ignored.' </span><span class="s3">% {</span><span class="s6">'fileobj'</span><span class="s3">: </span><span class="s1">f</span><span class="s3">, </span><span class="s6">'mmap_mode'</span><span class="s3">: </span><span class="s6">'r+'</span><span class="s3">})</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_file_handle_persistence_in_memory_mmap</span><span class="s3">():</span>
+    <span class="s1">obj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">random</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">10</span><span class="s3">))</span>
+    <span class="s1">buf </span><span class="s3">= </span><span class="s1">io</span><span class="s3">.</span><span class="s1">BytesIO</span><span class="s3">()</span>
+
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">buf</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">warns</span><span class="s3">(</span><span class="s1">UserWarning</span><span class="s3">) </span><span class="s2">as </span><span class="s1">warninfo</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">buf</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r+'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">) == </span><span class="s5">1</span>
+    <span class="s2">assert </span><span class="s3">(</span><span class="s1">str</span><span class="s3">(</span><span class="s1">warninfo</span><span class="s3">[</span><span class="s5">0</span><span class="s3">].</span><span class="s1">message</span><span class="s3">) ==</span>
+            <span class="s6">'In memory persistence is not compatible with mmap_mode '</span>
+            <span class="s6">'&quot;%(mmap_mode)s&quot; flag passed. mmap_mode option will be '</span>
+            <span class="s6">'ignored.' </span><span class="s3">% {</span><span class="s6">'mmap_mode'</span><span class="s3">: </span><span class="s6">'r+'</span><span class="s3">})</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'data'</span><span class="s3">, [</span><span class="s7">b'a little data as bytes.'</span><span class="s3">,</span>
+                      <span class="s4"># More bytes</span>
+                      <span class="s5">10000 </span><span class="s3">* </span><span class="s6">&quot;{}&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span>
+                          <span class="s1">random</span><span class="s3">.</span><span class="s1">randint</span><span class="s3">(</span><span class="s5">0</span><span class="s3">, </span><span class="s5">1000</span><span class="s3">) * </span><span class="s5">1000</span><span class="s3">).</span><span class="s1">encode</span><span class="s3">(</span><span class="s6">'latin-1'</span><span class="s3">)],</span>
+             <span class="s1">ids</span><span class="s3">=[</span><span class="s6">&quot;a little data as bytes.&quot;</span><span class="s3">, </span><span class="s6">&quot;a large data as bytes.&quot;</span><span class="s3">])</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'compress_level'</span><span class="s3">, [</span><span class="s5">1</span><span class="s3">, </span><span class="s5">3</span><span class="s3">, </span><span class="s5">9</span><span class="s3">])</span>
+<span class="s2">def </span><span class="s1">test_binary_zlibfile</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">data</span><span class="s3">, </span><span class="s1">compress_level</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s4"># Regular cases</span>
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">with </span><span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">,</span>
+                            <span class="s1">compresslevel</span><span class="s3">=</span><span class="s1">compress_level</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fz</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">writable</span><span class="s3">()</span>
+            <span class="s1">fz</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">fileno</span><span class="s3">() == </span><span class="s1">f</span><span class="s3">.</span><span class="s1">fileno</span><span class="s3">()</span>
+            <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">io</span><span class="s3">.</span><span class="s1">UnsupportedOperation</span><span class="s3">):</span>
+                <span class="s1">fz</span><span class="s3">.</span><span class="s1">_check_can_read</span><span class="s3">()</span>
+
+            <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">io</span><span class="s3">.</span><span class="s1">UnsupportedOperation</span><span class="s3">):</span>
+                <span class="s1">fz</span><span class="s3">.</span><span class="s1">_check_can_seek</span><span class="s3">()</span>
+        <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">closed</span>
+        <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">):</span>
+            <span class="s1">fz</span><span class="s3">.</span><span class="s1">_check_not_closed</span><span class="s3">()</span>
+
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">with </span><span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">f</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fz</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">readable</span><span class="s3">()</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">seekable</span><span class="s3">()</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">fileno</span><span class="s3">() == </span><span class="s1">f</span><span class="s3">.</span><span class="s1">fileno</span><span class="s3">()</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">read</span><span class="s3">() == </span><span class="s1">data</span>
+            <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">io</span><span class="s3">.</span><span class="s1">UnsupportedOperation</span><span class="s3">):</span>
+                <span class="s1">fz</span><span class="s3">.</span><span class="s1">_check_can_write</span><span class="s3">()</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">seekable</span><span class="s3">()</span>
+            <span class="s1">fz</span><span class="s3">.</span><span class="s1">seek</span><span class="s3">(</span><span class="s5">0</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">tell</span><span class="s3">() == </span><span class="s5">0</span>
+        <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">closed</span>
+
+    <span class="s4"># Test with a filename as input</span>
+    <span class="s2">with </span><span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">,</span>
+                        <span class="s1">compresslevel</span><span class="s3">=</span><span class="s1">compress_level</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fz</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">writable</span><span class="s3">()</span>
+        <span class="s1">fz</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">fz</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">read</span><span class="s3">() == </span><span class="s1">data</span>
+        <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">seekable</span><span class="s3">()</span>
+
+    <span class="s4"># Test without context manager</span>
+    <span class="s1">fz </span><span class="s3">= </span><span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">, </span><span class="s1">compresslevel</span><span class="s3">=</span><span class="s1">compress_level</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">writable</span><span class="s3">()</span>
+    <span class="s1">fz</span><span class="s3">.</span><span class="s1">write</span><span class="s3">(</span><span class="s1">data</span><span class="s3">)</span>
+    <span class="s1">fz</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+
+    <span class="s1">fz </span><span class="s3">= </span><span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">fz</span><span class="s3">.</span><span class="s1">read</span><span class="s3">() == </span><span class="s1">data</span>
+    <span class="s1">fz</span><span class="s3">.</span><span class="s1">close</span><span class="s3">()</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'bad_value'</span><span class="s3">, [-</span><span class="s5">1</span><span class="s3">, </span><span class="s5">10</span><span class="s3">, </span><span class="s5">15</span><span class="s3">, </span><span class="s6">'a'</span><span class="s3">, (), {}])</span>
+<span class="s2">def </span><span class="s1">test_binary_zlibfile_bad_compression_levels</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">bad_value</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s6">'wb'</span><span class="s3">, </span><span class="s1">compresslevel</span><span class="s3">=</span><span class="s1">bad_value</span><span class="s3">)</span>
+    <span class="s1">pattern </span><span class="s3">= </span><span class="s1">re</span><span class="s3">.</span><span class="s1">escape</span><span class="s3">(</span><span class="s6">&quot;'compresslevel' must be an integer between 1 and 9. &quot;</span>
+                        <span class="s6">&quot;You provided 'compresslevel={}'&quot;</span><span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">bad_value</span><span class="s3">))</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">pattern</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'bad_mode'</span><span class="s3">, [</span><span class="s6">'a'</span><span class="s3">, </span><span class="s6">'x'</span><span class="s3">, </span><span class="s6">'r'</span><span class="s3">, </span><span class="s6">'w'</span><span class="s3">, </span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">])</span>
+<span class="s2">def </span><span class="s1">test_binary_zlibfile_invalid_modes</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">bad_mode</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">, </span><span class="s1">bad_mode</span><span class="s3">)</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s6">&quot;Invalid mode&quot;</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'bad_file'</span><span class="s3">, [</span><span class="s5">1</span><span class="s3">, (), {}])</span>
+<span class="s2">def </span><span class="s1">test_binary_zlibfile_invalid_filename_type</span><span class="s3">(</span><span class="s1">bad_file</span><span class="s3">):</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">TypeError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">BinaryZlibFile</span><span class="s3">(</span><span class="s1">bad_file</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">)</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s6">&quot;filename must be a str or bytes object, or a file&quot;</span><span class="s3">)</span>
+
+
+<span class="s4">###############################################################################</span>
+<span class="s4"># Test dumping array subclasses</span>
+<span class="s2">if </span><span class="s1">np </span><span class="s2">is not None</span><span class="s3">:</span>
+
+    <span class="s2">class </span><span class="s1">SubArray</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">__reduce__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">_load_sub_array</span><span class="s3">, (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">), )</span>
+
+    <span class="s2">def </span><span class="s1">_load_sub_array</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">):</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">SubArray</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">)</span>
+        <span class="s1">d</span><span class="s3">[:] = </span><span class="s1">arr</span>
+        <span class="s2">return </span><span class="s1">d</span>
+
+    <span class="s2">class </span><span class="s1">ComplexTestObject</span><span class="s3">:</span>
+        <span class="s0">&quot;&quot;&quot;A complex object containing numpy arrays as attributes.&quot;&quot;&quot;</span>
+
+        <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">array_float </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">100</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'float64'</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">array_int </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s5">100</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'int32'</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">array_obj </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s6">'a'</span><span class="s3">, </span><span class="s5">10</span><span class="s3">, </span><span class="s5">20.0</span><span class="s3">], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'object'</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_numpy_subclass</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">SubArray</span><span class="s3">((</span><span class="s5">10</span><span class="s3">,))</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s1">c </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">SubArray</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">c</span><span class="s3">, </span><span class="s1">a</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_pathlib</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">value </span><span class="s3">= </span><span class="s5">123</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">Path</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">))</span>
+    <span class="s2">assert </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">) == </span><span class="s1">value</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">value</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">Path</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)) == </span><span class="s1">value</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_non_contiguous_array_pickling</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+
+    <span class="s2">for </span><span class="s1">array </span><span class="s2">in </span><span class="s3">[  </span><span class="s4"># Array that triggers a contiguousness issue with nditer,</span>
+                    <span class="s4"># see https://github.com/joblib/joblib/pull/352 and see</span>
+                    <span class="s4"># https://github.com/joblib/joblib/pull/353</span>
+                    <span class="s1">np</span><span class="s3">.</span><span class="s1">asfortranarray</span><span class="s3">([[</span><span class="s5">1</span><span class="s3">, </span><span class="s5">2</span><span class="s3">], [</span><span class="s5">3</span><span class="s3">, </span><span class="s5">4</span><span class="s3">]])[</span><span class="s5">1</span><span class="s3">:],</span>
+                    <span class="s4"># Non contiguous array with works fine with nditer</span>
+                    <span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s5">10</span><span class="s3">, </span><span class="s5">50</span><span class="s3">, </span><span class="s5">20</span><span class="s3">), </span><span class="s1">order</span><span class="s3">=</span><span class="s6">'F'</span><span class="s3">)[:, :</span><span class="s5">1</span><span class="s3">, :]]:</span>
+        <span class="s2">assert not </span><span class="s1">array</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">c_contiguous</span>
+        <span class="s2">assert not </span><span class="s1">array</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">f_contiguous</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">array</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">)</span>
+        <span class="s1">array_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">array_reloaded</span><span class="s3">, </span><span class="s1">array</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_pickle_highest_protocol</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># ensure persistence of a numpy array is valid even when using</span>
+    <span class="s4"># the pickle HIGHEST_PROTOCOL.</span>
+    <span class="s4"># see https://github.com/joblib/joblib/issues/362</span>
+
+    <span class="s1">filename </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">test_array </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s5">10</span><span class="s3">)</span>
+
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">test_array</span><span class="s3">, </span><span class="s1">filename</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">HIGHEST_PROTOCOL</span><span class="s3">)</span>
+    <span class="s1">array_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">filename</span><span class="s3">)</span>
+
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">array_reloaded</span><span class="s3">, </span><span class="s1">test_array</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_pickle_in_socket</span><span class="s3">():</span>
+    <span class="s4"># test that joblib can pickle in sockets</span>
+    <span class="s1">test_array </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">10</span><span class="s3">)</span>
+    <span class="s1">_ADDR </span><span class="s3">= (</span><span class="s6">&quot;localhost&quot;</span><span class="s3">, </span><span class="s5">12345</span><span class="s3">)</span>
+    <span class="s1">listener </span><span class="s3">= </span><span class="s1">socket</span><span class="s3">.</span><span class="s1">socket</span><span class="s3">(</span><span class="s1">socket</span><span class="s3">.</span><span class="s1">AF_INET</span><span class="s3">, </span><span class="s1">socket</span><span class="s3">.</span><span class="s1">SOCK_STREAM</span><span class="s3">)</span>
+    <span class="s1">listener</span><span class="s3">.</span><span class="s1">bind</span><span class="s3">(</span><span class="s1">_ADDR</span><span class="s3">)</span>
+    <span class="s1">listener</span><span class="s3">.</span><span class="s1">listen</span><span class="s3">(</span><span class="s5">1</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">socket</span><span class="s3">.</span><span class="s1">create_connection</span><span class="s3">(</span><span class="s1">_ADDR</span><span class="s3">) </span><span class="s2">as </span><span class="s1">client</span><span class="s3">:</span>
+        <span class="s1">server</span><span class="s3">, </span><span class="s1">client_addr </span><span class="s3">= </span><span class="s1">listener</span><span class="s3">.</span><span class="s1">accept</span><span class="s3">()</span>
+
+        <span class="s2">with </span><span class="s1">server</span><span class="s3">.</span><span class="s1">makefile</span><span class="s3">(</span><span class="s6">&quot;wb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">sf</span><span class="s3">:</span>
+            <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">test_array</span><span class="s3">, </span><span class="s1">sf</span><span class="s3">)</span>
+
+        <span class="s2">with </span><span class="s1">client</span><span class="s3">.</span><span class="s1">makefile</span><span class="s3">(</span><span class="s6">&quot;rb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">cf</span><span class="s3">:</span>
+            <span class="s1">array_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">cf</span><span class="s3">)</span>
+
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">array_reloaded</span><span class="s3">, </span><span class="s1">test_array</span><span class="s3">)</span>
+
+        <span class="s4"># Check that a byte-aligned numpy array written in a file can be send</span>
+        <span class="s4"># over a socket and then read on the other side</span>
+        <span class="s1">bytes_to_send </span><span class="s3">= </span><span class="s1">io</span><span class="s3">.</span><span class="s1">BytesIO</span><span class="s3">()</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">test_array</span><span class="s3">, </span><span class="s1">bytes_to_send</span><span class="s3">)</span>
+        <span class="s1">server</span><span class="s3">.</span><span class="s1">send</span><span class="s3">(</span><span class="s1">bytes_to_send</span><span class="s3">.</span><span class="s1">getvalue</span><span class="s3">())</span>
+
+        <span class="s2">with </span><span class="s1">client</span><span class="s3">.</span><span class="s1">makefile</span><span class="s3">(</span><span class="s6">&quot;rb&quot;</span><span class="s3">) </span><span class="s2">as </span><span class="s1">cf</span><span class="s3">:</span>
+            <span class="s1">array_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">cf</span><span class="s3">)</span>
+
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">array_reloaded</span><span class="s3">, </span><span class="s1">test_array</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s2">def </span><span class="s1">test_load_memmap_with_big_offset</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># Test that numpy memmap offset is set correctly if greater than</span>
+    <span class="s4"># mmap.ALLOCATIONGRANULARITY, see</span>
+    <span class="s4"># https://github.com/joblib/joblib/issues/451 and</span>
+    <span class="s4"># https://github.com/numpy/numpy/pull/8443 for more details.</span>
+    <span class="s1">fname </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.mmap'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">size </span><span class="s3">= </span><span class="s1">mmap</span><span class="s3">.</span><span class="s1">ALLOCATIONGRANULARITY</span>
+    <span class="s1">obj </span><span class="s3">= [</span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">size</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'uint8'</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">(</span><span class="s1">size</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s6">'uint8'</span><span class="s3">)]</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">)</span>
+    <span class="s1">memmaps </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">memmaps</span><span class="s3">[</span><span class="s5">1</span><span class="s3">], </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">memmaps</span><span class="s3">[</span><span class="s5">1</span><span class="s3">].</span><span class="s1">offset </span><span class="s3">&gt; </span><span class="s1">size</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">, </span><span class="s1">memmaps</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_register_compressor</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># Check that registering compressor file works.</span>
+    <span class="s1">compressor_name </span><span class="s3">= </span><span class="s6">'test-name'</span>
+    <span class="s1">compressor_prefix </span><span class="s3">= </span><span class="s6">'test-prefix'</span>
+
+    <span class="s2">class </span><span class="s1">BinaryCompressorTestFile</span><span class="s3">(</span><span class="s1">io</span><span class="s3">.</span><span class="s1">BufferedIOBase</span><span class="s3">):</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">class </span><span class="s1">BinaryCompressorTestWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+        <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+            <span class="s1">CompressorWrapper</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">BinaryCompressorTestFile</span><span class="s3">,</span>
+                                       <span class="s1">prefix</span><span class="s3">=</span><span class="s1">compressor_prefix</span><span class="s3">)</span>
+
+    <span class="s1">register_compressor</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">, </span><span class="s1">BinaryCompressorTestWrapper</span><span class="s3">())</span>
+
+    <span class="s2">assert </span><span class="s3">(</span><span class="s1">_COMPRESSORS</span><span class="s3">[</span><span class="s1">compressor_name</span><span class="s3">].</span><span class="s1">fileobj_factory </span><span class="s3">==</span>
+            <span class="s1">BinaryCompressorTestFile</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">_COMPRESSORS</span><span class="s3">[</span><span class="s1">compressor_name</span><span class="s3">].</span><span class="s1">prefix </span><span class="s3">== </span><span class="s1">compressor_prefix</span>
+
+    <span class="s4"># Remove this dummy compressor file from extra compressors because other</span>
+    <span class="s4"># tests might fail because of this</span>
+    <span class="s1">_COMPRESSORS</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'invalid_name'</span><span class="s3">, [</span><span class="s5">1</span><span class="s3">, (), {}])</span>
+<span class="s2">def </span><span class="s1">test_register_compressor_invalid_name</span><span class="s3">(</span><span class="s1">invalid_name</span><span class="s3">):</span>
+    <span class="s4"># Test that registering an invalid compressor name is not allowed.</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">register_compressor</span><span class="s3">(</span><span class="s1">invalid_name</span><span class="s3">, </span><span class="s2">None</span><span class="s3">)</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s6">&quot;Compressor name should be a string&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_register_compressor_invalid_fileobj</span><span class="s3">():</span>
+    <span class="s4"># Test that registering an invalid file object is not allowed.</span>
+
+    <span class="s2">class </span><span class="s1">InvalidFileObject</span><span class="s3">():</span>
+        <span class="s2">pass</span>
+
+    <span class="s2">class </span><span class="s1">InvalidFileObjectWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+            <span class="s1">CompressorWrapper</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">InvalidFileObject</span><span class="s3">,</span>
+                                       <span class="s1">prefix</span><span class="s3">=</span><span class="s7">b'prefix'</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">register_compressor</span><span class="s3">(</span><span class="s6">'invalid'</span><span class="s3">, </span><span class="s1">InvalidFileObjectWrapper</span><span class="s3">())</span>
+
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s6">&quot;Compressor 'fileobj_factory' attribute should implement &quot;</span>
+                  <span class="s6">&quot;the file object interface&quot;</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">AnotherZlibCompressorWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">CompressorWrapper</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">BinaryZlibFile</span><span class="s3">, </span><span class="s1">prefix</span><span class="s3">=</span><span class="s7">b'prefix'</span><span class="s3">)</span>
+
+
+<span class="s2">class </span><span class="s1">StandardLibGzipCompressorWrapper</span><span class="s3">(</span><span class="s1">CompressorWrapper</span><span class="s3">):</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s1">CompressorWrapper</span><span class="s3">.</span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">obj</span><span class="s3">=</span><span class="s1">gzip</span><span class="s3">.</span><span class="s1">GzipFile</span><span class="s3">, </span><span class="s1">prefix</span><span class="s3">=</span><span class="s7">b'prefix'</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">test_register_compressor_already_registered</span><span class="s3">():</span>
+    <span class="s4"># Test registration of existing compressor files.</span>
+    <span class="s1">compressor_name </span><span class="s3">= </span><span class="s6">'test-name'</span>
+
+    <span class="s4"># register a test compressor</span>
+    <span class="s1">register_compressor</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">, </span><span class="s1">AnotherZlibCompressorWrapper</span><span class="s3">())</span>
+
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">register_compressor</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">,</span>
+                            <span class="s1">StandardLibGzipCompressorWrapper</span><span class="s3">())</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s6">&quot;Compressor '{}' already registered.&quot;</span>
+                  <span class="s3">.</span><span class="s1">format</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">))</span>
+
+    <span class="s1">register_compressor</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">, </span><span class="s1">StandardLibGzipCompressorWrapper</span><span class="s3">(),</span>
+                        <span class="s1">force</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">assert </span><span class="s1">compressor_name </span><span class="s2">in </span><span class="s1">_COMPRESSORS</span>
+    <span class="s2">assert </span><span class="s1">_COMPRESSORS</span><span class="s3">[</span><span class="s1">compressor_name</span><span class="s3">].</span><span class="s1">fileobj_factory </span><span class="s3">== </span><span class="s1">gzip</span><span class="s3">.</span><span class="s1">GzipFile</span>
+
+    <span class="s4"># Remove this dummy compressor file from extra compressors because other</span>
+    <span class="s4"># tests might fail because of this</span>
+    <span class="s1">_COMPRESSORS</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s1">compressor_name</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_lz4</span>
+<span class="s2">def </span><span class="s1">test_lz4_compression</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># Check that lz4 can be used when dependency is available.</span>
+    <span class="s2">import </span><span class="s1">lz4</span><span class="s3">.</span><span class="s1">frame</span>
+    <span class="s1">compressor </span><span class="s3">= </span><span class="s6">'lz4'</span>
+    <span class="s2">assert </span><span class="s1">compressor </span><span class="s2">in </span><span class="s1">_COMPRESSORS</span>
+    <span class="s2">assert </span><span class="s1">_COMPRESSORS</span><span class="s3">[</span><span class="s1">compressor</span><span class="s3">].</span><span class="s1">fileobj_factory </span><span class="s3">== </span><span class="s1">lz4</span><span class="s3">.</span><span class="s1">frame</span><span class="s3">.</span><span class="s1">LZ4FrameFile</span>
+
+    <span class="s1">fname </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.pkl'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">data </span><span class="s3">= </span><span class="s6">'test data'</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s1">compressor</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">f</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">_LZ4_PREFIX</span><span class="s3">)) == </span><span class="s1">_LZ4_PREFIX</span>
+    <span class="s2">assert </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">) == </span><span class="s1">data</span>
+
+    <span class="s4"># Test that LZ4 is applied based on file extension</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, </span><span class="s1">fname </span><span class="s3">+ </span><span class="s6">'.lz4'</span><span class="s3">)</span>
+    <span class="s2">with </span><span class="s1">open</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s6">'rb'</span><span class="s3">) </span><span class="s2">as </span><span class="s1">f</span><span class="s3">:</span>
+        <span class="s2">assert </span><span class="s1">f</span><span class="s3">.</span><span class="s1">read</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">_LZ4_PREFIX</span><span class="s3">)) == </span><span class="s1">_LZ4_PREFIX</span>
+    <span class="s2">assert </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">) == </span><span class="s1">data</span>
+
+
+<span class="s3">@</span><span class="s1">without_lz4</span>
+<span class="s2">def </span><span class="s1">test_lz4_compression_without_lz4</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">):</span>
+    <span class="s4"># Check that lz4 cannot be used when dependency is not available.</span>
+    <span class="s1">fname </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.nolz4'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">data </span><span class="s3">= </span><span class="s6">'test data'</span>
+    <span class="s1">msg </span><span class="s3">= </span><span class="s1">LZ4_NOT_INSTALLED_ERROR</span>
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">, </span><span class="s1">compress</span><span class="s3">=</span><span class="s6">'lz4'</span><span class="s3">)</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+    <span class="s2">with </span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">) </span><span class="s2">as </span><span class="s1">excinfo</span><span class="s3">:</span>
+        <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">data</span><span class="s3">, </span><span class="s1">fname </span><span class="s3">+ </span><span class="s6">'.lz4'</span><span class="s3">)</span>
+    <span class="s1">excinfo</span><span class="s3">.</span><span class="s1">match</span><span class="s3">(</span><span class="s1">msg</span><span class="s3">)</span>
+
+
+<span class="s1">protocols </span><span class="s3">= [</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">DEFAULT_PROTOCOL</span><span class="s3">]</span>
+<span class="s2">if </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">HIGHEST_PROTOCOL </span><span class="s3">!= </span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">DEFAULT_PROTOCOL</span><span class="s3">:</span>
+    <span class="s1">protocols</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">pickle</span><span class="s3">.</span><span class="s1">HIGHEST_PROTOCOL</span><span class="s3">)</span>
+
+
+<span class="s3">@</span><span class="s1">with_numpy</span>
+<span class="s3">@</span><span class="s1">parametrize</span><span class="s3">(</span><span class="s6">'protocol'</span><span class="s3">, </span><span class="s1">protocols</span><span class="s3">)</span>
+<span class="s2">def </span><span class="s1">test_memmap_alignment_padding</span><span class="s3">(</span><span class="s1">tmpdir</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">):</span>
+    <span class="s4"># Test that memmaped arrays returned by numpy.load are correctly aligned</span>
+    <span class="s1">fname </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test.mmap'</span><span class="s3">).</span><span class="s1">strpath</span>
+
+    <span class="s1">a </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">randn</span><span class="s3">(</span><span class="s5">2</span><span class="s3">)</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s1">protocol</span><span class="s3">)</span>
+    <span class="s1">memmap </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">memmap</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+    <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">memmap</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s3">(</span>
+        <span class="s1">memmap</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data </span><span class="s3">% </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">NUMPY_ARRAY_ALIGNMENT_BYTES </span><span class="s3">== </span><span class="s5">0</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">memmap</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">aligned</span>
+
+    <span class="s1">array_list </span><span class="s3">= [</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">randn</span><span class="s3">(</span><span class="s5">2</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">randn</span><span class="s3">(</span><span class="s5">2</span><span class="s3">),</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">randn</span><span class="s3">(</span><span class="s5">2</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">random</span><span class="s3">.</span><span class="s1">randn</span><span class="s3">(</span><span class="s5">2</span><span class="s3">)</span>
+    <span class="s3">]</span>
+
+    <span class="s4"># On Windows OSError 22 if reusing the same path for memmap ...</span>
+    <span class="s1">fname </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test1.mmap'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">array_list</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s1">protocol</span><span class="s3">)</span>
+    <span class="s1">l_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">idx</span><span class="s3">, </span><span class="s1">memmap </span><span class="s2">in </span><span class="s1">enumerate</span><span class="s3">(</span><span class="s1">l_reloaded</span><span class="s3">):</span>
+        <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">memmap</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">array_list</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">], </span><span class="s1">memmap</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s3">(</span>
+            <span class="s1">memmap</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data </span><span class="s3">% </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">NUMPY_ARRAY_ALIGNMENT_BYTES </span><span class="s3">== </span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">memmap</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">aligned</span>
+
+    <span class="s1">array_dict </span><span class="s3">= {</span>
+        <span class="s6">'a0'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">2</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a1'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">3</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a2'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">5</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a3'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">7</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a4'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">11</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a5'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">13</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a6'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">17</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a7'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">19</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+        <span class="s6">'a8'</span><span class="s3">: </span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s5">23</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">uint8</span><span class="s3">),</span>
+    <span class="s3">}</span>
+
+    <span class="s4"># On Windows OSError 22 if reusing the same path for memmap ...</span>
+    <span class="s1">fname </span><span class="s3">= </span><span class="s1">tmpdir</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s6">'test2.mmap'</span><span class="s3">).</span><span class="s1">strpath</span>
+    <span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">dump</span><span class="s3">(</span><span class="s1">array_dict</span><span class="s3">, </span><span class="s1">fname</span><span class="s3">, </span><span class="s1">protocol</span><span class="s3">=</span><span class="s1">protocol</span><span class="s3">)</span>
+    <span class="s1">d_reloaded </span><span class="s3">= </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">load</span><span class="s3">(</span><span class="s1">fname</span><span class="s3">, </span><span class="s1">mmap_mode</span><span class="s3">=</span><span class="s6">'r'</span><span class="s3">)</span>
+
+    <span class="s2">for </span><span class="s1">key</span><span class="s3">, </span><span class="s1">memmap </span><span class="s2">in </span><span class="s1">d_reloaded</span><span class="s3">.</span><span class="s1">items</span><span class="s3">():</span>
+        <span class="s2">assert </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">memmap</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">memmap</span><span class="s3">)</span>
+        <span class="s1">np</span><span class="s3">.</span><span class="s1">testing</span><span class="s3">.</span><span class="s1">assert_array_equal</span><span class="s3">(</span><span class="s1">array_dict</span><span class="s3">[</span><span class="s1">key</span><span class="s3">], </span><span class="s1">memmap</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s3">(</span>
+            <span class="s1">memmap</span><span class="s3">.</span><span class="s1">ctypes</span><span class="s3">.</span><span class="s1">data </span><span class="s3">% </span><span class="s1">numpy_pickle</span><span class="s3">.</span><span class="s1">NUMPY_ARRAY_ALIGNMENT_BYTES </span><span class="s3">== </span><span class="s5">0</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">memmap</span><span class="s3">.</span><span class="s1">flags</span><span class="s3">.</span><span class="s1">aligned</span>
+</pre>
+</body>
+</html>

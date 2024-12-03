@@ -1,0 +1,583 @@
+<html>
+<head>
+<title>trf.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+trf.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Trust Region Reflective algorithm for least-squares optimization. 
+ 
+The algorithm is based on ideas from paper [STIR]_. The main idea is to 
+account for the presence of the bounds by appropriate scaling of the variables (or, 
+equivalently, changing a trust-region shape). Let's introduce a vector v: 
+ 
+           | ub[i] - x[i], if g[i] &lt; 0 and ub[i] &lt; np.inf 
+    v[i] = | x[i] - lb[i], if g[i] &gt; 0 and lb[i] &gt; -np.inf 
+           | 1,           otherwise 
+ 
+where g is the gradient of a cost function and lb, ub are the bounds. Its 
+components are distances to the bounds at which the anti-gradient points (if 
+this distance is finite). Define a scaling matrix D = diag(v**0.5). 
+First-order optimality conditions can be stated as 
+ 
+    D^2 g(x) = 0. 
+ 
+Meaning that components of the gradient should be zero for strictly interior 
+variables, and components must point inside the feasible region for variables 
+on the bound. 
+ 
+Now consider this system of equations as a new optimization problem. If the 
+point x is strictly interior (not on the bound), then the left-hand side is 
+differentiable and the Newton step for it satisfies 
+ 
+    (D^2 H + diag(g) Jv) p = -D^2 g 
+ 
+where H is the Hessian matrix (or its J^T J approximation in least squares), 
+Jv is the Jacobian matrix of v with components -1, 1 or 0, such that all 
+elements of matrix C = diag(g) Jv are non-negative. Introduce the change 
+of the variables x = D x_h (_h would be &quot;hat&quot; in LaTeX). In the new variables, 
+we have a Newton step satisfying 
+ 
+    B_h p_h = -g_h, 
+ 
+where B_h = D H D + C, g_h = D g. In least squares B_h = J_h^T J_h, where 
+J_h = J D. Note that J_h and g_h are proper Jacobian and gradient with respect 
+to &quot;hat&quot; variables. To guarantee global convergence we formulate a 
+trust-region problem based on the Newton step in the new variables: 
+ 
+    0.5 * p_h^T B_h p + g_h^T p_h -&gt; min, ||p_h|| &lt;= Delta 
+ 
+In the original space B = H + D^{-1} C D^{-1}, and the equivalent trust-region 
+problem is 
+ 
+    0.5 * p^T B p + g^T p -&gt; min, ||D^{-1} p|| &lt;= Delta 
+ 
+Here, the meaning of the matrix D becomes more clear: it alters the shape 
+of a trust-region, such that large steps towards the bounds are not allowed. 
+In the implementation, the trust-region problem is solved in &quot;hat&quot; space, 
+but handling of the bounds is done in the original space (see below and read 
+the code). 
+ 
+The introduction of the matrix D doesn't allow to ignore bounds, the algorithm 
+must keep iterates strictly feasible (to satisfy aforementioned 
+differentiability), the parameter theta controls step back from the boundary 
+(see the code for details). 
+ 
+The algorithm does another important trick. If the trust-region solution 
+doesn't fit into the bounds, then a reflected (from a firstly encountered 
+bound) search direction is considered. For motivation and analysis refer to 
+[STIR]_ paper (and other papers of the authors). In practice, it doesn't need 
+a lot of justifications, the algorithm simply chooses the best step among 
+three: a constrained trust-region step, a reflected step and a constrained 
+Cauchy step (a minimizer along -g_h in &quot;hat&quot; space, or -D^2 g in the original 
+space). 
+ 
+Another feature is that a trust-region radius control strategy is modified to 
+account for appearance of the diagonal C matrix (called diag_h in the code). 
+ 
+Note that all described peculiarities are completely gone as we consider 
+problems without bounds (the algorithm becomes a standard trust-region type 
+algorithm very similar to ones implemented in MINPACK). 
+ 
+The implementation supports two methods of solving the trust-region problem. 
+The first, called 'exact', applies SVD on Jacobian and then solves the problem 
+very accurately using the algorithm described in [JJMore]_. It is not 
+applicable to large problem. The second, called 'lsmr', uses the 2-D subspace 
+approach (sometimes called &quot;indefinite dogleg&quot;), where the problem is solved 
+in a subspace spanned by the gradient and the approximate Gauss-Newton step 
+found by ``scipy.sparse.linalg.lsmr``. A 2-D trust-region problem is 
+reformulated as a 4th order algebraic equation and solved very accurately by 
+``numpy.roots``. The subspace approach allows to solve very large problems 
+(up to couple of millions of residuals on a regular PC), provided the Jacobian 
+matrix is sufficiently sparse. 
+ 
+References 
+---------- 
+.. [STIR] Branch, M.A., T.F. Coleman, and Y. Li, &quot;A Subspace, Interior, 
+      and Conjugate Gradient Method for Large-Scale Bound-Constrained 
+      Minimization Problems,&quot; SIAM Journal on Scientific Computing, 
+      Vol. 21, Number 1, pp 1-23, 1999. 
+.. [JJMore] More, J. J., &quot;The Levenberg-Marquardt Algorithm: Implementation 
+    and Theory,&quot; Numerical Analysis, ed. G. A. Watson, Lecture 
+&quot;&quot;&quot;</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">numpy</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">norm</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">svd</span><span class="s3">, </span><span class="s1">qr</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">sparse</span><span class="s3">.</span><span class="s1">linalg </span><span class="s2">import </span><span class="s1">lsmr</span>
+<span class="s2">from </span><span class="s1">scipy</span><span class="s3">.</span><span class="s1">optimize </span><span class="s2">import </span><span class="s1">OptimizeResult</span>
+
+<span class="s2">from </span><span class="s3">.</span><span class="s1">common </span><span class="s2">import </span><span class="s3">(</span>
+    <span class="s1">step_size_to_bound</span><span class="s3">, </span><span class="s1">find_active_constraints</span><span class="s3">, </span><span class="s1">in_bounds</span><span class="s3">,</span>
+    <span class="s1">make_strictly_feasible</span><span class="s3">, </span><span class="s1">intersect_trust_region</span><span class="s3">, </span><span class="s1">solve_lsq_trust_region</span><span class="s3">,</span>
+    <span class="s1">solve_trust_region_2d</span><span class="s3">, </span><span class="s1">minimize_quadratic_1d</span><span class="s3">, </span><span class="s1">build_quadratic_1d</span><span class="s3">,</span>
+    <span class="s1">evaluate_quadratic</span><span class="s3">, </span><span class="s1">right_multiplied_operator</span><span class="s3">, </span><span class="s1">regularized_lsq_operator</span><span class="s3">,</span>
+    <span class="s1">CL_scaling_vector</span><span class="s3">, </span><span class="s1">compute_grad</span><span class="s3">, </span><span class="s1">compute_jac_scale</span><span class="s3">, </span><span class="s1">check_termination</span><span class="s3">,</span>
+    <span class="s1">update_tr_radius</span><span class="s3">, </span><span class="s1">scale_for_robust_loss_function</span><span class="s3">, </span><span class="s1">print_header_nonlinear</span><span class="s3">,</span>
+    <span class="s1">print_iteration_nonlinear</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">trf</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">J0</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">, </span><span class="s1">ftol</span><span class="s3">, </span><span class="s1">xtol</span><span class="s3">, </span><span class="s1">gtol</span><span class="s3">, </span><span class="s1">max_nfev</span><span class="s3">, </span><span class="s1">x_scale</span><span class="s3">,</span>
+        <span class="s1">loss_function</span><span class="s3">, </span><span class="s1">tr_solver</span><span class="s3">, </span><span class="s1">tr_options</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">):</span>
+    <span class="s4"># For efficiency, it makes sense to run the simplified version of the</span>
+    <span class="s4"># algorithm when no bounds are imposed. We decided to write the two</span>
+    <span class="s4"># separate functions. It violates the DRY principle, but the individual</span>
+    <span class="s4"># functions are kept the most readable.</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">lb </span><span class="s3">== -</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">) </span><span class="s2">and </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">ub </span><span class="s3">== </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">):</span>
+        <span class="s2">return </span><span class="s1">trf_no_bounds</span><span class="s3">(</span>
+            <span class="s1">fun</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">J0</span><span class="s3">, </span><span class="s1">ftol</span><span class="s3">, </span><span class="s1">xtol</span><span class="s3">, </span><span class="s1">gtol</span><span class="s3">, </span><span class="s1">max_nfev</span><span class="s3">, </span><span class="s1">x_scale</span><span class="s3">,</span>
+            <span class="s1">loss_function</span><span class="s3">, </span><span class="s1">tr_solver</span><span class="s3">, </span><span class="s1">tr_options</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">trf_bounds</span><span class="s3">(</span>
+            <span class="s1">fun</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">J0</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">, </span><span class="s1">ftol</span><span class="s3">, </span><span class="s1">xtol</span><span class="s3">, </span><span class="s1">gtol</span><span class="s3">, </span><span class="s1">max_nfev</span><span class="s3">, </span><span class="s1">x_scale</span><span class="s3">,</span>
+            <span class="s1">loss_function</span><span class="s3">, </span><span class="s1">tr_solver</span><span class="s3">, </span><span class="s1">tr_options</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">select_step</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">diag_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">p_h</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">Delta</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">, </span><span class="s1">theta</span><span class="s3">):</span>
+    <span class="s0">&quot;&quot;&quot;Select the best step according to Trust Region Reflective algorithm.&quot;&quot;&quot;</span>
+    <span class="s2">if </span><span class="s1">in_bounds</span><span class="s3">(</span><span class="s1">x </span><span class="s3">+ </span><span class="s1">p</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">):</span>
+        <span class="s1">p_value </span><span class="s3">= </span><span class="s1">evaluate_quadratic</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">p_h</span><span class="s3">, </span><span class="s1">diag</span><span class="s3">=</span><span class="s1">diag_h</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">p</span><span class="s3">, </span><span class="s1">p_h</span><span class="s3">, -</span><span class="s1">p_value</span>
+
+    <span class="s1">p_stride</span><span class="s3">, </span><span class="s1">hits </span><span class="s3">= </span><span class="s1">step_size_to_bound</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">)</span>
+
+    <span class="s4"># Compute the reflected direction.</span>
+    <span class="s1">r_h </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">(</span><span class="s1">p_h</span><span class="s3">)</span>
+    <span class="s1">r_h</span><span class="s3">[</span><span class="s1">hits</span><span class="s3">.</span><span class="s1">astype</span><span class="s3">(</span><span class="s1">bool</span><span class="s3">)] *= -</span><span class="s5">1</span>
+    <span class="s1">r </span><span class="s3">= </span><span class="s1">d </span><span class="s3">* </span><span class="s1">r_h</span>
+
+    <span class="s4"># Restrict trust-region step, such that it hits the bound.</span>
+    <span class="s1">p </span><span class="s3">*= </span><span class="s1">p_stride</span>
+    <span class="s1">p_h </span><span class="s3">*= </span><span class="s1">p_stride</span>
+    <span class="s1">x_on_bound </span><span class="s3">= </span><span class="s1">x </span><span class="s3">+ </span><span class="s1">p</span>
+
+    <span class="s4"># Reflected direction will cross first either feasible region or trust</span>
+    <span class="s4"># region boundary.</span>
+    <span class="s1">_</span><span class="s3">, </span><span class="s1">to_tr </span><span class="s3">= </span><span class="s1">intersect_trust_region</span><span class="s3">(</span><span class="s1">p_h</span><span class="s3">, </span><span class="s1">r_h</span><span class="s3">, </span><span class="s1">Delta</span><span class="s3">)</span>
+    <span class="s1">to_bound</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">step_size_to_bound</span><span class="s3">(</span><span class="s1">x_on_bound</span><span class="s3">, </span><span class="s1">r</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">)</span>
+
+    <span class="s4"># Find lower and upper bounds on a step size along the reflected</span>
+    <span class="s4"># direction, considering the strict feasibility requirement. There is no</span>
+    <span class="s4"># single correct way to do that, the chosen approach seems to work best</span>
+    <span class="s4"># on test problems.</span>
+    <span class="s1">r_stride </span><span class="s3">= </span><span class="s1">min</span><span class="s3">(</span><span class="s1">to_bound</span><span class="s3">, </span><span class="s1">to_tr</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">r_stride </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">r_stride_l </span><span class="s3">= (</span><span class="s5">1 </span><span class="s3">- </span><span class="s1">theta</span><span class="s3">) * </span><span class="s1">p_stride </span><span class="s3">/ </span><span class="s1">r_stride</span>
+        <span class="s2">if </span><span class="s1">r_stride </span><span class="s3">== </span><span class="s1">to_bound</span><span class="s3">:</span>
+            <span class="s1">r_stride_u </span><span class="s3">= </span><span class="s1">theta </span><span class="s3">* </span><span class="s1">to_bound</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">r_stride_u </span><span class="s3">= </span><span class="s1">to_tr</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">r_stride_l </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">r_stride_u </span><span class="s3">= -</span><span class="s5">1</span>
+
+    <span class="s4"># Check if reflection step is available.</span>
+    <span class="s2">if </span><span class="s1">r_stride_l </span><span class="s3">&lt;= </span><span class="s1">r_stride_u</span><span class="s3">:</span>
+        <span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">c </span><span class="s3">= </span><span class="s1">build_quadratic_1d</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">r_h</span><span class="s3">, </span><span class="s1">s0</span><span class="s3">=</span><span class="s1">p_h</span><span class="s3">, </span><span class="s1">diag</span><span class="s3">=</span><span class="s1">diag_h</span><span class="s3">)</span>
+        <span class="s1">r_stride</span><span class="s3">, </span><span class="s1">r_value </span><span class="s3">= </span><span class="s1">minimize_quadratic_1d</span><span class="s3">(</span>
+            <span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s1">r_stride_l</span><span class="s3">, </span><span class="s1">r_stride_u</span><span class="s3">, </span><span class="s1">c</span><span class="s3">=</span><span class="s1">c</span><span class="s3">)</span>
+        <span class="s1">r_h </span><span class="s3">*= </span><span class="s1">r_stride</span>
+        <span class="s1">r_h </span><span class="s3">+= </span><span class="s1">p_h</span>
+        <span class="s1">r </span><span class="s3">= </span><span class="s1">r_h </span><span class="s3">* </span><span class="s1">d</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">r_value </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span>
+
+    <span class="s4"># Now correct p_h to make it strictly interior.</span>
+    <span class="s1">p </span><span class="s3">*= </span><span class="s1">theta</span>
+    <span class="s1">p_h </span><span class="s3">*= </span><span class="s1">theta</span>
+    <span class="s1">p_value </span><span class="s3">= </span><span class="s1">evaluate_quadratic</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">p_h</span><span class="s3">, </span><span class="s1">diag</span><span class="s3">=</span><span class="s1">diag_h</span><span class="s3">)</span>
+
+    <span class="s1">ag_h </span><span class="s3">= -</span><span class="s1">g_h</span>
+    <span class="s1">ag </span><span class="s3">= </span><span class="s1">d </span><span class="s3">* </span><span class="s1">ag_h</span>
+
+    <span class="s1">to_tr </span><span class="s3">= </span><span class="s1">Delta </span><span class="s3">/ </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">ag_h</span><span class="s3">)</span>
+    <span class="s1">to_bound</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">step_size_to_bound</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">ag</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">to_bound </span><span class="s3">&lt; </span><span class="s1">to_tr</span><span class="s3">:</span>
+        <span class="s1">ag_stride </span><span class="s3">= </span><span class="s1">theta </span><span class="s3">* </span><span class="s1">to_bound</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">ag_stride </span><span class="s3">= </span><span class="s1">to_tr</span>
+
+    <span class="s1">a</span><span class="s3">, </span><span class="s1">b </span><span class="s3">= </span><span class="s1">build_quadratic_1d</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">ag_h</span><span class="s3">, </span><span class="s1">diag</span><span class="s3">=</span><span class="s1">diag_h</span><span class="s3">)</span>
+    <span class="s1">ag_stride</span><span class="s3">, </span><span class="s1">ag_value </span><span class="s3">= </span><span class="s1">minimize_quadratic_1d</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s1">ag_stride</span><span class="s3">)</span>
+    <span class="s1">ag_h </span><span class="s3">*= </span><span class="s1">ag_stride</span>
+    <span class="s1">ag </span><span class="s3">*= </span><span class="s1">ag_stride</span>
+
+    <span class="s2">if </span><span class="s1">p_value </span><span class="s3">&lt; </span><span class="s1">r_value </span><span class="s2">and </span><span class="s1">p_value </span><span class="s3">&lt; </span><span class="s1">ag_value</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">p</span><span class="s3">, </span><span class="s1">p_h</span><span class="s3">, -</span><span class="s1">p_value</span>
+    <span class="s2">elif </span><span class="s1">r_value </span><span class="s3">&lt; </span><span class="s1">p_value </span><span class="s2">and </span><span class="s1">r_value </span><span class="s3">&lt; </span><span class="s1">ag_value</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">r</span><span class="s3">, </span><span class="s1">r_h</span><span class="s3">, -</span><span class="s1">r_value</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s2">return </span><span class="s1">ag</span><span class="s3">, </span><span class="s1">ag_h</span><span class="s3">, -</span><span class="s1">ag_value</span>
+
+
+<span class="s2">def </span><span class="s1">trf_bounds</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">J0</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">, </span><span class="s1">ftol</span><span class="s3">, </span><span class="s1">xtol</span><span class="s3">, </span><span class="s1">gtol</span><span class="s3">, </span><span class="s1">max_nfev</span><span class="s3">,</span>
+               <span class="s1">x_scale</span><span class="s3">, </span><span class="s1">loss_function</span><span class="s3">, </span><span class="s1">tr_solver</span><span class="s3">, </span><span class="s1">tr_options</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">):</span>
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+    <span class="s1">f </span><span class="s3">= </span><span class="s1">f0</span>
+    <span class="s1">f_true </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">nfev </span><span class="s3">= </span><span class="s5">1</span>
+
+    <span class="s1">J </span><span class="s3">= </span><span class="s1">J0</span>
+    <span class="s1">njev </span><span class="s3">= </span><span class="s5">1</span>
+    <span class="s1">m</span><span class="s3">, </span><span class="s1">n </span><span class="s3">= </span><span class="s1">J</span><span class="s3">.</span><span class="s1">shape</span>
+
+    <span class="s2">if </span><span class="s1">loss_function </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">rho </span><span class="s3">= </span><span class="s1">loss_function</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+        <span class="s1">cost </span><span class="s3">= </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">rho</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+        <span class="s1">J</span><span class="s3">, </span><span class="s1">f </span><span class="s3">= </span><span class="s1">scale_for_robust_loss_function</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">rho</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">cost </span><span class="s3">= </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+    <span class="s1">g </span><span class="s3">= </span><span class="s1">compute_grad</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+    <span class="s1">jac_scale </span><span class="s3">= </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">x_scale</span><span class="s3">, </span><span class="s1">str</span><span class="s3">) </span><span class="s2">and </span><span class="s1">x_scale </span><span class="s3">== </span><span class="s6">'jac'</span>
+    <span class="s2">if </span><span class="s1">jac_scale</span><span class="s3">:</span>
+        <span class="s1">scale</span><span class="s3">, </span><span class="s1">scale_inv </span><span class="s3">= </span><span class="s1">compute_jac_scale</span><span class="s3">(</span><span class="s1">J</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">scale</span><span class="s3">, </span><span class="s1">scale_inv </span><span class="s3">= </span><span class="s1">x_scale</span><span class="s3">, </span><span class="s5">1 </span><span class="s3">/ </span><span class="s1">x_scale</span>
+
+    <span class="s1">v</span><span class="s3">, </span><span class="s1">dv </span><span class="s3">= </span><span class="s1">CL_scaling_vector</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">g</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">)</span>
+    <span class="s1">v</span><span class="s3">[</span><span class="s1">dv </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">] *= </span><span class="s1">scale_inv</span><span class="s3">[</span><span class="s1">dv </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">]</span>
+    <span class="s1">Delta </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">x0 </span><span class="s3">* </span><span class="s1">scale_inv </span><span class="s3">/ </span><span class="s1">v</span><span class="s3">**</span><span class="s5">0.5</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">Delta </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">Delta </span><span class="s3">= </span><span class="s5">1.0</span>
+
+    <span class="s1">g_norm </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">g </span><span class="s3">* </span><span class="s1">v</span><span class="s3">, </span><span class="s1">ord</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+
+    <span class="s1">f_augmented </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">(</span><span class="s1">m </span><span class="s3">+ </span><span class="s1">n</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'exact'</span><span class="s3">:</span>
+        <span class="s1">J_augmented </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">empty</span><span class="s3">((</span><span class="s1">m </span><span class="s3">+ </span><span class="s1">n</span><span class="s3">, </span><span class="s1">n</span><span class="s3">))</span>
+    <span class="s2">elif </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'lsmr'</span><span class="s3">:</span>
+        <span class="s1">reg_term </span><span class="s3">= </span><span class="s5">0.0</span>
+        <span class="s1">regularize </span><span class="s3">= </span><span class="s1">tr_options</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s6">'regularize'</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">max_nfev </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">max_nfev </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">size </span><span class="s3">* </span><span class="s5">100</span>
+
+    <span class="s1">alpha </span><span class="s3">= </span><span class="s5">0.0  </span><span class="s4"># &quot;Levenberg-Marquardt&quot; parameter</span>
+
+    <span class="s1">termination_status </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s1">iteration </span><span class="s3">= </span><span class="s5">0</span>
+    <span class="s1">step_norm </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s1">actual_reduction </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:</span>
+        <span class="s1">print_header_nonlinear</span><span class="s3">()</span>
+
+    <span class="s2">while True</span><span class="s3">:</span>
+        <span class="s1">v</span><span class="s3">, </span><span class="s1">dv </span><span class="s3">= </span><span class="s1">CL_scaling_vector</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">g</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">)</span>
+
+        <span class="s1">g_norm </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">g </span><span class="s3">* </span><span class="s1">v</span><span class="s3">, </span><span class="s1">ord</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">g_norm </span><span class="s3">&lt; </span><span class="s1">gtol</span><span class="s3">:</span>
+            <span class="s1">termination_status </span><span class="s3">= </span><span class="s5">1</span>
+
+        <span class="s2">if </span><span class="s1">verbose </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:</span>
+            <span class="s1">print_iteration_nonlinear</span><span class="s3">(</span><span class="s1">iteration</span><span class="s3">, </span><span class="s1">nfev</span><span class="s3">, </span><span class="s1">cost</span><span class="s3">, </span><span class="s1">actual_reduction</span><span class="s3">,</span>
+                                      <span class="s1">step_norm</span><span class="s3">, </span><span class="s1">g_norm</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">termination_status </span><span class="s2">is not None or </span><span class="s1">nfev </span><span class="s3">== </span><span class="s1">max_nfev</span><span class="s3">:</span>
+            <span class="s2">break</span>
+
+        <span class="s4"># Now compute variables in &quot;hat&quot; space. Here, we also account for</span>
+        <span class="s4"># scaling introduced by `x_scale` parameter. This part is a bit tricky,</span>
+        <span class="s4"># you have to write down the formulas and see how the trust-region</span>
+        <span class="s4"># problem is formulated when the two types of scaling are applied.</span>
+        <span class="s4"># The idea is that first we apply `x_scale` and then apply Coleman-Li</span>
+        <span class="s4"># approach in the new variables.</span>
+
+        <span class="s4"># v is recomputed in the variables after applying `x_scale`, note that</span>
+        <span class="s4"># components which were identically 1 not affected.</span>
+        <span class="s1">v</span><span class="s3">[</span><span class="s1">dv </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">] *= </span><span class="s1">scale_inv</span><span class="s3">[</span><span class="s1">dv </span><span class="s3">!= </span><span class="s5">0</span><span class="s3">]</span>
+
+        <span class="s4"># Here, we apply two types of scaling.</span>
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">v</span><span class="s3">**</span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">scale</span>
+
+        <span class="s4"># C = diag(g * scale) Jv</span>
+        <span class="s1">diag_h </span><span class="s3">= </span><span class="s1">g </span><span class="s3">* </span><span class="s1">dv </span><span class="s3">* </span><span class="s1">scale</span>
+
+        <span class="s4"># After all this has been done, we continue normally.</span>
+
+        <span class="s4"># &quot;hat&quot; gradient.</span>
+        <span class="s1">g_h </span><span class="s3">= </span><span class="s1">d </span><span class="s3">* </span><span class="s1">g</span>
+
+        <span class="s1">f_augmented</span><span class="s3">[:</span><span class="s1">m</span><span class="s3">] = </span><span class="s1">f</span>
+        <span class="s2">if </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'exact'</span><span class="s3">:</span>
+            <span class="s1">J_augmented</span><span class="s3">[:</span><span class="s1">m</span><span class="s3">] = </span><span class="s1">J </span><span class="s3">* </span><span class="s1">d</span>
+            <span class="s1">J_h </span><span class="s3">= </span><span class="s1">J_augmented</span><span class="s3">[:</span><span class="s1">m</span><span class="s3">]  </span><span class="s4"># Memory view.</span>
+            <span class="s1">J_augmented</span><span class="s3">[</span><span class="s1">m</span><span class="s3">:] = </span><span class="s1">np</span><span class="s3">.</span><span class="s1">diag</span><span class="s3">(</span><span class="s1">diag_h</span><span class="s3">**</span><span class="s5">0.5</span><span class="s3">)</span>
+            <span class="s1">U</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">V </span><span class="s3">= </span><span class="s1">svd</span><span class="s3">(</span><span class="s1">J_augmented</span><span class="s3">, </span><span class="s1">full_matrices</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s1">V </span><span class="s3">= </span><span class="s1">V</span><span class="s3">.</span><span class="s1">T</span>
+            <span class="s1">uf </span><span class="s3">= </span><span class="s1">U</span><span class="s3">.</span><span class="s1">T</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">f_augmented</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'lsmr'</span><span class="s3">:</span>
+            <span class="s1">J_h </span><span class="s3">= </span><span class="s1">right_multiplied_operator</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">d</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">regularize</span><span class="s3">:</span>
+                <span class="s1">a</span><span class="s3">, </span><span class="s1">b </span><span class="s3">= </span><span class="s1">build_quadratic_1d</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, -</span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">diag</span><span class="s3">=</span><span class="s1">diag_h</span><span class="s3">)</span>
+                <span class="s1">to_tr </span><span class="s3">= </span><span class="s1">Delta </span><span class="s3">/ </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">g_h</span><span class="s3">)</span>
+                <span class="s1">ag_value </span><span class="s3">= </span><span class="s1">minimize_quadratic_1d</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s1">to_tr</span><span class="s3">)[</span><span class="s5">1</span><span class="s3">]</span>
+                <span class="s1">reg_term </span><span class="s3">= -</span><span class="s1">ag_value </span><span class="s3">/ </span><span class="s1">Delta</span><span class="s3">**</span><span class="s5">2</span>
+
+            <span class="s1">lsmr_op </span><span class="s3">= </span><span class="s1">regularized_lsq_operator</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, (</span><span class="s1">diag_h </span><span class="s3">+ </span><span class="s1">reg_term</span><span class="s3">)**</span><span class="s5">0.5</span><span class="s3">)</span>
+            <span class="s1">gn_h </span><span class="s3">= </span><span class="s1">lsmr</span><span class="s3">(</span><span class="s1">lsmr_op</span><span class="s3">, </span><span class="s1">f_augmented</span><span class="s3">, **</span><span class="s1">tr_options</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]</span>
+            <span class="s1">S </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">vstack</span><span class="s3">((</span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">gn_h</span><span class="s3">)).</span><span class="s1">T</span>
+            <span class="s1">S</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">qr</span><span class="s3">(</span><span class="s1">S</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s6">'economic'</span><span class="s3">)</span>
+            <span class="s1">JS </span><span class="s3">= </span><span class="s1">J_h</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">S</span><span class="s3">)  </span><span class="s4"># LinearOperator does dot too.</span>
+            <span class="s1">B_S </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">JS</span><span class="s3">.</span><span class="s1">T</span><span class="s3">, </span><span class="s1">JS</span><span class="s3">) + </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">S</span><span class="s3">.</span><span class="s1">T </span><span class="s3">* </span><span class="s1">diag_h</span><span class="s3">, </span><span class="s1">S</span><span class="s3">)</span>
+            <span class="s1">g_S </span><span class="s3">= </span><span class="s1">S</span><span class="s3">.</span><span class="s1">T</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">g_h</span><span class="s3">)</span>
+
+        <span class="s4"># theta controls step back step ratio from the bounds.</span>
+        <span class="s1">theta </span><span class="s3">= </span><span class="s1">max</span><span class="s3">(</span><span class="s5">0.995</span><span class="s3">, </span><span class="s5">1 </span><span class="s3">- </span><span class="s1">g_norm</span><span class="s3">)</span>
+
+        <span class="s1">actual_reduction </span><span class="s3">= -</span><span class="s5">1</span>
+        <span class="s2">while </span><span class="s1">actual_reduction </span><span class="s3">&lt;= </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">nfev </span><span class="s3">&lt; </span><span class="s1">max_nfev</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'exact'</span><span class="s3">:</span>
+                <span class="s1">p_h</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">n_iter </span><span class="s3">= </span><span class="s1">solve_lsq_trust_region</span><span class="s3">(</span>
+                    <span class="s1">n</span><span class="s3">, </span><span class="s1">m</span><span class="s3">, </span><span class="s1">uf</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">V</span><span class="s3">, </span><span class="s1">Delta</span><span class="s3">, </span><span class="s1">initial_alpha</span><span class="s3">=</span><span class="s1">alpha</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'lsmr'</span><span class="s3">:</span>
+                <span class="s1">p_S</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">solve_trust_region_2d</span><span class="s3">(</span><span class="s1">B_S</span><span class="s3">, </span><span class="s1">g_S</span><span class="s3">, </span><span class="s1">Delta</span><span class="s3">)</span>
+                <span class="s1">p_h </span><span class="s3">= </span><span class="s1">S</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">p_S</span><span class="s3">)</span>
+
+            <span class="s1">p </span><span class="s3">= </span><span class="s1">d </span><span class="s3">* </span><span class="s1">p_h  </span><span class="s4"># Trust-region solution in the original space.</span>
+            <span class="s1">step</span><span class="s3">, </span><span class="s1">step_h</span><span class="s3">, </span><span class="s1">predicted_reduction </span><span class="s3">= </span><span class="s1">select_step</span><span class="s3">(</span>
+                <span class="s1">x</span><span class="s3">, </span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">diag_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">p_h</span><span class="s3">, </span><span class="s1">d</span><span class="s3">, </span><span class="s1">Delta</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">, </span><span class="s1">theta</span><span class="s3">)</span>
+
+            <span class="s1">x_new </span><span class="s3">= </span><span class="s1">make_strictly_feasible</span><span class="s3">(</span><span class="s1">x </span><span class="s3">+ </span><span class="s1">step</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">, </span><span class="s1">rstep</span><span class="s3">=</span><span class="s5">0</span><span class="s3">)</span>
+            <span class="s1">f_new </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x_new</span><span class="s3">)</span>
+            <span class="s1">nfev </span><span class="s3">+= </span><span class="s5">1</span>
+
+            <span class="s1">step_h_norm </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">step_h</span><span class="s3">)</span>
+
+            <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">f_new</span><span class="s3">)):</span>
+                <span class="s1">Delta </span><span class="s3">= </span><span class="s5">0.25 </span><span class="s3">* </span><span class="s1">step_h_norm</span>
+                <span class="s2">continue</span>
+
+            <span class="s4"># Usual trust-region step quality estimation.</span>
+            <span class="s2">if </span><span class="s1">loss_function </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">cost_new </span><span class="s3">= </span><span class="s1">loss_function</span><span class="s3">(</span><span class="s1">f_new</span><span class="s3">, </span><span class="s1">cost_only</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">cost_new </span><span class="s3">= </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">f_new</span><span class="s3">, </span><span class="s1">f_new</span><span class="s3">)</span>
+            <span class="s1">actual_reduction </span><span class="s3">= </span><span class="s1">cost </span><span class="s3">- </span><span class="s1">cost_new</span>
+            <span class="s1">Delta_new</span><span class="s3">, </span><span class="s1">ratio </span><span class="s3">= </span><span class="s1">update_tr_radius</span><span class="s3">(</span>
+                <span class="s1">Delta</span><span class="s3">, </span><span class="s1">actual_reduction</span><span class="s3">, </span><span class="s1">predicted_reduction</span><span class="s3">,</span>
+                <span class="s1">step_h_norm</span><span class="s3">, </span><span class="s1">step_h_norm </span><span class="s3">&gt; </span><span class="s5">0.95 </span><span class="s3">* </span><span class="s1">Delta</span><span class="s3">)</span>
+
+            <span class="s1">step_norm </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">step</span><span class="s3">)</span>
+            <span class="s1">termination_status </span><span class="s3">= </span><span class="s1">check_termination</span><span class="s3">(</span>
+                <span class="s1">actual_reduction</span><span class="s3">, </span><span class="s1">cost</span><span class="s3">, </span><span class="s1">step_norm</span><span class="s3">, </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">x</span><span class="s3">), </span><span class="s1">ratio</span><span class="s3">, </span><span class="s1">ftol</span><span class="s3">, </span><span class="s1">xtol</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">termination_status </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">break</span>
+
+            <span class="s1">alpha </span><span class="s3">*= </span><span class="s1">Delta </span><span class="s3">/ </span><span class="s1">Delta_new</span>
+            <span class="s1">Delta </span><span class="s3">= </span><span class="s1">Delta_new</span>
+
+        <span class="s2">if </span><span class="s1">actual_reduction </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x_new</span>
+
+            <span class="s1">f </span><span class="s3">= </span><span class="s1">f_new</span>
+            <span class="s1">f_true </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+            <span class="s1">cost </span><span class="s3">= </span><span class="s1">cost_new</span>
+
+            <span class="s1">J </span><span class="s3">= </span><span class="s1">jac</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+            <span class="s1">njev </span><span class="s3">+= </span><span class="s5">1</span>
+
+            <span class="s2">if </span><span class="s1">loss_function </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">rho </span><span class="s3">= </span><span class="s1">loss_function</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+                <span class="s1">J</span><span class="s3">, </span><span class="s1">f </span><span class="s3">= </span><span class="s1">scale_for_robust_loss_function</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">rho</span><span class="s3">)</span>
+
+            <span class="s1">g </span><span class="s3">= </span><span class="s1">compute_grad</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">jac_scale</span><span class="s3">:</span>
+                <span class="s1">scale</span><span class="s3">, </span><span class="s1">scale_inv </span><span class="s3">= </span><span class="s1">compute_jac_scale</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">scale_inv</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">step_norm </span><span class="s3">= </span><span class="s5">0</span>
+            <span class="s1">actual_reduction </span><span class="s3">= </span><span class="s5">0</span>
+
+        <span class="s1">iteration </span><span class="s3">+= </span><span class="s5">1</span>
+
+    <span class="s2">if </span><span class="s1">termination_status </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">termination_status </span><span class="s3">= </span><span class="s5">0</span>
+
+    <span class="s1">active_mask </span><span class="s3">= </span><span class="s1">find_active_constraints</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">lb</span><span class="s3">, </span><span class="s1">ub</span><span class="s3">, </span><span class="s1">rtol</span><span class="s3">=</span><span class="s1">xtol</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">OptimizeResult</span><span class="s3">(</span>
+        <span class="s1">x</span><span class="s3">=</span><span class="s1">x</span><span class="s3">, </span><span class="s1">cost</span><span class="s3">=</span><span class="s1">cost</span><span class="s3">, </span><span class="s1">fun</span><span class="s3">=</span><span class="s1">f_true</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">=</span><span class="s1">J</span><span class="s3">, </span><span class="s1">grad</span><span class="s3">=</span><span class="s1">g</span><span class="s3">, </span><span class="s1">optimality</span><span class="s3">=</span><span class="s1">g_norm</span><span class="s3">,</span>
+        <span class="s1">active_mask</span><span class="s3">=</span><span class="s1">active_mask</span><span class="s3">, </span><span class="s1">nfev</span><span class="s3">=</span><span class="s1">nfev</span><span class="s3">, </span><span class="s1">njev</span><span class="s3">=</span><span class="s1">njev</span><span class="s3">,</span>
+        <span class="s1">status</span><span class="s3">=</span><span class="s1">termination_status</span><span class="s3">)</span>
+
+
+<span class="s2">def </span><span class="s1">trf_no_bounds</span><span class="s3">(</span><span class="s1">fun</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">, </span><span class="s1">x0</span><span class="s3">, </span><span class="s1">f0</span><span class="s3">, </span><span class="s1">J0</span><span class="s3">, </span><span class="s1">ftol</span><span class="s3">, </span><span class="s1">xtol</span><span class="s3">, </span><span class="s1">gtol</span><span class="s3">, </span><span class="s1">max_nfev</span><span class="s3">,</span>
+                  <span class="s1">x_scale</span><span class="s3">, </span><span class="s1">loss_function</span><span class="s3">, </span><span class="s1">tr_solver</span><span class="s3">, </span><span class="s1">tr_options</span><span class="s3">, </span><span class="s1">verbose</span><span class="s3">):</span>
+    <span class="s1">x </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+    <span class="s1">f </span><span class="s3">= </span><span class="s1">f0</span>
+    <span class="s1">f_true </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+    <span class="s1">nfev </span><span class="s3">= </span><span class="s5">1</span>
+
+    <span class="s1">J </span><span class="s3">= </span><span class="s1">J0</span>
+    <span class="s1">njev </span><span class="s3">= </span><span class="s5">1</span>
+    <span class="s1">m</span><span class="s3">, </span><span class="s1">n </span><span class="s3">= </span><span class="s1">J</span><span class="s3">.</span><span class="s1">shape</span>
+
+    <span class="s2">if </span><span class="s1">loss_function </span><span class="s2">is not None</span><span class="s3">:</span>
+        <span class="s1">rho </span><span class="s3">= </span><span class="s1">loss_function</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+        <span class="s1">cost </span><span class="s3">= </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">rho</span><span class="s3">[</span><span class="s5">0</span><span class="s3">])</span>
+        <span class="s1">J</span><span class="s3">, </span><span class="s1">f </span><span class="s3">= </span><span class="s1">scale_for_robust_loss_function</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">rho</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">cost </span><span class="s3">= </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">f</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+    <span class="s1">g </span><span class="s3">= </span><span class="s1">compute_grad</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+    <span class="s1">jac_scale </span><span class="s3">= </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">x_scale</span><span class="s3">, </span><span class="s1">str</span><span class="s3">) </span><span class="s2">and </span><span class="s1">x_scale </span><span class="s3">== </span><span class="s6">'jac'</span>
+    <span class="s2">if </span><span class="s1">jac_scale</span><span class="s3">:</span>
+        <span class="s1">scale</span><span class="s3">, </span><span class="s1">scale_inv </span><span class="s3">= </span><span class="s1">compute_jac_scale</span><span class="s3">(</span><span class="s1">J</span><span class="s3">)</span>
+    <span class="s2">else</span><span class="s3">:</span>
+        <span class="s1">scale</span><span class="s3">, </span><span class="s1">scale_inv </span><span class="s3">= </span><span class="s1">x_scale</span><span class="s3">, </span><span class="s5">1 </span><span class="s3">/ </span><span class="s1">x_scale</span>
+
+    <span class="s1">Delta </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">x0 </span><span class="s3">* </span><span class="s1">scale_inv</span><span class="s3">)</span>
+    <span class="s2">if </span><span class="s1">Delta </span><span class="s3">== </span><span class="s5">0</span><span class="s3">:</span>
+        <span class="s1">Delta </span><span class="s3">= </span><span class="s5">1.0</span>
+
+    <span class="s2">if </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'lsmr'</span><span class="s3">:</span>
+        <span class="s1">reg_term </span><span class="s3">= </span><span class="s5">0</span>
+        <span class="s1">damp </span><span class="s3">= </span><span class="s1">tr_options</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s6">'damp'</span><span class="s3">, </span><span class="s5">0.0</span><span class="s3">)</span>
+        <span class="s1">regularize </span><span class="s3">= </span><span class="s1">tr_options</span><span class="s3">.</span><span class="s1">pop</span><span class="s3">(</span><span class="s6">'regularize'</span><span class="s3">, </span><span class="s2">True</span><span class="s3">)</span>
+
+    <span class="s2">if </span><span class="s1">max_nfev </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">max_nfev </span><span class="s3">= </span><span class="s1">x0</span><span class="s3">.</span><span class="s1">size </span><span class="s3">* </span><span class="s5">100</span>
+
+    <span class="s1">alpha </span><span class="s3">= </span><span class="s5">0.0  </span><span class="s4"># &quot;Levenberg-Marquardt&quot; parameter</span>
+
+    <span class="s1">termination_status </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s1">iteration </span><span class="s3">= </span><span class="s5">0</span>
+    <span class="s1">step_norm </span><span class="s3">= </span><span class="s2">None</span>
+    <span class="s1">actual_reduction </span><span class="s3">= </span><span class="s2">None</span>
+
+    <span class="s2">if </span><span class="s1">verbose </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:</span>
+        <span class="s1">print_header_nonlinear</span><span class="s3">()</span>
+
+    <span class="s2">while True</span><span class="s3">:</span>
+        <span class="s1">g_norm </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">g</span><span class="s3">, </span><span class="s1">ord</span><span class="s3">=</span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">g_norm </span><span class="s3">&lt; </span><span class="s1">gtol</span><span class="s3">:</span>
+            <span class="s1">termination_status </span><span class="s3">= </span><span class="s5">1</span>
+
+        <span class="s2">if </span><span class="s1">verbose </span><span class="s3">== </span><span class="s5">2</span><span class="s3">:</span>
+            <span class="s1">print_iteration_nonlinear</span><span class="s3">(</span><span class="s1">iteration</span><span class="s3">, </span><span class="s1">nfev</span><span class="s3">, </span><span class="s1">cost</span><span class="s3">, </span><span class="s1">actual_reduction</span><span class="s3">,</span>
+                                      <span class="s1">step_norm</span><span class="s3">, </span><span class="s1">g_norm</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">termination_status </span><span class="s2">is not None or </span><span class="s1">nfev </span><span class="s3">== </span><span class="s1">max_nfev</span><span class="s3">:</span>
+            <span class="s2">break</span>
+
+        <span class="s1">d </span><span class="s3">= </span><span class="s1">scale</span>
+        <span class="s1">g_h </span><span class="s3">= </span><span class="s1">d </span><span class="s3">* </span><span class="s1">g</span>
+
+        <span class="s2">if </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'exact'</span><span class="s3">:</span>
+            <span class="s1">J_h </span><span class="s3">= </span><span class="s1">J </span><span class="s3">* </span><span class="s1">d</span>
+            <span class="s1">U</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">V </span><span class="s3">= </span><span class="s1">svd</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">full_matrices</span><span class="s3">=</span><span class="s2">False</span><span class="s3">)</span>
+            <span class="s1">V </span><span class="s3">= </span><span class="s1">V</span><span class="s3">.</span><span class="s1">T</span>
+            <span class="s1">uf </span><span class="s3">= </span><span class="s1">U</span><span class="s3">.</span><span class="s1">T</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+        <span class="s2">elif </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'lsmr'</span><span class="s3">:</span>
+            <span class="s1">J_h </span><span class="s3">= </span><span class="s1">right_multiplied_operator</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">d</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">regularize</span><span class="s3">:</span>
+                <span class="s1">a</span><span class="s3">, </span><span class="s1">b </span><span class="s3">= </span><span class="s1">build_quadratic_1d</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, -</span><span class="s1">g_h</span><span class="s3">)</span>
+                <span class="s1">to_tr </span><span class="s3">= </span><span class="s1">Delta </span><span class="s3">/ </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">g_h</span><span class="s3">)</span>
+                <span class="s1">ag_value </span><span class="s3">= </span><span class="s1">minimize_quadratic_1d</span><span class="s3">(</span><span class="s1">a</span><span class="s3">, </span><span class="s1">b</span><span class="s3">, </span><span class="s5">0</span><span class="s3">, </span><span class="s1">to_tr</span><span class="s3">)[</span><span class="s5">1</span><span class="s3">]</span>
+                <span class="s1">reg_term </span><span class="s3">= -</span><span class="s1">ag_value </span><span class="s3">/ </span><span class="s1">Delta</span><span class="s3">**</span><span class="s5">2</span>
+
+            <span class="s1">damp_full </span><span class="s3">= (</span><span class="s1">damp</span><span class="s3">**</span><span class="s5">2 </span><span class="s3">+ </span><span class="s1">reg_term</span><span class="s3">)**</span><span class="s5">0.5</span>
+            <span class="s1">gn_h </span><span class="s3">= </span><span class="s1">lsmr</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">damp</span><span class="s3">=</span><span class="s1">damp_full</span><span class="s3">, **</span><span class="s1">tr_options</span><span class="s3">)[</span><span class="s5">0</span><span class="s3">]</span>
+            <span class="s1">S </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">vstack</span><span class="s3">((</span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">gn_h</span><span class="s3">)).</span><span class="s1">T</span>
+            <span class="s1">S</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">qr</span><span class="s3">(</span><span class="s1">S</span><span class="s3">, </span><span class="s1">mode</span><span class="s3">=</span><span class="s6">'economic'</span><span class="s3">)</span>
+            <span class="s1">JS </span><span class="s3">= </span><span class="s1">J_h</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">S</span><span class="s3">)</span>
+            <span class="s1">B_S </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">JS</span><span class="s3">.</span><span class="s1">T</span><span class="s3">, </span><span class="s1">JS</span><span class="s3">)</span>
+            <span class="s1">g_S </span><span class="s3">= </span><span class="s1">S</span><span class="s3">.</span><span class="s1">T</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">g_h</span><span class="s3">)</span>
+
+        <span class="s1">actual_reduction </span><span class="s3">= -</span><span class="s5">1</span>
+        <span class="s2">while </span><span class="s1">actual_reduction </span><span class="s3">&lt;= </span><span class="s5">0 </span><span class="s2">and </span><span class="s1">nfev </span><span class="s3">&lt; </span><span class="s1">max_nfev</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'exact'</span><span class="s3">:</span>
+                <span class="s1">step_h</span><span class="s3">, </span><span class="s1">alpha</span><span class="s3">, </span><span class="s1">n_iter </span><span class="s3">= </span><span class="s1">solve_lsq_trust_region</span><span class="s3">(</span>
+                    <span class="s1">n</span><span class="s3">, </span><span class="s1">m</span><span class="s3">, </span><span class="s1">uf</span><span class="s3">, </span><span class="s1">s</span><span class="s3">, </span><span class="s1">V</span><span class="s3">, </span><span class="s1">Delta</span><span class="s3">, </span><span class="s1">initial_alpha</span><span class="s3">=</span><span class="s1">alpha</span><span class="s3">)</span>
+            <span class="s2">elif </span><span class="s1">tr_solver </span><span class="s3">== </span><span class="s6">'lsmr'</span><span class="s3">:</span>
+                <span class="s1">p_S</span><span class="s3">, </span><span class="s1">_ </span><span class="s3">= </span><span class="s1">solve_trust_region_2d</span><span class="s3">(</span><span class="s1">B_S</span><span class="s3">, </span><span class="s1">g_S</span><span class="s3">, </span><span class="s1">Delta</span><span class="s3">)</span>
+                <span class="s1">step_h </span><span class="s3">= </span><span class="s1">S</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">p_S</span><span class="s3">)</span>
+
+            <span class="s1">predicted_reduction </span><span class="s3">= -</span><span class="s1">evaluate_quadratic</span><span class="s3">(</span><span class="s1">J_h</span><span class="s3">, </span><span class="s1">g_h</span><span class="s3">, </span><span class="s1">step_h</span><span class="s3">)</span>
+            <span class="s1">step </span><span class="s3">= </span><span class="s1">d </span><span class="s3">* </span><span class="s1">step_h</span>
+            <span class="s1">x_new </span><span class="s3">= </span><span class="s1">x </span><span class="s3">+ </span><span class="s1">step</span>
+            <span class="s1">f_new </span><span class="s3">= </span><span class="s1">fun</span><span class="s3">(</span><span class="s1">x_new</span><span class="s3">)</span>
+            <span class="s1">nfev </span><span class="s3">+= </span><span class="s5">1</span>
+
+            <span class="s1">step_h_norm </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">step_h</span><span class="s3">)</span>
+
+            <span class="s2">if not </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">isfinite</span><span class="s3">(</span><span class="s1">f_new</span><span class="s3">)):</span>
+                <span class="s1">Delta </span><span class="s3">= </span><span class="s5">0.25 </span><span class="s3">* </span><span class="s1">step_h_norm</span>
+                <span class="s2">continue</span>
+
+            <span class="s4"># Usual trust-region step quality estimation.</span>
+            <span class="s2">if </span><span class="s1">loss_function </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">cost_new </span><span class="s3">= </span><span class="s1">loss_function</span><span class="s3">(</span><span class="s1">f_new</span><span class="s3">, </span><span class="s1">cost_only</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">cost_new </span><span class="s3">= </span><span class="s5">0.5 </span><span class="s3">* </span><span class="s1">np</span><span class="s3">.</span><span class="s1">dot</span><span class="s3">(</span><span class="s1">f_new</span><span class="s3">, </span><span class="s1">f_new</span><span class="s3">)</span>
+            <span class="s1">actual_reduction </span><span class="s3">= </span><span class="s1">cost </span><span class="s3">- </span><span class="s1">cost_new</span>
+
+            <span class="s1">Delta_new</span><span class="s3">, </span><span class="s1">ratio </span><span class="s3">= </span><span class="s1">update_tr_radius</span><span class="s3">(</span>
+                <span class="s1">Delta</span><span class="s3">, </span><span class="s1">actual_reduction</span><span class="s3">, </span><span class="s1">predicted_reduction</span><span class="s3">,</span>
+                <span class="s1">step_h_norm</span><span class="s3">, </span><span class="s1">step_h_norm </span><span class="s3">&gt; </span><span class="s5">0.95 </span><span class="s3">* </span><span class="s1">Delta</span><span class="s3">)</span>
+
+            <span class="s1">step_norm </span><span class="s3">= </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">step</span><span class="s3">)</span>
+            <span class="s1">termination_status </span><span class="s3">= </span><span class="s1">check_termination</span><span class="s3">(</span>
+                <span class="s1">actual_reduction</span><span class="s3">, </span><span class="s1">cost</span><span class="s3">, </span><span class="s1">step_norm</span><span class="s3">, </span><span class="s1">norm</span><span class="s3">(</span><span class="s1">x</span><span class="s3">), </span><span class="s1">ratio</span><span class="s3">, </span><span class="s1">ftol</span><span class="s3">, </span><span class="s1">xtol</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">termination_status </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">break</span>
+
+            <span class="s1">alpha </span><span class="s3">*= </span><span class="s1">Delta </span><span class="s3">/ </span><span class="s1">Delta_new</span>
+            <span class="s1">Delta </span><span class="s3">= </span><span class="s1">Delta_new</span>
+
+        <span class="s2">if </span><span class="s1">actual_reduction </span><span class="s3">&gt; </span><span class="s5">0</span><span class="s3">:</span>
+            <span class="s1">x </span><span class="s3">= </span><span class="s1">x_new</span>
+
+            <span class="s1">f </span><span class="s3">= </span><span class="s1">f_new</span>
+            <span class="s1">f_true </span><span class="s3">= </span><span class="s1">f</span><span class="s3">.</span><span class="s1">copy</span><span class="s3">()</span>
+
+            <span class="s1">cost </span><span class="s3">= </span><span class="s1">cost_new</span>
+
+            <span class="s1">J </span><span class="s3">= </span><span class="s1">jac</span><span class="s3">(</span><span class="s1">x</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+            <span class="s1">njev </span><span class="s3">+= </span><span class="s5">1</span>
+
+            <span class="s2">if </span><span class="s1">loss_function </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s1">rho </span><span class="s3">= </span><span class="s1">loss_function</span><span class="s3">(</span><span class="s1">f</span><span class="s3">)</span>
+                <span class="s1">J</span><span class="s3">, </span><span class="s1">f </span><span class="s3">= </span><span class="s1">scale_for_robust_loss_function</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">, </span><span class="s1">rho</span><span class="s3">)</span>
+
+            <span class="s1">g </span><span class="s3">= </span><span class="s1">compute_grad</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">f</span><span class="s3">)</span>
+
+            <span class="s2">if </span><span class="s1">jac_scale</span><span class="s3">:</span>
+                <span class="s1">scale</span><span class="s3">, </span><span class="s1">scale_inv </span><span class="s3">= </span><span class="s1">compute_jac_scale</span><span class="s3">(</span><span class="s1">J</span><span class="s3">, </span><span class="s1">scale_inv</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">step_norm </span><span class="s3">= </span><span class="s5">0</span>
+            <span class="s1">actual_reduction </span><span class="s3">= </span><span class="s5">0</span>
+
+        <span class="s1">iteration </span><span class="s3">+= </span><span class="s5">1</span>
+
+    <span class="s2">if </span><span class="s1">termination_status </span><span class="s2">is None</span><span class="s3">:</span>
+        <span class="s1">termination_status </span><span class="s3">= </span><span class="s5">0</span>
+
+    <span class="s1">active_mask </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros_like</span><span class="s3">(</span><span class="s1">x</span><span class="s3">)</span>
+    <span class="s2">return </span><span class="s1">OptimizeResult</span><span class="s3">(</span>
+        <span class="s1">x</span><span class="s3">=</span><span class="s1">x</span><span class="s3">, </span><span class="s1">cost</span><span class="s3">=</span><span class="s1">cost</span><span class="s3">, </span><span class="s1">fun</span><span class="s3">=</span><span class="s1">f_true</span><span class="s3">, </span><span class="s1">jac</span><span class="s3">=</span><span class="s1">J</span><span class="s3">, </span><span class="s1">grad</span><span class="s3">=</span><span class="s1">g</span><span class="s3">, </span><span class="s1">optimality</span><span class="s3">=</span><span class="s1">g_norm</span><span class="s3">,</span>
+        <span class="s1">active_mask</span><span class="s3">=</span><span class="s1">active_mask</span><span class="s3">, </span><span class="s1">nfev</span><span class="s3">=</span><span class="s1">nfev</span><span class="s3">, </span><span class="s1">njev</span><span class="s3">=</span><span class="s1">njev</span><span class="s3">,</span>
+        <span class="s1">status</span><span class="s3">=</span><span class="s1">termination_status</span><span class="s3">)</span>
+</pre>
+</body>
+</html>

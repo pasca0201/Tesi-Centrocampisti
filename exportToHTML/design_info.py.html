@@ -1,0 +1,1222 @@
+<html>
+<head>
+<title>design_info.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #7a7e85;}
+.s1 { color: #bcbec4;}
+.s2 { color: #cf8e6d;}
+.s3 { color: #bcbec4;}
+.s4 { color: #6aab73;}
+.s5 { color: #5f826b; font-style: italic;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+design_info.py</font>
+</center></td></tr></table>
+<pre><span class="s0"># This file is part of Patsy</span>
+<span class="s0"># Copyright (C) 2011-2015 Nathaniel Smith &lt;njs@pobox.com&gt;</span>
+<span class="s0"># See file LICENSE.txt for license information.</span>
+
+<span class="s0"># This file defines the main class for storing metadata about a model</span>
+<span class="s0"># design. It also defines a 'value-added' design matrix type -- a subclass of</span>
+<span class="s0"># ndarray that represents a design matrix and holds metadata about its</span>
+<span class="s0"># columns.  The intent is that these are useful and usable data structures</span>
+<span class="s0"># even if you're not using *any* of the rest of patsy to actually build</span>
+<span class="s0"># your matrices.</span>
+
+
+<span class="s0"># XX TMP TODO:</span>
+<span class="s0">#</span>
+<span class="s0"># - update design_matrix_builders and build_design_matrices docs</span>
+<span class="s0"># - add tests and docs for new design info stuff</span>
+<span class="s0"># - consider renaming design_matrix_builders (and I guess</span>
+<span class="s0">#   build_design_matrices too). Ditto for highlevel dbuilder functions.</span>
+
+
+<span class="s2">from </span><span class="s1">__future__ </span><span class="s2">import </span><span class="s1">print_function</span>
+
+<span class="s0"># These are made available in the patsy.* namespace</span>
+<span class="s1">__all__ </span><span class="s3">= [</span><span class="s4">&quot;DesignInfo&quot;</span><span class="s3">, </span><span class="s4">&quot;FactorInfo&quot;</span><span class="s3">, </span><span class="s4">&quot;SubtermInfo&quot;</span><span class="s3">, </span><span class="s4">&quot;DesignMatrix&quot;</span><span class="s3">]</span>
+
+<span class="s2">import </span><span class="s1">warnings</span>
+<span class="s2">import </span><span class="s1">numbers</span>
+<span class="s2">import </span><span class="s1">six</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">from </span><span class="s1">patsy </span><span class="s2">import </span><span class="s1">PatsyError</span>
+<span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">util </span><span class="s2">import </span><span class="s1">atleast_2d_column_default</span>
+<span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">compat </span><span class="s2">import </span><span class="s1">OrderedDict</span>
+<span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">util </span><span class="s2">import </span><span class="s3">(</span><span class="s1">repr_pretty_delegate</span><span class="s3">, </span><span class="s1">repr_pretty_impl</span><span class="s3">,</span>
+                        <span class="s1">safe_issubdtype</span><span class="s3">,</span>
+                        <span class="s1">no_pickling</span><span class="s3">, </span><span class="s1">assert_no_pickling</span><span class="s3">)</span>
+<span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">constraint </span><span class="s2">import </span><span class="s1">linear_constraint</span>
+<span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">contrasts </span><span class="s2">import </span><span class="s1">ContrastMatrix</span>
+<span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">desc </span><span class="s2">import </span><span class="s1">ModelDesc</span><span class="s3">, </span><span class="s1">Term</span>
+
+<span class="s2">class </span><span class="s1">FactorInfo</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;A FactorInfo object is a simple class that provides some metadata about 
+    the role of a factor within a model. :attr:`DesignInfo.factor_infos` is 
+    a dictionary which maps factor objects to FactorInfo objects for each 
+    factor in the model. 
+ 
+    .. versionadded:: 0.4.0 
+ 
+    Attributes: 
+ 
+    .. attribute:: factor 
+ 
+       The factor object being described. 
+ 
+    .. attribute:: type 
+ 
+       The type of the factor -- either the string ``&quot;numerical&quot;`` or the 
+       string ``&quot;categorical&quot;``. 
+ 
+    .. attribute:: state 
+ 
+       An opaque object which holds the state needed to evaluate this 
+       factor on new data (e.g., for prediction). See 
+       :meth:`factor_protocol.eval`. 
+ 
+    .. attribute:: num_columns 
+ 
+       For numerical factors, the number of columns this factor produces. For 
+       categorical factors, this attribute will always be ``None``. 
+ 
+    .. attribute:: categories 
+ 
+       For categorical factors, a tuple of the possible categories this factor 
+       takes on, in order. For numerical factors, this attribute will always be 
+       ``None``. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">factor</span><span class="s3">, </span><span class="s1">type</span><span class="s3">, </span><span class="s1">state</span><span class="s3">,</span>
+                 <span class="s1">num_columns</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">categories</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">factor </span><span class="s3">= </span><span class="s1">factor</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">type </span><span class="s3">= </span><span class="s1">type</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">type </span><span class="s2">not in </span><span class="s3">[</span><span class="s4">&quot;numerical&quot;</span><span class="s3">, </span><span class="s4">&quot;categorical&quot;</span><span class="s3">]:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;FactorInfo.type must be &quot;</span>
+                             <span class="s4">&quot;'numerical' or 'categorical', not %r&quot;</span>
+                             <span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">type</span><span class="s3">,))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">state </span><span class="s3">= </span><span class="s1">state</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s4">&quot;numerical&quot;</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">num_columns</span><span class="s3">, </span><span class="s1">six</span><span class="s3">.</span><span class="s1">integer_types</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;For numerical factors, num_columns &quot;</span>
+                                 <span class="s4">&quot;must be an integer&quot;</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">categories </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;For numerical factors, categories &quot;</span>
+                                 <span class="s4">&quot;must be None&quot;</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s1">self</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s4">&quot;categorical&quot;</span>
+            <span class="s2">if </span><span class="s1">num_columns </span><span class="s2">is not None</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;For categorical factors, num_columns &quot;</span>
+                                 <span class="s4">&quot;must be None&quot;</span><span class="s3">)</span>
+            <span class="s1">categories </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">categories</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">num_columns </span><span class="s3">= </span><span class="s1">num_columns</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">categories </span><span class="s3">= </span><span class="s1">categories</span>
+
+    <span class="s1">__repr__ </span><span class="s3">= </span><span class="s1">repr_pretty_delegate</span>
+    <span class="s2">def </span><span class="s1">_repr_pretty_</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">cycle</span><span class="s3">):</span>
+        <span class="s2">assert not </span><span class="s1">cycle</span>
+        <span class="s2">class </span><span class="s1">FactorState</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+            <span class="s2">def </span><span class="s1">__repr__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+                <span class="s2">return </span><span class="s4">&quot;&lt;factor state&gt;&quot;</span>
+        <span class="s1">kwlist </span><span class="s3">= [(</span><span class="s4">&quot;factor&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor</span><span class="s3">),</span>
+                  <span class="s3">(</span><span class="s4">&quot;type&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">type</span><span class="s3">),</span>
+                  <span class="s0"># Don't put the state in people's faces, it will</span>
+                  <span class="s0"># just encourage them to pay attention to the</span>
+                  <span class="s0"># contents :-). Plus it's a bunch of gobbledygook</span>
+                  <span class="s0"># they don't care about. They can always look at</span>
+                  <span class="s0"># self.state if they want to know...</span>
+                  <span class="s3">(</span><span class="s4">&quot;state&quot;</span><span class="s3">, </span><span class="s1">FactorState</span><span class="s3">()),</span>
+                  <span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s4">&quot;numerical&quot;</span><span class="s3">:</span>
+            <span class="s1">kwlist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s4">&quot;num_columns&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">num_columns</span><span class="s3">))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">kwlist</span><span class="s3">.</span><span class="s1">append</span><span class="s3">((</span><span class="s4">&quot;categories&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">categories</span><span class="s3">))</span>
+        <span class="s1">repr_pretty_impl</span><span class="s3">(</span><span class="s1">p</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, [], </span><span class="s1">kwlist</span><span class="s3">)</span>
+
+    <span class="s1">__getstate__ </span><span class="s3">= </span><span class="s1">no_pickling</span>
+
+<span class="s2">def </span><span class="s1">test_FactorInfo</span><span class="s3">():</span>
+    <span class="s1">fi1 </span><span class="s3">= </span><span class="s1">FactorInfo</span><span class="s3">(</span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">}, </span><span class="s1">num_columns</span><span class="s3">=</span><span class="s6">10</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">fi1</span><span class="s3">.</span><span class="s1">factor </span><span class="s3">== </span><span class="s4">&quot;asdf&quot;</span>
+    <span class="s2">assert </span><span class="s1">fi1</span><span class="s3">.</span><span class="s1">state </span><span class="s3">== {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">}</span>
+    <span class="s2">assert </span><span class="s1">fi1</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s4">&quot;numerical&quot;</span>
+    <span class="s2">assert </span><span class="s1">fi1</span><span class="s3">.</span><span class="s1">num_columns </span><span class="s3">== </span><span class="s6">10</span>
+    <span class="s2">assert </span><span class="s1">fi1</span><span class="s3">.</span><span class="s1">categories </span><span class="s2">is None</span>
+
+    <span class="s0"># smoke test</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">fi1</span><span class="s3">)</span>
+
+    <span class="s1">fi2 </span><span class="s3">= </span><span class="s1">FactorInfo</span><span class="s3">(</span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;categorical&quot;</span><span class="s3">, {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s6">2</span><span class="s3">}, </span><span class="s1">categories</span><span class="s3">=[</span><span class="s4">&quot;z&quot;</span><span class="s3">, </span><span class="s4">&quot;j&quot;</span><span class="s3">])</span>
+    <span class="s2">assert </span><span class="s1">fi2</span><span class="s3">.</span><span class="s1">factor </span><span class="s3">== </span><span class="s4">&quot;asdf&quot;</span>
+    <span class="s2">assert </span><span class="s1">fi2</span><span class="s3">.</span><span class="s1">state </span><span class="s3">== {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s6">2</span><span class="s3">}</span>
+    <span class="s2">assert </span><span class="s1">fi2</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s4">&quot;categorical&quot;</span>
+    <span class="s2">assert </span><span class="s1">fi2</span><span class="s3">.</span><span class="s1">num_columns </span><span class="s2">is None</span>
+    <span class="s2">assert </span><span class="s1">fi2</span><span class="s3">.</span><span class="s1">categories </span><span class="s3">== (</span><span class="s4">&quot;z&quot;</span><span class="s3">, </span><span class="s4">&quot;j&quot;</span><span class="s3">)</span>
+
+    <span class="s0"># smoke test</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">fi2</span><span class="s3">)</span>
+
+    <span class="s2">import </span><span class="s1">pytest</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;non-numerical&quot;</span><span class="s3">, {})</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {})</span>
+
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {},</span>
+                  <span class="s1">num_columns</span><span class="s3">=</span><span class="s4">&quot;asdf&quot;</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {},</span>
+                  <span class="s1">num_columns</span><span class="s3">=</span><span class="s6">1</span><span class="s3">, </span><span class="s1">categories</span><span class="s3">=</span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">TypeError</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;categorical&quot;</span><span class="s3">, {})</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;categorical&quot;</span><span class="s3">, {},</span>
+                  <span class="s1">num_columns</span><span class="s3">=</span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">TypeError</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;categorical&quot;</span><span class="s3">, {},</span>
+                  <span class="s1">categories</span><span class="s3">=</span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s0"># Make sure longs are legal for num_columns</span>
+    <span class="s0"># (Important on python2+win64, where array shapes are tuples-of-longs)</span>
+    <span class="s2">if not </span><span class="s1">six</span><span class="s3">.</span><span class="s1">PY3</span><span class="s3">:</span>
+        <span class="s1">fi_long </span><span class="s3">= </span><span class="s1">FactorInfo</span><span class="s3">(</span><span class="s4">&quot;asdf&quot;</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">},</span>
+                             <span class="s1">num_columns</span><span class="s3">=</span><span class="s1">long</span><span class="s3">(</span><span class="s6">10</span><span class="s3">))</span>
+        <span class="s2">assert </span><span class="s1">fi_long</span><span class="s3">.</span><span class="s1">num_columns </span><span class="s3">== </span><span class="s6">10</span>
+
+<span class="s2">class </span><span class="s1">SubtermInfo</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;A SubtermInfo object is a simple metadata container describing a single 
+    primitive interaction and how it is coded in our design matrix. Our final 
+    design matrix is produced by coding each primitive interaction in order 
+    from left to right, and then stacking the resulting columns. For each 
+    :class:`Term`, we have one or more of these objects which describe how 
+    that term is encoded. :attr:`DesignInfo.term_codings` is a dictionary 
+    which maps term objects to lists of SubtermInfo objects. 
+ 
+    To code a primitive interaction, the following steps are performed: 
+ 
+    * Evaluate each factor on the provided data. 
+    * Encode each factor into one or more proto-columns. For numerical 
+      factors, these proto-columns are identical to whatever the factor 
+      evaluates to; for categorical factors, they are encoded using a 
+      specified contrast matrix. 
+    * Form all pairwise, elementwise products between proto-columns generated 
+      by different factors. (For example, if factor 1 generated proto-columns 
+      A and B, and factor 2 generated proto-columns C and D, then our final 
+      columns are ``A * C``, ``B * C``, ``A * D``, ``B * D``.) 
+    * The resulting columns are stored directly into the final design matrix. 
+ 
+    Sometimes multiple primitive interactions are needed to encode a single 
+    term; this occurs, for example, in the formula ``&quot;1 + a:b&quot;`` when ``a`` 
+    and ``b`` are categorical. See :ref:`formulas-building` for full details. 
+ 
+    .. versionadded:: 0.4.0 
+ 
+    Attributes: 
+ 
+    .. attribute:: factors 
+ 
+       The factors which appear in this subterm's interaction. 
+ 
+    .. attribute:: contrast_matrices 
+ 
+       A dict mapping factor objects to :class:`ContrastMatrix` objects, 
+       describing how each categorical factor in this interaction is coded. 
+ 
+    .. attribute:: num_columns 
+ 
+       The number of design matrix columns which this interaction generates. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">factors</span><span class="s3">, </span><span class="s1">contrast_matrices</span><span class="s3">, </span><span class="s1">num_columns</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">factors </span><span class="s3">= </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">factors</span><span class="s3">)</span>
+        <span class="s1">factor_set </span><span class="s3">= </span><span class="s1">frozenset</span><span class="s3">(</span><span class="s1">factors</span><span class="s3">)</span>
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">contrast_matrices</span><span class="s3">, </span><span class="s1">dict</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;contrast_matrices must be dict&quot;</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">factor</span><span class="s3">, </span><span class="s1">contrast_matrix </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">contrast_matrices</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">factor </span><span class="s2">not in </span><span class="s1">factor_set</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Unexpected factor in contrast_matrices dict&quot;</span><span class="s3">)</span>
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">contrast_matrix</span><span class="s3">, </span><span class="s1">ContrastMatrix</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Expected a ContrastMatrix, not %r&quot;</span>
+                                 <span class="s3">% (</span><span class="s1">contrast_matrix</span><span class="s3">,))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">contrast_matrices </span><span class="s3">= </span><span class="s1">contrast_matrices</span>
+        <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">num_columns</span><span class="s3">, </span><span class="s1">six</span><span class="s3">.</span><span class="s1">integer_types</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;num_columns must be an integer&quot;</span><span class="s3">)</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">num_columns </span><span class="s3">= </span><span class="s1">num_columns</span>
+
+    <span class="s1">__repr__ </span><span class="s3">= </span><span class="s1">repr_pretty_delegate</span>
+    <span class="s2">def </span><span class="s1">_repr_pretty_</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">cycle</span><span class="s3">):</span>
+        <span class="s2">assert not </span><span class="s1">cycle</span>
+        <span class="s1">repr_pretty_impl</span><span class="s3">(</span><span class="s1">p</span><span class="s3">, </span><span class="s1">self</span><span class="s3">, [],</span>
+                         <span class="s3">[(</span><span class="s4">&quot;factors&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factors</span><span class="s3">),</span>
+                          <span class="s3">(</span><span class="s4">&quot;contrast_matrices&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">contrast_matrices</span><span class="s3">),</span>
+                          <span class="s3">(</span><span class="s4">&quot;num_columns&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">num_columns</span><span class="s3">)])</span>
+
+    <span class="s1">__getstate__ </span><span class="s3">= </span><span class="s1">no_pickling</span>
+
+<span class="s2">def </span><span class="s1">test_SubtermInfo</span><span class="s3">():</span>
+    <span class="s1">cm </span><span class="s3">= </span><span class="s1">ContrastMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">2</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)), [</span><span class="s4">&quot;[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;[2]&quot;</span><span class="s3">])</span>
+    <span class="s1">s </span><span class="s3">= </span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;x&quot;</span><span class="s3">], {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s1">cm</span><span class="s3">}, </span><span class="s6">4</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">s</span><span class="s3">.</span><span class="s1">factors </span><span class="s3">== (</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;x&quot;</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">s</span><span class="s3">.</span><span class="s1">contrast_matrices </span><span class="s3">== {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s1">cm</span><span class="s3">}</span>
+    <span class="s2">assert </span><span class="s1">s</span><span class="s3">.</span><span class="s1">num_columns </span><span class="s3">== </span><span class="s6">4</span>
+
+    <span class="s0"># Make sure longs are accepted for num_columns</span>
+    <span class="s2">if not </span><span class="s1">six</span><span class="s3">.</span><span class="s1">PY3</span><span class="s3">:</span>
+        <span class="s1">s </span><span class="s3">= </span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;x&quot;</span><span class="s3">], {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s1">cm</span><span class="s3">}, </span><span class="s1">long</span><span class="s3">(</span><span class="s6">4</span><span class="s3">))</span>
+        <span class="s2">assert </span><span class="s1">s</span><span class="s3">.</span><span class="s1">num_columns </span><span class="s3">== </span><span class="s6">4</span>
+
+    <span class="s0"># smoke test</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">s</span><span class="s3">)</span>
+
+    <span class="s2">import </span><span class="s1">pytest</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">TypeError</span><span class="s3">, </span><span class="s1">SubtermInfo</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, {}, </span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">SubtermInfo</span><span class="s3">, [</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;x&quot;</span><span class="s3">], </span><span class="s6">1</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">SubtermInfo</span><span class="s3">, [</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;x&quot;</span><span class="s3">], {</span><span class="s4">&quot;z&quot;</span><span class="s3">: </span><span class="s1">cm</span><span class="s3">}, </span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">SubtermInfo</span><span class="s3">, [</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;x&quot;</span><span class="s3">], {</span><span class="s4">&quot;a&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">}, </span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">SubtermInfo</span><span class="s3">, [</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;x&quot;</span><span class="s3">], {}, </span><span class="s6">1.5</span><span class="s3">)</span>
+
+<span class="s2">class </span><span class="s1">DesignInfo</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;A DesignInfo object holds metadata about a design matrix. 
+ 
+    This is the main object that Patsy uses to pass metadata about a design 
+    matrix to statistical libraries, in order to allow further downstream 
+    processing like intelligent tests, prediction on new data, etc. Usually 
+    encountered as the `.design_info` attribute on design matrices. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">column_names</span><span class="s3">,</span>
+                 <span class="s1">factor_infos</span><span class="s3">=</span><span class="s2">None</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">=</span><span class="s2">None</span><span class="s3">):</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">column_name_indexes </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">column_names</span><span class="s3">,</span>
+                                                   <span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">column_names</span><span class="s3">))))</span>
+
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">factor_infos </span><span class="s2">is None</span><span class="s3">) != (</span><span class="s1">term_codings </span><span class="s2">is None</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Must specify either both or neither of &quot;</span>
+                             <span class="s4">&quot;factor_infos= and term_codings=&quot;</span><span class="s3">)</span>
+
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos </span><span class="s3">= </span><span class="s1">factor_infos</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings </span><span class="s3">= </span><span class="s1">term_codings</span>
+
+        <span class="s0"># factor_infos is a dict containing one entry for every factor</span>
+        <span class="s0">#    mentioned in our terms</span>
+        <span class="s0">#    and mapping each to FactorInfo object</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">dict</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;factor_infos should be a dict&quot;</span><span class="s3">)</span>
+
+            <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">, </span><span class="s1">OrderedDict</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;term_codings must be an OrderedDict&quot;</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">term</span><span class="s3">, </span><span class="s1">subterms </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">):</span>
+                <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">term</span><span class="s3">, </span><span class="s1">Term</span><span class="s3">):</span>
+                    <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;expected a Term, not %r&quot; </span><span class="s3">% (</span><span class="s1">term</span><span class="s3">,))</span>
+                <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">subterms</span><span class="s3">, </span><span class="s1">list</span><span class="s3">):</span>
+                    <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;term_codings must contain lists&quot;</span><span class="s3">)</span>
+                <span class="s1">term_factors </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">term</span><span class="s3">.</span><span class="s1">factors</span><span class="s3">)</span>
+                <span class="s2">for </span><span class="s1">subterm </span><span class="s2">in </span><span class="s1">subterms</span><span class="s3">:</span>
+                    <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">subterm</span><span class="s3">, </span><span class="s1">SubtermInfo</span><span class="s3">):</span>
+                        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;expected SubtermInfo, &quot;</span>
+                                         <span class="s4">&quot;not %r&quot; </span><span class="s3">% (</span><span class="s1">subterm</span><span class="s3">,))</span>
+                    <span class="s2">if not </span><span class="s1">term_factors</span><span class="s3">.</span><span class="s1">issuperset</span><span class="s3">(</span><span class="s1">subterm</span><span class="s3">.</span><span class="s1">factors</span><span class="s3">):</span>
+                        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;unexpected factors in subterm&quot;</span><span class="s3">)</span>
+
+            <span class="s1">all_factors </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+            <span class="s2">for </span><span class="s1">term </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">:</span>
+                <span class="s1">all_factors</span><span class="s3">.</span><span class="s1">update</span><span class="s3">(</span><span class="s1">term</span><span class="s3">.</span><span class="s1">factors</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">all_factors </span><span class="s3">!= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Provided Term objects and factor_infos &quot;</span>
+                                 <span class="s4">&quot;do not match&quot;</span><span class="s3">)</span>
+            <span class="s2">for </span><span class="s1">factor</span><span class="s3">, </span><span class="s1">factor_info </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos</span><span class="s3">):</span>
+                <span class="s2">if not </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">factor_info</span><span class="s3">, </span><span class="s1">FactorInfo</span><span class="s3">):</span>
+                    <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;expected FactorInfo object, not %r&quot;</span>
+                                     <span class="s3">% (</span><span class="s1">factor_info</span><span class="s3">,))</span>
+                <span class="s2">if </span><span class="s1">factor </span><span class="s3">!= </span><span class="s1">factor_info</span><span class="s3">.</span><span class="s1">factor</span><span class="s3">:</span>
+                    <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;mismatched factor_info.factor&quot;</span><span class="s3">)</span>
+
+            <span class="s2">for </span><span class="s1">term</span><span class="s3">, </span><span class="s1">subterms </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">):</span>
+                <span class="s2">for </span><span class="s1">subterm </span><span class="s2">in </span><span class="s1">subterms</span><span class="s3">:</span>
+                    <span class="s1">exp_cols </span><span class="s3">= </span><span class="s6">1</span>
+                    <span class="s1">cat_factors </span><span class="s3">= </span><span class="s1">set</span><span class="s3">()</span>
+                    <span class="s2">for </span><span class="s1">factor </span><span class="s2">in </span><span class="s1">subterm</span><span class="s3">.</span><span class="s1">factors</span><span class="s3">:</span>
+                        <span class="s1">fi </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos</span><span class="s3">[</span><span class="s1">factor</span><span class="s3">]</span>
+                        <span class="s2">if </span><span class="s1">fi</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s4">&quot;numerical&quot;</span><span class="s3">:</span>
+                            <span class="s1">exp_cols </span><span class="s3">*= </span><span class="s1">fi</span><span class="s3">.</span><span class="s1">num_columns</span>
+                        <span class="s2">else</span><span class="s3">:</span>
+                            <span class="s2">assert </span><span class="s1">fi</span><span class="s3">.</span><span class="s1">type </span><span class="s3">== </span><span class="s4">&quot;categorical&quot;</span>
+                            <span class="s1">cm </span><span class="s3">= </span><span class="s1">subterm</span><span class="s3">.</span><span class="s1">contrast_matrices</span><span class="s3">[</span><span class="s1">factor</span><span class="s3">].</span><span class="s1">matrix</span>
+                            <span class="s2">if </span><span class="s1">cm</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] != </span><span class="s1">len</span><span class="s3">(</span><span class="s1">fi</span><span class="s3">.</span><span class="s1">categories</span><span class="s3">):</span>
+                                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Mismatched contrast matrix &quot;</span>
+                                                 <span class="s4">&quot;for factor %r&quot; </span><span class="s3">% (</span><span class="s1">factor</span><span class="s3">,))</span>
+                            <span class="s1">cat_factors</span><span class="s3">.</span><span class="s1">add</span><span class="s3">(</span><span class="s1">factor</span><span class="s3">)</span>
+                            <span class="s1">exp_cols </span><span class="s3">*= </span><span class="s1">cm</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]</span>
+                    <span class="s2">if </span><span class="s1">cat_factors </span><span class="s3">!= </span><span class="s1">set</span><span class="s3">(</span><span class="s1">subterm</span><span class="s3">.</span><span class="s1">contrast_matrices</span><span class="s3">):</span>
+                        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Mismatch between contrast_matrices &quot;</span>
+                                         <span class="s4">&quot;and categorical factors&quot;</span><span class="s3">)</span>
+                    <span class="s2">if </span><span class="s1">exp_cols </span><span class="s3">!= </span><span class="s1">subterm</span><span class="s3">.</span><span class="s1">num_columns</span><span class="s3">:</span>
+                        <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;Unexpected num_columns&quot;</span><span class="s3">)</span>
+
+        <span class="s2">if </span><span class="s1">term_codings </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s0"># Need to invent term information</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices </span><span class="s3">= </span><span class="s2">None</span>
+            <span class="s0"># We invent one term per column, with the same name as the column</span>
+            <span class="s1">term_names </span><span class="s3">= </span><span class="s1">column_names</span>
+            <span class="s1">slices </span><span class="s3">= [</span><span class="s1">slice</span><span class="s3">(</span><span class="s1">i</span><span class="s3">, </span><span class="s1">i </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">) </span><span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">column_names</span><span class="s3">))]</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(</span><span class="s1">term_names</span><span class="s3">, </span><span class="s1">slices</span><span class="s3">))</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s0"># Need to derive term information from term_codings</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">()</span>
+            <span class="s1">idx </span><span class="s3">= </span><span class="s6">0</span>
+            <span class="s2">for </span><span class="s1">term</span><span class="s3">, </span><span class="s1">subterm_infos </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">):</span>
+                <span class="s1">term_columns </span><span class="s3">= </span><span class="s6">0</span>
+                <span class="s2">for </span><span class="s1">subterm_info </span><span class="s2">in </span><span class="s1">subterm_infos</span><span class="s3">:</span>
+                    <span class="s1">term_columns </span><span class="s3">+= </span><span class="s1">subterm_info</span><span class="s3">.</span><span class="s1">num_columns</span>
+                <span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices</span><span class="s3">[</span><span class="s1">term</span><span class="s3">] = </span><span class="s1">slice</span><span class="s3">(</span><span class="s1">idx</span><span class="s3">, </span><span class="s1">idx </span><span class="s3">+ </span><span class="s1">term_columns</span><span class="s3">)</span>
+                <span class="s1">idx </span><span class="s3">+= </span><span class="s1">term_columns</span>
+            <span class="s2">if </span><span class="s1">idx </span><span class="s3">!= </span><span class="s1">len</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_names</span><span class="s3">):</span>
+                <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;mismatch between column_names and columns &quot;</span>
+                                 <span class="s4">&quot;coded by given terms&quot;</span><span class="s3">)</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span>
+                <span class="s3">[(</span><span class="s1">term</span><span class="s3">.</span><span class="s1">name</span><span class="s3">(), </span><span class="s1">slice_</span><span class="s3">)</span>
+                 <span class="s2">for </span><span class="s3">(</span><span class="s1">term</span><span class="s3">, </span><span class="s1">slice_</span><span class="s3">) </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices</span><span class="s3">)])</span>
+
+        <span class="s0"># Guarantees:</span>
+        <span class="s0">#   term_name_slices is never None</span>
+        <span class="s0">#   The slices in term_name_slices are in order and exactly cover the</span>
+        <span class="s0">#     whole range of columns.</span>
+        <span class="s0">#   term_slices may be None</span>
+        <span class="s0">#   If term_slices is not None, then its slices match the ones in</span>
+        <span class="s0">#     term_name_slices.</span>
+        <span class="s2">assert </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices </span><span class="s2">is not None</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices </span><span class="s2">is not None</span><span class="s3">:</span>
+            <span class="s2">assert </span><span class="s3">(</span><span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices</span><span class="s3">.</span><span class="s1">values</span><span class="s3">())</span>
+                    <span class="s3">== </span><span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">.</span><span class="s1">values</span><span class="s3">()))</span>
+        <span class="s0"># These checks probably aren't necessary anymore now that we always</span>
+        <span class="s0"># generate the slices ourselves, but we'll leave them in just to be</span>
+        <span class="s0"># safe.</span>
+        <span class="s1">covered </span><span class="s3">= </span><span class="s6">0</span>
+        <span class="s2">for </span><span class="s1">slice_ </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">itervalues</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">):</span>
+            <span class="s1">start</span><span class="s3">, </span><span class="s1">stop</span><span class="s3">, </span><span class="s1">step </span><span class="s3">= </span><span class="s1">slice_</span><span class="s3">.</span><span class="s1">indices</span><span class="s3">(</span><span class="s1">len</span><span class="s3">(</span><span class="s1">column_names</span><span class="s3">))</span>
+            <span class="s2">assert </span><span class="s1">start </span><span class="s3">== </span><span class="s1">covered</span>
+            <span class="s2">assert </span><span class="s1">step </span><span class="s3">== </span><span class="s6">1</span>
+            <span class="s1">covered </span><span class="s3">= </span><span class="s1">stop</span>
+        <span class="s2">assert </span><span class="s1">covered </span><span class="s3">== </span><span class="s1">len</span><span class="s3">(</span><span class="s1">column_names</span><span class="s3">)</span>
+        <span class="s0">#   If there is any name overlap between terms and columns, they refer</span>
+        <span class="s0">#     to the same columns.</span>
+        <span class="s2">for </span><span class="s1">column_name</span><span class="s3">, </span><span class="s1">index </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_name_indexes</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">column_name </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">:</span>
+                <span class="s1">slice_ </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">[</span><span class="s1">column_name</span><span class="s3">]</span>
+                <span class="s2">if </span><span class="s1">slice_ </span><span class="s3">!= </span><span class="s1">slice</span><span class="s3">(</span><span class="s1">index</span><span class="s3">, </span><span class="s1">index </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">):</span>
+                    <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;term/column name collision&quot;</span><span class="s3">)</span>
+
+    <span class="s1">__repr__ </span><span class="s3">= </span><span class="s1">repr_pretty_delegate</span>
+    <span class="s2">def </span><span class="s1">_repr_pretty_</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">cycle</span><span class="s3">):</span>
+        <span class="s2">assert not </span><span class="s1">cycle</span>
+        <span class="s1">repr_pretty_impl</span><span class="s3">(</span><span class="s1">p</span><span class="s3">, </span><span class="s1">self</span><span class="s3">,</span>
+                         <span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_names</span><span class="s3">],</span>
+                         <span class="s3">[(</span><span class="s4">&quot;factor_infos&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos</span><span class="s3">),</span>
+                          <span class="s3">(</span><span class="s4">&quot;term_codings&quot;</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">)])</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">column_names</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;A list of the column names, in order.&quot;</span>
+        <span class="s2">return </span><span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_name_indexes</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">terms</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;A list of :class:`Terms`, in order, or else None.&quot;</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s2">return None</span>
+        <span class="s2">return </span><span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">term_names</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;A list of terms, in order.&quot;</span>
+        <span class="s2">return </span><span class="s1">list</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">builder</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;.. deprecated:: 0.4.0&quot;</span>
+        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">DeprecationWarning</span><span class="s3">(</span>
+            <span class="s4">&quot;The DesignInfo.builder attribute is deprecated starting in &quot;</span>
+            <span class="s4">&quot;patsy v0.4.0; distinct builder objects have been eliminated &quot;</span>
+            <span class="s4">&quot;and design_info.builder is now just a long-winded way of &quot;</span>
+            <span class="s4">&quot;writing 'design_info' (i.e. the .builder attribute just &quot;</span>
+            <span class="s4">&quot;returns self)&quot;</span><span class="s3">), </span><span class="s1">stacklevel</span><span class="s3">=</span><span class="s6">2</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s3">@</span><span class="s1">property</span>
+    <span class="s2">def </span><span class="s1">design_info</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;.. deprecated:: 0.4.0&quot;</span>
+        <span class="s1">warnings</span><span class="s3">.</span><span class="s1">warn</span><span class="s3">(</span><span class="s1">DeprecationWarning</span><span class="s3">(</span>
+            <span class="s4">&quot;Starting in patsy v0.4.0, the DesignMatrixBuilder class has &quot;</span>
+            <span class="s4">&quot;been merged into the DesignInfo class. So there's no need to &quot;</span>
+            <span class="s4">&quot;use builder.design_info to access the DesignInfo; 'builder' &quot;</span>
+            <span class="s4">&quot;already *is* a DesignInfo.&quot;</span><span class="s3">), </span><span class="s1">stacklevel</span><span class="s3">=</span><span class="s6">2</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s2">def </span><span class="s1">slice</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">columns_specifier</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Locate a subset of design matrix columns, specified symbolically. 
+ 
+        A patsy design matrix has two levels of structure: the individual 
+        columns (which are named), and the :ref:`terms &lt;formulas&gt;` in 
+        the formula that generated those columns. This is a one-to-many 
+        relationship: a single term may span several columns. This method 
+        provides a user-friendly API for locating those columns. 
+ 
+        (While we talk about columns here, this is probably most useful for 
+        indexing into other arrays that are derived from the design matrix, 
+        such as regression coefficients or covariance matrices.) 
+ 
+        The `columns_specifier` argument can take a number of forms: 
+ 
+        * A term name 
+        * A column name 
+        * A :class:`Term` object 
+        * An integer giving a raw index 
+        * A raw slice object 
+ 
+        In all cases, a Python :func:`slice` object is returned, which can be 
+        used directly for indexing. 
+ 
+        Example:: 
+ 
+          y, X = dmatrices(&quot;y ~ a&quot;, demo_data(&quot;y&quot;, &quot;a&quot;, nlevels=3)) 
+          betas = np.linalg.lstsq(X, y)[0] 
+          a_betas = betas[X.design_info.slice(&quot;a&quot;)] 
+ 
+        (If you want to look up a single individual column by name, use 
+        ``design_info.column_name_indexes[name]``.) 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">columns_specifier</span><span class="s3">, </span><span class="s1">slice</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">columns_specifier</span>
+        <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">issubdtype</span><span class="s3">(</span><span class="s1">type</span><span class="s3">(</span><span class="s1">columns_specifier</span><span class="s3">), </span><span class="s1">np</span><span class="s3">.</span><span class="s1">integer</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">slice</span><span class="s3">(</span><span class="s1">columns_specifier</span><span class="s3">, </span><span class="s1">columns_specifier </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices </span><span class="s2">is not None</span>
+            <span class="s2">and </span><span class="s1">columns_specifier </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices</span><span class="s3">[</span><span class="s1">columns_specifier</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">columns_specifier </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">:</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">[</span><span class="s1">columns_specifier</span><span class="s3">]</span>
+        <span class="s2">if </span><span class="s1">columns_specifier </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_name_indexes</span><span class="s3">:</span>
+            <span class="s1">idx </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_name_indexes</span><span class="s3">[</span><span class="s1">columns_specifier</span><span class="s3">]</span>
+            <span class="s2">return </span><span class="s1">slice</span><span class="s3">(</span><span class="s1">idx</span><span class="s3">, </span><span class="s1">idx </span><span class="s3">+ </span><span class="s6">1</span><span class="s3">)</span>
+        <span class="s2">raise </span><span class="s1">PatsyError</span><span class="s3">(</span><span class="s4">&quot;unknown column specified '%s'&quot;</span>
+                            <span class="s3">% (</span><span class="s1">columns_specifier</span><span class="s3">,))</span>
+
+    <span class="s2">def </span><span class="s1">linear_constraint</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">constraint_likes</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Construct a linear constraint in matrix form from a (possibly 
+        symbolic) description. 
+ 
+        Possible inputs: 
+ 
+        * A dictionary which is taken as a set of equality constraint. Keys 
+          can be either string column names, or integer column indexes. 
+        * A string giving a arithmetic expression referring to the matrix 
+          columns by name. 
+        * A list of such strings which are ANDed together. 
+        * A tuple (A, b) where A and b are array_likes, and the constraint is 
+          Ax = b. If necessary, these will be coerced to the proper 
+          dimensionality by appending dimensions with size 1. 
+ 
+        The string-based language has the standard arithmetic operators, / * + 
+        - and parentheses, plus &quot;=&quot; is used for equality and &quot;,&quot; is used to 
+        AND together multiple constraint equations within a string. You can 
+        If no = appears in some expression, then that expression is assumed to 
+        be equal to zero. Division is always float-based, even if 
+        ``__future__.true_division`` isn't in effect. 
+ 
+        Returns a :class:`LinearConstraint` object. 
+ 
+        Examples:: 
+ 
+          di = DesignInfo([&quot;x1&quot;, &quot;x2&quot;, &quot;x3&quot;]) 
+ 
+          # Equivalent ways to write x1 == 0: 
+          di.linear_constraint({&quot;x1&quot;: 0})  # by name 
+          di.linear_constraint({0: 0})  # by index 
+          di.linear_constraint(&quot;x1 = 0&quot;)  # string based 
+          di.linear_constraint(&quot;x1&quot;)  # can leave out &quot;= 0&quot; 
+          di.linear_constraint(&quot;2 * x1 = (x1 + 2 * x1) / 3&quot;) 
+          di.linear_constraint(([1, 0, 0], 0))  # constraint matrices 
+ 
+          # Equivalent ways to write x1 == 0 and x3 == 10 
+          di.linear_constraint({&quot;x1&quot;: 0, &quot;x3&quot;: 10}) 
+          di.linear_constraint({0: 0, 2: 10}) 
+          di.linear_constraint({0: 0, &quot;x3&quot;: 10}) 
+          di.linear_constraint(&quot;x1 = 0, x3 = 10&quot;) 
+          di.linear_constraint(&quot;x1, x3 = 10&quot;) 
+          di.linear_constraint([&quot;x1&quot;, &quot;x3 = 0&quot;])  # list of strings 
+          di.linear_constraint(&quot;x1 = 0, x3 - 10 = x1&quot;) 
+          di.linear_constraint([[1, 0, 0], [0, 0, 1]], [0, 10]) 
+ 
+          # You can also chain together equalities, just like Python: 
+          di.linear_constraint(&quot;x1 = x2 = 3&quot;) 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">linear_constraint</span><span class="s3">(</span><span class="s1">constraint_likes</span><span class="s3">, </span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_names</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">describe</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Returns a human-readable string describing this design info. 
+ 
+        Example: 
+ 
+        .. ipython:: 
+ 
+          In [1]: y, X = dmatrices(&quot;y ~ x1 + x2&quot;, demo_data(&quot;y&quot;, &quot;x1&quot;, &quot;x2&quot;)) 
+ 
+          In [2]: y.design_info.describe() 
+          Out[2]: 'y' 
+ 
+          In [3]: X.design_info.describe() 
+          Out[3]: '1 + x1 + x2' 
+ 
+        .. warning:: 
+ 
+           There is no guarantee that the strings returned by this function 
+           can be parsed as formulas, or that if they can be parsed as a 
+           formula that they will produce a model equivalent to the one you 
+           started with. This function produces a best-effort description 
+           intended for humans to read. 
+ 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">names </span><span class="s3">= []</span>
+        <span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_names</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">name </span><span class="s3">== </span><span class="s4">&quot;Intercept&quot;</span><span class="s3">:</span>
+                <span class="s1">names</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s4">&quot;1&quot;</span><span class="s3">)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">names</span><span class="s3">.</span><span class="s1">append</span><span class="s3">(</span><span class="s1">name</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s4">&quot; + &quot;</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">names</span><span class="s3">)</span>
+
+    <span class="s2">def </span><span class="s1">subset</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">which_terms</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Create a new :class:`DesignInfo` for design matrices that contain a 
+        subset of the terms that the current :class:`DesignInfo` does. 
+ 
+        For example, if ``design_info`` has terms ``x``, ``y``, and ``z``, 
+        then:: 
+ 
+          design_info2 = design_info.subset([&quot;x&quot;, &quot;z&quot;]) 
+ 
+        will return a new DesignInfo that can be used to construct design 
+        matrices with only the columns corresponding to the terms ``x`` and 
+        ``z``. After we do this, then in general these two expressions will 
+        return the same thing (here we assume that ``x``, ``y``, and ``z`` 
+        each generate a single column of the output):: 
+ 
+          build_design_matrix([design_info], data)[0][:, [0, 2]] 
+          build_design_matrix([design_info2], data)[0] 
+ 
+        However, a critical difference is that in the second case, ``data`` 
+        need not contain any values for ``y``. This is very useful when doing 
+        prediction using a subset of a model, in which situation R usually 
+        forces you to specify dummy values for ``y``. 
+ 
+        If using a formula to specify the terms to include, remember that like 
+        any formula, the intercept term will be included by default, so use 
+        ``0`` or ``-1`` in your formula if you want to avoid this. 
+ 
+        This method can also be used to reorder the terms in your design 
+        matrix, in case you want to do that for some reason. I can't think of 
+        any. 
+ 
+        Note that this method will generally *not* produce the same result as 
+        creating a new model directly. Consider these DesignInfo objects:: 
+ 
+            design1 = dmatrix(&quot;1 + C(a)&quot;, data) 
+            design2 = design1.subset(&quot;0 + C(a)&quot;) 
+            design3 = dmatrix(&quot;0 + C(a)&quot;, data) 
+ 
+        Here ``design2`` and ``design3`` will both produce design matrices 
+        that contain an encoding of ``C(a)`` without any intercept term. But 
+        ``design3`` uses a full-rank encoding for the categorical term 
+        ``C(a)``, while ``design2`` uses the same reduced-rank encoding as 
+        ``design1``. 
+ 
+        :arg which_terms: The terms which should be kept in the new 
+          :class:`DesignMatrixBuilder`. If this is a string, then it is parsed 
+          as a formula, and then the names of the resulting terms are taken as 
+          the terms to keep. If it is a list, then it can contain a mixture of 
+          term names (as strings) and :class:`Term` objects. 
+ 
+        .. versionadded: 0.2.0 
+           New method on the class DesignMatrixBuilder. 
+ 
+        .. versionchanged: 0.4.0 
+           Moved from DesignMatrixBuilder to DesignInfo, as part of the 
+           removal of DesignMatrixBuilder. 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">which_terms</span><span class="s3">, </span><span class="s1">str</span><span class="s3">):</span>
+            <span class="s1">desc </span><span class="s3">= </span><span class="s1">ModelDesc</span><span class="s3">.</span><span class="s1">from_formula</span><span class="s3">(</span><span class="s1">which_terms</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">desc</span><span class="s3">.</span><span class="s1">lhs_termlist</span><span class="s3">:</span>
+                <span class="s2">raise </span><span class="s1">PatsyError</span><span class="s3">(</span><span class="s4">&quot;right-hand-side-only formula required&quot;</span><span class="s3">)</span>
+            <span class="s1">which_terms </span><span class="s3">= [</span><span class="s1">term</span><span class="s3">.</span><span class="s1">name</span><span class="s3">() </span><span class="s2">for </span><span class="s1">term </span><span class="s2">in </span><span class="s1">desc</span><span class="s3">.</span><span class="s1">rhs_termlist</span><span class="s3">]</span>
+
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s0"># This is a minimal DesignInfo</span>
+            <span class="s0"># If the name is unknown we just let the KeyError escape</span>
+            <span class="s1">new_names </span><span class="s3">= []</span>
+            <span class="s2">for </span><span class="s1">t </span><span class="s2">in </span><span class="s1">which_terms</span><span class="s3">:</span>
+                <span class="s1">new_names </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_names</span><span class="s3">[</span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">[</span><span class="s1">t</span><span class="s3">]]</span>
+            <span class="s2">return </span><span class="s1">DesignInfo</span><span class="s3">(</span><span class="s1">new_names</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">term_name_to_term </span><span class="s3">= {}</span>
+            <span class="s2">for </span><span class="s1">term </span><span class="s2">in </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">:</span>
+                <span class="s1">term_name_to_term</span><span class="s3">[</span><span class="s1">term</span><span class="s3">.</span><span class="s1">name</span><span class="s3">()] = </span><span class="s1">term</span>
+
+            <span class="s1">new_column_names </span><span class="s3">= []</span>
+            <span class="s1">new_factor_infos </span><span class="s3">= {}</span>
+            <span class="s1">new_term_codings </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">()</span>
+            <span class="s2">for </span><span class="s1">name_or_term </span><span class="s2">in </span><span class="s1">which_terms</span><span class="s3">:</span>
+                <span class="s1">term </span><span class="s3">= </span><span class="s1">term_name_to_term</span><span class="s3">.</span><span class="s1">get</span><span class="s3">(</span><span class="s1">name_or_term</span><span class="s3">, </span><span class="s1">name_or_term</span><span class="s3">)</span>
+                <span class="s0"># If the name is unknown we just let the KeyError escape</span>
+                <span class="s1">s </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_slices</span><span class="s3">[</span><span class="s1">term</span><span class="s3">]</span>
+                <span class="s1">new_column_names </span><span class="s3">+= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">column_names</span><span class="s3">[</span><span class="s1">s</span><span class="s3">]</span>
+                <span class="s2">for </span><span class="s1">f </span><span class="s2">in </span><span class="s1">term</span><span class="s3">.</span><span class="s1">factors</span><span class="s3">:</span>
+                    <span class="s1">new_factor_infos</span><span class="s3">[</span><span class="s1">f</span><span class="s3">] = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">factor_infos</span><span class="s3">[</span><span class="s1">f</span><span class="s3">]</span>
+                <span class="s1">new_term_codings</span><span class="s3">[</span><span class="s1">term</span><span class="s3">] = </span><span class="s1">self</span><span class="s3">.</span><span class="s1">term_codings</span><span class="s3">[</span><span class="s1">term</span><span class="s3">]</span>
+            <span class="s2">return </span><span class="s1">DesignInfo</span><span class="s3">(</span><span class="s1">new_column_names</span><span class="s3">,</span>
+                              <span class="s1">factor_infos</span><span class="s3">=</span><span class="s1">new_factor_infos</span><span class="s3">,</span>
+                              <span class="s1">term_codings</span><span class="s3">=</span><span class="s1">new_term_codings</span><span class="s3">)</span>
+
+    <span class="s3">@</span><span class="s1">classmethod</span>
+    <span class="s2">def </span><span class="s1">from_array</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">array_like</span><span class="s3">, </span><span class="s1">default_column_prefix</span><span class="s3">=</span><span class="s4">&quot;column&quot;</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Find or construct a DesignInfo appropriate for a given array_like. 
+ 
+        If the input `array_like` already has a ``.design_info`` 
+        attribute, then it will be returned. Otherwise, a new DesignInfo 
+        object will be constructed, using names either taken from the 
+        `array_like` (e.g., for a pandas DataFrame with named columns), or 
+        constructed using `default_column_prefix`. 
+ 
+        This is how :func:`dmatrix` (for example) creates a DesignInfo object 
+        if an arbitrary matrix is passed in. 
+ 
+        :arg array_like: An ndarray or pandas container. 
+        :arg default_column_prefix: If it's necessary to invent column names, 
+          then this will be used to construct them. 
+        :returns: a DesignInfo object 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">array_like</span><span class="s3">, </span><span class="s4">&quot;design_info&quot;</span><span class="s3">) </span><span class="s2">and </span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">array_like</span><span class="s3">.</span><span class="s1">design_info</span><span class="s3">, </span><span class="s1">cls</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">array_like</span><span class="s3">.</span><span class="s1">design_info</span>
+        <span class="s1">arr </span><span class="s3">= </span><span class="s1">atleast_2d_column_default</span><span class="s3">(</span><span class="s1">array_like</span><span class="s3">, </span><span class="s1">preserve_pandas</span><span class="s3">=</span><span class="s2">True</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">arr</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">&gt; </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;design matrix can't have &gt;2 dimensions&quot;</span><span class="s3">)</span>
+        <span class="s1">columns </span><span class="s3">= </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">, </span><span class="s4">&quot;columns&quot;</span><span class="s3">, </span><span class="s1">range</span><span class="s3">(</span><span class="s1">arr</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]))</span>
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">columns</span><span class="s3">, </span><span class="s4">&quot;dtype&quot;</span><span class="s3">)</span>
+            <span class="s2">and not </span><span class="s1">safe_issubdtype</span><span class="s3">(</span><span class="s1">columns</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">integer</span><span class="s3">)):</span>
+            <span class="s1">column_names </span><span class="s3">= [</span><span class="s1">str</span><span class="s3">(</span><span class="s1">obj</span><span class="s3">) </span><span class="s2">for </span><span class="s1">obj </span><span class="s2">in </span><span class="s1">columns</span><span class="s3">]</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">column_names </span><span class="s3">= [</span><span class="s4">&quot;%s%s&quot; </span><span class="s3">% (</span><span class="s1">default_column_prefix</span><span class="s3">, </span><span class="s1">i</span><span class="s3">)</span>
+                            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">columns</span><span class="s3">]</span>
+        <span class="s2">return </span><span class="s1">DesignInfo</span><span class="s3">(</span><span class="s1">column_names</span><span class="s3">)</span>
+
+    <span class="s1">__getstate__ </span><span class="s3">= </span><span class="s1">no_pickling</span>
+
+<span class="s2">def </span><span class="s1">test_DesignInfo</span><span class="s3">():</span>
+    <span class="s2">import </span><span class="s1">pytest</span>
+    <span class="s2">class </span><span class="s1">_MockFactor</span><span class="s3">(</span><span class="s1">object</span><span class="s3">):</span>
+        <span class="s2">def </span><span class="s1">__init__</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">name</span><span class="s3">):</span>
+            <span class="s1">self</span><span class="s3">.</span><span class="s1">_name </span><span class="s3">= </span><span class="s1">name</span>
+
+        <span class="s2">def </span><span class="s1">name</span><span class="s3">(</span><span class="s1">self</span><span class="s3">):</span>
+            <span class="s2">return </span><span class="s1">self</span><span class="s3">.</span><span class="s1">_name</span>
+    <span class="s1">f_x </span><span class="s3">= </span><span class="s1">_MockFactor</span><span class="s3">(</span><span class="s4">&quot;x&quot;</span><span class="s3">)</span>
+    <span class="s1">f_y </span><span class="s3">= </span><span class="s1">_MockFactor</span><span class="s3">(</span><span class="s4">&quot;y&quot;</span><span class="s3">)</span>
+    <span class="s1">t_x </span><span class="s3">= </span><span class="s1">Term</span><span class="s3">([</span><span class="s1">f_x</span><span class="s3">])</span>
+    <span class="s1">t_y </span><span class="s3">= </span><span class="s1">Term</span><span class="s3">([</span><span class="s1">f_y</span><span class="s3">])</span>
+    <span class="s1">factor_infos </span><span class="s3">= {</span><span class="s1">f_x</span><span class="s3">:</span>
+                      <span class="s1">FactorInfo</span><span class="s3">(</span><span class="s1">f_x</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {}, </span><span class="s1">num_columns</span><span class="s3">=</span><span class="s6">3</span><span class="s3">),</span>
+                    <span class="s1">f_y</span><span class="s3">:</span>
+                      <span class="s1">FactorInfo</span><span class="s3">(</span><span class="s1">f_y</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {}, </span><span class="s1">num_columns</span><span class="s3">=</span><span class="s6">1</span><span class="s3">),</span>
+                   <span class="s3">}</span>
+    <span class="s1">term_codings </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">([(</span><span class="s1">t_x</span><span class="s3">, [</span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_x</span><span class="s3">], {}, </span><span class="s6">3</span><span class="s3">)]),</span>
+                                <span class="s3">(</span><span class="s1">t_y</span><span class="s3">, [</span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_y</span><span class="s3">], {}, </span><span class="s6">1</span><span class="s3">)])])</span>
+    <span class="s1">di </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">([</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">term_names </span><span class="s3">== [</span><span class="s4">&quot;x&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">terms </span><span class="s3">== [</span><span class="s1">t_x</span><span class="s3">, </span><span class="s1">t_y</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">column_name_indexes </span><span class="s3">== {</span><span class="s4">&quot;x1&quot;</span><span class="s3">: </span><span class="s6">0</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">: </span><span class="s6">2</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">: </span><span class="s6">3</span><span class="s3">}</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">term_name_slices </span><span class="s3">== {</span><span class="s4">&quot;x&quot;</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">3</span><span class="s3">), </span><span class="s4">&quot;y&quot;</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)}</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">term_slices </span><span class="s3">== {</span><span class="s1">t_x</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">3</span><span class="s3">), </span><span class="s1">t_y</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)}</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">describe</span><span class="s3">() == </span><span class="s4">&quot;x + y&quot;</span>
+
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s6">1</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;x1&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;x2&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;x3&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;x&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s1">t_x</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;y&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s1">t_y</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s1">slice</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">PatsyError</span><span class="s3">, </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">, </span><span class="s4">&quot;asdf&quot;</span><span class="s3">)</span>
+
+    <span class="s0"># smoke test</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">di</span><span class="s3">)</span>
+
+    <span class="s1">assert_no_pickling</span><span class="s3">(</span><span class="s1">di</span><span class="s3">)</span>
+
+    <span class="s0"># One without term objects</span>
+    <span class="s1">di </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">([</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">])</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">term_names </span><span class="s3">== [</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">terms </span><span class="s2">is None</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">column_name_indexes </span><span class="s3">== {</span><span class="s4">&quot;a1&quot;</span><span class="s3">: </span><span class="s6">0</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">: </span><span class="s6">1</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">: </span><span class="s6">2</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">: </span><span class="s6">3</span><span class="s3">}</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">term_name_slices </span><span class="s3">== {</span><span class="s4">&quot;a1&quot;</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">),</span>
+                                   <span class="s4">&quot;a2&quot;</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">),</span>
+                                   <span class="s4">&quot;a3&quot;</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">),</span>
+                                   <span class="s4">&quot;b&quot;</span><span class="s3">: </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)}</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">term_slices </span><span class="s2">is None</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">describe</span><span class="s3">() == </span><span class="s4">&quot;a1 + a2 + a3 + b&quot;</span>
+
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s6">1</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;a1&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;a2&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;a3&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">slice</span><span class="s3">(</span><span class="s4">&quot;b&quot;</span><span class="s3">) == </span><span class="s1">slice</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">)</span>
+
+    <span class="s0"># Check intercept handling in describe()</span>
+    <span class="s2">assert </span><span class="s1">DesignInfo</span><span class="s3">([</span><span class="s4">&quot;Intercept&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]).</span><span class="s1">describe</span><span class="s3">() == </span><span class="s4">&quot;1 + a + b&quot;</span>
+
+    <span class="s0"># Failure modes</span>
+    <span class="s0"># must specify either both or neither of factor_infos and term_codings:</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">=</span><span class="s1">factor_infos</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">term_codings</span><span class="s3">=</span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s0"># factor_infos must be a dict</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">list</span><span class="s3">(</span><span class="s1">factor_infos</span><span class="s3">), </span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s0"># wrong number of column names:</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y1&quot;</span><span class="s3">, </span><span class="s4">&quot;y2&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s0"># name overlap problems</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">, </span><span class="s4">&quot;y2&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s0"># duplicate name</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">)</span>
+
+    <span class="s0"># f_y is in factor_infos, but not mentioned in any term</span>
+    <span class="s1">term_codings_x_only </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s2">del </span><span class="s1">term_codings_x_only</span><span class="s3">[</span><span class="s1">t_y</span><span class="s3">]</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">term_codings_x_only</span><span class="s3">)</span>
+
+    <span class="s0"># f_a is in a term, but not in factor_infos</span>
+    <span class="s1">f_a </span><span class="s3">= </span><span class="s1">_MockFactor</span><span class="s3">(</span><span class="s4">&quot;a&quot;</span><span class="s3">)</span>
+    <span class="s1">t_a </span><span class="s3">= </span><span class="s1">Term</span><span class="s3">([</span><span class="s1">f_a</span><span class="s3">])</span>
+    <span class="s1">term_codings_with_a </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s1">term_codings_with_a</span><span class="s3">[</span><span class="s1">t_a</span><span class="s3">] = [</span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_a</span><span class="s3">], {}, </span><span class="s6">1</span><span class="s3">)]</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">, </span><span class="s4">&quot;a&quot;</span><span class="s3">],</span>
+                  <span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">term_codings_with_a</span><span class="s3">)</span>
+
+    <span class="s0"># bad factor_infos</span>
+    <span class="s1">not_factor_infos </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">factor_infos</span><span class="s3">)</span>
+    <span class="s1">not_factor_infos</span><span class="s3">[</span><span class="s1">f_x</span><span class="s3">] = </span><span class="s4">&quot;what is this I don't even&quot;</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">not_factor_infos</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">)</span>
+
+    <span class="s1">mismatch_factor_infos </span><span class="s3">= </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">factor_infos</span><span class="s3">)</span>
+    <span class="s1">mismatch_factor_infos</span><span class="s3">[</span><span class="s1">f_x</span><span class="s3">] = </span><span class="s1">FactorInfo</span><span class="s3">(</span><span class="s1">f_a</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {}, </span><span class="s1">num_columns</span><span class="s3">=</span><span class="s6">3</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">mismatch_factor_infos</span><span class="s3">, </span><span class="s1">term_codings</span><span class="s3">)</span>
+
+    <span class="s0"># bad term_codings</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">dict</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">))</span>
+
+    <span class="s1">not_term_codings </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s1">not_term_codings</span><span class="s3">[</span><span class="s4">&quot;this is a string&quot;</span><span class="s3">] = </span><span class="s1">term_codings</span><span class="s3">[</span><span class="s1">t_x</span><span class="s3">]</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">not_term_codings</span><span class="s3">)</span>
+
+    <span class="s1">non_list_term_codings </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s1">non_list_term_codings</span><span class="s3">[</span><span class="s1">t_y</span><span class="s3">] = </span><span class="s1">tuple</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">[</span><span class="s1">t_y</span><span class="s3">])</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">non_list_term_codings</span><span class="s3">)</span>
+
+    <span class="s1">non_subterm_term_codings </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s1">non_subterm_term_codings</span><span class="s3">[</span><span class="s1">t_y</span><span class="s3">][</span><span class="s6">0</span><span class="s3">] = </span><span class="s4">&quot;not a SubtermInfo&quot;</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">non_subterm_term_codings</span><span class="s3">)</span>
+
+    <span class="s1">bad_subterm </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">(</span><span class="s1">term_codings</span><span class="s3">)</span>
+    <span class="s0"># f_x is a factor in this model, but it is not a factor in t_y</span>
+    <span class="s1">term_codings</span><span class="s3">[</span><span class="s1">t_y</span><span class="s3">][</span><span class="s6">0</span><span class="s3">] = </span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_x</span><span class="s3">], {}, </span><span class="s6">1</span><span class="s3">)</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">, </span><span class="s4">&quot;y&quot;</span><span class="s3">], </span><span class="s1">factor_infos</span><span class="s3">, </span><span class="s1">bad_subterm</span><span class="s3">)</span>
+
+    <span class="s0"># contrast matrix has wrong number of rows</span>
+    <span class="s1">factor_codings_a </span><span class="s3">= {</span><span class="s1">f_a</span><span class="s3">:</span>
+                          <span class="s1">FactorInfo</span><span class="s3">(</span><span class="s1">f_a</span><span class="s3">, </span><span class="s4">&quot;categorical&quot;</span><span class="s3">, {},</span>
+                                     <span class="s1">categories</span><span class="s3">=[</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">])}</span>
+    <span class="s1">term_codings_a_bad_rows </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">([</span>
+        <span class="s3">(</span><span class="s1">t_a</span><span class="s3">,</span>
+         <span class="s3">[</span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_a</span><span class="s3">],</span>
+                      <span class="s3">{</span><span class="s1">f_a</span><span class="s3">: </span><span class="s1">ContrastMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">3</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)),</span>
+                                           <span class="s3">[</span><span class="s4">&quot;[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;[2]&quot;</span><span class="s3">])},</span>
+                      <span class="s6">2</span><span class="s3">)])])</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;a[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[2]&quot;</span><span class="s3">],</span>
+                  <span class="s1">factor_codings_a</span><span class="s3">,</span>
+                  <span class="s1">term_codings_a_bad_rows</span><span class="s3">)</span>
+
+    <span class="s0"># have a contrast matrix for a non-categorical factor</span>
+    <span class="s1">t_ax </span><span class="s3">= </span><span class="s1">Term</span><span class="s3">([</span><span class="s1">f_a</span><span class="s3">, </span><span class="s1">f_x</span><span class="s3">])</span>
+    <span class="s1">factor_codings_ax </span><span class="s3">= {</span><span class="s1">f_a</span><span class="s3">:</span>
+                           <span class="s1">FactorInfo</span><span class="s3">(</span><span class="s1">f_a</span><span class="s3">, </span><span class="s4">&quot;categorical&quot;</span><span class="s3">, {},</span>
+                                      <span class="s1">categories</span><span class="s3">=[</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">]),</span>
+                         <span class="s1">f_x</span><span class="s3">:</span>
+                           <span class="s1">FactorInfo</span><span class="s3">(</span><span class="s1">f_x</span><span class="s3">, </span><span class="s4">&quot;numerical&quot;</span><span class="s3">, {},</span>
+                                      <span class="s1">num_columns</span><span class="s3">=</span><span class="s6">2</span><span class="s3">)}</span>
+    <span class="s1">term_codings_ax_extra_cm </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">([</span>
+        <span class="s3">(</span><span class="s1">t_ax</span><span class="s3">,</span>
+         <span class="s3">[</span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_a</span><span class="s3">, </span><span class="s1">f_x</span><span class="s3">],</span>
+                      <span class="s3">{</span><span class="s1">f_a</span><span class="s3">: </span><span class="s1">ContrastMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">2</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)), [</span><span class="s4">&quot;[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;[2]&quot;</span><span class="s3">]),</span>
+                       <span class="s1">f_x</span><span class="s3">: </span><span class="s1">ContrastMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">2</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)), [</span><span class="s4">&quot;[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;[2]&quot;</span><span class="s3">])},</span>
+                      <span class="s6">4</span><span class="s3">)])])</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;a[1]:x[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[2]:x[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[1]:x[2]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[2]:x[2]&quot;</span><span class="s3">],</span>
+                  <span class="s1">factor_codings_ax</span><span class="s3">,</span>
+                  <span class="s1">term_codings_ax_extra_cm</span><span class="s3">)</span>
+
+    <span class="s0"># no contrast matrix for a categorical factor</span>
+    <span class="s1">term_codings_ax_missing_cm </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">([</span>
+        <span class="s3">(</span><span class="s1">t_ax</span><span class="s3">,</span>
+         <span class="s3">[</span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_a</span><span class="s3">, </span><span class="s1">f_x</span><span class="s3">],</span>
+                      <span class="s3">{},</span>
+                      <span class="s6">4</span><span class="s3">)])])</span>
+    <span class="s0"># This actually fails before it hits the relevant check with a KeyError,</span>
+    <span class="s0"># but that's okay... the previous test still exercises the check.</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">((</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">KeyError</span><span class="s3">), </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;a[1]:x[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[2]:x[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[1]:x[2]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[2]:x[2]&quot;</span><span class="s3">],</span>
+                  <span class="s1">factor_codings_ax</span><span class="s3">,</span>
+                  <span class="s1">term_codings_ax_missing_cm</span><span class="s3">)</span>
+
+    <span class="s0"># subterm num_columns doesn't match the value computed from the individual</span>
+    <span class="s0"># factors</span>
+    <span class="s1">term_codings_ax_wrong_subterm_columns </span><span class="s3">= </span><span class="s1">OrderedDict</span><span class="s3">([</span>
+        <span class="s3">(</span><span class="s1">t_ax</span><span class="s3">,</span>
+         <span class="s3">[</span><span class="s1">SubtermInfo</span><span class="s3">([</span><span class="s1">f_a</span><span class="s3">, </span><span class="s1">f_x</span><span class="s3">],</span>
+                      <span class="s3">{</span><span class="s1">f_a</span><span class="s3">: </span><span class="s1">ContrastMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">)),</span>
+                                           <span class="s3">[</span><span class="s4">&quot;[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;[2]&quot;</span><span class="s3">, </span><span class="s4">&quot;[3]&quot;</span><span class="s3">])},</span>
+                      <span class="s0"># should be 2 * 3 = 6</span>
+                      <span class="s6">5</span><span class="s3">)])])</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">,</span>
+                  <span class="s3">[</span><span class="s4">&quot;a[1]:x[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[2]:x[1]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[3]:x[1]&quot;</span><span class="s3">,</span>
+                   <span class="s4">&quot;a[1]:x[2]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[2]:x[2]&quot;</span><span class="s3">, </span><span class="s4">&quot;a[3]:x[2]&quot;</span><span class="s3">],</span>
+                  <span class="s1">factor_codings_ax</span><span class="s3">,</span>
+                  <span class="s1">term_codings_ax_wrong_subterm_columns</span><span class="s3">)</span>
+
+<span class="s2">def </span><span class="s1">test_DesignInfo_from_array</span><span class="s3">():</span>
+    <span class="s1">di </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">([</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">])</span>
+    <span class="s2">assert </span><span class="s1">di</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;column0&quot;</span><span class="s3">]</span>
+    <span class="s1">di2 </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">([[</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">], [</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">], [</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">]])</span>
+    <span class="s2">assert </span><span class="s1">di2</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;column0&quot;</span><span class="s3">, </span><span class="s4">&quot;column1&quot;</span><span class="s3">]</span>
+    <span class="s1">di3 </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">([</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">], </span><span class="s1">default_column_prefix</span><span class="s3">=</span><span class="s4">&quot;x&quot;</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di3</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;x0&quot;</span><span class="s3">]</span>
+    <span class="s1">di4 </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">([[</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">], [</span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">], [</span><span class="s6">3</span><span class="s3">, </span><span class="s6">4</span><span class="s3">]],</span>
+                                <span class="s1">default_column_prefix</span><span class="s3">=</span><span class="s4">&quot;x&quot;</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di4</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;x0&quot;</span><span class="s3">, </span><span class="s4">&quot;x1&quot;</span><span class="s3">]</span>
+    <span class="s1">m </span><span class="s3">= </span><span class="s1">DesignMatrix</span><span class="s3">([</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">], </span><span class="s1">di3</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">(</span><span class="s1">m</span><span class="s3">) </span><span class="s2">is </span><span class="s1">di3</span>
+    <span class="s0"># But weird objects are ignored</span>
+    <span class="s1">m</span><span class="s3">.</span><span class="s1">design_info </span><span class="s3">= </span><span class="s4">&quot;asdf&quot;</span>
+    <span class="s1">di_weird </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">(</span><span class="s1">m</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">di_weird</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;column0&quot;</span><span class="s3">]</span>
+
+    <span class="s2">import </span><span class="s1">pytest</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">ones</span><span class="s3">((</span><span class="s6">2</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">2</span><span class="s3">)))</span>
+
+    <span class="s2">from </span><span class="s1">patsy</span><span class="s3">.</span><span class="s1">util </span><span class="s2">import </span><span class="s1">have_pandas</span>
+    <span class="s2">if </span><span class="s1">have_pandas</span><span class="s3">:</span>
+        <span class="s2">import </span><span class="s1">pandas</span>
+        <span class="s0"># with named columns</span>
+        <span class="s1">di5 </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">(</span><span class="s1">pandas</span><span class="s3">.</span><span class="s1">DataFrame</span><span class="s3">([[</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">]],</span>
+                                                     <span class="s1">columns</span><span class="s3">=[</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]))</span>
+        <span class="s2">assert </span><span class="s1">di5</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]</span>
+        <span class="s0"># with irregularly numbered columns</span>
+        <span class="s1">di6 </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">(</span><span class="s1">pandas</span><span class="s3">.</span><span class="s1">DataFrame</span><span class="s3">([[</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">]],</span>
+                                                     <span class="s1">columns</span><span class="s3">=[</span><span class="s6">0</span><span class="s3">, </span><span class="s6">10</span><span class="s3">]))</span>
+        <span class="s2">assert </span><span class="s1">di6</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;column0&quot;</span><span class="s3">, </span><span class="s4">&quot;column10&quot;</span><span class="s3">]</span>
+        <span class="s0"># with .design_info attr</span>
+        <span class="s1">df </span><span class="s3">= </span><span class="s1">pandas</span><span class="s3">.</span><span class="s1">DataFrame</span><span class="s3">([[</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">]])</span>
+        <span class="s1">df</span><span class="s3">.</span><span class="s1">design_info </span><span class="s3">= </span><span class="s1">di6</span>
+        <span class="s2">assert </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">(</span><span class="s1">df</span><span class="s3">) </span><span class="s2">is </span><span class="s1">di6</span>
+
+<span class="s2">def </span><span class="s1">test_DesignInfo_linear_constraint</span><span class="s3">():</span>
+    <span class="s1">di </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">([</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">])</span>
+    <span class="s1">con </span><span class="s3">= </span><span class="s1">di</span><span class="s3">.</span><span class="s1">linear_constraint</span><span class="s3">([</span><span class="s4">&quot;2 * a1 = b + 1&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">])</span>
+    <span class="s2">assert </span><span class="s1">con</span><span class="s3">.</span><span class="s1">variable_names </span><span class="s3">== [</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]</span>
+    <span class="s2">assert </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">con</span><span class="s3">.</span><span class="s1">coefs </span><span class="s3">== [[</span><span class="s6">2</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, -</span><span class="s6">1</span><span class="s3">], [</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">, </span><span class="s6">0</span><span class="s3">]])</span>
+    <span class="s2">assert </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">(</span><span class="s1">con</span><span class="s3">.</span><span class="s1">constants </span><span class="s3">== [[</span><span class="s6">1</span><span class="s3">], [</span><span class="s6">0</span><span class="s3">]])</span>
+
+<span class="s2">def </span><span class="s1">test_DesignInfo_deprecated_attributes</span><span class="s3">():</span>
+    <span class="s1">d </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">([</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">])</span>
+    <span class="s2">def </span><span class="s1">check</span><span class="s3">(</span><span class="s1">attr</span><span class="s3">):</span>
+        <span class="s2">with </span><span class="s1">warnings</span><span class="s3">.</span><span class="s1">catch_warnings</span><span class="s3">(</span><span class="s1">record</span><span class="s3">=</span><span class="s2">True</span><span class="s3">) </span><span class="s2">as </span><span class="s1">w</span><span class="s3">:</span>
+            <span class="s1">warnings</span><span class="s3">.</span><span class="s1">simplefilter</span><span class="s3">(</span><span class="s4">&quot;always&quot;</span><span class="s3">)</span>
+            <span class="s2">assert </span><span class="s1">getattr</span><span class="s3">(</span><span class="s1">d</span><span class="s3">, </span><span class="s1">attr</span><span class="s3">) </span><span class="s2">is </span><span class="s1">d</span>
+        <span class="s2">assert </span><span class="s1">len</span><span class="s3">(</span><span class="s1">w</span><span class="s3">) == </span><span class="s6">1</span>
+        <span class="s2">assert </span><span class="s1">w</span><span class="s3">[</span><span class="s6">0</span><span class="s3">].</span><span class="s1">category </span><span class="s2">is </span><span class="s1">DeprecationWarning</span>
+    <span class="s1">check</span><span class="s3">(</span><span class="s4">&quot;builder&quot;</span><span class="s3">)</span>
+    <span class="s1">check</span><span class="s3">(</span><span class="s4">&quot;design_info&quot;</span><span class="s3">)</span>
+
+<span class="s0"># Idea: format with a reasonable amount of precision, then if that turns out</span>
+<span class="s0"># to be higher than necessary, remove as many zeros as we can. But only do</span>
+<span class="s0"># this while we can do it to *all* the ordinarily-formatted numbers, to keep</span>
+<span class="s0"># decimal points aligned.</span>
+<span class="s2">def </span><span class="s1">_format_float_column</span><span class="s3">(</span><span class="s1">precision</span><span class="s3">, </span><span class="s1">col</span><span class="s3">):</span>
+    <span class="s1">format_str </span><span class="s3">= </span><span class="s4">&quot;%.&quot; </span><span class="s3">+ </span><span class="s1">str</span><span class="s3">(</span><span class="s1">precision</span><span class="s3">) + </span><span class="s4">&quot;f&quot;</span>
+    <span class="s2">assert </span><span class="s1">col</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s6">1</span>
+    <span class="s0"># We don't want to look at numbers like &quot;1e-5&quot; or &quot;nan&quot; when stripping.</span>
+    <span class="s1">simple_float_chars </span><span class="s3">= </span><span class="s1">set</span><span class="s3">(</span><span class="s4">&quot;+-0123456789.&quot;</span><span class="s3">)</span>
+    <span class="s1">col_strs </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s1">format_str </span><span class="s3">% (</span><span class="s1">x</span><span class="s3">,) </span><span class="s2">for </span><span class="s1">x </span><span class="s2">in </span><span class="s1">col</span><span class="s3">], </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">object</span><span class="s3">)</span>
+    <span class="s0"># Really every item should have a decimal, but just in case, we don't want</span>
+    <span class="s0"># to strip zeros off the end of &quot;10&quot; or something like that.</span>
+    <span class="s1">mask </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array</span><span class="s3">([</span><span class="s1">simple_float_chars</span><span class="s3">.</span><span class="s1">issuperset</span><span class="s3">(</span><span class="s1">col_str</span><span class="s3">) </span><span class="s2">and </span><span class="s4">&quot;.&quot; </span><span class="s2">in </span><span class="s1">col_str</span>
+                     <span class="s2">for </span><span class="s1">col_str </span><span class="s2">in </span><span class="s1">col_strs</span><span class="s3">])</span>
+    <span class="s1">mask_idxes </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nonzero</span><span class="s3">(</span><span class="s1">mask</span><span class="s3">)[</span><span class="s6">0</span><span class="s3">]</span>
+    <span class="s1">strip_char </span><span class="s3">= </span><span class="s4">&quot;0&quot;</span>
+    <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">any</span><span class="s3">(</span><span class="s1">mask</span><span class="s3">):</span>
+        <span class="s2">while True</span><span class="s3">:</span>
+            <span class="s2">if </span><span class="s1">np</span><span class="s3">.</span><span class="s1">all</span><span class="s3">([</span><span class="s1">s</span><span class="s3">.</span><span class="s1">endswith</span><span class="s3">(</span><span class="s1">strip_char</span><span class="s3">) </span><span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">col_strs</span><span class="s3">[</span><span class="s1">mask</span><span class="s3">]]):</span>
+                <span class="s2">for </span><span class="s1">idx </span><span class="s2">in </span><span class="s1">mask_idxes</span><span class="s3">:</span>
+                    <span class="s1">col_strs</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">] = </span><span class="s1">col_strs</span><span class="s3">[</span><span class="s1">idx</span><span class="s3">][:-</span><span class="s6">1</span><span class="s3">]</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s2">if </span><span class="s1">strip_char </span><span class="s3">== </span><span class="s4">&quot;0&quot;</span><span class="s3">:</span>
+                    <span class="s1">strip_char </span><span class="s3">= </span><span class="s4">&quot;.&quot;</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">break</span>
+    <span class="s2">return </span><span class="s1">col_strs</span>
+
+<span class="s2">def </span><span class="s1">test__format_float_column</span><span class="s3">():</span>
+    <span class="s2">def </span><span class="s1">t</span><span class="s3">(</span><span class="s1">precision</span><span class="s3">, </span><span class="s1">numbers</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">):</span>
+        <span class="s1">got </span><span class="s3">= </span><span class="s1">_format_float_column</span><span class="s3">(</span><span class="s1">precision</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">numbers</span><span class="s3">))</span>
+        <span class="s1">print</span><span class="s3">(</span><span class="s1">got</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">np</span><span class="s3">.</span><span class="s1">array_equal</span><span class="s3">(</span><span class="s1">got</span><span class="s3">, </span><span class="s1">expected</span><span class="s3">)</span>
+    <span class="s0"># This acts weird on old python versions (e.g. it can be &quot;-nan&quot;), so don't</span>
+    <span class="s0"># hardcode it:</span>
+    <span class="s1">nan_string </span><span class="s3">= </span><span class="s4">&quot;%.3f&quot; </span><span class="s3">% (</span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">,)</span>
+    <span class="s1">t</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, [</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2.1234</span><span class="s3">, </span><span class="s6">2.1239</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">], [</span><span class="s4">&quot;1.000&quot;</span><span class="s3">, </span><span class="s4">&quot;2.123&quot;</span><span class="s3">, </span><span class="s4">&quot;2.124&quot;</span><span class="s3">, </span><span class="s1">nan_string</span><span class="s3">])</span>
+    <span class="s1">t</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, [</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">], [</span><span class="s4">&quot;1&quot;</span><span class="s3">, </span><span class="s4">&quot;2&quot;</span><span class="s3">, </span><span class="s4">&quot;3&quot;</span><span class="s3">, </span><span class="s1">nan_string</span><span class="s3">])</span>
+    <span class="s1">t</span><span class="s3">(</span><span class="s6">3</span><span class="s3">, [</span><span class="s6">1.0001</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">], [</span><span class="s4">&quot;1&quot;</span><span class="s3">, </span><span class="s4">&quot;2&quot;</span><span class="s3">, </span><span class="s4">&quot;3&quot;</span><span class="s3">, </span><span class="s1">nan_string</span><span class="s3">])</span>
+    <span class="s1">t</span><span class="s3">(</span><span class="s6">4</span><span class="s3">, [</span><span class="s6">1.0001</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">], [</span><span class="s4">&quot;1.0001&quot;</span><span class="s3">, </span><span class="s4">&quot;2.0000&quot;</span><span class="s3">, </span><span class="s4">&quot;3.0000&quot;</span><span class="s3">, </span><span class="s1">nan_string</span><span class="s3">])</span>
+
+<span class="s0"># http://docs.scipy.org/doc/numpy/user/basics.subclassing.html#slightly-more-realistic-example-attribute-added-to-existing-array</span>
+<span class="s2">class </span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">ndarray</span><span class="s3">):</span>
+    <span class="s5">&quot;&quot;&quot;A simple numpy array subclass that carries design matrix metadata. 
+ 
+    .. attribute:: design_info 
+ 
+       A :class:`DesignInfo` object containing metadata about this design 
+       matrix. 
+ 
+    This class also defines a fancy __repr__ method with labeled 
+    columns. Otherwise it is identical to a regular numpy ndarray. 
+ 
+    .. warning:: 
+ 
+       You should never check for this class using 
+       :func:`isinstance`. Limitations of the numpy API mean that it is 
+       impossible to prevent the creation of numpy arrays that have type 
+       DesignMatrix, but that are not actually design matrices (and such 
+       objects will behave like regular ndarrays in every way). Instead, check 
+       for the presence of a ``.design_info`` attribute -- this will be 
+       present only on &quot;real&quot; DesignMatrix objects. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2">def </span><span class="s1">__new__</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">, </span><span class="s1">input_array</span><span class="s3">, </span><span class="s1">design_info</span><span class="s3">=</span><span class="s2">None</span><span class="s3">,</span>
+                <span class="s1">default_column_prefix</span><span class="s3">=</span><span class="s4">&quot;column&quot;</span><span class="s3">):</span>
+        <span class="s5">&quot;&quot;&quot;Create a DesignMatrix, or cast an existing matrix to a DesignMatrix. 
+ 
+        A call like:: 
+ 
+          DesignMatrix(my_array) 
+ 
+        will convert an arbitrary array_like object into a DesignMatrix. 
+ 
+        The return from this function is guaranteed to be a two-dimensional 
+        ndarray with a real-valued floating point dtype, and a 
+        ``.design_info`` attribute which matches its shape. If the 
+        `design_info` argument is not given, then one is created via 
+        :meth:`DesignInfo.from_array` using the given 
+        `default_column_prefix`. 
+ 
+        Depending on the input array, it is possible this will pass through 
+        its input unchanged, or create a view. 
+        &quot;&quot;&quot;</span>
+        <span class="s0"># Pass through existing DesignMatrixes. The design_info check is</span>
+        <span class="s0"># necessary because numpy is sort of annoying and cannot be stopped</span>
+        <span class="s0"># from turning non-design-matrix arrays into DesignMatrix</span>
+        <span class="s0"># instances. (E.g., my_dm.diagonal() will return a DesignMatrix</span>
+        <span class="s0"># object, but one without a design_info attribute.)</span>
+        <span class="s2">if </span><span class="s3">(</span><span class="s1">isinstance</span><span class="s3">(</span><span class="s1">input_array</span><span class="s3">, </span><span class="s1">DesignMatrix</span><span class="s3">)</span>
+            <span class="s2">and </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">input_array</span><span class="s3">, </span><span class="s4">&quot;design_info&quot;</span><span class="s3">)):</span>
+            <span class="s2">return </span><span class="s1">input_array</span>
+        <span class="s1">self </span><span class="s3">= </span><span class="s1">atleast_2d_column_default</span><span class="s3">(</span><span class="s1">input_array</span><span class="s3">).</span><span class="s1">view</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">)</span>
+        <span class="s0"># Upcast integer to floating point</span>
+        <span class="s2">if </span><span class="s1">safe_issubdtype</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">integer</span><span class="s3">):</span>
+            <span class="s1">self </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">dtype</span><span class="s3">=</span><span class="s1">float</span><span class="s3">).</span><span class="s1">view</span><span class="s3">(</span><span class="s1">cls</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">&gt; </span><span class="s6">2</span><span class="s3">:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;DesignMatrix must be 2d&quot;</span><span class="s3">)</span>
+        <span class="s2">assert </span><span class="s1">self</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s6">2</span>
+        <span class="s2">if </span><span class="s1">design_info </span><span class="s2">is None</span><span class="s3">:</span>
+            <span class="s1">design_info </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">.</span><span class="s1">from_array</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">default_column_prefix</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">len</span><span class="s3">(</span><span class="s1">design_info</span><span class="s3">.</span><span class="s1">column_names</span><span class="s3">) != </span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]:</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;wrong number of column names for design matrix &quot;</span>
+                             <span class="s4">&quot;(got %s, wanted %s)&quot;</span>
+                             <span class="s3">% (</span><span class="s1">len</span><span class="s3">(</span><span class="s1">design_info</span><span class="s3">.</span><span class="s1">column_names</span><span class="s3">), </span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">]))</span>
+        <span class="s1">self</span><span class="s3">.</span><span class="s1">design_info </span><span class="s3">= </span><span class="s1">design_info</span>
+        <span class="s2">if not </span><span class="s1">safe_issubdtype</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">dtype</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">floating</span><span class="s3">):</span>
+            <span class="s2">raise </span><span class="s1">ValueError</span><span class="s3">(</span><span class="s4">&quot;design matrix must be real-valued floating point&quot;</span><span class="s3">)</span>
+        <span class="s2">return </span><span class="s1">self</span>
+
+    <span class="s1">__repr__ </span><span class="s3">= </span><span class="s1">repr_pretty_delegate</span>
+    <span class="s2">def </span><span class="s1">_repr_pretty_</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s1">p</span><span class="s3">, </span><span class="s1">cycle</span><span class="s3">):</span>
+        <span class="s2">if not </span><span class="s1">hasattr</span><span class="s3">(</span><span class="s1">self</span><span class="s3">, </span><span class="s4">&quot;design_info&quot;</span><span class="s3">):</span>
+            <span class="s0"># Not a real DesignMatrix</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">pretty</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">))</span>
+            <span class="s2">return</span>
+        <span class="s2">assert not </span><span class="s1">cycle</span>
+
+        <span class="s0"># XX: could try calculating width of the current terminal window:</span>
+        <span class="s0">#   http://stackoverflow.com/questions/566746/how-to-get-console-window-width-in-python</span>
+        <span class="s0"># sadly it looks like ipython does not actually pass this information</span>
+        <span class="s0"># in, even if we use _repr_pretty_ -- the pretty-printer object has a</span>
+        <span class="s0"># fixed width it always uses. (As of IPython 0.12.)</span>
+        <span class="s1">MAX_TOTAL_WIDTH </span><span class="s3">= </span><span class="s6">78</span>
+        <span class="s1">SEP </span><span class="s3">= </span><span class="s6">2</span>
+        <span class="s1">INDENT </span><span class="s3">= </span><span class="s6">2</span>
+        <span class="s1">MAX_ROWS </span><span class="s3">= </span><span class="s6">30</span>
+        <span class="s1">PRECISION </span><span class="s3">= </span><span class="s6">5</span>
+
+        <span class="s1">names </span><span class="s3">= </span><span class="s1">self</span><span class="s3">.</span><span class="s1">design_info</span><span class="s3">.</span><span class="s1">column_names</span>
+        <span class="s1">column_name_widths </span><span class="s3">= [</span><span class="s1">len</span><span class="s3">(</span><span class="s1">name</span><span class="s3">) </span><span class="s2">for </span><span class="s1">name </span><span class="s2">in </span><span class="s1">names</span><span class="s3">]</span>
+        <span class="s1">min_total_width </span><span class="s3">= (</span><span class="s1">INDENT </span><span class="s3">+ </span><span class="s1">SEP </span><span class="s3">* (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">] - </span><span class="s6">1</span><span class="s3">)</span>
+                           <span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">column_name_widths</span><span class="s3">))</span>
+        <span class="s2">if </span><span class="s1">min_total_width </span><span class="s3">&lt;= </span><span class="s1">MAX_TOTAL_WIDTH</span><span class="s3">:</span>
+            <span class="s1">printable_part </span><span class="s3">= </span><span class="s1">np</span><span class="s3">.</span><span class="s1">asarray</span><span class="s3">(</span><span class="s1">self</span><span class="s3">)[:</span><span class="s1">MAX_ROWS</span><span class="s3">, :]</span>
+            <span class="s1">formatted_cols </span><span class="s3">= [</span><span class="s1">_format_float_column</span><span class="s3">(</span><span class="s1">PRECISION</span><span class="s3">,</span>
+                                                   <span class="s1">printable_part</span><span class="s3">[:, </span><span class="s1">i</span><span class="s3">])</span>
+                              <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">])]</span>
+            <span class="s2">def </span><span class="s1">max_width</span><span class="s3">(</span><span class="s1">col</span><span class="s3">):</span>
+                <span class="s2">assert </span><span class="s1">col</span><span class="s3">.</span><span class="s1">ndim </span><span class="s3">== </span><span class="s6">1</span>
+                <span class="s2">if not </span><span class="s1">col</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]:</span>
+                    <span class="s2">return </span><span class="s6">0</span>
+                <span class="s2">else</span><span class="s3">:</span>
+                    <span class="s2">return </span><span class="s1">max</span><span class="s3">([</span><span class="s1">len</span><span class="s3">(</span><span class="s1">s</span><span class="s3">) </span><span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">col</span><span class="s3">])</span>
+            <span class="s1">column_num_widths </span><span class="s3">= [</span><span class="s1">max_width</span><span class="s3">(</span><span class="s1">col</span><span class="s3">) </span><span class="s2">for </span><span class="s1">col </span><span class="s2">in </span><span class="s1">formatted_cols</span><span class="s3">]</span>
+            <span class="s1">column_widths </span><span class="s3">= [</span><span class="s1">max</span><span class="s3">(</span><span class="s1">name_width</span><span class="s3">, </span><span class="s1">num_width</span><span class="s3">)</span>
+                             <span class="s2">for </span><span class="s3">(</span><span class="s1">name_width</span><span class="s3">, </span><span class="s1">num_width</span><span class="s3">)</span>
+                             <span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">column_name_widths</span><span class="s3">, </span><span class="s1">column_num_widths</span><span class="s3">)]</span>
+            <span class="s1">total_width </span><span class="s3">= (</span><span class="s1">INDENT </span><span class="s3">+ </span><span class="s1">SEP </span><span class="s3">* (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">1</span><span class="s3">] - </span><span class="s6">1</span><span class="s3">)</span>
+                           <span class="s3">+ </span><span class="s1">np</span><span class="s3">.</span><span class="s1">sum</span><span class="s3">(</span><span class="s1">column_widths</span><span class="s3">))</span>
+            <span class="s1">print_numbers </span><span class="s3">= (</span><span class="s1">total_width </span><span class="s3">&lt; </span><span class="s1">MAX_TOTAL_WIDTH</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">print_numbers </span><span class="s3">= </span><span class="s2">False</span>
+
+        <span class="s1">p</span><span class="s3">.</span><span class="s1">begin_group</span><span class="s3">(</span><span class="s1">INDENT</span><span class="s3">, </span><span class="s4">&quot;DesignMatrix with shape %s&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">,))</span>
+        <span class="s1">p</span><span class="s3">.</span><span class="s1">breakable</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">p</span><span class="s3">.</span><span class="s1">indentation</span><span class="s3">)</span>
+        <span class="s2">if </span><span class="s1">print_numbers</span><span class="s3">:</span>
+            <span class="s0"># We can fit the numbers on the screen</span>
+            <span class="s1">sep </span><span class="s3">= </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">SEP</span>
+            <span class="s0"># list() is for Py3 compatibility</span>
+            <span class="s2">for </span><span class="s1">row </span><span class="s2">in </span><span class="s3">[</span><span class="s1">names</span><span class="s3">] + </span><span class="s1">list</span><span class="s3">(</span><span class="s1">zip</span><span class="s3">(*</span><span class="s1">formatted_cols</span><span class="s3">)):</span>
+                <span class="s1">cells </span><span class="s3">= [</span><span class="s1">cell</span><span class="s3">.</span><span class="s1">rjust</span><span class="s3">(</span><span class="s1">width</span><span class="s3">)</span>
+                         <span class="s2">for </span><span class="s3">(</span><span class="s1">width</span><span class="s3">, </span><span class="s1">cell</span><span class="s3">) </span><span class="s2">in </span><span class="s1">zip</span><span class="s3">(</span><span class="s1">column_widths</span><span class="s3">, </span><span class="s1">row</span><span class="s3">)]</span>
+                <span class="s1">p</span><span class="s3">.</span><span class="s1">text</span><span class="s3">(</span><span class="s1">sep</span><span class="s3">.</span><span class="s1">join</span><span class="s3">(</span><span class="s1">cells</span><span class="s3">))</span>
+                <span class="s1">p</span><span class="s3">.</span><span class="s1">text</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">p</span><span class="s3">.</span><span class="s1">indentation</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">MAX_ROWS </span><span class="s3">&lt; </span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">]:</span>
+                <span class="s1">p</span><span class="s3">.</span><span class="s1">text</span><span class="s3">(</span><span class="s4">&quot;[%s rows omitted]&quot; </span><span class="s3">% (</span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] - </span><span class="s1">MAX_ROWS</span><span class="s3">,))</span>
+                <span class="s1">p</span><span class="s3">.</span><span class="s1">text</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">p</span><span class="s3">.</span><span class="s1">indentation</span><span class="s3">)</span>
+        <span class="s2">else</span><span class="s3">:</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">begin_group</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s4">&quot;Columns:&quot;</span><span class="s3">)</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">breakable</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">p</span><span class="s3">.</span><span class="s1">indentation</span><span class="s3">)</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">pretty</span><span class="s3">(</span><span class="s1">names</span><span class="s3">)</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">end_group</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s3">)</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">breakable</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">p</span><span class="s3">.</span><span class="s1">indentation</span><span class="s3">)</span>
+
+        <span class="s1">p</span><span class="s3">.</span><span class="s1">begin_group</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s4">&quot;Terms:&quot;</span><span class="s3">)</span>
+        <span class="s1">p</span><span class="s3">.</span><span class="s1">breakable</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">p</span><span class="s3">.</span><span class="s1">indentation</span><span class="s3">)</span>
+        <span class="s2">for </span><span class="s1">term_name</span><span class="s3">, </span><span class="s1">span </span><span class="s2">in </span><span class="s1">six</span><span class="s3">.</span><span class="s1">iteritems</span><span class="s3">(</span><span class="s1">self</span><span class="s3">.</span><span class="s1">design_info</span><span class="s3">.</span><span class="s1">term_name_slices</span><span class="s3">):</span>
+            <span class="s2">if </span><span class="s1">span</span><span class="s3">.</span><span class="s1">start </span><span class="s3">!= </span><span class="s6">0</span><span class="s3">:</span>
+                <span class="s1">p</span><span class="s3">.</span><span class="s1">breakable</span><span class="s3">(</span><span class="s4">&quot;, &quot;</span><span class="s3">)</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">pretty</span><span class="s3">(</span><span class="s1">term_name</span><span class="s3">)</span>
+            <span class="s2">if </span><span class="s1">span</span><span class="s3">.</span><span class="s1">stop </span><span class="s3">- </span><span class="s1">span</span><span class="s3">.</span><span class="s1">start </span><span class="s3">== </span><span class="s6">1</span><span class="s3">:</span>
+                <span class="s1">coltext </span><span class="s3">= </span><span class="s4">&quot;column %s&quot; </span><span class="s3">% (</span><span class="s1">span</span><span class="s3">.</span><span class="s1">start</span><span class="s3">,)</span>
+            <span class="s2">else</span><span class="s3">:</span>
+                <span class="s1">coltext </span><span class="s3">= </span><span class="s4">&quot;columns %s:%s&quot; </span><span class="s3">% (</span><span class="s1">span</span><span class="s3">.</span><span class="s1">start</span><span class="s3">, </span><span class="s1">span</span><span class="s3">.</span><span class="s1">stop</span><span class="s3">)</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">text</span><span class="s3">(</span><span class="s4">&quot; (%s)&quot; </span><span class="s3">% (</span><span class="s1">coltext</span><span class="s3">,))</span>
+        <span class="s1">p</span><span class="s3">.</span><span class="s1">end_group</span><span class="s3">(</span><span class="s6">2</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s3">)</span>
+
+        <span class="s2">if not </span><span class="s1">print_numbers </span><span class="s2">or </span><span class="s1">self</span><span class="s3">.</span><span class="s1">shape</span><span class="s3">[</span><span class="s6">0</span><span class="s3">] &gt; </span><span class="s1">MAX_ROWS</span><span class="s3">:</span>
+            <span class="s0"># some data was not shown</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">breakable</span><span class="s3">(</span><span class="s4">&quot;</span><span class="s2">\n</span><span class="s4">&quot; </span><span class="s3">+ </span><span class="s4">&quot; &quot; </span><span class="s3">* </span><span class="s1">p</span><span class="s3">.</span><span class="s1">indentation</span><span class="s3">)</span>
+            <span class="s1">p</span><span class="s3">.</span><span class="s1">text</span><span class="s3">(</span><span class="s4">&quot;(to view full data, use np.asarray(this_obj))&quot;</span><span class="s3">)</span>
+
+        <span class="s1">p</span><span class="s3">.</span><span class="s1">end_group</span><span class="s3">(</span><span class="s1">INDENT</span><span class="s3">, </span><span class="s4">&quot;&quot;</span><span class="s3">)</span>
+
+    <span class="s0"># No __array_finalize__ method, because we don't want slices of this</span>
+    <span class="s0"># object to keep the design_info (they may have different columns!), or</span>
+    <span class="s0"># anything fancy like that.</span>
+
+    <span class="s1">__reduce__ </span><span class="s3">= </span><span class="s1">no_pickling</span>
+
+<span class="s2">def </span><span class="s1">test_design_matrix</span><span class="s3">():</span>
+    <span class="s2">import </span><span class="s1">pytest</span>
+
+    <span class="s1">di </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">([</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">])</span>
+    <span class="s1">mm </span><span class="s3">= </span><span class="s1">DesignMatrix</span><span class="s3">([[</span><span class="s6">12</span><span class="s3">, </span><span class="s6">14</span><span class="s3">, </span><span class="s6">16</span><span class="s3">, </span><span class="s6">18</span><span class="s3">]], </span><span class="s1">di</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">mm</span><span class="s3">.</span><span class="s1">design_info</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;a1&quot;</span><span class="s3">, </span><span class="s4">&quot;a2&quot;</span><span class="s3">, </span><span class="s4">&quot;a3&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">]</span>
+
+    <span class="s1">bad_di </span><span class="s3">= </span><span class="s1">DesignInfo</span><span class="s3">([</span><span class="s4">&quot;a1&quot;</span><span class="s3">])</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignMatrix</span><span class="s3">, [[</span><span class="s6">12</span><span class="s3">, </span><span class="s6">14</span><span class="s3">, </span><span class="s6">16</span><span class="s3">, </span><span class="s6">18</span><span class="s3">]], </span><span class="s1">bad_di</span><span class="s3">)</span>
+
+    <span class="s1">mm2 </span><span class="s3">= </span><span class="s1">DesignMatrix</span><span class="s3">([[</span><span class="s6">12</span><span class="s3">, </span><span class="s6">14</span><span class="s3">, </span><span class="s6">16</span><span class="s3">, </span><span class="s6">18</span><span class="s3">]])</span>
+    <span class="s2">assert </span><span class="s1">mm2</span><span class="s3">.</span><span class="s1">design_info</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;column0&quot;</span><span class="s3">, </span><span class="s4">&quot;column1&quot;</span><span class="s3">, </span><span class="s4">&quot;column2&quot;</span><span class="s3">,</span>
+                                            <span class="s4">&quot;column3&quot;</span><span class="s3">]</span>
+
+    <span class="s1">mm3 </span><span class="s3">= </span><span class="s1">DesignMatrix</span><span class="s3">([</span><span class="s6">12</span><span class="s3">, </span><span class="s6">14</span><span class="s3">, </span><span class="s6">16</span><span class="s3">, </span><span class="s6">18</span><span class="s3">])</span>
+    <span class="s2">assert </span><span class="s1">mm3</span><span class="s3">.</span><span class="s1">shape </span><span class="s3">== (</span><span class="s6">4</span><span class="s3">, </span><span class="s6">1</span><span class="s3">)</span>
+
+    <span class="s0"># DesignMatrix always has exactly 2 dimensions</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignMatrix</span><span class="s3">, [[[</span><span class="s6">1</span><span class="s3">]]])</span>
+
+    <span class="s0"># DesignMatrix constructor passes through existing DesignMatrixes</span>
+    <span class="s1">mm4 </span><span class="s3">= </span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">mm</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">mm4 </span><span class="s2">is </span><span class="s1">mm</span>
+    <span class="s0"># But not if they are really slices:</span>
+    <span class="s1">mm5 </span><span class="s3">= </span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">mm</span><span class="s3">.</span><span class="s1">diagonal</span><span class="s3">())</span>
+    <span class="s2">assert </span><span class="s1">mm5 </span><span class="s2">is not </span><span class="s1">mm</span>
+
+    <span class="s1">mm6 </span><span class="s3">= </span><span class="s1">DesignMatrix</span><span class="s3">([[</span><span class="s6">12</span><span class="s3">, </span><span class="s6">14</span><span class="s3">, </span><span class="s6">16</span><span class="s3">, </span><span class="s6">18</span><span class="s3">]], </span><span class="s1">default_column_prefix</span><span class="s3">=</span><span class="s4">&quot;x&quot;</span><span class="s3">)</span>
+    <span class="s2">assert </span><span class="s1">mm6</span><span class="s3">.</span><span class="s1">design_info</span><span class="s3">.</span><span class="s1">column_names </span><span class="s3">== [</span><span class="s4">&quot;x0&quot;</span><span class="s3">, </span><span class="s4">&quot;x1&quot;</span><span class="s3">, </span><span class="s4">&quot;x2&quot;</span><span class="s3">, </span><span class="s4">&quot;x3&quot;</span><span class="s3">]</span>
+
+    <span class="s1">assert_no_pickling</span><span class="s3">(</span><span class="s1">mm6</span><span class="s3">)</span>
+
+    <span class="s0"># Only real-valued matrices can be DesignMatrixs</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignMatrix</span><span class="s3">, [</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s6">3j</span><span class="s3">])</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignMatrix</span><span class="s3">, [</span><span class="s4">&quot;a&quot;</span><span class="s3">, </span><span class="s4">&quot;b&quot;</span><span class="s3">, </span><span class="s4">&quot;c&quot;</span><span class="s3">])</span>
+    <span class="s1">pytest</span><span class="s3">.</span><span class="s1">raises</span><span class="s3">(</span><span class="s1">ValueError</span><span class="s3">, </span><span class="s1">DesignMatrix</span><span class="s3">, [</span><span class="s6">1</span><span class="s3">, </span><span class="s6">2</span><span class="s3">, </span><span class="s1">object</span><span class="s3">()])</span>
+
+    <span class="s0"># Just smoke tests</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">mm</span><span class="s3">)</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s6">100</span><span class="s3">)))</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s6">100</span><span class="s3">) * </span><span class="s6">2.0</span><span class="s3">))</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">mm</span><span class="s3">[</span><span class="s6">1</span><span class="s3">:, :])</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">arange</span><span class="s3">(</span><span class="s6">100</span><span class="s3">).</span><span class="s1">reshape</span><span class="s3">((</span><span class="s6">1</span><span class="s3">, </span><span class="s6">100</span><span class="s3">))))</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">([</span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">, </span><span class="s1">np</span><span class="s3">.</span><span class="s1">inf</span><span class="s3">]))</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">([</span><span class="s1">np</span><span class="s3">.</span><span class="s1">nan</span><span class="s3">, </span><span class="s6">0</span><span class="s3">, </span><span class="s6">1e20</span><span class="s3">, </span><span class="s6">20.5</span><span class="s3">]))</span>
+    <span class="s0"># handling of zero-size matrices</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">1</span><span class="s3">, </span><span class="s6">0</span><span class="s3">))))</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">0</span><span class="s3">, </span><span class="s6">1</span><span class="s3">))))</span>
+    <span class="s1">repr</span><span class="s3">(</span><span class="s1">DesignMatrix</span><span class="s3">(</span><span class="s1">np</span><span class="s3">.</span><span class="s1">zeros</span><span class="s3">((</span><span class="s6">0</span><span class="s3">, </span><span class="s6">0</span><span class="s3">))))</span>
+</pre>
+</body>
+</html>

@@ -1,0 +1,247 @@
+<html>
+<head>
+<title>lsoda.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #5f826b; font-style: italic;}
+.s4 { color: #2aacb8;}
+.s5 { color: #7a7e85;}
+.s6 { color: #6aab73;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+lsoda.py</font>
+</center></td></tr></table>
+<pre><span class="s0">import </span><span class="s1">numpy </span><span class="s0">as </span><span class="s1">np</span>
+<span class="s0">from </span><span class="s1">scipy</span><span class="s2">.</span><span class="s1">integrate </span><span class="s0">import </span><span class="s1">ode</span>
+<span class="s0">from </span><span class="s2">.</span><span class="s1">common </span><span class="s0">import </span><span class="s1">validate_tol</span><span class="s2">, </span><span class="s1">validate_first_step</span><span class="s2">, </span><span class="s1">warn_extraneous</span>
+<span class="s0">from </span><span class="s2">.</span><span class="s1">base </span><span class="s0">import </span><span class="s1">OdeSolver</span><span class="s2">, </span><span class="s1">DenseOutput</span>
+
+
+<span class="s0">class </span><span class="s1">LSODA</span><span class="s2">(</span><span class="s1">OdeSolver</span><span class="s2">):</span>
+    <span class="s3">&quot;&quot;&quot;Adams/BDF method with automatic stiffness detection and switching. 
+ 
+    This is a wrapper to the Fortran solver from ODEPACK [1]_. It switches 
+    automatically between the nonstiff Adams method and the stiff BDF method. 
+    The method was originally detailed in [2]_. 
+ 
+    Parameters 
+    ---------- 
+    fun : callable 
+        Right-hand side of the system: the time derivative of the state ``y`` 
+        at time ``t``. The calling signature is ``fun(t, y)``, where ``t`` is a 
+        scalar and ``y`` is an ndarray with ``len(y) = len(y0)``. ``fun`` must 
+        return an array of the same shape as ``y``. See `vectorized` for more 
+        information. 
+    t0 : float 
+        Initial time. 
+    y0 : array_like, shape (n,) 
+        Initial state. 
+    t_bound : float 
+        Boundary time - the integration won't continue beyond it. It also 
+        determines the direction of the integration. 
+    first_step : float or None, optional 
+        Initial step size. Default is ``None`` which means that the algorithm 
+        should choose. 
+    min_step : float, optional 
+        Minimum allowed step size. Default is 0.0, i.e., the step size is not 
+        bounded and determined solely by the solver. 
+    max_step : float, optional 
+        Maximum allowed step size. Default is np.inf, i.e., the step size is not 
+        bounded and determined solely by the solver. 
+    rtol, atol : float and array_like, optional 
+        Relative and absolute tolerances. The solver keeps the local error 
+        estimates less than ``atol + rtol * abs(y)``. Here `rtol` controls a 
+        relative accuracy (number of correct digits), while `atol` controls 
+        absolute accuracy (number of correct decimal places). To achieve the 
+        desired `rtol`, set `atol` to be smaller than the smallest value that 
+        can be expected from ``rtol * abs(y)`` so that `rtol` dominates the 
+        allowable error. If `atol` is larger than ``rtol * abs(y)`` the 
+        number of correct digits is not guaranteed. Conversely, to achieve the 
+        desired `atol` set `rtol` such that ``rtol * abs(y)`` is always smaller 
+        than `atol`. If components of y have different scales, it might be 
+        beneficial to set different `atol` values for different components by 
+        passing array_like with shape (n,) for `atol`. Default values are 
+        1e-3 for `rtol` and 1e-6 for `atol`. 
+    jac : None or callable, optional 
+        Jacobian matrix of the right-hand side of the system with respect to 
+        ``y``. The Jacobian matrix has shape (n, n) and its element (i, j) is 
+        equal to ``d f_i / d y_j``. The function will be called as 
+        ``jac(t, y)``. If None (default), the Jacobian will be 
+        approximated by finite differences. It is generally recommended to 
+        provide the Jacobian rather than relying on a finite-difference 
+        approximation. 
+    lband, uband : int or None 
+        Parameters defining the bandwidth of the Jacobian, 
+        i.e., ``jac[i, j] != 0 only for i - lband &lt;= j &lt;= i + uband``. Setting 
+        these requires your jac routine to return the Jacobian in the packed format: 
+        the returned array must have ``n`` columns and ``uband + lband + 1`` 
+        rows in which Jacobian diagonals are written. Specifically 
+        ``jac_packed[uband + i - j , j] = jac[i, j]``. The same format is used 
+        in `scipy.linalg.solve_banded` (check for an illustration). 
+        These parameters can be also used with ``jac=None`` to reduce the 
+        number of Jacobian elements estimated by finite differences. 
+    vectorized : bool, optional 
+        Whether `fun` may be called in a vectorized fashion. False (default) 
+        is recommended for this solver. 
+ 
+        If ``vectorized`` is False, `fun` will always be called with ``y`` of 
+        shape ``(n,)``, where ``n = len(y0)``. 
+ 
+        If ``vectorized`` is True, `fun` may be called with ``y`` of shape 
+        ``(n, k)``, where ``k`` is an integer. In this case, `fun` must behave 
+        such that ``fun(t, y)[:, i] == fun(t, y[:, i])`` (i.e. each column of 
+        the returned array is the time derivative of the state corresponding 
+        with a column of ``y``). 
+ 
+        Setting ``vectorized=True`` allows for faster finite difference 
+        approximation of the Jacobian by methods 'Radau' and 'BDF', but 
+        will result in slower execution for this solver. 
+ 
+    Attributes 
+    ---------- 
+    n : int 
+        Number of equations. 
+    status : string 
+        Current status of the solver: 'running', 'finished' or 'failed'. 
+    t_bound : float 
+        Boundary time. 
+    direction : float 
+        Integration direction: +1 or -1. 
+    t : float 
+        Current time. 
+    y : ndarray 
+        Current state. 
+    t_old : float 
+        Previous time. None if no steps were made yet. 
+    nfev : int 
+        Number of evaluations of the right-hand side. 
+    njev : int 
+        Number of evaluations of the Jacobian. 
+ 
+    References 
+    ---------- 
+    .. [1] A. C. Hindmarsh, &quot;ODEPACK, A Systematized Collection of ODE 
+           Solvers,&quot; IMACS Transactions on Scientific Computation, Vol 1., 
+           pp. 55-64, 1983. 
+    .. [2] L. Petzold, &quot;Automatic selection of methods for solving stiff and 
+           nonstiff systems of ordinary differential equations&quot;, SIAM Journal 
+           on Scientific and Statistical Computing, Vol. 4, No. 1, pp. 136-148, 
+           1983. 
+    &quot;&quot;&quot;</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">fun</span><span class="s2">, </span><span class="s1">t0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">t_bound</span><span class="s2">, </span><span class="s1">first_step</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">min_step</span><span class="s2">=</span><span class="s4">0.0</span><span class="s2">,</span>
+                 <span class="s1">max_step</span><span class="s2">=</span><span class="s1">np</span><span class="s2">.</span><span class="s1">inf</span><span class="s2">, </span><span class="s1">rtol</span><span class="s2">=</span><span class="s4">1e-3</span><span class="s2">, </span><span class="s1">atol</span><span class="s2">=</span><span class="s4">1e-6</span><span class="s2">, </span><span class="s1">jac</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">lband</span><span class="s2">=</span><span class="s0">None</span><span class="s2">,</span>
+                 <span class="s1">uband</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">vectorized</span><span class="s2">=</span><span class="s0">False</span><span class="s2">, **</span><span class="s1">extraneous</span><span class="s2">):</span>
+        <span class="s1">warn_extraneous</span><span class="s2">(</span><span class="s1">extraneous</span><span class="s2">)</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">fun</span><span class="s2">, </span><span class="s1">t0</span><span class="s2">, </span><span class="s1">y0</span><span class="s2">, </span><span class="s1">t_bound</span><span class="s2">, </span><span class="s1">vectorized</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">first_step </span><span class="s0">is None</span><span class="s2">:</span>
+            <span class="s1">first_step </span><span class="s2">= </span><span class="s4">0  </span><span class="s5"># LSODA value for automatic selection.</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">first_step </span><span class="s2">= </span><span class="s1">validate_first_step</span><span class="s2">(</span><span class="s1">first_step</span><span class="s2">, </span><span class="s1">t0</span><span class="s2">, </span><span class="s1">t_bound</span><span class="s2">)</span>
+
+        <span class="s1">first_step </span><span class="s2">*= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">direction</span>
+
+        <span class="s0">if </span><span class="s1">max_step </span><span class="s2">== </span><span class="s1">np</span><span class="s2">.</span><span class="s1">inf</span><span class="s2">:</span>
+            <span class="s1">max_step </span><span class="s2">= </span><span class="s4">0  </span><span class="s5"># LSODA value for infinity.</span>
+        <span class="s0">elif </span><span class="s1">max_step </span><span class="s2">&lt;= </span><span class="s4">0</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s6">&quot;`max_step` must be positive.&quot;</span><span class="s2">)</span>
+
+        <span class="s0">if </span><span class="s1">min_step </span><span class="s2">&lt; </span><span class="s4">0</span><span class="s2">:</span>
+            <span class="s0">raise </span><span class="s1">ValueError</span><span class="s2">(</span><span class="s6">&quot;`min_step` must be nonnegative.&quot;</span><span class="s2">)</span>
+
+        <span class="s1">rtol</span><span class="s2">, </span><span class="s1">atol </span><span class="s2">= </span><span class="s1">validate_tol</span><span class="s2">(</span><span class="s1">rtol</span><span class="s2">, </span><span class="s1">atol</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">n</span><span class="s2">)</span>
+
+        <span class="s1">solver </span><span class="s2">= </span><span class="s1">ode</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">fun</span><span class="s2">, </span><span class="s1">jac</span><span class="s2">)</span>
+        <span class="s1">solver</span><span class="s2">.</span><span class="s1">set_integrator</span><span class="s2">(</span><span class="s6">'lsoda'</span><span class="s2">, </span><span class="s1">rtol</span><span class="s2">=</span><span class="s1">rtol</span><span class="s2">, </span><span class="s1">atol</span><span class="s2">=</span><span class="s1">atol</span><span class="s2">, </span><span class="s1">max_step</span><span class="s2">=</span><span class="s1">max_step</span><span class="s2">,</span>
+                              <span class="s1">min_step</span><span class="s2">=</span><span class="s1">min_step</span><span class="s2">, </span><span class="s1">first_step</span><span class="s2">=</span><span class="s1">first_step</span><span class="s2">,</span>
+                              <span class="s1">lband</span><span class="s2">=</span><span class="s1">lband</span><span class="s2">, </span><span class="s1">uband</span><span class="s2">=</span><span class="s1">uband</span><span class="s2">)</span>
+        <span class="s1">solver</span><span class="s2">.</span><span class="s1">set_initial_value</span><span class="s2">(</span><span class="s1">y0</span><span class="s2">, </span><span class="s1">t0</span><span class="s2">)</span>
+
+        <span class="s5"># Inject t_bound into rwork array as needed for itask=5.</span>
+        <span class="s1">solver</span><span class="s2">.</span><span class="s1">_integrator</span><span class="s2">.</span><span class="s1">rwork</span><span class="s2">[</span><span class="s4">0</span><span class="s2">] = </span><span class="s1">self</span><span class="s2">.</span><span class="s1">t_bound</span>
+        <span class="s1">solver</span><span class="s2">.</span><span class="s1">_integrator</span><span class="s2">.</span><span class="s1">call_args</span><span class="s2">[</span><span class="s4">4</span><span class="s2">] = </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">_integrator</span><span class="s2">.</span><span class="s1">rwork</span>
+
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">_lsoda_solver </span><span class="s2">= </span><span class="s1">solver</span>
+
+    <span class="s0">def </span><span class="s1">_step_impl</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">solver </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_lsoda_solver</span>
+        <span class="s1">integrator </span><span class="s2">= </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">_integrator</span>
+
+        <span class="s5"># From lsoda.step and lsoda.integrate itask=5 means take a single</span>
+        <span class="s5"># step and do not go past t_bound.</span>
+        <span class="s1">itask </span><span class="s2">= </span><span class="s1">integrator</span><span class="s2">.</span><span class="s1">call_args</span><span class="s2">[</span><span class="s4">2</span><span class="s2">]</span>
+        <span class="s1">integrator</span><span class="s2">.</span><span class="s1">call_args</span><span class="s2">[</span><span class="s4">2</span><span class="s2">] = </span><span class="s4">5</span>
+        <span class="s1">solver</span><span class="s2">.</span><span class="s1">_y</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">t </span><span class="s2">= </span><span class="s1">integrator</span><span class="s2">.</span><span class="s1">run</span><span class="s2">(</span>
+            <span class="s1">solver</span><span class="s2">.</span><span class="s1">f</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">jac </span><span class="s0">or </span><span class="s2">(</span><span class="s0">lambda</span><span class="s2">: </span><span class="s0">None</span><span class="s2">), </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">_y</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">t</span><span class="s2">,</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">t_bound</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">f_params</span><span class="s2">, </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">jac_params</span><span class="s2">)</span>
+        <span class="s1">integrator</span><span class="s2">.</span><span class="s1">call_args</span><span class="s2">[</span><span class="s4">2</span><span class="s2">] = </span><span class="s1">itask</span>
+
+        <span class="s0">if </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">successful</span><span class="s2">():</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">t </span><span class="s2">= </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">t</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">y </span><span class="s2">= </span><span class="s1">solver</span><span class="s2">.</span><span class="s1">_y</span>
+            <span class="s5"># From LSODA Fortran source njev is equal to nlu.</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">njev </span><span class="s2">= </span><span class="s1">integrator</span><span class="s2">.</span><span class="s1">iwork</span><span class="s2">[</span><span class="s4">12</span><span class="s2">]</span>
+            <span class="s1">self</span><span class="s2">.</span><span class="s1">nlu </span><span class="s2">= </span><span class="s1">integrator</span><span class="s2">.</span><span class="s1">iwork</span><span class="s2">[</span><span class="s4">12</span><span class="s2">]</span>
+            <span class="s0">return True</span><span class="s2">, </span><span class="s0">None</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s0">return False</span><span class="s2">, </span><span class="s6">'Unexpected istate in LSODA.'</span>
+
+    <span class="s0">def </span><span class="s1">_dense_output_impl</span><span class="s2">(</span><span class="s1">self</span><span class="s2">):</span>
+        <span class="s1">iwork </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_lsoda_solver</span><span class="s2">.</span><span class="s1">_integrator</span><span class="s2">.</span><span class="s1">iwork</span>
+        <span class="s1">rwork </span><span class="s2">= </span><span class="s1">self</span><span class="s2">.</span><span class="s1">_lsoda_solver</span><span class="s2">.</span><span class="s1">_integrator</span><span class="s2">.</span><span class="s1">rwork</span>
+
+        <span class="s5"># We want to produce the Nordsieck history array, yh, up to the order</span>
+        <span class="s5"># used in the last successful iteration. The step size is unimportant</span>
+        <span class="s5"># because it will be scaled out in LsodaDenseOutput. Some additional</span>
+        <span class="s5"># work may be required because ODEPACK's LSODA implementation produces</span>
+        <span class="s5"># the Nordsieck history in the state needed for the next iteration.</span>
+
+        <span class="s5"># iwork[13] contains order from last successful iteration, while</span>
+        <span class="s5"># iwork[14] contains order to be attempted next.</span>
+        <span class="s1">order </span><span class="s2">= </span><span class="s1">iwork</span><span class="s2">[</span><span class="s4">13</span><span class="s2">]</span>
+
+        <span class="s5"># rwork[11] contains the step size to be attempted next, while</span>
+        <span class="s5"># rwork[10] contains step size from last successful iteration.</span>
+        <span class="s1">h </span><span class="s2">= </span><span class="s1">rwork</span><span class="s2">[</span><span class="s4">11</span><span class="s2">]</span>
+
+        <span class="s5"># rwork[20:20 + (iwork[14] + 1) * self.n] contains entries of the</span>
+        <span class="s5"># Nordsieck array in state needed for next iteration. We want</span>
+        <span class="s5"># the entries up to order for the last successful step so use the </span>
+        <span class="s5"># following.</span>
+        <span class="s1">yh </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">reshape</span><span class="s2">(</span><span class="s1">rwork</span><span class="s2">[</span><span class="s4">20</span><span class="s2">:</span><span class="s4">20 </span><span class="s2">+ (</span><span class="s1">order </span><span class="s2">+ </span><span class="s4">1</span><span class="s2">) * </span><span class="s1">self</span><span class="s2">.</span><span class="s1">n</span><span class="s2">],</span>
+                        <span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">n</span><span class="s2">, </span><span class="s1">order </span><span class="s2">+ </span><span class="s4">1</span><span class="s2">), </span><span class="s1">order</span><span class="s2">=</span><span class="s6">'F'</span><span class="s2">).</span><span class="s1">copy</span><span class="s2">()</span>
+        <span class="s0">if </span><span class="s1">iwork</span><span class="s2">[</span><span class="s4">14</span><span class="s2">] &lt; </span><span class="s1">order</span><span class="s2">:</span>
+            <span class="s5"># If the order is set to decrease then the final column of yh</span>
+            <span class="s5"># has not been updated within ODEPACK's LSODA</span>
+            <span class="s5"># implementation because this column will not be used in the</span>
+            <span class="s5"># next iteration. We must rescale this column to make the</span>
+            <span class="s5"># associated step size consistent with the other columns.</span>
+            <span class="s1">yh</span><span class="s2">[:, -</span><span class="s4">1</span><span class="s2">] *= (</span><span class="s1">h </span><span class="s2">/ </span><span class="s1">rwork</span><span class="s2">[</span><span class="s4">10</span><span class="s2">]) ** </span><span class="s1">order</span>
+
+        <span class="s0">return </span><span class="s1">LsodaDenseOutput</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">t_old</span><span class="s2">, </span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">order</span><span class="s2">, </span><span class="s1">yh</span><span class="s2">)</span>
+
+
+<span class="s0">class </span><span class="s1">LsodaDenseOutput</span><span class="s2">(</span><span class="s1">DenseOutput</span><span class="s2">):</span>
+    <span class="s0">def </span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">t_old</span><span class="s2">, </span><span class="s1">t</span><span class="s2">, </span><span class="s1">h</span><span class="s2">, </span><span class="s1">order</span><span class="s2">, </span><span class="s1">yh</span><span class="s2">):</span>
+        <span class="s1">super</span><span class="s2">().</span><span class="s1">__init__</span><span class="s2">(</span><span class="s1">t_old</span><span class="s2">, </span><span class="s1">t</span><span class="s2">)</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">h </span><span class="s2">= </span><span class="s1">h</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">yh </span><span class="s2">= </span><span class="s1">yh</span>
+        <span class="s1">self</span><span class="s2">.</span><span class="s1">p </span><span class="s2">= </span><span class="s1">np</span><span class="s2">.</span><span class="s1">arange</span><span class="s2">(</span><span class="s1">order </span><span class="s2">+ </span><span class="s4">1</span><span class="s2">)</span>
+
+    <span class="s0">def </span><span class="s1">_call_impl</span><span class="s2">(</span><span class="s1">self</span><span class="s2">, </span><span class="s1">t</span><span class="s2">):</span>
+        <span class="s0">if </span><span class="s1">t</span><span class="s2">.</span><span class="s1">ndim </span><span class="s2">== </span><span class="s4">0</span><span class="s2">:</span>
+            <span class="s1">x </span><span class="s2">= ((</span><span class="s1">t </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">) / </span><span class="s1">self</span><span class="s2">.</span><span class="s1">h</span><span class="s2">) ** </span><span class="s1">self</span><span class="s2">.</span><span class="s1">p</span>
+        <span class="s0">else</span><span class="s2">:</span>
+            <span class="s1">x </span><span class="s2">= ((</span><span class="s1">t </span><span class="s2">- </span><span class="s1">self</span><span class="s2">.</span><span class="s1">t</span><span class="s2">) / </span><span class="s1">self</span><span class="s2">.</span><span class="s1">h</span><span class="s2">) ** </span><span class="s1">self</span><span class="s2">.</span><span class="s1">p</span><span class="s2">[:, </span><span class="s0">None</span><span class="s2">]</span>
+
+        <span class="s0">return </span><span class="s1">np</span><span class="s2">.</span><span class="s1">dot</span><span class="s2">(</span><span class="s1">self</span><span class="s2">.</span><span class="s1">yh</span><span class="s2">, </span><span class="s1">x</span><span class="s2">)</span>
+</pre>
+</body>
+</html>

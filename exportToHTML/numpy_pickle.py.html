@@ -1,0 +1,683 @@
+<html>
+<head>
+<title>numpy_pickle.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+.s7 { color: #a5c261;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+numpy_pickle.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot;Utilities for fast persistence of big data, with optional compression.&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Gael Varoquaux &lt;gael dot varoquaux at normalesup dot org&gt;</span>
+<span class="s2"># Copyright (c) 2009 Gael Varoquaux</span>
+<span class="s2"># License: BSD Style, 3 clauses.</span>
+
+<span class="s3">import </span><span class="s1">pickle</span>
+<span class="s3">import </span><span class="s1">os</span>
+<span class="s3">import </span><span class="s1">warnings</span>
+<span class="s3">import </span><span class="s1">io</span>
+<span class="s3">from </span><span class="s1">pathlib </span><span class="s3">import </span><span class="s1">Path</span>
+
+<span class="s3">from </span><span class="s4">.</span><span class="s1">compressor </span><span class="s3">import </span><span class="s1">lz4</span><span class="s4">, </span><span class="s1">LZ4_NOT_INSTALLED_ERROR</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">compressor </span><span class="s3">import </span><span class="s1">_COMPRESSORS</span><span class="s4">, </span><span class="s1">register_compressor</span><span class="s4">, </span><span class="s1">BinaryZlibFile</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">compressor </span><span class="s3">import </span><span class="s4">(</span><span class="s1">ZlibCompressorWrapper</span><span class="s4">, </span><span class="s1">GzipCompressorWrapper</span><span class="s4">,</span>
+                         <span class="s1">BZ2CompressorWrapper</span><span class="s4">, </span><span class="s1">LZMACompressorWrapper</span><span class="s4">,</span>
+                         <span class="s1">XZCompressorWrapper</span><span class="s4">, </span><span class="s1">LZ4CompressorWrapper</span><span class="s4">)</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">numpy_pickle_utils </span><span class="s3">import </span><span class="s1">Unpickler</span><span class="s4">, </span><span class="s1">Pickler</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">numpy_pickle_utils </span><span class="s3">import </span><span class="s1">_read_fileobject</span><span class="s4">, </span><span class="s1">_write_fileobject</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">numpy_pickle_utils </span><span class="s3">import </span><span class="s1">_read_bytes</span><span class="s4">, </span><span class="s1">BUFFER_SIZE</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">numpy_pickle_utils </span><span class="s3">import </span><span class="s1">_ensure_native_byte_order</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">numpy_pickle_compat </span><span class="s3">import </span><span class="s1">load_compatibility</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">numpy_pickle_compat </span><span class="s3">import </span><span class="s1">NDArrayWrapper</span>
+<span class="s2"># For compatibility with old versions of joblib, we need ZNDArrayWrapper</span>
+<span class="s2"># to be visible in the current namespace.</span>
+<span class="s2"># Explicitly skipping next line from flake8 as it triggers an F401 warning</span>
+<span class="s2"># which we don't care.</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">numpy_pickle_compat </span><span class="s3">import </span><span class="s1">ZNDArrayWrapper  </span><span class="s2"># noqa</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">backports </span><span class="s3">import </span><span class="s1">make_memmap</span>
+
+<span class="s2"># Register supported compressors</span>
+<span class="s1">register_compressor</span><span class="s4">(</span><span class="s5">'zlib'</span><span class="s4">, </span><span class="s1">ZlibCompressorWrapper</span><span class="s4">())</span>
+<span class="s1">register_compressor</span><span class="s4">(</span><span class="s5">'gzip'</span><span class="s4">, </span><span class="s1">GzipCompressorWrapper</span><span class="s4">())</span>
+<span class="s1">register_compressor</span><span class="s4">(</span><span class="s5">'bz2'</span><span class="s4">, </span><span class="s1">BZ2CompressorWrapper</span><span class="s4">())</span>
+<span class="s1">register_compressor</span><span class="s4">(</span><span class="s5">'lzma'</span><span class="s4">, </span><span class="s1">LZMACompressorWrapper</span><span class="s4">())</span>
+<span class="s1">register_compressor</span><span class="s4">(</span><span class="s5">'xz'</span><span class="s4">, </span><span class="s1">XZCompressorWrapper</span><span class="s4">())</span>
+<span class="s1">register_compressor</span><span class="s4">(</span><span class="s5">'lz4'</span><span class="s4">, </span><span class="s1">LZ4CompressorWrapper</span><span class="s4">())</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># Utility objects for persistence.</span>
+
+<span class="s2"># For convenience, 16 bytes are used to be sure to cover all the possible</span>
+<span class="s2"># dtypes' alignments. For reference, see:</span>
+<span class="s2"># https://numpy.org/devdocs/dev/alignment.html</span>
+<span class="s1">NUMPY_ARRAY_ALIGNMENT_BYTES </span><span class="s4">= </span><span class="s6">16</span>
+
+
+<span class="s3">class </span><span class="s1">NumpyArrayWrapper</span><span class="s4">(</span><span class="s1">object</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;An object to be persisted instead of numpy arrays. 
+ 
+    This object is used to hack into the pickle machinery and read numpy 
+    array data from our custom persistence format. 
+    More precisely, this object is used for: 
+    * carrying the information of the persisted array: subclass, shape, order, 
+    dtype. Those ndarray metadata are used to correctly reconstruct the array 
+    with low level numpy functions. 
+    * determining if memmap is allowed on the array. 
+    * reading the array bytes from a file. 
+    * reading the array using memorymap from a file. 
+    * writing the array bytes to a file. 
+ 
+    Attributes 
+    ---------- 
+    subclass: numpy.ndarray subclass 
+        Determine the subclass of the wrapped array. 
+    shape: numpy.ndarray shape 
+        Determine the shape of the wrapped array. 
+    order: {'C', 'F'} 
+        Determine the order of wrapped array data. 'C' is for C order, 'F' is 
+        for fortran order. 
+    dtype: numpy.ndarray dtype 
+        Determine the data type of the wrapped array. 
+    allow_mmap: bool 
+        Determine if memory mapping is allowed on the wrapped array. 
+        Default: False. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">subclass</span><span class="s4">, </span><span class="s1">shape</span><span class="s4">, </span><span class="s1">order</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">, </span><span class="s1">allow_mmap</span><span class="s4">=</span><span class="s3">False</span><span class="s4">,</span>
+                 <span class="s1">numpy_array_alignment_bytes</span><span class="s4">=</span><span class="s1">NUMPY_ARRAY_ALIGNMENT_BYTES</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Constructor. Store the useful information for later.&quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">subclass </span><span class="s4">= </span><span class="s1">subclass</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">shape </span><span class="s4">= </span><span class="s1">shape</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">order </span><span class="s4">= </span><span class="s1">order</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">dtype </span><span class="s4">= </span><span class="s1">dtype</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">allow_mmap </span><span class="s4">= </span><span class="s1">allow_mmap</span>
+        <span class="s2"># We make numpy_array_alignment_bytes an instance attribute to allow us</span>
+        <span class="s2"># to change our mind about the default alignment and still load the old</span>
+        <span class="s2"># pickles (with the previous alignment) correctly</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">numpy_array_alignment_bytes </span><span class="s4">= </span><span class="s1">numpy_array_alignment_bytes</span>
+
+    <span class="s3">def </span><span class="s1">safe_get_numpy_array_alignment_bytes</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s2"># NumpyArrayWrapper instances loaded from joblib &lt;= 1.1 pickles don't</span>
+        <span class="s2"># have an numpy_array_alignment_bytes attribute</span>
+        <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s5">'numpy_array_alignment_bytes'</span><span class="s4">, </span><span class="s3">None</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">write_array</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">array</span><span class="s4">, </span><span class="s1">pickler</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Write array bytes to pickler file handle. 
+ 
+        This function is an adaptation of the numpy write_array function 
+        available in version 1.10.1 in numpy/lib/format.py. 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># Set buffer size to 16 MiB to hide the Python loop overhead.</span>
+        <span class="s1">buffersize </span><span class="s4">= </span><span class="s1">max</span><span class="s4">(</span><span class="s6">16 </span><span class="s4">* </span><span class="s6">1024 </span><span class="s4">** </span><span class="s6">2 </span><span class="s4">// </span><span class="s1">array</span><span class="s4">.</span><span class="s1">itemsize</span><span class="s4">, </span><span class="s6">1</span><span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">array</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">hasobject</span><span class="s4">:</span>
+            <span class="s2"># We contain Python objects so we cannot write out the data</span>
+            <span class="s2"># directly. Instead, we will pickle it out with version 2 of the</span>
+            <span class="s2"># pickle protocol.</span>
+            <span class="s1">pickle</span><span class="s4">.</span><span class="s1">dump</span><span class="s4">(</span><span class="s1">array</span><span class="s4">, </span><span class="s1">pickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s6">2</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">numpy_array_alignment_bytes </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">safe_get_numpy_array_alignment_bytes</span><span class="s4">()</span>
+            <span class="s3">if </span><span class="s1">numpy_array_alignment_bytes </span><span class="s3">is not None</span><span class="s4">:</span>
+                <span class="s1">current_pos </span><span class="s4">= </span><span class="s1">pickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">tell</span><span class="s4">()</span>
+                <span class="s1">pos_after_padding_byte </span><span class="s4">= </span><span class="s1">current_pos </span><span class="s4">+ </span><span class="s6">1</span>
+                <span class="s1">padding_length </span><span class="s4">= </span><span class="s1">numpy_array_alignment_bytes </span><span class="s4">- (</span>
+                    <span class="s1">pos_after_padding_byte </span><span class="s4">% </span><span class="s1">numpy_array_alignment_bytes</span><span class="s4">)</span>
+                <span class="s2"># A single byte is written that contains the padding length in</span>
+                <span class="s2"># bytes</span>
+                <span class="s1">padding_length_byte </span><span class="s4">= </span><span class="s1">int</span><span class="s4">.</span><span class="s1">to_bytes</span><span class="s4">(</span>
+                    <span class="s1">padding_length</span><span class="s4">, </span><span class="s1">length</span><span class="s4">=</span><span class="s6">1</span><span class="s4">, </span><span class="s1">byteorder</span><span class="s4">=</span><span class="s5">'little'</span><span class="s4">)</span>
+                <span class="s1">pickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">write</span><span class="s4">(</span><span class="s1">padding_length_byte</span><span class="s4">)</span>
+
+                <span class="s3">if </span><span class="s1">padding_length </span><span class="s4">!= </span><span class="s6">0</span><span class="s4">:</span>
+                    <span class="s1">padding </span><span class="s4">= </span><span class="s7">b'</span><span class="s3">\xff</span><span class="s7">' </span><span class="s4">* </span><span class="s1">padding_length</span>
+                    <span class="s1">pickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">write</span><span class="s4">(</span><span class="s1">padding</span><span class="s4">)</span>
+
+            <span class="s3">for </span><span class="s1">chunk </span><span class="s3">in </span><span class="s1">pickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">nditer</span><span class="s4">(</span><span class="s1">array</span><span class="s4">,</span>
+                                           <span class="s1">flags</span><span class="s4">=[</span><span class="s5">'external_loop'</span><span class="s4">,</span>
+                                                  <span class="s5">'buffered'</span><span class="s4">,</span>
+                                                  <span class="s5">'zerosize_ok'</span><span class="s4">],</span>
+                                           <span class="s1">buffersize</span><span class="s4">=</span><span class="s1">buffersize</span><span class="s4">,</span>
+                                           <span class="s1">order</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">order</span><span class="s4">):</span>
+                <span class="s1">pickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">write</span><span class="s4">(</span><span class="s1">chunk</span><span class="s4">.</span><span class="s1">tobytes</span><span class="s4">(</span><span class="s5">'C'</span><span class="s4">))</span>
+
+    <span class="s3">def </span><span class="s1">read_array</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">unpickler</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Read array from unpickler file handle. 
+ 
+        This function is an adaptation of the numpy read_array function 
+        available in version 1.10.1 in numpy/lib/format.py. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">) == </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s1">count </span><span class="s4">= </span><span class="s6">1</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s2"># joblib issue #859: we cast the elements of self.shape to int64 to</span>
+            <span class="s2"># prevent a potential overflow when computing their product.</span>
+            <span class="s1">shape_int64 </span><span class="s4">= [</span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">int64</span><span class="s4">(</span><span class="s1">x</span><span class="s4">) </span><span class="s3">for </span><span class="s1">x </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">]</span>
+            <span class="s1">count </span><span class="s4">= </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">multiply</span><span class="s4">.</span><span class="s1">reduce</span><span class="s4">(</span><span class="s1">shape_int64</span><span class="s4">)</span>
+        <span class="s2"># Now read the actual data.</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">hasobject</span><span class="s4">:</span>
+            <span class="s2"># The array contained Python objects. We need to unpickle the data.</span>
+            <span class="s1">array </span><span class="s4">= </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">load</span><span class="s4">(</span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">numpy_array_alignment_bytes </span><span class="s4">= </span><span class="s1">\</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">safe_get_numpy_array_alignment_bytes</span><span class="s4">()</span>
+            <span class="s3">if </span><span class="s1">numpy_array_alignment_bytes </span><span class="s3">is not None</span><span class="s4">:</span>
+                <span class="s1">padding_byte </span><span class="s4">= </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">read</span><span class="s4">(</span><span class="s6">1</span><span class="s4">)</span>
+                <span class="s1">padding_length </span><span class="s4">= </span><span class="s1">int</span><span class="s4">.</span><span class="s1">from_bytes</span><span class="s4">(</span>
+                    <span class="s1">padding_byte</span><span class="s4">, </span><span class="s1">byteorder</span><span class="s4">=</span><span class="s5">'little'</span><span class="s4">)</span>
+                <span class="s3">if </span><span class="s1">padding_length </span><span class="s4">!= </span><span class="s6">0</span><span class="s4">:</span>
+                    <span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">read</span><span class="s4">(</span><span class="s1">padding_length</span><span class="s4">)</span>
+
+            <span class="s2"># This is not a real file. We have to read it the</span>
+            <span class="s2"># memory-intensive way.</span>
+            <span class="s2"># crc32 module fails on reads greater than 2 ** 32 bytes,</span>
+            <span class="s2"># breaking large reads from gzip streams. Chunk reads to</span>
+            <span class="s2"># BUFFER_SIZE bytes to avoid issue and reduce memory overhead</span>
+            <span class="s2"># of the read. In non-chunked case count &lt; max_read_count, so</span>
+            <span class="s2"># only one read is performed.</span>
+            <span class="s1">max_read_count </span><span class="s4">= </span><span class="s1">BUFFER_SIZE </span><span class="s4">// </span><span class="s1">min</span><span class="s4">(</span><span class="s1">BUFFER_SIZE</span><span class="s4">,</span>
+                                                <span class="s1">self</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">itemsize</span><span class="s4">)</span>
+
+            <span class="s1">array </span><span class="s4">= </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">empty</span><span class="s4">(</span><span class="s1">count</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">)</span>
+            <span class="s3">for </span><span class="s1">i </span><span class="s3">in </span><span class="s1">range</span><span class="s4">(</span><span class="s6">0</span><span class="s4">, </span><span class="s1">count</span><span class="s4">, </span><span class="s1">max_read_count</span><span class="s4">):</span>
+                <span class="s1">read_count </span><span class="s4">= </span><span class="s1">min</span><span class="s4">(</span><span class="s1">max_read_count</span><span class="s4">, </span><span class="s1">count </span><span class="s4">- </span><span class="s1">i</span><span class="s4">)</span>
+                <span class="s1">read_size </span><span class="s4">= </span><span class="s1">int</span><span class="s4">(</span><span class="s1">read_count </span><span class="s4">* </span><span class="s1">self</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">itemsize</span><span class="s4">)</span>
+                <span class="s1">data </span><span class="s4">= </span><span class="s1">_read_bytes</span><span class="s4">(</span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">,</span>
+                                   <span class="s1">read_size</span><span class="s4">, </span><span class="s5">&quot;array data&quot;</span><span class="s4">)</span>
+                <span class="s1">array</span><span class="s4">[</span><span class="s1">i</span><span class="s4">:</span><span class="s1">i </span><span class="s4">+ </span><span class="s1">read_count</span><span class="s4">] = </span><span class="s1">\</span>
+                    <span class="s1">unpickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">frombuffer</span><span class="s4">(</span><span class="s1">data</span><span class="s4">, </span><span class="s1">dtype</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">,</span>
+                                            <span class="s1">count</span><span class="s4">=</span><span class="s1">read_count</span><span class="s4">)</span>
+                <span class="s3">del </span><span class="s1">data</span>
+
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">order </span><span class="s4">== </span><span class="s5">'F'</span><span class="s4">:</span>
+                <span class="s1">array</span><span class="s4">.</span><span class="s1">shape </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">[::-</span><span class="s6">1</span><span class="s4">]</span>
+                <span class="s1">array </span><span class="s4">= </span><span class="s1">array</span><span class="s4">.</span><span class="s1">transpose</span><span class="s4">()</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">array</span><span class="s4">.</span><span class="s1">shape </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">shape</span>
+
+        <span class="s2"># Detect byte order mismatch and swap as needed.</span>
+        <span class="s3">return </span><span class="s1">_ensure_native_byte_order</span><span class="s4">(</span><span class="s1">array</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">read_mmap</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">unpickler</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Read an array using numpy memmap.&quot;&quot;&quot;</span>
+        <span class="s1">current_pos </span><span class="s4">= </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">tell</span><span class="s4">()</span>
+        <span class="s1">offset </span><span class="s4">= </span><span class="s1">current_pos</span>
+        <span class="s1">numpy_array_alignment_bytes </span><span class="s4">= </span><span class="s1">\</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">safe_get_numpy_array_alignment_bytes</span><span class="s4">()</span>
+
+        <span class="s3">if </span><span class="s1">numpy_array_alignment_bytes </span><span class="s3">is not None</span><span class="s4">:</span>
+            <span class="s1">padding_byte </span><span class="s4">= </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">read</span><span class="s4">(</span><span class="s6">1</span><span class="s4">)</span>
+            <span class="s1">padding_length </span><span class="s4">= </span><span class="s1">int</span><span class="s4">.</span><span class="s1">from_bytes</span><span class="s4">(</span><span class="s1">padding_byte</span><span class="s4">, </span><span class="s1">byteorder</span><span class="s4">=</span><span class="s5">'little'</span><span class="s4">)</span>
+            <span class="s2"># + 1 is for the padding byte</span>
+            <span class="s1">offset </span><span class="s4">+= </span><span class="s1">padding_length </span><span class="s4">+ </span><span class="s6">1</span>
+
+        <span class="s3">if </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s4">== </span><span class="s5">'w+'</span><span class="s4">:</span>
+            <span class="s1">unpickler</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s4">= </span><span class="s5">'r+'</span>
+
+        <span class="s1">marray </span><span class="s4">= </span><span class="s1">make_memmap</span><span class="s4">(</span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">filename</span><span class="s4">,</span>
+                             <span class="s1">dtype</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">,</span>
+                             <span class="s1">shape</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">,</span>
+                             <span class="s1">order</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">order</span><span class="s4">,</span>
+                             <span class="s1">mode</span><span class="s4">=</span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">mmap_mode</span><span class="s4">,</span>
+                             <span class="s1">offset</span><span class="s4">=</span><span class="s1">offset</span><span class="s4">)</span>
+        <span class="s2"># update the offset so that it corresponds to the end of the read array</span>
+        <span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">seek</span><span class="s4">(</span><span class="s1">offset </span><span class="s4">+ </span><span class="s1">marray</span><span class="s4">.</span><span class="s1">nbytes</span><span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s4">(</span><span class="s1">numpy_array_alignment_bytes </span><span class="s3">is None and</span>
+                <span class="s1">current_pos </span><span class="s4">% </span><span class="s1">NUMPY_ARRAY_ALIGNMENT_BYTES </span><span class="s4">!= </span><span class="s6">0</span><span class="s4">):</span>
+            <span class="s1">message </span><span class="s4">= (</span>
+                <span class="s5">f'The memmapped array </span><span class="s3">{</span><span class="s1">marray</span><span class="s3">} </span><span class="s5">loaded from the file '</span>
+                <span class="s5">f'</span><span class="s3">{</span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">name</span><span class="s3">} </span><span class="s5">is not byte aligned. '</span>
+                <span class="s5">'This may cause segmentation faults if this memmapped array '</span>
+                <span class="s5">'is used in some libraries like BLAS or PyTorch. '</span>
+                <span class="s5">'To get rid of this warning, regenerate your pickle file '</span>
+                <span class="s5">'with joblib &gt;= 1.2.0. '</span>
+                <span class="s5">'See https://github.com/joblib/joblib/issues/563 '</span>
+                <span class="s5">'for more details'</span>
+            <span class="s4">)</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s1">message</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">_ensure_native_byte_order</span><span class="s4">(</span><span class="s1">marray</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">read</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">unpickler</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Read the array corresponding to this wrapper. 
+ 
+        Use the unpickler to get all information to correctly read the array. 
+ 
+        Parameters 
+        ---------- 
+        unpickler: NumpyUnpickler 
+ 
+        Returns 
+        ------- 
+        array: numpy.ndarray 
+ 
+        &quot;&quot;&quot;</span>
+        <span class="s2"># When requested, only use memmap mode if allowed.</span>
+        <span class="s3">if </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s3">is not None and </span><span class="s1">self</span><span class="s4">.</span><span class="s1">allow_mmap</span><span class="s4">:</span>
+            <span class="s1">array </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">read_mmap</span><span class="s4">(</span><span class="s1">unpickler</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">array </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">read_array</span><span class="s4">(</span><span class="s1">unpickler</span><span class="s4">)</span>
+
+        <span class="s2"># Manage array subclass case</span>
+        <span class="s3">if </span><span class="s4">(</span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">array</span><span class="s4">, </span><span class="s5">'__array_prepare__'</span><span class="s4">) </span><span class="s3">and</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">subclass </span><span class="s3">not in </span><span class="s4">(</span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ndarray</span><span class="s4">,</span>
+                                  <span class="s1">unpickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">memmap</span><span class="s4">)):</span>
+            <span class="s2"># We need to reconstruct another subclass</span>
+            <span class="s1">new_array </span><span class="s4">= </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">core</span><span class="s4">.</span><span class="s1">multiarray</span><span class="s4">.</span><span class="s1">_reconstruct</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">subclass</span><span class="s4">, (</span><span class="s6">0</span><span class="s4">,), </span><span class="s5">'b'</span><span class="s4">)</span>
+            <span class="s3">return </span><span class="s1">new_array</span><span class="s4">.</span><span class="s1">__array_prepare__</span><span class="s4">(</span><span class="s1">array</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">return </span><span class="s1">array</span>
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># Pickler classes</span>
+
+
+<span class="s3">class </span><span class="s1">NumpyPickler</span><span class="s4">(</span><span class="s1">Pickler</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;A pickler to persist big data efficiently. 
+ 
+    The main features of this object are: 
+    * persistence of numpy arrays in a single file. 
+    * optional compression with a special care on avoiding memory copies. 
+ 
+    Attributes 
+    ---------- 
+    fp: file 
+        File object handle used for serializing the input object. 
+    protocol: int, optional 
+        Pickle protocol used. Default is pickle.DEFAULT_PROTOCOL. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">dispatch </span><span class="s4">= </span><span class="s1">Pickler</span><span class="s4">.</span><span class="s1">dispatch</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">fp</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">file_handle </span><span class="s4">= </span><span class="s1">fp</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">buffered </span><span class="s4">= </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">, </span><span class="s1">BinaryZlibFile</span><span class="s4">)</span>
+
+        <span class="s2"># By default we want a pickle protocol that only changes with</span>
+        <span class="s2"># the major python version and not the minor one</span>
+        <span class="s3">if </span><span class="s1">protocol </span><span class="s3">is None</span><span class="s4">:</span>
+            <span class="s1">protocol </span><span class="s4">= </span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">DEFAULT_PROTOCOL</span>
+
+        <span class="s1">Pickler</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s1">protocol</span><span class="s4">)</span>
+        <span class="s2"># delayed import of numpy, to avoid tight coupling</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+        <span class="s3">except </span><span class="s1">ImportError</span><span class="s4">:</span>
+            <span class="s1">np </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">np </span><span class="s4">= </span><span class="s1">np</span>
+
+    <span class="s3">def </span><span class="s1">_create_array_wrapper</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">array</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Create and returns a numpy array wrapper from a numpy array.&quot;&quot;&quot;</span>
+        <span class="s1">order </span><span class="s4">= </span><span class="s5">'F' </span><span class="s3">if </span><span class="s4">(</span><span class="s1">array</span><span class="s4">.</span><span class="s1">flags</span><span class="s4">.</span><span class="s1">f_contiguous </span><span class="s3">and</span>
+                        <span class="s3">not </span><span class="s1">array</span><span class="s4">.</span><span class="s1">flags</span><span class="s4">.</span><span class="s1">c_contiguous</span><span class="s4">) </span><span class="s3">else </span><span class="s5">'C'</span>
+        <span class="s1">allow_mmap </span><span class="s4">= </span><span class="s3">not </span><span class="s1">self</span><span class="s4">.</span><span class="s1">buffered </span><span class="s3">and not </span><span class="s1">array</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">.</span><span class="s1">hasobject</span>
+
+        <span class="s1">kwargs </span><span class="s4">= {}</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">.</span><span class="s1">tell</span><span class="s4">()</span>
+        <span class="s3">except </span><span class="s1">io</span><span class="s4">.</span><span class="s1">UnsupportedOperation</span><span class="s4">:</span>
+            <span class="s1">kwargs </span><span class="s4">= {</span><span class="s5">'numpy_array_alignment_bytes'</span><span class="s4">: </span><span class="s3">None</span><span class="s4">}</span>
+
+        <span class="s1">wrapper </span><span class="s4">= </span><span class="s1">NumpyArrayWrapper</span><span class="s4">(</span><span class="s1">type</span><span class="s4">(</span><span class="s1">array</span><span class="s4">),</span>
+                                    <span class="s1">array</span><span class="s4">.</span><span class="s1">shape</span><span class="s4">, </span><span class="s1">order</span><span class="s4">, </span><span class="s1">array</span><span class="s4">.</span><span class="s1">dtype</span><span class="s4">,</span>
+                                    <span class="s1">allow_mmap</span><span class="s4">=</span><span class="s1">allow_mmap</span><span class="s4">,</span>
+                                    <span class="s4">**</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">wrapper</span>
+
+    <span class="s3">def </span><span class="s1">save</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Subclass the Pickler `save` method. 
+ 
+        This is a total abuse of the Pickler class in order to use the numpy 
+        persistence function `save` instead of the default pickle 
+        implementation. The numpy array is replaced by a custom wrapper in the 
+        pickle persistence stack and the serialized array is written right 
+        after in the file. Warning: the file produced does not follow the 
+        pickle format. As such it can not be read with `pickle.load`. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">np </span><span class="s3">is not None and </span><span class="s1">type</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">) </span><span class="s3">in </span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">ndarray</span><span class="s4">,</span>
+                                                 <span class="s1">self</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">matrix</span><span class="s4">,</span>
+                                                 <span class="s1">self</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">memmap</span><span class="s4">):</span>
+            <span class="s3">if </span><span class="s1">type</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">) </span><span class="s3">is </span><span class="s1">self</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">memmap</span><span class="s4">:</span>
+                <span class="s2"># Pickling doesn't work with memmapped arrays</span>
+                <span class="s1">obj </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">np</span><span class="s4">.</span><span class="s1">asanyarray</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+
+            <span class="s2"># The array wrapper is pickled instead of the real array.</span>
+            <span class="s1">wrapper </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_create_array_wrapper</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+            <span class="s1">Pickler</span><span class="s4">.</span><span class="s1">save</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">wrapper</span><span class="s4">)</span>
+
+            <span class="s2"># A framer was introduced with pickle protocol 4 and we want to</span>
+            <span class="s2"># ensure the wrapper object is written before the numpy array</span>
+            <span class="s2"># buffer in the pickle file.</span>
+            <span class="s2"># See https://www.python.org/dev/peps/pep-3154/#framing to get</span>
+            <span class="s2"># more information on the framer behavior.</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">proto </span><span class="s4">&gt;= </span><span class="s6">4</span><span class="s4">:</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">framer</span><span class="s4">.</span><span class="s1">commit_frame</span><span class="s4">(</span><span class="s1">force</span><span class="s4">=</span><span class="s3">True</span><span class="s4">)</span>
+
+            <span class="s2"># And then array bytes are written right after the wrapper.</span>
+            <span class="s1">wrapper</span><span class="s4">.</span><span class="s1">write_array</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">self</span><span class="s4">)</span>
+            <span class="s3">return</span>
+
+        <span class="s3">return </span><span class="s1">Pickler</span><span class="s4">.</span><span class="s1">save</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">NumpyUnpickler</span><span class="s4">(</span><span class="s1">Unpickler</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;A subclass of the Unpickler to unpickle our numpy pickles. 
+ 
+    Attributes 
+    ---------- 
+    mmap_mode: str 
+        The memorymap mode to use for reading numpy arrays. 
+    file_handle: file_like 
+        File object to unpickle from. 
+    filename: str 
+        Name of the file to unpickle from. It should correspond to file_handle. 
+        This parameter is required when using mmap_mode. 
+    np: module 
+        Reference to numpy module if numpy is installed else None. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s1">dispatch </span><span class="s4">= </span><span class="s1">Unpickler</span><span class="s4">.</span><span class="s1">dispatch</span><span class="s4">.</span><span class="s1">copy</span><span class="s4">()</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">file_handle</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s2"># The next line is for backward compatibility with pickle generated</span>
+        <span class="s2"># with joblib versions less than 0.10.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_dirname </span><span class="s4">= </span><span class="s1">os</span><span class="s4">.</span><span class="s1">path</span><span class="s4">.</span><span class="s1">dirname</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">)</span>
+
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">mmap_mode </span><span class="s4">= </span><span class="s1">mmap_mode</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">file_handle </span><span class="s4">= </span><span class="s1">file_handle</span>
+        <span class="s2"># filename is required for numpy mmap mode.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">filename </span><span class="s4">= </span><span class="s1">filename</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">compat_mode </span><span class="s4">= </span><span class="s3">False</span>
+        <span class="s1">Unpickler</span><span class="s4">.</span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">file_handle</span><span class="s4">)</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s3">import </span><span class="s1">numpy </span><span class="s3">as </span><span class="s1">np</span>
+        <span class="s3">except </span><span class="s1">ImportError</span><span class="s4">:</span>
+            <span class="s1">np </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">np </span><span class="s4">= </span><span class="s1">np</span>
+
+    <span class="s3">def </span><span class="s1">load_build</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Called to set the state of a newly created object. 
+ 
+        We capture it to replace our place-holder objects, NDArrayWrapper or 
+        NumpyArrayWrapper, by the array we are interested in. We 
+        replace them directly in the stack of pickler. 
+        NDArrayWrapper is used for backward compatibility with joblib &lt;= 0.9. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">Unpickler</span><span class="s4">.</span><span class="s1">load_build</span><span class="s4">(</span><span class="s1">self</span><span class="s4">)</span>
+
+        <span class="s2"># For backward compatibility, we support NDArrayWrapper objects.</span>
+        <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">stack</span><span class="s4">[-</span><span class="s6">1</span><span class="s4">], (</span><span class="s1">NDArrayWrapper</span><span class="s4">, </span><span class="s1">NumpyArrayWrapper</span><span class="s4">)):</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">np </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ImportError</span><span class="s4">(</span><span class="s5">&quot;Trying to unpickle an ndarray, &quot;</span>
+                                  <span class="s5">&quot;but numpy didn't import correctly&quot;</span><span class="s4">)</span>
+            <span class="s1">array_wrapper </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">stack</span><span class="s4">.</span><span class="s1">pop</span><span class="s4">()</span>
+            <span class="s2"># If any NDArrayWrapper is found, we switch to compatibility mode,</span>
+            <span class="s2"># this will be used to raise a DeprecationWarning to the user at</span>
+            <span class="s2"># the end of the unpickling.</span>
+            <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">array_wrapper</span><span class="s4">, </span><span class="s1">NDArrayWrapper</span><span class="s4">):</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">compat_mode </span><span class="s4">= </span><span class="s3">True</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">stack</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">array_wrapper</span><span class="s4">.</span><span class="s1">read</span><span class="s4">(</span><span class="s1">self</span><span class="s4">))</span>
+
+    <span class="s2"># Be careful to register our new method.</span>
+    <span class="s1">dispatch</span><span class="s4">[</span><span class="s1">pickle</span><span class="s4">.</span><span class="s1">BUILD</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]] = </span><span class="s1">load_build</span>
+
+
+<span class="s2">###############################################################################</span>
+<span class="s2"># Utility functions</span>
+
+<span class="s3">def </span><span class="s1">dump</span><span class="s4">(</span><span class="s1">value</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">compress</span><span class="s4">=</span><span class="s6">0</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s3">None</span><span class="s4">, </span><span class="s1">cache_size</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Persist an arbitrary Python object into one file. 
+ 
+    Read more in the :ref:`User Guide &lt;persistence&gt;`. 
+ 
+    Parameters 
+    ---------- 
+    value: any Python object 
+        The object to store to disk. 
+    filename: str, pathlib.Path, or file object. 
+        The file object or path of the file in which it is to be stored. 
+        The compression method corresponding to one of the supported filename 
+        extensions ('.z', '.gz', '.bz2', '.xz' or '.lzma') will be used 
+        automatically. 
+    compress: int from 0 to 9 or bool or 2-tuple, optional 
+        Optional compression level for the data. 0 or False is no compression. 
+        Higher value means more compression, but also slower read and 
+        write times. Using a value of 3 is often a good compromise. 
+        See the notes for more details. 
+        If compress is True, the compression level used is 3. 
+        If compress is a 2-tuple, the first element must correspond to a string 
+        between supported compressors (e.g 'zlib', 'gzip', 'bz2', 'lzma' 
+        'xz'), the second element must be an integer from 0 to 9, corresponding 
+        to the compression level. 
+    protocol: int, optional 
+        Pickle protocol, see pickle.dump documentation for more details. 
+    cache_size: positive int, optional 
+        This option is deprecated in 0.10 and has no effect. 
+ 
+    Returns 
+    ------- 
+    filenames: list of strings 
+        The list of file names in which the data is stored. If 
+        compress is false, each array is stored in a different file. 
+ 
+    See Also 
+    -------- 
+    joblib.load : corresponding loader 
+ 
+    Notes 
+    ----- 
+    Memmapping on load cannot be used for compressed files. Thus 
+    using compression can significantly slow down loading. In 
+    addition, compressed files take up extra memory during 
+    dump and load. 
+ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">Path </span><span class="s3">is not None and </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">Path</span><span class="s4">):</span>
+        <span class="s1">filename </span><span class="s4">= </span><span class="s1">str</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">)</span>
+
+    <span class="s1">is_filename </span><span class="s4">= </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">str</span><span class="s4">)</span>
+    <span class="s1">is_fileobj </span><span class="s4">= </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s5">&quot;write&quot;</span><span class="s4">)</span>
+
+    <span class="s1">compress_method </span><span class="s4">= </span><span class="s5">'zlib'  </span><span class="s2"># zlib is the default compression method.</span>
+    <span class="s3">if </span><span class="s1">compress </span><span class="s3">is True</span><span class="s4">:</span>
+        <span class="s2"># By default, if compress is enabled, we want the default compress</span>
+        <span class="s2"># level of the compressor.</span>
+        <span class="s1">compress_level </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">compress</span><span class="s4">, </span><span class="s1">tuple</span><span class="s4">):</span>
+        <span class="s2"># a 2-tuple was set in compress</span>
+        <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">compress</span><span class="s4">) != </span><span class="s6">2</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">'Compress argument tuple should contain exactly 2 elements: '</span>
+                <span class="s5">'(compress method, compress level), you passed {}'</span>
+                <span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">compress</span><span class="s4">))</span>
+        <span class="s1">compress_method</span><span class="s4">, </span><span class="s1">compress_level </span><span class="s4">= </span><span class="s1">compress</span>
+    <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">compress</span><span class="s4">, </span><span class="s1">str</span><span class="s4">):</span>
+        <span class="s1">compress_method </span><span class="s4">= </span><span class="s1">compress</span>
+        <span class="s1">compress_level </span><span class="s4">= </span><span class="s3">None  </span><span class="s2"># Use default compress level</span>
+        <span class="s1">compress </span><span class="s4">= (</span><span class="s1">compress_method</span><span class="s4">, </span><span class="s1">compress_level</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">compress_level </span><span class="s4">= </span><span class="s1">compress</span>
+
+    <span class="s3">if </span><span class="s1">compress_method </span><span class="s4">== </span><span class="s5">'lz4' </span><span class="s3">and </span><span class="s1">lz4 </span><span class="s3">is None</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span><span class="s1">LZ4_NOT_INSTALLED_ERROR</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s4">(</span><span class="s1">compress_level </span><span class="s3">is not None and</span>
+            <span class="s1">compress_level </span><span class="s3">is not False and</span>
+            <span class="s1">compress_level </span><span class="s3">not in </span><span class="s1">range</span><span class="s4">(</span><span class="s6">10</span><span class="s4">)):</span>
+        <span class="s2"># Raising an error if a non valid compress level is given.</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">'Non valid compress level given: &quot;{}&quot;. Possible values are '</span>
+            <span class="s5">'{}.'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">compress_level</span><span class="s4">, </span><span class="s1">list</span><span class="s4">(</span><span class="s1">range</span><span class="s4">(</span><span class="s6">10</span><span class="s4">))))</span>
+
+    <span class="s3">if </span><span class="s1">compress_method </span><span class="s3">not in </span><span class="s1">_COMPRESSORS</span><span class="s4">:</span>
+        <span class="s2"># Raising an error if an unsupported compression method is given.</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">'Non valid compression method given: &quot;{}&quot;. Possible values are '</span>
+            <span class="s5">'{}.'</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">compress_method</span><span class="s4">, </span><span class="s1">_COMPRESSORS</span><span class="s4">))</span>
+
+    <span class="s3">if not </span><span class="s1">is_filename </span><span class="s3">and not </span><span class="s1">is_fileobj</span><span class="s4">:</span>
+        <span class="s2"># People keep inverting arguments, and the resulting error is</span>
+        <span class="s2"># incomprehensible</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">'Second argument should be a filename or a file-like object, '</span>
+            <span class="s5">'%s (type %s) was given.'</span>
+            <span class="s4">% (</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">type</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">))</span>
+        <span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">is_filename </span><span class="s3">and not </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">compress</span><span class="s4">, </span><span class="s1">tuple</span><span class="s4">):</span>
+        <span class="s2"># In case no explicit compression was requested using both compression</span>
+        <span class="s2"># method and level in a tuple and the filename has an explicit</span>
+        <span class="s2"># extension, we select the corresponding compressor.</span>
+
+        <span class="s2"># unset the variable to be sure no compression level is set afterwards.</span>
+        <span class="s1">compress_method </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s3">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">compressor </span><span class="s3">in </span><span class="s1">_COMPRESSORS</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s3">if </span><span class="s1">filename</span><span class="s4">.</span><span class="s1">endswith</span><span class="s4">(</span><span class="s1">compressor</span><span class="s4">.</span><span class="s1">extension</span><span class="s4">):</span>
+                <span class="s1">compress_method </span><span class="s4">= </span><span class="s1">name</span>
+
+        <span class="s3">if </span><span class="s1">compress_method </span><span class="s3">in </span><span class="s1">_COMPRESSORS </span><span class="s3">and </span><span class="s1">compress_level </span><span class="s4">== </span><span class="s6">0</span><span class="s4">:</span>
+            <span class="s2"># we choose the default compress_level in case it was not given</span>
+            <span class="s2"># as an argument (using compress).</span>
+            <span class="s1">compress_level </span><span class="s4">= </span><span class="s3">None</span>
+
+    <span class="s3">if </span><span class="s1">cache_size </span><span class="s3">is not None</span><span class="s4">:</span>
+        <span class="s2"># Cache size is deprecated starting from version 0.10</span>
+        <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;Please do not set 'cache_size' in joblib.dump, &quot;</span>
+                      <span class="s5">&quot;this parameter has no effect and will be removed. &quot;</span>
+                      <span class="s5">&quot;You used 'cache_size={}'&quot;</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">cache_size</span><span class="s4">),</span>
+                      <span class="s1">DeprecationWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">2</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">compress_level </span><span class="s4">!= </span><span class="s6">0</span><span class="s4">:</span>
+        <span class="s3">with </span><span class="s1">_write_fileobject</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">compress</span><span class="s4">=(</span><span class="s1">compress_method</span><span class="s4">,</span>
+                                                   <span class="s1">compress_level</span><span class="s4">)) </span><span class="s3">as </span><span class="s1">f</span><span class="s4">:</span>
+            <span class="s1">NumpyPickler</span><span class="s4">(</span><span class="s1">f</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s1">protocol</span><span class="s4">).</span><span class="s1">dump</span><span class="s4">(</span><span class="s1">value</span><span class="s4">)</span>
+    <span class="s3">elif </span><span class="s1">is_filename</span><span class="s4">:</span>
+        <span class="s3">with </span><span class="s1">open</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s5">'wb'</span><span class="s4">) </span><span class="s3">as </span><span class="s1">f</span><span class="s4">:</span>
+            <span class="s1">NumpyPickler</span><span class="s4">(</span><span class="s1">f</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s1">protocol</span><span class="s4">).</span><span class="s1">dump</span><span class="s4">(</span><span class="s1">value</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s1">NumpyPickler</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">protocol</span><span class="s4">=</span><span class="s1">protocol</span><span class="s4">).</span><span class="s1">dump</span><span class="s4">(</span><span class="s1">value</span><span class="s4">)</span>
+
+    <span class="s2"># If the target container is a file object, nothing is returned.</span>
+    <span class="s3">if </span><span class="s1">is_fileobj</span><span class="s4">:</span>
+        <span class="s3">return</span>
+
+    <span class="s2"># For compatibility, the list of created filenames (e.g with one element</span>
+    <span class="s2"># after 0.10.0) is returned by default.</span>
+    <span class="s3">return </span><span class="s4">[</span><span class="s1">filename</span><span class="s4">]</span>
+
+
+<span class="s3">def </span><span class="s1">_unpickle</span><span class="s4">(</span><span class="s1">fobj</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">=</span><span class="s5">&quot;&quot;</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Internal unpickling function.&quot;&quot;&quot;</span>
+    <span class="s2"># We are careful to open the file handle early and keep it open to</span>
+    <span class="s2"># avoid race-conditions on renames.</span>
+    <span class="s2"># That said, if data is stored in companion files, which can be</span>
+    <span class="s2"># the case with the old persistence format, moving the directory</span>
+    <span class="s2"># will create a race when joblib tries to access the companion</span>
+    <span class="s2"># files.</span>
+    <span class="s1">unpickler </span><span class="s4">= </span><span class="s1">NumpyUnpickler</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">fobj</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s1">mmap_mode</span><span class="s4">)</span>
+    <span class="s1">obj </span><span class="s4">= </span><span class="s3">None</span>
+    <span class="s3">try</span><span class="s4">:</span>
+        <span class="s1">obj </span><span class="s4">= </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">load</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">unpickler</span><span class="s4">.</span><span class="s1">compat_mode</span><span class="s4">:</span>
+            <span class="s1">warnings</span><span class="s4">.</span><span class="s1">warn</span><span class="s4">(</span><span class="s5">&quot;The file '%s' has been generated with a &quot;</span>
+                          <span class="s5">&quot;joblib version less than 0.10. &quot;</span>
+                          <span class="s5">&quot;Please regenerate this pickle file.&quot;</span>
+                          <span class="s4">% </span><span class="s1">filename</span><span class="s4">,</span>
+                          <span class="s1">DeprecationWarning</span><span class="s4">, </span><span class="s1">stacklevel</span><span class="s4">=</span><span class="s6">3</span><span class="s4">)</span>
+    <span class="s3">except </span><span class="s1">UnicodeDecodeError </span><span class="s3">as </span><span class="s1">exc</span><span class="s4">:</span>
+        <span class="s2"># More user-friendly error message</span>
+        <span class="s1">new_exc </span><span class="s4">= </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">'You may be trying to read with '</span>
+            <span class="s5">'python 3 a joblib pickle generated with python 2. '</span>
+            <span class="s5">'This feature is not supported by joblib.'</span><span class="s4">)</span>
+        <span class="s1">new_exc</span><span class="s4">.</span><span class="s1">__cause__ </span><span class="s4">= </span><span class="s1">exc</span>
+        <span class="s3">raise </span><span class="s1">new_exc</span>
+    <span class="s3">return </span><span class="s1">obj</span>
+
+
+<span class="s3">def </span><span class="s1">load_temporary_memmap</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">, </span><span class="s1">unlink_on_gc_collect</span><span class="s4">):</span>
+    <span class="s3">from </span><span class="s4">.</span><span class="s1">_memmapping_reducer </span><span class="s3">import </span><span class="s1">JOBLIB_MMAPS</span><span class="s4">, </span><span class="s1">add_maybe_unlink_finalizer</span>
+    <span class="s1">obj </span><span class="s4">= </span><span class="s1">load</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">)</span>
+    <span class="s1">JOBLIB_MMAPS</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">filename</span><span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">unlink_on_gc_collect</span><span class="s4">:</span>
+        <span class="s1">add_maybe_unlink_finalizer</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">obj</span>
+
+
+<span class="s3">def </span><span class="s1">load</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Reconstruct a Python object from a file persisted with joblib.dump. 
+ 
+    Read more in the :ref:`User Guide &lt;persistence&gt;`. 
+ 
+    WARNING: joblib.load relies on the pickle module and can therefore 
+    execute arbitrary Python code. It should therefore never be used 
+    to load files from untrusted sources. 
+ 
+    Parameters 
+    ---------- 
+    filename: str, pathlib.Path, or file object. 
+        The file object or path of the file from which to load the object 
+    mmap_mode: {None, 'r+', 'r', 'w+', 'c'}, optional 
+        If not None, the arrays are memory-mapped from the disk. This 
+        mode has no effect for compressed files. Note that in this 
+        case the reconstructed object might no longer match exactly 
+        the originally pickled object. 
+ 
+    Returns 
+    ------- 
+    result: any Python object 
+        The object stored in the file. 
+ 
+    See Also 
+    -------- 
+    joblib.dump : function to save an object 
+ 
+    Notes 
+    ----- 
+ 
+    This function can load numpy array files saved separately during the 
+    dump. If the mmap_mode argument is given, it is passed to np.load and 
+    arrays are loaded as memmaps. As a consequence, the reconstructed 
+    object might not match the original pickled object. Note that if the 
+    file was saved with compression, the arrays cannot be memmapped. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">Path </span><span class="s3">is not None and </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s1">Path</span><span class="s4">):</span>
+        <span class="s1">filename </span><span class="s4">= </span><span class="s1">str</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">)</span>
+
+    <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s5">&quot;read&quot;</span><span class="s4">):</span>
+        <span class="s1">fobj </span><span class="s4">= </span><span class="s1">filename</span>
+        <span class="s1">filename </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">fobj</span><span class="s4">, </span><span class="s5">'name'</span><span class="s4">, </span><span class="s5">''</span><span class="s4">)</span>
+        <span class="s3">with </span><span class="s1">_read_fileobject</span><span class="s4">(</span><span class="s1">fobj</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">) </span><span class="s3">as </span><span class="s1">fobj</span><span class="s4">:</span>
+            <span class="s1">obj </span><span class="s4">= </span><span class="s1">_unpickle</span><span class="s4">(</span><span class="s1">fobj</span><span class="s4">)</span>
+    <span class="s3">else</span><span class="s4">:</span>
+        <span class="s3">with </span><span class="s1">open</span><span class="s4">(</span><span class="s1">filename</span><span class="s4">, </span><span class="s5">'rb'</span><span class="s4">) </span><span class="s3">as </span><span class="s1">f</span><span class="s4">:</span>
+            <span class="s3">with </span><span class="s1">_read_fileobject</span><span class="s4">(</span><span class="s1">f</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">) </span><span class="s3">as </span><span class="s1">fobj</span><span class="s4">:</span>
+                <span class="s3">if </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">fobj</span><span class="s4">, </span><span class="s1">str</span><span class="s4">):</span>
+                    <span class="s2"># if the returned file object is a string, this means we</span>
+                    <span class="s2"># try to load a pickle file generated with an version of</span>
+                    <span class="s2"># Joblib so we load it with joblib compatibility function.</span>
+                    <span class="s3">return </span><span class="s1">load_compatibility</span><span class="s4">(</span><span class="s1">fobj</span><span class="s4">)</span>
+
+                <span class="s1">obj </span><span class="s4">= </span><span class="s1">_unpickle</span><span class="s4">(</span><span class="s1">fobj</span><span class="s4">, </span><span class="s1">filename</span><span class="s4">, </span><span class="s1">mmap_mode</span><span class="s4">)</span>
+    <span class="s3">return </span><span class="s1">obj</span>
+</pre>
+</body>
+</html>

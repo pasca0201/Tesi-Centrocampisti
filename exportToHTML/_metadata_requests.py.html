@@ -1,0 +1,1615 @@
+<html>
+<head>
+<title>_metadata_requests.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #5f826b; font-style: italic;}
+.s1 { color: #bcbec4;}
+.s2 { color: #7a7e85;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #bcbec4;}
+.s5 { color: #6aab73;}
+.s6 { color: #2aacb8;}
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+_metadata_requests.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Metadata Routing Utility 
+ 
+In order to better understand the components implemented in this file, one 
+needs to understand their relationship to one another. 
+ 
+The only relevant public API for end users are the ``set_{method}_request`` methods, 
+e.g. ``estimator.set_fit_request(sample_weight=True)``. However, third-party 
+developers and users who implement custom meta-estimators, need to deal with 
+the objects implemented in this file. 
+ 
+All estimators (should) implement a ``get_metadata_routing`` method, returning 
+the routing requests set for the estimator. This method is automatically 
+implemented via ``BaseEstimator`` for all simple estimators, but needs a custom 
+implementation for meta-estimators. 
+ 
+In non-routing consumers, i.e. the simplest case, e.g. ``SVM``, 
+``get_metadata_routing`` returns a ``MetadataRequest`` object. 
+ 
+In routers, e.g. meta-estimators and a multi metric scorer, 
+``get_metadata_routing`` returns a ``MetadataRouter`` object. 
+ 
+An object which is both a router and a consumer, e.g. a meta-estimator which 
+consumes ``sample_weight`` and routes ``sample_weight`` to its sub-estimators, 
+routing information includes both information about the object itself (added 
+via ``MetadataRouter.add_self_request``), as well as the routing information 
+for its sub-estimators. 
+ 
+A ``MetadataRequest`` instance includes one ``MethodMetadataRequest`` per 
+method in ``METHODS``, which includes ``fit``, ``score``, etc. 
+ 
+Request values are added to the routing mechanism by adding them to 
+``MethodMetadataRequest`` instances, e.g. 
+``metadatarequest.fit.add(param=&quot;sample_weight&quot;, alias=&quot;my_weights&quot;)``. This is 
+used in ``set_{method}_request`` which are automatically generated, so users 
+and developers almost never need to directly call methods on a 
+``MethodMetadataRequest``. 
+ 
+The ``alias`` above in the ``add`` method has to be either a string (an alias), 
+or a {True (requested), False (unrequested), None (error if passed)}``. There 
+are some other special values such as ``UNUSED`` and ``WARN`` which are used 
+for purposes such as warning of removing a metadata in a child class, but not 
+used by the end users. 
+ 
+``MetadataRouter`` includes information about sub-objects' routing and how 
+methods are mapped together. For instance, the information about which methods 
+of a sub-estimator are called in which methods of the meta-estimator are all 
+stored here. Conceptually, this information looks like: 
+ 
+``` 
+{ 
+    &quot;sub_estimator1&quot;: ( 
+        mapping=[(caller=&quot;fit&quot;, callee=&quot;transform&quot;), ...], 
+        router=MetadataRequest(...),  # or another MetadataRouter 
+    ), 
+    ... 
+} 
+``` 
+ 
+To give the above representation some structure, we use the following objects: 
+ 
+- ``(caller=..., callee=...)`` is a namedtuple called ``MethodPair`` 
+ 
+- The list of ``MethodPair`` stored in the ``mapping`` field of a `RouterMappingPair` is 
+  a ``MethodMapping`` object 
+ 
+- ``(mapping=..., router=...)`` is a namedtuple called ``RouterMappingPair`` 
+ 
+The ``set_{method}_request`` methods are dynamically generated for estimators 
+which inherit from the ``BaseEstimator``. This is done by attaching instances 
+of the ``RequestMethod`` descriptor to classes, which is done in the 
+``_MetadataRequester`` class, and ``BaseEstimator`` inherits from this mixin. 
+This mixin also implements the ``get_metadata_routing``, which meta-estimators 
+need to override, but it works for simple consumers as is. 
+&quot;&quot;&quot;</span>
+
+<span class="s2"># Author: Adrin Jalali &lt;adrin.jalali@gmail.com&gt;</span>
+<span class="s2"># License: BSD 3 clause</span>
+
+<span class="s3">import </span><span class="s1">inspect</span>
+<span class="s3">from </span><span class="s1">collections </span><span class="s3">import </span><span class="s1">namedtuple</span>
+<span class="s3">from </span><span class="s1">copy </span><span class="s3">import </span><span class="s1">deepcopy</span>
+<span class="s3">from </span><span class="s1">typing </span><span class="s3">import </span><span class="s1">TYPE_CHECKING</span><span class="s4">, </span><span class="s1">Optional</span><span class="s4">, </span><span class="s1">Union</span>
+<span class="s3">from </span><span class="s1">warnings </span><span class="s3">import </span><span class="s1">warn</span>
+
+<span class="s3">from </span><span class="s4">.. </span><span class="s3">import </span><span class="s1">get_config</span>
+<span class="s3">from </span><span class="s4">..</span><span class="s1">exceptions </span><span class="s3">import </span><span class="s1">UnsetMetadataPassedError</span>
+<span class="s3">from </span><span class="s4">.</span><span class="s1">_bunch </span><span class="s3">import </span><span class="s1">Bunch</span>
+
+<span class="s2"># Only the following methods are supported in the routing mechanism. Adding new</span>
+<span class="s2"># methods at the moment involves monkeypatching this list.</span>
+<span class="s2"># Note that if this list is changed or monkeypatched, the corresponding method</span>
+<span class="s2"># needs to be added under a TYPE_CHECKING condition like the one done here in</span>
+<span class="s2"># _MetadataRequester</span>
+<span class="s1">SIMPLE_METHODS </span><span class="s4">= [</span>
+    <span class="s5">&quot;fit&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;partial_fit&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;predict&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;predict_proba&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;predict_log_proba&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;decision_function&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;score&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;split&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;transform&quot;</span><span class="s4">,</span>
+    <span class="s5">&quot;inverse_transform&quot;</span><span class="s4">,</span>
+<span class="s4">]</span>
+
+<span class="s2"># These methods are a composite of other methods and one cannot set their</span>
+<span class="s2"># requests directly. Instead they should be set by setting the requests of the</span>
+<span class="s2"># simple methods which make the composite ones.</span>
+<span class="s1">COMPOSITE_METHODS </span><span class="s4">= {</span>
+    <span class="s5">&quot;fit_transform&quot;</span><span class="s4">: [</span><span class="s5">&quot;fit&quot;</span><span class="s4">, </span><span class="s5">&quot;transform&quot;</span><span class="s4">],</span>
+    <span class="s5">&quot;fit_predict&quot;</span><span class="s4">: [</span><span class="s5">&quot;fit&quot;</span><span class="s4">, </span><span class="s5">&quot;predict&quot;</span><span class="s4">],</span>
+<span class="s4">}</span>
+
+<span class="s1">METHODS </span><span class="s4">= </span><span class="s1">SIMPLE_METHODS </span><span class="s4">+ </span><span class="s1">list</span><span class="s4">(</span><span class="s1">COMPOSITE_METHODS</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">())</span>
+
+
+<span class="s3">def </span><span class="s1">_routing_enabled</span><span class="s4">():</span>
+    <span class="s0">&quot;&quot;&quot;Return whether metadata routing is enabled. 
+ 
+    .. versionadded:: 1.3 
+ 
+    Returns 
+    ------- 
+    enabled : bool 
+        Whether metadata routing is enabled. If the config is not set, it 
+        defaults to False. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">get_config</span><span class="s4">().</span><span class="s1">get</span><span class="s4">(</span><span class="s5">&quot;enable_metadata_routing&quot;</span><span class="s4">, </span><span class="s3">False</span><span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_raise_for_params</span><span class="s4">(</span><span class="s1">params</span><span class="s4">, </span><span class="s1">owner</span><span class="s4">, </span><span class="s1">method</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Raise an error if metadata routing is not enabled and params are passed. 
+ 
+    .. versionadded:: 1.4 
+ 
+    Parameters 
+    ---------- 
+    params : dict 
+        The metadata passed to a method. 
+ 
+    owner : object 
+        The object to which the method belongs. 
+ 
+    method : str 
+        The name of the method, e.g. &quot;fit&quot;. 
+ 
+    Raises 
+    ------ 
+    ValueError 
+        If metadata routing is not enabled and params are passed. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">caller </span><span class="s4">= (</span>
+        <span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">owner</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s3">}</span><span class="s5">.</span><span class="s3">{</span><span class="s1">method</span><span class="s3">}</span><span class="s5">&quot; </span><span class="s3">if </span><span class="s1">method </span><span class="s3">else </span><span class="s1">owner</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span>
+    <span class="s4">)</span>
+    <span class="s3">if not </span><span class="s1">_routing_enabled</span><span class="s4">() </span><span class="s3">and </span><span class="s1">params</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+            <span class="s5">f&quot;Passing extra keyword arguments to </span><span class="s3">{</span><span class="s1">caller</span><span class="s3">} </span><span class="s5">is only supported if&quot;</span>
+            <span class="s5">&quot; enable_metadata_routing=True, which you can set using&quot;</span>
+            <span class="s5">&quot; `sklearn.set_config`. See the User Guide&quot;</span>
+            <span class="s5">&quot; &lt;https://scikit-learn.org/stable/metadata_routing.html&gt; for more&quot;</span>
+            <span class="s5">f&quot; details. Extra parameters passed are: </span><span class="s3">{</span><span class="s1">set</span><span class="s4">(</span><span class="s1">params</span><span class="s4">)</span><span class="s3">}</span><span class="s5">&quot;</span>
+        <span class="s4">)</span>
+
+
+<span class="s3">def </span><span class="s1">_raise_for_unsupported_routing</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Raise when metadata routing is enabled and metadata is passed. 
+ 
+    This is used in meta-estimators which have not implemented metadata routing 
+    to prevent silent bugs. There is no need to use this function if the 
+    meta-estimator is not accepting any metadata, especially in `fit`, since 
+    if a meta-estimator accepts any metadata, they would do that in `fit` as 
+    well. 
+ 
+    Parameters 
+    ---------- 
+    obj : estimator 
+        The estimator for which we're raising the error. 
+ 
+    method : str 
+        The method where the error is raised. 
+ 
+    **kwargs : dict 
+        The metadata passed to the method. 
+    &quot;&quot;&quot;</span>
+    <span class="s1">kwargs </span><span class="s4">= {</span><span class="s1">key</span><span class="s4">: </span><span class="s1">value </span><span class="s3">for </span><span class="s1">key</span><span class="s4">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">kwargs</span><span class="s4">.</span><span class="s1">items</span><span class="s4">() </span><span class="s3">if </span><span class="s1">value </span><span class="s3">is not None</span><span class="s4">}</span>
+    <span class="s3">if </span><span class="s1">_routing_enabled</span><span class="s4">() </span><span class="s3">and </span><span class="s1">kwargs</span><span class="s4">:</span>
+        <span class="s1">cls_name </span><span class="s4">= </span><span class="s1">obj</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span><span class="s4">(</span>
+            <span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">cls_name</span><span class="s3">}</span><span class="s5">.</span><span class="s3">{</span><span class="s1">method</span><span class="s3">} </span><span class="s5">cannot accept given metadata (</span><span class="s3">{</span><span class="s1">set</span><span class="s4">(</span><span class="s1">kwargs</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">())</span><span class="s3">}</span><span class="s5">)&quot;</span>
+            <span class="s5">f&quot; since metadata routing is not yet implemented for </span><span class="s3">{</span><span class="s1">cls_name</span><span class="s3">}</span><span class="s5">.&quot;</span>
+        <span class="s4">)</span>
+
+
+<span class="s3">class </span><span class="s1">_RoutingNotSupportedMixin</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;A mixin to be used to remove the default `get_metadata_routing`. 
+ 
+    This is used in meta-estimators where metadata routing is not yet 
+    implemented. 
+ 
+    This also makes it clear in our rendered documentation that this method 
+    cannot be used. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">get_metadata_routing</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Raise `NotImplementedError`. 
+ 
+        This estimator does not support metadata routing yet.&quot;&quot;&quot;</span>
+        <span class="s3">raise </span><span class="s1">NotImplementedError</span><span class="s4">(</span>
+            <span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s3">} </span><span class="s5">has not implemented metadata routing yet.&quot;</span>
+        <span class="s4">)</span>
+
+
+<span class="s2"># Request values</span>
+<span class="s2"># ==============</span>
+<span class="s2"># Each request value needs to be one of the following values, or an alias.</span>
+
+<span class="s2"># this is used in `__metadata_request__*` attributes to indicate that a</span>
+<span class="s2"># metadata is not present even though it may be present in the</span>
+<span class="s2"># corresponding method's signature.</span>
+<span class="s1">UNUSED </span><span class="s4">= </span><span class="s5">&quot;$UNUSED$&quot;</span>
+
+<span class="s2"># this is used whenever a default value is changed, and therefore the user</span>
+<span class="s2"># should explicitly set the value, otherwise a warning is shown. An example</span>
+<span class="s2"># is when a meta-estimator is only a router, but then becomes also a</span>
+<span class="s2"># consumer in a new release.</span>
+<span class="s1">WARN </span><span class="s4">= </span><span class="s5">&quot;$WARN$&quot;</span>
+
+<span class="s2"># this is the default used in `set_{method}_request` methods to indicate no</span>
+<span class="s2"># change requested by the user.</span>
+<span class="s1">UNCHANGED </span><span class="s4">= </span><span class="s5">&quot;$UNCHANGED$&quot;</span>
+
+<span class="s1">VALID_REQUEST_VALUES </span><span class="s4">= [</span><span class="s3">False</span><span class="s4">, </span><span class="s3">True</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">UNUSED</span><span class="s4">, </span><span class="s1">WARN</span><span class="s4">]</span>
+
+
+<span class="s3">def </span><span class="s1">request_is_alias</span><span class="s4">(</span><span class="s1">item</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Check if an item is a valid alias. 
+ 
+    Values in ``VALID_REQUEST_VALUES`` are not considered aliases in this 
+    context. Only a string which is a valid identifier is. 
+ 
+    Parameters 
+    ---------- 
+    item : object 
+        The given item to be checked if it can be an alias. 
+ 
+    Returns 
+    ------- 
+    result : bool 
+        Whether the given item is a valid alias. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if </span><span class="s1">item </span><span class="s3">in </span><span class="s1">VALID_REQUEST_VALUES</span><span class="s4">:</span>
+        <span class="s3">return False</span>
+
+    <span class="s2"># item is only an alias if it's a valid identifier</span>
+    <span class="s3">return </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">item</span><span class="s4">, </span><span class="s1">str</span><span class="s4">) </span><span class="s3">and </span><span class="s1">item</span><span class="s4">.</span><span class="s1">isidentifier</span><span class="s4">()</span>
+
+
+<span class="s3">def </span><span class="s1">request_is_valid</span><span class="s4">(</span><span class="s1">item</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Check if an item is a valid request value (and not an alias). 
+ 
+    Parameters 
+    ---------- 
+    item : object 
+        The given item to be checked. 
+ 
+    Returns 
+    ------- 
+    result : bool 
+        Whether the given item is valid. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">return </span><span class="s1">item </span><span class="s3">in </span><span class="s1">VALID_REQUEST_VALUES</span>
+
+
+<span class="s2"># Metadata Request for Simple Consumers</span>
+<span class="s2"># =====================================</span>
+<span class="s2"># This section includes MethodMetadataRequest and MetadataRequest which are</span>
+<span class="s2"># used in simple consumers.</span>
+
+
+<span class="s3">class </span><span class="s1">MethodMetadataRequest</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;A prescription of how metadata is to be passed to a single method. 
+ 
+    Refer to :class:`MetadataRequest` for how this class is used. 
+ 
+    .. versionadded:: 1.3 
+ 
+    Parameters 
+    ---------- 
+    owner : str 
+        A display name for the object owning these requests. 
+ 
+    method : str 
+        The name of the method to which these requests belong. 
+ 
+    requests : dict of {str: bool, None or str}, default=None 
+        The initial requests for this method. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">owner</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">requests</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_requests </span><span class="s4">= </span><span class="s1">requests </span><span class="s3">or </span><span class="s1">dict</span><span class="s4">()</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">owner </span><span class="s4">= </span><span class="s1">owner</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">method </span><span class="s4">= </span><span class="s1">method</span>
+
+    <span class="s4">@</span><span class="s1">property</span>
+    <span class="s3">def </span><span class="s1">requests</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Dictionary of the form: ``{key: alias}``.&quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span>
+
+    <span class="s3">def </span><span class="s1">add_request</span><span class="s4">(</span>
+        <span class="s1">self</span><span class="s4">,</span>
+        <span class="s4">*,</span>
+        <span class="s1">param</span><span class="s4">,</span>
+        <span class="s1">alias</span><span class="s4">,</span>
+    <span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Add request info for a metadata. 
+ 
+        Parameters 
+        ---------- 
+        param : str 
+            The property for which a request is set. 
+ 
+        alias : str, or {True, False, None} 
+            Specifies which metadata should be routed to `param` 
+ 
+            - str: the name (or alias) of metadata given to a meta-estimator that 
+              should be routed to this parameter. 
+ 
+            - True: requested 
+ 
+            - False: not requested 
+ 
+            - None: error if passed 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if not </span><span class="s1">request_is_alias</span><span class="s4">(</span><span class="s1">alias</span><span class="s4">) </span><span class="s3">and not </span><span class="s1">request_is_valid</span><span class="s4">(</span><span class="s1">alias</span><span class="s4">):</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">f&quot;The alias you're setting for `</span><span class="s3">{</span><span class="s1">param</span><span class="s3">}</span><span class="s5">` should be either a &quot;</span>
+                <span class="s5">&quot;valid identifier or one of {None, True, False}, but given &quot;</span>
+                <span class="s5">f&quot;value is: `</span><span class="s3">{</span><span class="s1">alias</span><span class="s3">}</span><span class="s5">`&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s3">if </span><span class="s1">alias </span><span class="s4">== </span><span class="s1">param</span><span class="s4">:</span>
+            <span class="s1">alias </span><span class="s4">= </span><span class="s3">True</span>
+
+        <span class="s3">if </span><span class="s1">alias </span><span class="s4">== </span><span class="s1">UNUSED</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">param </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">:</span>
+                <span class="s3">del </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">[</span><span class="s1">param</span><span class="s4">]</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">f&quot;Trying to remove parameter </span><span class="s3">{</span><span class="s1">param</span><span class="s3">} </span><span class="s5">with UNUSED which doesn't&quot;</span>
+                    <span class="s5">&quot; exist.&quot;</span>
+                <span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">[</span><span class="s1">param</span><span class="s4">] = </span><span class="s1">alias</span>
+
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">_get_param_names</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Get names of all metadata that can be consumed or routed by this method. 
+ 
+        This method returns the names of all metadata, even the ``False`` 
+        ones. 
+ 
+        Parameters 
+        ---------- 
+        return_alias : bool 
+            Controls whether original or aliased names should be returned. If 
+            ``False``, aliases are ignored and original names are returned. 
+ 
+        Returns 
+        ------- 
+        names : set of str 
+            A set of strings with the names of all parameters. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">set</span><span class="s4">(</span>
+            <span class="s1">alias </span><span class="s3">if </span><span class="s1">return_alias </span><span class="s3">and not </span><span class="s1">request_is_valid</span><span class="s4">(</span><span class="s1">alias</span><span class="s4">) </span><span class="s3">else </span><span class="s1">prop</span>
+            <span class="s3">for </span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">.</span><span class="s1">items</span><span class="s4">()</span>
+            <span class="s3">if not </span><span class="s1">request_is_valid</span><span class="s4">(</span><span class="s1">alias</span><span class="s4">) </span><span class="s3">or </span><span class="s1">alias </span><span class="s3">is not False</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_check_warnings</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">params</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check whether metadata is passed which is marked as WARN. 
+ 
+        If any metadata is passed which is marked as WARN, a warning is raised. 
+ 
+        Parameters 
+        ---------- 
+        params : dict 
+            The metadata passed to a method. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">params </span><span class="s4">= {} </span><span class="s3">if </span><span class="s1">params </span><span class="s3">is None else </span><span class="s1">params</span>
+        <span class="s1">warn_params </span><span class="s4">= {</span>
+            <span class="s1">prop</span>
+            <span class="s3">for </span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">.</span><span class="s1">items</span><span class="s4">()</span>
+            <span class="s3">if </span><span class="s1">alias </span><span class="s4">== </span><span class="s1">WARN </span><span class="s3">and </span><span class="s1">prop </span><span class="s3">in </span><span class="s1">params</span>
+        <span class="s4">}</span>
+        <span class="s3">for </span><span class="s1">param </span><span class="s3">in </span><span class="s1">warn_params</span><span class="s4">:</span>
+            <span class="s1">warn</span><span class="s4">(</span>
+                <span class="s5">f&quot;Support for </span><span class="s3">{</span><span class="s1">param</span><span class="s3">} </span><span class="s5">has recently been added to this class. &quot;</span>
+                <span class="s5">&quot;To maintain backward compatibility, it is ignored now. &quot;</span>
+                <span class="s5">f&quot;Using `set_</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">method</span><span class="s3">}</span><span class="s5">_request(</span><span class="s3">{</span><span class="s1">param</span><span class="s3">}</span><span class="s5">=</span><span class="s3">{{</span><span class="s5">True, False</span><span class="s3">}}</span><span class="s5">)` &quot;</span>
+                <span class="s5">&quot;on this method of the class, you can set the request value &quot;</span>
+                <span class="s5">&quot;to False to silence this warning, or to True to consume and &quot;</span>
+                <span class="s5">&quot;use the metadata.&quot;</span>
+            <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_route_params</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">params</span><span class="s4">, </span><span class="s1">parent</span><span class="s4">, </span><span class="s1">caller</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Prepare the given parameters to be passed to the method. 
+ 
+        The output of this method can be used directly as the input to the 
+        corresponding method as extra props. 
+ 
+        Parameters 
+        ---------- 
+        params : dict 
+            A dictionary of provided metadata. 
+ 
+        parent : object 
+            Parent class object, that routes the metadata. 
+ 
+        caller : str 
+            Method from the parent class object, where the metadata is routed from. 
+ 
+        Returns 
+        ------- 
+        params : Bunch 
+            A :class:`~sklearn.utils.Bunch` of {prop: value} which can be given to the 
+            corresponding method. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_check_warnings</span><span class="s4">(</span><span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">)</span>
+        <span class="s1">unrequested </span><span class="s4">= </span><span class="s1">dict</span><span class="s4">()</span>
+        <span class="s1">args </span><span class="s4">= {</span><span class="s1">arg</span><span class="s4">: </span><span class="s1">value </span><span class="s3">for </span><span class="s1">arg</span><span class="s4">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">items</span><span class="s4">() </span><span class="s3">if </span><span class="s1">value </span><span class="s3">is not None</span><span class="s4">}</span>
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">Bunch</span><span class="s4">()</span>
+        <span class="s3">for </span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s3">if </span><span class="s1">alias </span><span class="s3">is False or </span><span class="s1">alias </span><span class="s4">== </span><span class="s1">WARN</span><span class="s4">:</span>
+                <span class="s3">continue</span>
+            <span class="s3">elif </span><span class="s1">alias </span><span class="s3">is True and </span><span class="s1">prop </span><span class="s3">in </span><span class="s1">args</span><span class="s4">:</span>
+                <span class="s1">res</span><span class="s4">[</span><span class="s1">prop</span><span class="s4">] = </span><span class="s1">args</span><span class="s4">[</span><span class="s1">prop</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">alias </span><span class="s3">is None and </span><span class="s1">prop </span><span class="s3">in </span><span class="s1">args</span><span class="s4">:</span>
+                <span class="s1">unrequested</span><span class="s4">[</span><span class="s1">prop</span><span class="s4">] = </span><span class="s1">args</span><span class="s4">[</span><span class="s1">prop</span><span class="s4">]</span>
+            <span class="s3">elif </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">args</span><span class="s4">:</span>
+                <span class="s1">res</span><span class="s4">[</span><span class="s1">prop</span><span class="s4">] = </span><span class="s1">args</span><span class="s4">[</span><span class="s1">alias</span><span class="s4">]</span>
+        <span class="s3">if </span><span class="s1">unrequested</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">method </span><span class="s3">in </span><span class="s1">COMPOSITE_METHODS</span><span class="s4">:</span>
+                <span class="s1">callee_methods </span><span class="s4">= </span><span class="s1">COMPOSITE_METHODS</span><span class="s4">[</span><span class="s1">self</span><span class="s4">.</span><span class="s1">method</span><span class="s4">]</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">callee_methods </span><span class="s4">= [</span><span class="s1">self</span><span class="s4">.</span><span class="s1">method</span><span class="s4">]</span>
+            <span class="s1">set_requests_on </span><span class="s4">= </span><span class="s5">&quot;&quot;</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span>
+                <span class="s4">[</span>
+                    <span class="s5">f&quot;.set_</span><span class="s3">{</span><span class="s1">method</span><span class="s3">}</span><span class="s5">_request(</span><span class="s3">{{</span><span class="s5">metadata</span><span class="s3">}}</span><span class="s5">=True/False)&quot;</span>
+                    <span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">callee_methods</span>
+                <span class="s4">]</span>
+            <span class="s4">)</span>
+            <span class="s1">message </span><span class="s4">= (</span>
+                <span class="s5">f&quot;[</span><span class="s3">{</span><span class="s5">', '</span><span class="s4">.</span><span class="s1">join</span><span class="s4">([</span><span class="s1">key </span><span class="s3">for </span><span class="s1">key </span><span class="s3">in </span><span class="s1">unrequested</span><span class="s4">])</span><span class="s3">}</span><span class="s5">] are passed but are not&quot;</span>
+                <span class="s5">&quot; explicitly set as requested or not requested for&quot;</span>
+                <span class="s5">f&quot; </span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">owner</span><span class="s3">}</span><span class="s5">.</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">method</span><span class="s3">}</span><span class="s5">, which is used within&quot;</span>
+                <span class="s5">f&quot; </span><span class="s3">{</span><span class="s1">parent</span><span class="s3">}</span><span class="s5">.</span><span class="s3">{</span><span class="s1">caller</span><span class="s3">}</span><span class="s5">. Call `</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">owner</span><span class="s3">}</span><span class="s5">&quot;</span>
+                <span class="s4">+ </span><span class="s1">set_requests_on</span>
+                <span class="s4">+ </span><span class="s5">&quot;` for each metadata you want to request/ignore.&quot;</span>
+            <span class="s4">)</span>
+            <span class="s3">raise </span><span class="s1">UnsetMetadataPassedError</span><span class="s4">(</span>
+                <span class="s1">message</span><span class="s4">=</span><span class="s1">message</span><span class="s4">,</span>
+                <span class="s1">unrequested_params</span><span class="s4">=</span><span class="s1">unrequested</span><span class="s4">,</span>
+                <span class="s1">routed_params</span><span class="s4">=</span><span class="s1">res</span><span class="s4">,</span>
+            <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">_consumes</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check whether the given parameters are consumed by this method. 
+ 
+        Parameters 
+        ---------- 
+        params : iterable of str 
+            An iterable of parameters to check. 
+ 
+        Returns 
+        ------- 
+        consumed : set of str 
+            A set of parameters which are consumed by this method. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">params </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">params</span><span class="s4">)</span>
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">set</span><span class="s4">()</span>
+        <span class="s3">for </span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s3">if </span><span class="s1">alias </span><span class="s3">is True and </span><span class="s1">prop </span><span class="s3">in </span><span class="s1">params</span><span class="s4">:</span>
+                <span class="s1">res</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">prop</span><span class="s4">)</span>
+            <span class="s3">elif </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">alias</span><span class="s4">, </span><span class="s1">str</span><span class="s4">) </span><span class="s3">and </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">params</span><span class="s4">:</span>
+                <span class="s1">res</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">alias</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">_serialize</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Serialize the object. 
+ 
+        Returns 
+        ------- 
+        obj : dict 
+            A serialized version of the instance in the form of a dictionary. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_requests</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">())</span>
+
+    <span class="s3">def </span><span class="s1">__str__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">repr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">))</span>
+
+
+<span class="s3">class </span><span class="s1">MetadataRequest</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Contains the metadata request info of a consumer. 
+ 
+    Instances of `MethodMetadataRequest` are used in this class for each 
+    available method under `metadatarequest.{method}`. 
+ 
+    Consumer-only classes such as simple estimators return a serialized 
+    version of this class as the output of `get_metadata_routing()`. 
+ 
+    .. versionadded:: 1.3 
+ 
+    Parameters 
+    ---------- 
+    owner : str 
+        The name of the object to which these requests belong. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2"># this is here for us to use this attribute's value instead of doing</span>
+    <span class="s2"># `isinstance` in our checks, so that we avoid issues when people vendor</span>
+    <span class="s2"># this file instead of using it directly from scikit-learn.</span>
+    <span class="s1">_type </span><span class="s4">= </span><span class="s5">&quot;metadata_request&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">owner</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">owner </span><span class="s4">= </span><span class="s1">owner</span>
+        <span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">SIMPLE_METHODS</span><span class="s4">:</span>
+            <span class="s1">setattr</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">,</span>
+                <span class="s1">method</span><span class="s4">,</span>
+                <span class="s1">MethodMetadataRequest</span><span class="s4">(</span><span class="s1">owner</span><span class="s4">=</span><span class="s1">owner</span><span class="s4">, </span><span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">),</span>
+            <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">consumes</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check whether the given parameters are consumed by the given method. 
+ 
+        .. versionadded:: 1.4 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            The name of the method to check. 
+ 
+        params : iterable of str 
+            An iterable of parameters to check. 
+ 
+        Returns 
+        ------- 
+        consumed : set of str 
+            A set of parameters which are consumed by the given method. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">).</span><span class="s1">_consumes</span><span class="s4">(</span><span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__getattr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">):</span>
+        <span class="s2"># Called when the default attribute access fails with an AttributeError</span>
+        <span class="s2"># (either __getattribute__() raises an AttributeError because name is</span>
+        <span class="s2"># not an instance attribute or an attribute in the class tree for self;</span>
+        <span class="s2"># or __get__() of a name property raises AttributeError). This method</span>
+        <span class="s2"># should either return the (computed) attribute value or raise an</span>
+        <span class="s2"># AttributeError exception.</span>
+        <span class="s2"># https://docs.python.org/3/reference/datamodel.html#object.__getattr__</span>
+        <span class="s3">if </span><span class="s1">name </span><span class="s3">not in </span><span class="s1">COMPOSITE_METHODS</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span>
+                <span class="s5">f&quot;'</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s3">}</span><span class="s5">' object has no attribute '</span><span class="s3">{</span><span class="s1">name</span><span class="s3">}</span><span class="s5">'&quot;</span>
+            <span class="s4">)</span>
+
+        <span class="s1">requests </span><span class="s4">= {}</span>
+        <span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">COMPOSITE_METHODS</span><span class="s4">[</span><span class="s1">name</span><span class="s4">]:</span>
+            <span class="s1">mmr </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">)</span>
+            <span class="s1">existing </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">requests</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">())</span>
+            <span class="s1">upcoming </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">mmr</span><span class="s4">.</span><span class="s1">requests</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">())</span>
+            <span class="s1">common </span><span class="s4">= </span><span class="s1">existing </span><span class="s4">&amp; </span><span class="s1">upcoming</span>
+            <span class="s1">conflicts </span><span class="s4">= [</span><span class="s1">key </span><span class="s3">for </span><span class="s1">key </span><span class="s3">in </span><span class="s1">common </span><span class="s3">if </span><span class="s1">requests</span><span class="s4">[</span><span class="s1">key</span><span class="s4">] != </span><span class="s1">mmr</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">[</span><span class="s1">key</span><span class="s4">]]</span>
+            <span class="s3">if </span><span class="s1">conflicts</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">f&quot;Conflicting metadata requests for </span><span class="s3">{</span><span class="s5">', '</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">conflicts</span><span class="s4">)</span><span class="s3">} </span><span class="s5">while&quot;</span>
+                    <span class="s5">f&quot; composing the requests for </span><span class="s3">{</span><span class="s1">name</span><span class="s3">}</span><span class="s5">. Metadata with the same name&quot;</span>
+                    <span class="s5">f&quot; for methods </span><span class="s3">{</span><span class="s5">', '</span><span class="s4">.</span><span class="s1">join</span><span class="s4">(</span><span class="s1">COMPOSITE_METHODS</span><span class="s4">[</span><span class="s1">name</span><span class="s4">])</span><span class="s3">} </span><span class="s5">should have the&quot;</span>
+                    <span class="s5">&quot; same request value.&quot;</span>
+                <span class="s4">)</span>
+            <span class="s1">requests</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">mmr</span><span class="s4">.</span><span class="s1">_requests</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">MethodMetadataRequest</span><span class="s4">(</span><span class="s1">owner</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">owner</span><span class="s4">, </span><span class="s1">method</span><span class="s4">=</span><span class="s1">name</span><span class="s4">, </span><span class="s1">requests</span><span class="s4">=</span><span class="s1">requests</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_get_param_names</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">, </span><span class="s1">ignore_self_request</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Get names of all metadata that can be consumed or routed by specified \ 
+            method. 
+ 
+        This method returns the names of all metadata, even the ``False`` 
+        ones. 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            The name of the method for which metadata names are requested. 
+ 
+        return_alias : bool 
+            Controls whether original or aliased names should be returned. If 
+            ``False``, aliases are ignored and original names are returned. 
+ 
+        ignore_self_request : bool 
+            Ignored. Present for API compatibility. 
+ 
+        Returns 
+        ------- 
+        names : set of str 
+            A set of strings with the names of all parameters. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">).</span><span class="s1">_get_param_names</span><span class="s4">(</span><span class="s1">return_alias</span><span class="s4">=</span><span class="s1">return_alias</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_route_params</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">params</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">parent</span><span class="s4">, </span><span class="s1">caller</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Prepare the given parameters to be passed to the method. 
+ 
+        The output of this method can be used directly as the input to the 
+        corresponding method as extra keyword arguments to pass metadata. 
+ 
+        Parameters 
+        ---------- 
+        params : dict 
+            A dictionary of provided metadata. 
+ 
+        method : str 
+            The name of the method for which the parameters are requested and 
+            routed. 
+ 
+        parent : object 
+            Parent class object, that routes the metadata. 
+ 
+        caller : str 
+            Method from the parent class object, where the metadata is routed from. 
+ 
+        Returns 
+        ------- 
+        params : Bunch 
+            A :class:`~sklearn.utils.Bunch` of {prop: value} which can be given to the 
+            corresponding method. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">).</span><span class="s1">_route_params</span><span class="s4">(</span>
+            <span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">, </span><span class="s1">parent</span><span class="s4">=</span><span class="s1">parent</span><span class="s4">, </span><span class="s1">caller</span><span class="s4">=</span><span class="s1">caller</span>
+        <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_check_warnings</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check whether metadata is passed which is marked as WARN. 
+ 
+        If any metadata is passed which is marked as WARN, a warning is raised. 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            The name of the method for which the warnings should be checked. 
+ 
+        params : dict 
+            The metadata passed to a method. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">).</span><span class="s1">_check_warnings</span><span class="s4">(</span><span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_serialize</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Serialize the object. 
+ 
+        Returns 
+        ------- 
+        obj : dict 
+            A serialized version of the instance in the form of a dictionary. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">output </span><span class="s4">= </span><span class="s1">dict</span><span class="s4">()</span>
+        <span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">SIMPLE_METHODS</span><span class="s4">:</span>
+            <span class="s1">mmr </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">)</span>
+            <span class="s3">if </span><span class="s1">len</span><span class="s4">(</span><span class="s1">mmr</span><span class="s4">.</span><span class="s1">requests</span><span class="s4">):</span>
+                <span class="s1">output</span><span class="s4">[</span><span class="s1">method</span><span class="s4">] = </span><span class="s1">mmr</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">()</span>
+        <span class="s3">return </span><span class="s1">output</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">())</span>
+
+    <span class="s3">def </span><span class="s1">__str__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">repr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">))</span>
+
+
+<span class="s2"># Metadata Request for Routers</span>
+<span class="s2"># ============================</span>
+<span class="s2"># This section includes all objects required for MetadataRouter which is used</span>
+<span class="s2"># in routers, returned by their ``get_metadata_routing``.</span>
+
+<span class="s2"># `RouterMappingPair` is used to store a (mapping, router) tuple where `mapping` is a</span>
+<span class="s2"># `MethodMapping` object and `router` is the output of `get_metadata_routing`.</span>
+<span class="s2"># `MetadataRouter` stores a collection of `RouterMappingPair` objects in its</span>
+<span class="s2"># `_route_mappings` attribute.</span>
+<span class="s1">RouterMappingPair </span><span class="s4">= </span><span class="s1">namedtuple</span><span class="s4">(</span><span class="s5">&quot;RouterMappingPair&quot;</span><span class="s4">, [</span><span class="s5">&quot;mapping&quot;</span><span class="s4">, </span><span class="s5">&quot;router&quot;</span><span class="s4">])</span>
+
+<span class="s2"># `MethodPair` is used to store a single method routing. `MethodMapping` stores a list</span>
+<span class="s2"># of `MethodPair` objects in its `_routes` attribute.</span>
+<span class="s1">MethodPair </span><span class="s4">= </span><span class="s1">namedtuple</span><span class="s4">(</span><span class="s5">&quot;MethodPair&quot;</span><span class="s4">, [</span><span class="s5">&quot;caller&quot;</span><span class="s4">, </span><span class="s5">&quot;callee&quot;</span><span class="s4">])</span>
+
+
+<span class="s3">class </span><span class="s1">MethodMapping</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Stores the mapping between caller and callee methods for a router. 
+ 
+    This class is primarily used in a ``get_metadata_routing()`` of a router 
+    object when defining the mapping between the router's methods and a sub-object (a 
+    sub-estimator or a scorer). 
+ 
+    Iterating through an instance of this class yields 
+    ``MethodPair(caller, callee)`` instances. 
+ 
+    .. versionadded:: 1.3 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_routes </span><span class="s4">= []</span>
+
+    <span class="s3">def </span><span class="s1">__iter__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">iter</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_routes</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">add</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">caller</span><span class="s4">, </span><span class="s1">callee</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Add a method mapping. 
+ 
+        Parameters 
+        ---------- 
+ 
+        caller : str 
+            Parent estimator's method name in which the ``callee`` is called. 
+ 
+        callee : str 
+            Child object's method name. This method is called in ``caller``. 
+ 
+        Returns 
+        ------- 
+        self : MethodMapping 
+            Returns self. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">caller </span><span class="s3">not in </span><span class="s1">METHODS</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">f&quot;Given caller:</span><span class="s3">{</span><span class="s1">caller</span><span class="s3">} </span><span class="s5">is not a valid method. Valid methods are:&quot;</span>
+                <span class="s5">f&quot; </span><span class="s3">{</span><span class="s1">METHODS</span><span class="s3">}</span><span class="s5">&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">callee </span><span class="s3">not in </span><span class="s1">METHODS</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">f&quot;Given callee:</span><span class="s3">{</span><span class="s1">callee</span><span class="s3">} </span><span class="s5">is not a valid method. Valid methods are:&quot;</span>
+                <span class="s5">f&quot; </span><span class="s3">{</span><span class="s1">METHODS</span><span class="s3">}</span><span class="s5">&quot;</span>
+            <span class="s4">)</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_routes</span><span class="s4">.</span><span class="s1">append</span><span class="s4">(</span><span class="s1">MethodPair</span><span class="s4">(</span><span class="s1">caller</span><span class="s4">=</span><span class="s1">caller</span><span class="s4">, </span><span class="s1">callee</span><span class="s4">=</span><span class="s1">callee</span><span class="s4">))</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">_serialize</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Serialize the object. 
+ 
+        Returns 
+        ------- 
+        obj : list 
+            A serialized version of the instance in the form of a list. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">result </span><span class="s4">= </span><span class="s1">list</span><span class="s4">()</span>
+        <span class="s3">for </span><span class="s1">route </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_routes</span><span class="s4">:</span>
+            <span class="s1">result</span><span class="s4">.</span><span class="s1">append</span><span class="s4">({</span><span class="s5">&quot;caller&quot;</span><span class="s4">: </span><span class="s1">route</span><span class="s4">.</span><span class="s1">caller</span><span class="s4">, </span><span class="s5">&quot;callee&quot;</span><span class="s4">: </span><span class="s1">route</span><span class="s4">.</span><span class="s1">callee</span><span class="s4">})</span>
+        <span class="s3">return </span><span class="s1">result</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">())</span>
+
+    <span class="s3">def </span><span class="s1">__str__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">repr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">))</span>
+
+
+<span class="s3">class </span><span class="s1">MetadataRouter</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Stores and handles metadata routing for a router object. 
+ 
+    This class is used by router objects to store and handle metadata routing. 
+    Routing information is stored as a dictionary of the form ``{&quot;object_name&quot;: 
+    RouteMappingPair(method_mapping, routing_info)}``, where ``method_mapping`` 
+    is an instance of :class:`~sklearn.utils.metadata_routing.MethodMapping` and 
+    ``routing_info`` is either a 
+    :class:`~sklearn.utils.metadata_routing.MetadataRequest` or a 
+    :class:`~sklearn.utils.metadata_routing.MetadataRouter` instance. 
+ 
+    .. versionadded:: 1.3 
+ 
+    Parameters 
+    ---------- 
+    owner : str 
+        The name of the object to which these requests belong. 
+    &quot;&quot;&quot;</span>
+
+    <span class="s2"># this is here for us to use this attribute's value instead of doing</span>
+    <span class="s2"># `isinstance`` in our checks, so that we avoid issues when people vendor</span>
+    <span class="s2"># this file instead of using it directly from scikit-learn.</span>
+    <span class="s1">_type </span><span class="s4">= </span><span class="s5">&quot;metadata_router&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">owner</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_route_mappings </span><span class="s4">= </span><span class="s1">dict</span><span class="s4">()</span>
+        <span class="s2"># `_self_request` is used if the router is also a consumer.</span>
+        <span class="s2"># _self_request, (added using `add_self_request()`) is treated</span>
+        <span class="s2"># differently from the other objects which are stored in</span>
+        <span class="s2"># _route_mappings.</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request </span><span class="s4">= </span><span class="s3">None</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">owner </span><span class="s4">= </span><span class="s1">owner</span>
+
+    <span class="s3">def </span><span class="s1">add_self_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">obj</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Add `self` (as a consumer) to the routing. 
+ 
+        This method is used if the router is also a consumer, and hence the 
+        router itself needs to be included in the routing. The passed object 
+        can be an estimator or a 
+        :class:`~sklearn.utils.metadata_routing.MetadataRequest`. 
+ 
+        A router should add itself using this method instead of `add` since it 
+        should be treated differently than the other objects to which metadata 
+        is routed by the router. 
+ 
+        Parameters 
+        ---------- 
+        obj : object 
+            This is typically the router instance, i.e. `self` in a 
+            ``get_metadata_routing()`` implementation. It can also be a 
+            ``MetadataRequest`` instance. 
+ 
+        Returns 
+        ------- 
+        self : MetadataRouter 
+            Returns `self`. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s5">&quot;_type&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">) == </span><span class="s5">&quot;metadata_request&quot;</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request </span><span class="s4">= </span><span class="s1">deepcopy</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+        <span class="s3">elif </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s5">&quot;_get_metadata_request&quot;</span><span class="s4">):</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request </span><span class="s4">= </span><span class="s1">deepcopy</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">_get_metadata_request</span><span class="s4">())</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                <span class="s5">&quot;Given `obj` is neither a `MetadataRequest` nor does it implement the&quot;</span>
+                <span class="s5">&quot; required API. Inheriting from `BaseEstimator` implements the required&quot;</span>
+                <span class="s5">&quot; API.&quot;</span>
+            <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">add</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">method_mapping</span><span class="s4">, **</span><span class="s1">objs</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Add named objects with their corresponding method mapping. 
+ 
+        Parameters 
+        ---------- 
+        method_mapping : MethodMapping 
+            The mapping between the child and the parent's methods. 
+ 
+        **objs : dict 
+            A dictionary of objects from which metadata is extracted by calling 
+            :func:`~sklearn.utils.metadata_routing.get_routing_for_object` on them. 
+ 
+        Returns 
+        ------- 
+        self : MetadataRouter 
+            Returns `self`. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">method_mapping </span><span class="s4">= </span><span class="s1">deepcopy</span><span class="s4">(</span><span class="s1">method_mapping</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">obj </span><span class="s3">in </span><span class="s1">objs</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_route_mappings</span><span class="s4">[</span><span class="s1">name</span><span class="s4">] = </span><span class="s1">RouterMappingPair</span><span class="s4">(</span>
+                <span class="s1">mapping</span><span class="s4">=</span><span class="s1">method_mapping</span><span class="s4">, </span><span class="s1">router</span><span class="s4">=</span><span class="s1">get_routing_for_object</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+            <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">self</span>
+
+    <span class="s3">def </span><span class="s1">consumes</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Check whether the given parameters are consumed by the given method. 
+ 
+        .. versionadded:: 1.4 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            The name of the method to check. 
+ 
+        params : iterable of str 
+            An iterable of parameters to check. 
+ 
+        Returns 
+        ------- 
+        consumed : set of str 
+            A set of parameters which are consumed by the given method. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">set</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">:</span>
+            <span class="s1">res </span><span class="s4">= </span><span class="s1">res </span><span class="s4">| </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">.</span><span class="s1">consumes</span><span class="s4">(</span><span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">, </span><span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">_</span><span class="s4">, </span><span class="s1">route_mapping </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_route_mappings</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s3">for </span><span class="s1">caller</span><span class="s4">, </span><span class="s1">callee </span><span class="s3">in </span><span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">mapping</span><span class="s4">:</span>
+                <span class="s3">if </span><span class="s1">caller </span><span class="s4">== </span><span class="s1">method</span><span class="s4">:</span>
+                    <span class="s1">res </span><span class="s4">= </span><span class="s1">res </span><span class="s4">| </span><span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">router</span><span class="s4">.</span><span class="s1">consumes</span><span class="s4">(</span>
+                        <span class="s1">method</span><span class="s4">=</span><span class="s1">callee</span><span class="s4">, </span><span class="s1">params</span><span class="s4">=</span><span class="s1">params</span>
+                    <span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">_get_param_names</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">, </span><span class="s1">ignore_self_request</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Get names of all metadata that can be consumed or routed by specified \ 
+            method. 
+ 
+        This method returns the names of all metadata, even the ``False`` 
+        ones. 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            The name of the method for which metadata names are requested. 
+ 
+        return_alias : bool 
+            Controls whether original or aliased names should be returned, 
+            which only applies to the stored `self`. If no `self` routing 
+            object is stored, this parameter has no effect. 
+ 
+        ignore_self_request : bool 
+            If `self._self_request` should be ignored. This is used in `_route_params`. 
+            If ``True``, ``return_alias`` has no effect. 
+ 
+        Returns 
+        ------- 
+        names : set of str 
+            A set of strings with the names of all parameters. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">set</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request </span><span class="s3">and not </span><span class="s1">ignore_self_request</span><span class="s4">:</span>
+            <span class="s1">res </span><span class="s4">= </span><span class="s1">res</span><span class="s4">.</span><span class="s1">union</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">.</span><span class="s1">_get_param_names</span><span class="s4">(</span>
+                    <span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">=</span><span class="s1">return_alias</span>
+                <span class="s4">)</span>
+            <span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">route_mapping </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_route_mappings</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s3">for </span><span class="s1">caller</span><span class="s4">, </span><span class="s1">callee </span><span class="s3">in </span><span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">mapping</span><span class="s4">:</span>
+                <span class="s3">if </span><span class="s1">caller </span><span class="s4">== </span><span class="s1">method</span><span class="s4">:</span>
+                    <span class="s1">res </span><span class="s4">= </span><span class="s1">res</span><span class="s4">.</span><span class="s1">union</span><span class="s4">(</span>
+                        <span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">router</span><span class="s4">.</span><span class="s1">_get_param_names</span><span class="s4">(</span>
+                            <span class="s1">method</span><span class="s4">=</span><span class="s1">callee</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">ignore_self_request</span><span class="s4">=</span><span class="s3">False</span>
+                        <span class="s4">)</span>
+                    <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">_route_params</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">params</span><span class="s4">, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">parent</span><span class="s4">, </span><span class="s1">caller</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Prepare the given parameters to be passed to the method. 
+ 
+        This is used when a router is used as a child object of another router. 
+        The parent router then passes all parameters understood by the child 
+        object to it and delegates their validation to the child. 
+ 
+        The output of this method can be used directly as the input to the 
+        corresponding method as extra props. 
+ 
+        Parameters 
+        ---------- 
+        params : dict 
+            A dictionary of provided metadata. 
+ 
+        method : str 
+            The name of the method for which the parameters are requested and 
+            routed. 
+ 
+        parent : object 
+            Parent class object, that routes the metadata. 
+ 
+        caller : str 
+            Method from the parent class object, where the metadata is routed from. 
+ 
+        Returns 
+        ------- 
+        params : Bunch 
+            A :class:`~sklearn.utils.Bunch` of {prop: value} which can be given to the 
+            corresponding method. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">Bunch</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">:</span>
+            <span class="s1">res</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span>
+                <span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">.</span><span class="s1">_route_params</span><span class="s4">(</span>
+                    <span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">,</span>
+                    <span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">,</span>
+                    <span class="s1">parent</span><span class="s4">=</span><span class="s1">parent</span><span class="s4">,</span>
+                    <span class="s1">caller</span><span class="s4">=</span><span class="s1">caller</span><span class="s4">,</span>
+                <span class="s4">)</span>
+            <span class="s4">)</span>
+
+        <span class="s1">param_names </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_param_names</span><span class="s4">(</span>
+            <span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">=</span><span class="s3">True</span><span class="s4">, </span><span class="s1">ignore_self_request</span><span class="s4">=</span><span class="s3">True</span>
+        <span class="s4">)</span>
+        <span class="s1">child_params </span><span class="s4">= {</span>
+            <span class="s1">key</span><span class="s4">: </span><span class="s1">value </span><span class="s3">for </span><span class="s1">key</span><span class="s4">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">params</span><span class="s4">.</span><span class="s1">items</span><span class="s4">() </span><span class="s3">if </span><span class="s1">key </span><span class="s3">in </span><span class="s1">param_names</span>
+        <span class="s4">}</span>
+        <span class="s3">for </span><span class="s1">key </span><span class="s3">in </span><span class="s1">set</span><span class="s4">(</span><span class="s1">res</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()).</span><span class="s1">intersection</span><span class="s4">(</span><span class="s1">child_params</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()):</span>
+            <span class="s2"># conflicts are okay if the passed objects are the same, but it's</span>
+            <span class="s2"># an issue if they're different objects.</span>
+            <span class="s3">if </span><span class="s1">child_params</span><span class="s4">[</span><span class="s1">key</span><span class="s4">] </span><span class="s3">is not </span><span class="s1">res</span><span class="s4">[</span><span class="s1">key</span><span class="s4">]:</span>
+                <span class="s3">raise </span><span class="s1">ValueError</span><span class="s4">(</span>
+                    <span class="s5">f&quot;In </span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">owner</span><span class="s3">}</span><span class="s5">, there is a conflict on </span><span class="s3">{</span><span class="s1">key</span><span class="s3">} </span><span class="s5">between what is&quot;</span>
+                    <span class="s5">&quot; requested for this estimator and what is requested by its&quot;</span>
+                    <span class="s5">&quot; children. You can resolve this conflict by using an alias for&quot;</span>
+                    <span class="s5">&quot; the child estimator(s) requested metadata.&quot;</span>
+                <span class="s4">)</span>
+
+        <span class="s1">res</span><span class="s4">.</span><span class="s1">update</span><span class="s4">(</span><span class="s1">child_params</span><span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">route_params</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">caller</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Return the input parameters requested by child objects. 
+ 
+        The output of this method is a bunch, which includes the metadata for all 
+        methods of each child object that is used in the router's `caller` method. 
+ 
+        If the router is also a consumer, it also checks for warnings of 
+        `self`'s/consumer's requested metadata. 
+ 
+        Parameters 
+        ---------- 
+        caller : str 
+            The name of the method for which the parameters are requested and 
+            routed. If called inside the :term:`fit` method of a router, it 
+            would be `&quot;fit&quot;`. 
+ 
+        params : dict 
+            A dictionary of provided metadata. 
+ 
+        Returns 
+        ------- 
+        params : Bunch 
+            A :class:`~sklearn.utils.Bunch` of the form 
+            ``{&quot;object_name&quot;: {&quot;method_name&quot;: {params: value}}}`` which can be 
+            used to pass the required metadata to corresponding methods or 
+            corresponding child objects. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">:</span>
+            <span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">.</span><span class="s1">_check_warnings</span><span class="s4">(</span><span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">, </span><span class="s1">method</span><span class="s4">=</span><span class="s1">caller</span><span class="s4">)</span>
+
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">Bunch</span><span class="s4">()</span>
+        <span class="s3">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">route_mapping </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_route_mappings</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s1">router</span><span class="s4">, </span><span class="s1">mapping </span><span class="s4">= </span><span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">router</span><span class="s4">, </span><span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">mapping</span>
+
+            <span class="s1">res</span><span class="s4">[</span><span class="s1">name</span><span class="s4">] = </span><span class="s1">Bunch</span><span class="s4">()</span>
+            <span class="s3">for </span><span class="s1">_caller</span><span class="s4">, </span><span class="s1">_callee </span><span class="s3">in </span><span class="s1">mapping</span><span class="s4">:</span>
+                <span class="s3">if </span><span class="s1">_caller </span><span class="s4">== </span><span class="s1">caller</span><span class="s4">:</span>
+                    <span class="s1">res</span><span class="s4">[</span><span class="s1">name</span><span class="s4">][</span><span class="s1">_callee</span><span class="s4">] = </span><span class="s1">router</span><span class="s4">.</span><span class="s1">_route_params</span><span class="s4">(</span>
+                        <span class="s1">params</span><span class="s4">=</span><span class="s1">params</span><span class="s4">,</span>
+                        <span class="s1">method</span><span class="s4">=</span><span class="s1">_callee</span><span class="s4">,</span>
+                        <span class="s1">parent</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">owner</span><span class="s4">,</span>
+                        <span class="s1">caller</span><span class="s4">=</span><span class="s1">caller</span><span class="s4">,</span>
+                    <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">validate_metadata</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, *, </span><span class="s1">method</span><span class="s4">, </span><span class="s1">params</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Validate given metadata for a method. 
+ 
+        This raises a ``TypeError`` if some of the passed metadata are not 
+        understood by child objects. 
+ 
+        Parameters 
+        ---------- 
+        method : str 
+            The name of the method for which the parameters are requested and 
+            routed. If called inside the :term:`fit` method of a router, it 
+            would be `&quot;fit&quot;`. 
+ 
+        params : dict 
+            A dictionary of provided metadata. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">param_names </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_param_names</span><span class="s4">(</span>
+            <span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">=</span><span class="s3">False</span><span class="s4">, </span><span class="s1">ignore_self_request</span><span class="s4">=</span><span class="s3">False</span>
+        <span class="s4">)</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">:</span>
+            <span class="s1">self_params </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">.</span><span class="s1">_get_param_names</span><span class="s4">(</span>
+                <span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">, </span><span class="s1">return_alias</span><span class="s4">=</span><span class="s3">False</span>
+            <span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">self_params </span><span class="s4">= </span><span class="s1">set</span><span class="s4">()</span>
+        <span class="s1">extra_keys </span><span class="s4">= </span><span class="s1">set</span><span class="s4">(</span><span class="s1">params</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">()) - </span><span class="s1">param_names </span><span class="s4">- </span><span class="s1">self_params</span>
+        <span class="s3">if </span><span class="s1">extra_keys</span><span class="s4">:</span>
+            <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span>
+                <span class="s5">f&quot;</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">owner</span><span class="s3">}</span><span class="s5">.</span><span class="s3">{</span><span class="s1">method</span><span class="s3">} </span><span class="s5">got unexpected argument(s) </span><span class="s3">{</span><span class="s1">extra_keys</span><span class="s3">}</span><span class="s5">, which&quot;</span>
+                <span class="s5">&quot; are not routed to any object.&quot;</span>
+            <span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">_serialize</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Serialize the object. 
+ 
+        Returns 
+        ------- 
+        obj : dict 
+            A serialized version of the instance in the form of a dictionary. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">res </span><span class="s4">= </span><span class="s1">dict</span><span class="s4">()</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">:</span>
+            <span class="s1">res</span><span class="s4">[</span><span class="s5">&quot;$self_request&quot;</span><span class="s4">] = </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">()</span>
+        <span class="s3">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">route_mapping </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_route_mappings</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s1">res</span><span class="s4">[</span><span class="s1">name</span><span class="s4">] = </span><span class="s1">dict</span><span class="s4">()</span>
+            <span class="s1">res</span><span class="s4">[</span><span class="s1">name</span><span class="s4">][</span><span class="s5">&quot;mapping&quot;</span><span class="s4">] = </span><span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">mapping</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">()</span>
+            <span class="s1">res</span><span class="s4">[</span><span class="s1">name</span><span class="s4">][</span><span class="s5">&quot;router&quot;</span><span class="s4">] = </span><span class="s1">route_mapping</span><span class="s4">.</span><span class="s1">router</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">()</span>
+
+        <span class="s3">return </span><span class="s1">res</span>
+
+    <span class="s3">def </span><span class="s1">__iter__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span><span class="s4">:</span>
+            <span class="s1">method_mapping </span><span class="s4">= </span><span class="s1">MethodMapping</span><span class="s4">()</span>
+            <span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">METHODS</span><span class="s4">:</span>
+                <span class="s1">method_mapping</span><span class="s4">.</span><span class="s1">add</span><span class="s4">(</span><span class="s1">caller</span><span class="s4">=</span><span class="s1">method</span><span class="s4">, </span><span class="s1">callee</span><span class="s4">=</span><span class="s1">method</span><span class="s4">)</span>
+            <span class="s3">yield </span><span class="s5">&quot;$self_request&quot;</span><span class="s4">, </span><span class="s1">RouterMappingPair</span><span class="s4">(</span>
+                <span class="s1">mapping</span><span class="s4">=</span><span class="s1">method_mapping</span><span class="s4">, </span><span class="s1">router</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_self_request</span>
+            <span class="s4">)</span>
+        <span class="s3">for </span><span class="s1">name</span><span class="s4">, </span><span class="s1">route_mapping </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_route_mappings</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+            <span class="s3">yield </span><span class="s4">(</span><span class="s1">name</span><span class="s4">, </span><span class="s1">route_mapping</span><span class="s4">)</span>
+
+    <span class="s3">def </span><span class="s1">__repr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_serialize</span><span class="s4">())</span>
+
+    <span class="s3">def </span><span class="s1">__str__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">str</span><span class="s4">(</span><span class="s1">repr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">))</span>
+
+
+<span class="s3">def </span><span class="s1">get_routing_for_object</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Get a ``Metadata{Router, Request}`` instance from the given object. 
+ 
+    This function returns a 
+    :class:`~sklearn.utils.metadata_routing.MetadataRouter` or a 
+    :class:`~sklearn.utils.metadata_routing.MetadataRequest` from the given input. 
+ 
+    This function always returns a copy or an instance constructed from the 
+    input, such that changing the output of this function will not change the 
+    original object. 
+ 
+    .. versionadded:: 1.3 
+ 
+    Parameters 
+    ---------- 
+    obj : object 
+        - If the object provides a `get_metadata_routing` method, return a copy 
+            of the output of that method. 
+        - If the object is already a 
+            :class:`~sklearn.utils.metadata_routing.MetadataRequest` or a 
+            :class:`~sklearn.utils.metadata_routing.MetadataRouter`, return a copy 
+            of that. 
+        - Returns an empty :class:`~sklearn.utils.metadata_routing.MetadataRequest` 
+            otherwise. 
+ 
+    Returns 
+    ------- 
+    obj : MetadataRequest or MetadataRouting 
+        A ``MetadataRequest`` or a ``MetadataRouting`` taken or created from 
+        the given object. 
+    &quot;&quot;&quot;</span>
+    <span class="s2"># doing this instead of a try/except since an AttributeError could be raised</span>
+    <span class="s2"># for other reasons.</span>
+    <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s5">&quot;get_metadata_routing&quot;</span><span class="s4">):</span>
+        <span class="s3">return </span><span class="s1">deepcopy</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">.</span><span class="s1">get_metadata_routing</span><span class="s4">())</span>
+
+    <span class="s3">elif </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">, </span><span class="s5">&quot;_type&quot;</span><span class="s4">, </span><span class="s3">None</span><span class="s4">) </span><span class="s3">in </span><span class="s4">[</span><span class="s5">&quot;metadata_request&quot;</span><span class="s4">, </span><span class="s5">&quot;metadata_router&quot;</span><span class="s4">]:</span>
+        <span class="s3">return </span><span class="s1">deepcopy</span><span class="s4">(</span><span class="s1">obj</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">MetadataRequest</span><span class="s4">(</span><span class="s1">owner</span><span class="s4">=</span><span class="s3">None</span><span class="s4">)</span>
+
+
+<span class="s2"># Request method</span>
+<span class="s2"># ==============</span>
+<span class="s2"># This section includes what's needed for the request method descriptor and</span>
+<span class="s2"># their dynamic generation in a meta class.</span>
+
+<span class="s2"># These strings are used to dynamically generate the docstrings for</span>
+<span class="s2"># set_{method}_request methods.</span>
+<span class="s1">REQUESTER_DOC </span><span class="s4">= </span><span class="s5">&quot;&quot;&quot;        Request metadata passed to the ``{method}`` method. 
+ 
+        Note that this method is only relevant if 
+        ``enable_metadata_routing=True`` (see :func:`sklearn.set_config`). 
+        Please see :ref:`User Guide &lt;metadata_routing&gt;` on how the routing 
+        mechanism works. 
+ 
+        The options for each parameter are: 
+ 
+        - ``True``: metadata is requested, and </span><span class="s3">\ 
+</span><span class="s5">passed to ``{method}`` if provided. The request is ignored if </span><span class="s3">\ 
+</span><span class="s5">metadata is not provided. 
+ 
+        - ``False``: metadata is not requested and the meta-estimator </span><span class="s3">\ 
+</span><span class="s5">will not pass it to ``{method}``. 
+ 
+        - ``None``: metadata is not requested, and the meta-estimator </span><span class="s3">\ 
+</span><span class="s5">will raise an error if the user provides it. 
+ 
+        - ``str``: metadata should be passed to the meta-estimator with </span><span class="s3">\ 
+</span><span class="s5">this given alias instead of the original name. 
+ 
+        The default (``sklearn.utils.metadata_routing.UNCHANGED``) retains the 
+        existing request. This allows you to change the request for some 
+        parameters and not others. 
+ 
+        .. versionadded:: 1.3 
+ 
+        .. note:: 
+            This method is only relevant if this estimator is used as a 
+            sub-estimator of a meta-estimator, e.g. used inside a 
+            :class:`~sklearn.pipeline.Pipeline`. Otherwise it has no effect. 
+ 
+        Parameters 
+        ---------- 
+&quot;&quot;&quot;</span>
+<span class="s1">REQUESTER_DOC_PARAM </span><span class="s4">= </span><span class="s5">&quot;&quot;&quot;        {metadata} : str, True, False, or None, </span><span class="s3">\ 
+                    </span><span class="s5">default=sklearn.utils.metadata_routing.UNCHANGED 
+            Metadata routing for ``{metadata}`` parameter in ``{method}``. 
+ 
+&quot;&quot;&quot;</span>
+<span class="s1">REQUESTER_DOC_RETURN </span><span class="s4">= </span><span class="s5">&quot;&quot;&quot;        Returns 
+        ------- 
+        self : object 
+            The updated object. 
+&quot;&quot;&quot;</span>
+
+
+<span class="s3">class </span><span class="s1">RequestMethod</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot; 
+    A descriptor for request methods. 
+ 
+    .. versionadded:: 1.3 
+ 
+    Parameters 
+    ---------- 
+    name : str 
+        The name of the method for which the request function should be 
+        created, e.g. ``&quot;fit&quot;`` would create a ``set_fit_request`` function. 
+ 
+    keys : list of str 
+        A list of strings which are accepted parameters by the created 
+        function, e.g. ``[&quot;sample_weight&quot;]`` if the corresponding method 
+        accepts it as a metadata. 
+ 
+    validate_keys : bool, default=True 
+        Whether to check if the requested parameters fit the actual parameters 
+        of the method. 
+ 
+    Notes 
+    ----- 
+    This class is a descriptor [1]_ and uses PEP-362 to set the signature of 
+    the returned function [2]_. 
+ 
+    References 
+    ---------- 
+    .. [1] https://docs.python.org/3/howto/descriptor.html 
+ 
+    .. [2] https://www.python.org/dev/peps/pep-0362/ 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">def </span><span class="s1">__init__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">keys</span><span class="s4">, </span><span class="s1">validate_keys</span><span class="s4">=</span><span class="s3">True</span><span class="s4">):</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">name </span><span class="s4">= </span><span class="s1">name</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">keys </span><span class="s4">= </span><span class="s1">keys</span>
+        <span class="s1">self</span><span class="s4">.</span><span class="s1">validate_keys </span><span class="s4">= </span><span class="s1">validate_keys</span>
+
+    <span class="s3">def </span><span class="s1">__get__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">instance</span><span class="s4">, </span><span class="s1">owner</span><span class="s4">):</span>
+        <span class="s2"># we would want to have a method which accepts only the expected args</span>
+        <span class="s3">def </span><span class="s1">func</span><span class="s4">(*</span><span class="s1">args</span><span class="s4">, **</span><span class="s1">kw</span><span class="s4">):</span>
+            <span class="s0">&quot;&quot;&quot;Updates the request for provided parameters 
+ 
+            This docstring is overwritten below. 
+            See REQUESTER_DOC for expected functionality 
+            &quot;&quot;&quot;</span>
+            <span class="s3">if not </span><span class="s1">_routing_enabled</span><span class="s4">():</span>
+                <span class="s3">raise </span><span class="s1">RuntimeError</span><span class="s4">(</span>
+                    <span class="s5">&quot;This method is only available when metadata routing is enabled.&quot;</span>
+                    <span class="s5">&quot; You can enable it using&quot;</span>
+                    <span class="s5">&quot; sklearn.set_config(enable_metadata_routing=True).&quot;</span>
+                <span class="s4">)</span>
+
+            <span class="s3">if </span><span class="s1">self</span><span class="s4">.</span><span class="s1">validate_keys </span><span class="s3">and </span><span class="s4">(</span><span class="s1">set</span><span class="s4">(</span><span class="s1">kw</span><span class="s4">) - </span><span class="s1">set</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">)):</span>
+                <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span>
+                    <span class="s5">f&quot;Unexpected args: </span><span class="s3">{</span><span class="s1">set</span><span class="s4">(</span><span class="s1">kw</span><span class="s4">) - </span><span class="s1">set</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">)</span><span class="s3">} </span><span class="s5">in </span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">name</span><span class="s3">}</span><span class="s5">. &quot;</span>
+                    <span class="s5">f&quot;Accepted arguments are: </span><span class="s3">{</span><span class="s1">set</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">)</span><span class="s3">}</span><span class="s5">&quot;</span>
+                <span class="s4">)</span>
+
+            <span class="s2"># This makes it possible to use the decorated method as an unbound method,</span>
+            <span class="s2"># for instance when monkeypatching.</span>
+            <span class="s2"># https://github.com/scikit-learn/scikit-learn/issues/28632</span>
+            <span class="s3">if </span><span class="s1">instance </span><span class="s3">is None</span><span class="s4">:</span>
+                <span class="s1">_instance </span><span class="s4">= </span><span class="s1">args</span><span class="s4">[</span><span class="s6">0</span><span class="s4">]</span>
+                <span class="s1">args </span><span class="s4">= </span><span class="s1">args</span><span class="s4">[</span><span class="s6">1</span><span class="s4">:]</span>
+            <span class="s3">else</span><span class="s4">:</span>
+                <span class="s1">_instance </span><span class="s4">= </span><span class="s1">instance</span>
+
+            <span class="s2"># Replicating python's behavior when positional args are given other than</span>
+            <span class="s2"># `self`, and `self` is only allowed if this method is unbound.</span>
+            <span class="s3">if </span><span class="s1">args</span><span class="s4">:</span>
+                <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span>
+                    <span class="s5">f&quot;set_</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">name</span><span class="s3">}</span><span class="s5">_request() takes 0 positional argument but&quot;</span>
+                    <span class="s5">f&quot; </span><span class="s3">{</span><span class="s1">len</span><span class="s4">(</span><span class="s1">args</span><span class="s4">)</span><span class="s3">} </span><span class="s5">were given&quot;</span>
+                <span class="s4">)</span>
+
+            <span class="s1">requests </span><span class="s4">= </span><span class="s1">_instance</span><span class="s4">.</span><span class="s1">_get_metadata_request</span><span class="s4">()</span>
+            <span class="s1">method_metadata_request </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">requests</span><span class="s4">, </span><span class="s1">self</span><span class="s4">.</span><span class="s1">name</span><span class="s4">)</span>
+
+            <span class="s3">for </span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">kw</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+                <span class="s3">if </span><span class="s1">alias </span><span class="s3">is not </span><span class="s1">UNCHANGED</span><span class="s4">:</span>
+                    <span class="s1">method_metadata_request</span><span class="s4">.</span><span class="s1">add_request</span><span class="s4">(</span><span class="s1">param</span><span class="s4">=</span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias</span><span class="s4">=</span><span class="s1">alias</span><span class="s4">)</span>
+            <span class="s1">_instance</span><span class="s4">.</span><span class="s1">_metadata_request </span><span class="s4">= </span><span class="s1">requests</span>
+
+            <span class="s3">return </span><span class="s1">_instance</span>
+
+        <span class="s2"># Now we set the relevant attributes of the function so that it seems</span>
+        <span class="s2"># like a normal method to the end user, with known expected arguments.</span>
+        <span class="s1">func</span><span class="s4">.</span><span class="s1">__name__ </span><span class="s4">= </span><span class="s5">f&quot;set_</span><span class="s3">{</span><span class="s1">self</span><span class="s4">.</span><span class="s1">name</span><span class="s3">}</span><span class="s5">_request&quot;</span>
+        <span class="s1">params </span><span class="s4">= [</span>
+            <span class="s1">inspect</span><span class="s4">.</span><span class="s1">Parameter</span><span class="s4">(</span>
+                <span class="s1">name</span><span class="s4">=</span><span class="s5">&quot;self&quot;</span><span class="s4">,</span>
+                <span class="s1">kind</span><span class="s4">=</span><span class="s1">inspect</span><span class="s4">.</span><span class="s1">Parameter</span><span class="s4">.</span><span class="s1">POSITIONAL_OR_KEYWORD</span><span class="s4">,</span>
+                <span class="s1">annotation</span><span class="s4">=</span><span class="s1">owner</span><span class="s4">,</span>
+            <span class="s4">)</span>
+        <span class="s4">]</span>
+        <span class="s1">params</span><span class="s4">.</span><span class="s1">extend</span><span class="s4">(</span>
+            <span class="s4">[</span>
+                <span class="s1">inspect</span><span class="s4">.</span><span class="s1">Parameter</span><span class="s4">(</span>
+                    <span class="s1">k</span><span class="s4">,</span>
+                    <span class="s1">inspect</span><span class="s4">.</span><span class="s1">Parameter</span><span class="s4">.</span><span class="s1">KEYWORD_ONLY</span><span class="s4">,</span>
+                    <span class="s1">default</span><span class="s4">=</span><span class="s1">UNCHANGED</span><span class="s4">,</span>
+                    <span class="s1">annotation</span><span class="s4">=</span><span class="s1">Optional</span><span class="s4">[</span><span class="s1">Union</span><span class="s4">[</span><span class="s1">bool</span><span class="s4">, </span><span class="s3">None</span><span class="s4">, </span><span class="s1">str</span><span class="s4">]],</span>
+                <span class="s4">)</span>
+                <span class="s3">for </span><span class="s1">k </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">keys</span>
+            <span class="s4">]</span>
+        <span class="s4">)</span>
+        <span class="s1">func</span><span class="s4">.</span><span class="s1">__signature__ </span><span class="s4">= </span><span class="s1">inspect</span><span class="s4">.</span><span class="s1">Signature</span><span class="s4">(</span>
+            <span class="s1">params</span><span class="s4">,</span>
+            <span class="s1">return_annotation</span><span class="s4">=</span><span class="s1">owner</span><span class="s4">,</span>
+        <span class="s4">)</span>
+        <span class="s1">doc </span><span class="s4">= </span><span class="s1">REQUESTER_DOC</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">method</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">name</span><span class="s4">)</span>
+        <span class="s3">for </span><span class="s1">metadata </span><span class="s3">in </span><span class="s1">self</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">:</span>
+            <span class="s1">doc </span><span class="s4">+= </span><span class="s1">REQUESTER_DOC_PARAM</span><span class="s4">.</span><span class="s1">format</span><span class="s4">(</span><span class="s1">metadata</span><span class="s4">=</span><span class="s1">metadata</span><span class="s4">, </span><span class="s1">method</span><span class="s4">=</span><span class="s1">self</span><span class="s4">.</span><span class="s1">name</span><span class="s4">)</span>
+        <span class="s1">doc </span><span class="s4">+= </span><span class="s1">REQUESTER_DOC_RETURN</span>
+        <span class="s1">func</span><span class="s4">.</span><span class="s1">__doc__ </span><span class="s4">= </span><span class="s1">doc</span>
+        <span class="s3">return </span><span class="s1">func</span>
+
+
+<span class="s3">class </span><span class="s1">_MetadataRequester</span><span class="s4">:</span>
+    <span class="s0">&quot;&quot;&quot;Mixin class for adding metadata request functionality. 
+ 
+    ``BaseEstimator`` inherits from this Mixin. 
+ 
+    .. versionadded:: 1.3 
+    &quot;&quot;&quot;</span>
+
+    <span class="s3">if </span><span class="s1">TYPE_CHECKING</span><span class="s4">:  </span><span class="s2"># pragma: no cover</span>
+        <span class="s2"># This code is never run in runtime, but it's here for type checking.</span>
+        <span class="s2"># Type checkers fail to understand that the `set_{method}_request`</span>
+        <span class="s2"># methods are dynamically generated, and they complain that they are</span>
+        <span class="s2"># not defined. We define them here to make type checkers happy.</span>
+        <span class="s2"># During type checking analyzers assume this to be True.</span>
+        <span class="s2"># The following list of defined methods mirrors the list of methods</span>
+        <span class="s2"># in SIMPLE_METHODS.</span>
+        <span class="s2"># fmt: off</span>
+        <span class="s3">def </span><span class="s1">set_fit_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_partial_fit_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_predict_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_predict_proba_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_predict_log_proba_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_decision_function_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_score_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_split_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_transform_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s3">def </span><span class="s1">set_inverse_transform_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">): </span><span class="s3">pass</span>
+        <span class="s2"># fmt: on</span>
+
+    <span class="s3">def </span><span class="s1">__init_subclass__</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Set the ``set_{method}_request`` methods. 
+ 
+        This uses PEP-487 [1]_ to set the ``set_{method}_request`` methods. It 
+        looks for the information available in the set default values which are 
+        set using ``__metadata_request__*`` class attributes, or inferred 
+        from method signatures. 
+ 
+        The ``__metadata_request__*`` class attributes are used when a method 
+        does not explicitly accept a metadata through its arguments or if the 
+        developer would like to specify a request value for those metadata 
+        which are different from the default ``None``. 
+ 
+        References 
+        ---------- 
+        .. [1] https://www.python.org/dev/peps/pep-0487 
+        &quot;&quot;&quot;</span>
+        <span class="s3">try</span><span class="s4">:</span>
+            <span class="s1">requests </span><span class="s4">= </span><span class="s1">cls</span><span class="s4">.</span><span class="s1">_get_default_requests</span><span class="s4">()</span>
+        <span class="s3">except </span><span class="s1">Exception</span><span class="s4">:</span>
+            <span class="s2"># if there are any issues in the default values, it will be raised</span>
+            <span class="s2"># when ``get_metadata_routing`` is called. Here we are going to</span>
+            <span class="s2"># ignore all the issues such as bad defaults etc.</span>
+            <span class="s1">super</span><span class="s4">().</span><span class="s1">__init_subclass__</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+            <span class="s3">return</span>
+
+        <span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">SIMPLE_METHODS</span><span class="s4">:</span>
+            <span class="s1">mmr </span><span class="s4">= </span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">requests</span><span class="s4">, </span><span class="s1">method</span><span class="s4">)</span>
+            <span class="s2"># set ``set_{method}_request``` methods</span>
+            <span class="s3">if not </span><span class="s1">len</span><span class="s4">(</span><span class="s1">mmr</span><span class="s4">.</span><span class="s1">requests</span><span class="s4">):</span>
+                <span class="s3">continue</span>
+            <span class="s1">setattr</span><span class="s4">(</span>
+                <span class="s1">cls</span><span class="s4">,</span>
+                <span class="s5">f&quot;set_</span><span class="s3">{</span><span class="s1">method</span><span class="s3">}</span><span class="s5">_request&quot;</span><span class="s4">,</span>
+                <span class="s1">RequestMethod</span><span class="s4">(</span><span class="s1">method</span><span class="s4">, </span><span class="s1">sorted</span><span class="s4">(</span><span class="s1">mmr</span><span class="s4">.</span><span class="s1">requests</span><span class="s4">.</span><span class="s1">keys</span><span class="s4">())),</span>
+            <span class="s4">)</span>
+        <span class="s1">super</span><span class="s4">().</span><span class="s1">__init_subclass__</span><span class="s4">(**</span><span class="s1">kwargs</span><span class="s4">)</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_build_request_for_signature</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">router</span><span class="s4">, </span><span class="s1">method</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Build the `MethodMetadataRequest` for a method using its signature. 
+ 
+        This method takes all arguments from the method signature and uses 
+        ``None`` as their default request value, except ``X``, ``y``, ``Y``, 
+        ``Xt``, ``yt``, ``*args``, and ``**kwargs``. 
+ 
+        Parameters 
+        ---------- 
+        router : MetadataRequest 
+            The parent object for the created `MethodMetadataRequest`. 
+        method : str 
+            The name of the method. 
+ 
+        Returns 
+        ------- 
+        method_request : MethodMetadataRequest 
+            The prepared request using the method's signature. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">mmr </span><span class="s4">= </span><span class="s1">MethodMetadataRequest</span><span class="s4">(</span><span class="s1">owner</span><span class="s4">=</span><span class="s1">cls</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">, </span><span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">)</span>
+        <span class="s2"># Here we use `isfunction` instead of `ismethod` because calling `getattr`</span>
+        <span class="s2"># on a class instead of an instance returns an unbound function.</span>
+        <span class="s3">if not </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">method</span><span class="s4">) </span><span class="s3">or not </span><span class="s1">inspect</span><span class="s4">.</span><span class="s1">isfunction</span><span class="s4">(</span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">method</span><span class="s4">)):</span>
+            <span class="s3">return </span><span class="s1">mmr</span>
+        <span class="s2"># ignore the first parameter of the method, which is usually &quot;self&quot;</span>
+        <span class="s1">params </span><span class="s4">= </span><span class="s1">list</span><span class="s4">(</span><span class="s1">inspect</span><span class="s4">.</span><span class="s1">signature</span><span class="s4">(</span><span class="s1">getattr</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">, </span><span class="s1">method</span><span class="s4">)).</span><span class="s1">parameters</span><span class="s4">.</span><span class="s1">items</span><span class="s4">())[</span><span class="s6">1</span><span class="s4">:]</span>
+        <span class="s3">for </span><span class="s1">pname</span><span class="s4">, </span><span class="s1">param </span><span class="s3">in </span><span class="s1">params</span><span class="s4">:</span>
+            <span class="s3">if </span><span class="s1">pname </span><span class="s3">in </span><span class="s4">{</span><span class="s5">&quot;X&quot;</span><span class="s4">, </span><span class="s5">&quot;y&quot;</span><span class="s4">, </span><span class="s5">&quot;Y&quot;</span><span class="s4">, </span><span class="s5">&quot;Xt&quot;</span><span class="s4">, </span><span class="s5">&quot;yt&quot;</span><span class="s4">}:</span>
+                <span class="s3">continue</span>
+            <span class="s3">if </span><span class="s1">param</span><span class="s4">.</span><span class="s1">kind </span><span class="s3">in </span><span class="s4">{</span><span class="s1">param</span><span class="s4">.</span><span class="s1">VAR_POSITIONAL</span><span class="s4">, </span><span class="s1">param</span><span class="s4">.</span><span class="s1">VAR_KEYWORD</span><span class="s4">}:</span>
+                <span class="s3">continue</span>
+            <span class="s1">mmr</span><span class="s4">.</span><span class="s1">add_request</span><span class="s4">(</span>
+                <span class="s1">param</span><span class="s4">=</span><span class="s1">pname</span><span class="s4">,</span>
+                <span class="s1">alias</span><span class="s4">=</span><span class="s3">None</span><span class="s4">,</span>
+            <span class="s4">)</span>
+        <span class="s3">return </span><span class="s1">mmr</span>
+
+    <span class="s4">@</span><span class="s1">classmethod</span>
+    <span class="s3">def </span><span class="s1">_get_default_requests</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Collect default request values. 
+ 
+        This method combines the information present in ``__metadata_request__*`` 
+        class attributes, as well as determining request keys from method 
+        signatures. 
+        &quot;&quot;&quot;</span>
+        <span class="s1">requests </span><span class="s4">= </span><span class="s1">MetadataRequest</span><span class="s4">(</span><span class="s1">owner</span><span class="s4">=</span><span class="s1">cls</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">)</span>
+
+        <span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">SIMPLE_METHODS</span><span class="s4">:</span>
+            <span class="s1">setattr</span><span class="s4">(</span>
+                <span class="s1">requests</span><span class="s4">,</span>
+                <span class="s1">method</span><span class="s4">,</span>
+                <span class="s1">cls</span><span class="s4">.</span><span class="s1">_build_request_for_signature</span><span class="s4">(</span><span class="s1">router</span><span class="s4">=</span><span class="s1">requests</span><span class="s4">, </span><span class="s1">method</span><span class="s4">=</span><span class="s1">method</span><span class="s4">),</span>
+            <span class="s4">)</span>
+
+        <span class="s2"># Then overwrite those defaults with the ones provided in</span>
+        <span class="s2"># __metadata_request__* attributes. Defaults set in</span>
+        <span class="s2"># __metadata_request__* attributes take precedence over signature</span>
+        <span class="s2"># sniffing.</span>
+
+        <span class="s2"># need to go through the MRO since this is a class attribute and</span>
+        <span class="s2"># ``vars`` doesn't report the parent class attributes. We go through</span>
+        <span class="s2"># the reverse of the MRO so that child classes have precedence over</span>
+        <span class="s2"># their parents.</span>
+        <span class="s1">substr </span><span class="s4">= </span><span class="s5">&quot;__metadata_request__&quot;</span>
+        <span class="s3">for </span><span class="s1">base_class </span><span class="s3">in </span><span class="s1">reversed</span><span class="s4">(</span><span class="s1">inspect</span><span class="s4">.</span><span class="s1">getmro</span><span class="s4">(</span><span class="s1">cls</span><span class="s4">)):</span>
+            <span class="s3">for </span><span class="s1">attr</span><span class="s4">, </span><span class="s1">value </span><span class="s3">in </span><span class="s1">vars</span><span class="s4">(</span><span class="s1">base_class</span><span class="s4">).</span><span class="s1">items</span><span class="s4">():</span>
+                <span class="s3">if </span><span class="s1">substr </span><span class="s3">not in </span><span class="s1">attr</span><span class="s4">:</span>
+                    <span class="s3">continue</span>
+                <span class="s2"># we don't check for attr.startswith() since python prefixes attrs</span>
+                <span class="s2"># starting with __ with the `_ClassName`.</span>
+                <span class="s1">method </span><span class="s4">= </span><span class="s1">attr</span><span class="s4">[</span><span class="s1">attr</span><span class="s4">.</span><span class="s1">index</span><span class="s4">(</span><span class="s1">substr</span><span class="s4">) + </span><span class="s1">len</span><span class="s4">(</span><span class="s1">substr</span><span class="s4">) :]</span>
+                <span class="s3">for </span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias </span><span class="s3">in </span><span class="s1">value</span><span class="s4">.</span><span class="s1">items</span><span class="s4">():</span>
+                    <span class="s2"># Here we add request values specified via those class attributes</span>
+                    <span class="s2"># to the `MetadataRequest` object. Adding a request which already</span>
+                    <span class="s2"># exists will override the previous one. Since we go through the</span>
+                    <span class="s2"># MRO in reverse order, the one specified by the lowest most classes</span>
+                    <span class="s2"># in the inheritance tree are the ones which take effect.</span>
+                    <span class="s1">getattr</span><span class="s4">(</span><span class="s1">requests</span><span class="s4">, </span><span class="s1">method</span><span class="s4">).</span><span class="s1">add_request</span><span class="s4">(</span><span class="s1">param</span><span class="s4">=</span><span class="s1">prop</span><span class="s4">, </span><span class="s1">alias</span><span class="s4">=</span><span class="s1">alias</span><span class="s4">)</span>
+
+        <span class="s3">return </span><span class="s1">requests</span>
+
+    <span class="s3">def </span><span class="s1">_get_metadata_request</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Get requested data properties. 
+ 
+        Please check :ref:`User Guide &lt;metadata_routing&gt;` on how the routing 
+        mechanism works. 
+ 
+        Returns 
+        ------- 
+        request : MetadataRequest 
+            A :class:`~sklearn.utils.metadata_routing.MetadataRequest` instance. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">if </span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s5">&quot;_metadata_request&quot;</span><span class="s4">):</span>
+            <span class="s1">requests </span><span class="s4">= </span><span class="s1">get_routing_for_object</span><span class="s4">(</span><span class="s1">self</span><span class="s4">.</span><span class="s1">_metadata_request</span><span class="s4">)</span>
+        <span class="s3">else</span><span class="s4">:</span>
+            <span class="s1">requests </span><span class="s4">= </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_default_requests</span><span class="s4">()</span>
+
+        <span class="s3">return </span><span class="s1">requests</span>
+
+    <span class="s3">def </span><span class="s1">get_metadata_routing</span><span class="s4">(</span><span class="s1">self</span><span class="s4">):</span>
+        <span class="s0">&quot;&quot;&quot;Get metadata routing of this object. 
+ 
+        Please check :ref:`User Guide &lt;metadata_routing&gt;` on how the routing 
+        mechanism works. 
+ 
+        Returns 
+        ------- 
+        routing : MetadataRequest 
+            A :class:`~sklearn.utils.metadata_routing.MetadataRequest` encapsulating 
+            routing information. 
+        &quot;&quot;&quot;</span>
+        <span class="s3">return </span><span class="s1">self</span><span class="s4">.</span><span class="s1">_get_metadata_request</span><span class="s4">()</span>
+
+
+<span class="s2"># Process Routing in Routers</span>
+<span class="s2"># ==========================</span>
+<span class="s2"># This is almost always the only method used in routers to process and route</span>
+<span class="s2"># given metadata. This is to minimize the boilerplate required in routers.</span>
+
+
+<span class="s2"># Here the first two arguments are positional only which makes everything</span>
+<span class="s2"># passed as keyword argument a metadata. The first two args also have an `_`</span>
+<span class="s2"># prefix to reduce the chances of name collisions with the passed metadata, and</span>
+<span class="s2"># since they're positional only, users will never type those underscores.</span>
+<span class="s3">def </span><span class="s1">process_routing</span><span class="s4">(</span><span class="s1">_obj</span><span class="s4">, </span><span class="s1">_method</span><span class="s4">, /, **</span><span class="s1">kwargs</span><span class="s4">):</span>
+    <span class="s0">&quot;&quot;&quot;Validate and route input parameters. 
+ 
+    This function is used inside a router's method, e.g. :term:`fit`, 
+    to validate the metadata and handle the routing. 
+ 
+    Assuming this signature of a router's fit method: 
+    ``fit(self, X, y, sample_weight=None, **fit_params)``, 
+    a call to this function would be: 
+    ``process_routing(self, &quot;fit&quot;, sample_weight=sample_weight, **fit_params)``. 
+ 
+    Note that if routing is not enabled and ``kwargs`` is empty, then it 
+    returns an empty routing where ``process_routing(...).ANYTHING.ANY_METHOD`` 
+    is always an empty dictionary. 
+ 
+    .. versionadded:: 1.3 
+ 
+    Parameters 
+    ---------- 
+    _obj : object 
+        An object implementing ``get_metadata_routing``. Typically a 
+        meta-estimator. 
+ 
+    _method : str 
+        The name of the router's method in which this function is called. 
+ 
+    **kwargs : dict 
+        Metadata to be routed. 
+ 
+    Returns 
+    ------- 
+    routed_params : Bunch 
+        A :class:`~utils.Bunch` of the form ``{&quot;object_name&quot;: {&quot;method_name&quot;: 
+        {params: value}}}`` which can be used to pass the required metadata to 
+        A :class:`~sklearn.utils.Bunch` of the form ``{&quot;object_name&quot;: {&quot;method_name&quot;: 
+        {params: value}}}`` which can be used to pass the required metadata to 
+        corresponding methods or corresponding child objects. The object names 
+        are those defined in `obj.get_metadata_routing()`. 
+    &quot;&quot;&quot;</span>
+    <span class="s3">if not </span><span class="s1">kwargs</span><span class="s4">:</span>
+        <span class="s2"># If routing is not enabled and kwargs are empty, then we don't have to</span>
+        <span class="s2"># try doing any routing, we can simply return a structure which returns</span>
+        <span class="s2"># an empty dict on routed_params.ANYTHING.ANY_METHOD.</span>
+        <span class="s3">class </span><span class="s1">EmptyRequest</span><span class="s4">:</span>
+            <span class="s3">def </span><span class="s1">get</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">, </span><span class="s1">default</span><span class="s4">=</span><span class="s3">None</span><span class="s4">):</span>
+                <span class="s3">return </span><span class="s1">Bunch</span><span class="s4">(**{</span><span class="s1">method</span><span class="s4">: </span><span class="s1">dict</span><span class="s4">() </span><span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">METHODS</span><span class="s4">})</span>
+
+            <span class="s3">def </span><span class="s1">__getitem__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">):</span>
+                <span class="s3">return </span><span class="s1">Bunch</span><span class="s4">(**{</span><span class="s1">method</span><span class="s4">: </span><span class="s1">dict</span><span class="s4">() </span><span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">METHODS</span><span class="s4">})</span>
+
+            <span class="s3">def </span><span class="s1">__getattr__</span><span class="s4">(</span><span class="s1">self</span><span class="s4">, </span><span class="s1">name</span><span class="s4">):</span>
+                <span class="s3">return </span><span class="s1">Bunch</span><span class="s4">(**{</span><span class="s1">method</span><span class="s4">: </span><span class="s1">dict</span><span class="s4">() </span><span class="s3">for </span><span class="s1">method </span><span class="s3">in </span><span class="s1">METHODS</span><span class="s4">})</span>
+
+        <span class="s3">return </span><span class="s1">EmptyRequest</span><span class="s4">()</span>
+
+    <span class="s3">if not </span><span class="s4">(</span><span class="s1">hasattr</span><span class="s4">(</span><span class="s1">_obj</span><span class="s4">, </span><span class="s5">&quot;get_metadata_routing&quot;</span><span class="s4">) </span><span class="s3">or </span><span class="s1">isinstance</span><span class="s4">(</span><span class="s1">_obj</span><span class="s4">, </span><span class="s1">MetadataRouter</span><span class="s4">)):</span>
+        <span class="s3">raise </span><span class="s1">AttributeError</span><span class="s4">(</span>
+            <span class="s5">f&quot;The given object (</span><span class="s3">{</span><span class="s1">repr</span><span class="s4">(</span><span class="s1">_obj</span><span class="s4">.</span><span class="s1">__class__</span><span class="s4">.</span><span class="s1">__name__</span><span class="s4">)</span><span class="s3">}</span><span class="s5">) needs to either&quot;</span>
+            <span class="s5">&quot; implement the routing method `get_metadata_routing` or be a&quot;</span>
+            <span class="s5">&quot; `MetadataRouter` instance.&quot;</span>
+        <span class="s4">)</span>
+    <span class="s3">if </span><span class="s1">_method </span><span class="s3">not in </span><span class="s1">METHODS</span><span class="s4">:</span>
+        <span class="s3">raise </span><span class="s1">TypeError</span><span class="s4">(</span>
+            <span class="s5">f&quot;Can only route and process input on these methods: </span><span class="s3">{</span><span class="s1">METHODS</span><span class="s3">}</span><span class="s5">, &quot;</span>
+            <span class="s5">f&quot;while the passed method is: </span><span class="s3">{</span><span class="s1">_method</span><span class="s3">}</span><span class="s5">.&quot;</span>
+        <span class="s4">)</span>
+
+    <span class="s1">request_routing </span><span class="s4">= </span><span class="s1">get_routing_for_object</span><span class="s4">(</span><span class="s1">_obj</span><span class="s4">)</span>
+    <span class="s1">request_routing</span><span class="s4">.</span><span class="s1">validate_metadata</span><span class="s4">(</span><span class="s1">params</span><span class="s4">=</span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">method</span><span class="s4">=</span><span class="s1">_method</span><span class="s4">)</span>
+    <span class="s1">routed_params </span><span class="s4">= </span><span class="s1">request_routing</span><span class="s4">.</span><span class="s1">route_params</span><span class="s4">(</span><span class="s1">params</span><span class="s4">=</span><span class="s1">kwargs</span><span class="s4">, </span><span class="s1">caller</span><span class="s4">=</span><span class="s1">_method</span><span class="s4">)</span>
+
+    <span class="s3">return </span><span class="s1">routed_params</span>
+</pre>
+</body>
+</html>
